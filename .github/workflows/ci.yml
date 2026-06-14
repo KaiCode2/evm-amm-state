@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The companion crates (amm-math, evm-fork-cache) are consumed as git
+  # dependencies from private repos, so cargo must fetch them with the git CLI
+  # (which honours the credential rewrite configured below).
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  check:
+    name: test / clippy / fmt / docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Required while the companion crates live in PRIVATE repos. Add a repo
+      # secret `PRIVATE_REPO_TOKEN` = a PAT (or fine-grained token) with read
+      # access to KaiCode2/amm-math and KaiCode2/evm-fork-cache. Once those
+      # crates are published to crates.io and the Cargo.toml deps switch to
+      # plain `version = "..."`, this step can be removed.
+      - name: Authenticate git for private companion crates
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --no-deps -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Docs
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
