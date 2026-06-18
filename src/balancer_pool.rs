@@ -102,6 +102,36 @@ impl BalancerPool {
         self.inner = WeightedPool::from_params(params, decimals);
     }
 
+    /// Apply a Balancer V2 vault `Swap` event in place.
+    ///
+    /// The vault emits `Swap(poolId, tokenIn, tokenOut, amountIn, amountOut)`,
+    /// which is enough to update the affected pool's balances exactly without an
+    /// RPC round-trip: `balance[tokenIn] += amountIn` and
+    /// `balance[tokenOut] -= amountOut`. Amounts are raw on-chain values and are
+    /// converted to the pool's internal real-unit representation using the
+    /// per-token decimals captured during initialization. Tokens not held by
+    /// this pool are ignored. Returns `true` if any balance changed.
+    pub fn apply_vault_swap(
+        &mut self,
+        token_in: Address,
+        amount_in: U256,
+        token_out: Address,
+        amount_out: U256,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(idx) = self.inner.tokens.iter().position(|t| *t == token_in) {
+            let delta = u256_to_f64_lossy(amount_in, self.token_decimals(token_in));
+            self.inner.balances[idx] += delta;
+            changed = true;
+        }
+        if let Some(idx) = self.inner.tokens.iter().position(|t| *t == token_out) {
+            let delta = u256_to_f64_lossy(amount_out, self.token_decimals(token_out));
+            self.inner.balances[idx] = (self.inner.balances[idx] - delta).max(0.0);
+            changed = true;
+        }
+        changed
+    }
+
     /// Return current balances as (token, U256) pairs for on-chain comparison.
     pub fn balances_u256(&self) -> Vec<(Address, U256)> {
         self.inner

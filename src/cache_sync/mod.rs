@@ -50,7 +50,7 @@ pub use v3_sync::{
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::{SolCall, sol};
@@ -80,6 +80,7 @@ use evm_fork_cache::cache::{
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
     v3_tick_info_storage_keys_with_base,
 };
+use evm_fork_cache::freshness::FreshnessParams;
 
 /// Shared AMM reference type used by synchronization entry points.
 pub type AMMRef = Arc<RwLock<LocalAMM>>;
@@ -92,6 +93,13 @@ pub(crate) const MAX_TICK: i32 = 887_272;
 /// the cache is considered potentially stale and should be re-verified.
 /// 256 ticks = 1 word, so this allows movement within ~4 words before triggering re-validation.
 pub(crate) const MAX_TICK_DRIFT_FOR_CACHE: i32 = 1024;
+
+fn current_observation_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
 
 /// Maximum number of words to scan in each direction from the current tick.
 /// This is a safety limit to prevent runaway scans. With tick_spacing=1,
@@ -330,7 +338,9 @@ async fn prefetch_accounts_parallel(
 
     // Use BlockingMode::Block so basic_ref calls can run on the blocking thread pool
     // without calling block_in_place (which would starve tokio worker threads).
-    let backend = cache.backend().with_blocking_mode(BlockingMode::Block);
+    let backend = cache
+        .unchecked_backend()
+        .with_blocking_mode(BlockingMode::Block);
 
     let result = adaptive_prefetch::run_adaptive_prefetch(
         &addresses_to_fetch,
@@ -363,7 +373,7 @@ async fn prefetch_accounts_parallel(
 // Parallel Pool State Refresh
 // ============================================================================
 //
-// Replaces the sequential sync_all_pool_state() in bot.rs. Uses cloned
+// Parallel alternative to a sequential per-pool refresh. Uses cloned
 // SharedBackend instances for parallel raw storage reads, keeping serial
 // phases only for fast in-memory operations (purging, decoding, pool updates).
 
@@ -401,8 +411,8 @@ struct CurvePoolWork {
 
 /// Refresh all pool state (V2 reserves + V3 slot0/ticks) using parallel raw storage reads.
 ///
-/// This is functionally equivalent to the sequential `sync_all_pool_state` in bot.rs
-/// but fetches storage slots in parallel via cloned `SharedBackend` instances, which
+/// This is functionally equivalent to refreshing each pool sequentially, but
+/// fetches storage slots in parallel via cloned `SharedBackend` instances, which
 /// dramatically reduces wall-clock time for large pool sets.
 #[allow(clippy::needless_late_init)]
 pub async fn sync_all_pool_state_parallel(
@@ -554,7 +564,7 @@ pub async fn sync_all_pool_state_parallel(
 
     // -- Phase 2: Parallel fetch via cloned backend --
     let phase2_start = Instant::now();
-    let backend = cache.backend().clone();
+    let backend = cache.unchecked_backend().clone();
 
     // Tag to identify what each fetched slot represents
     #[derive(Clone, Copy)]
@@ -749,7 +759,7 @@ pub async fn sync_all_pool_state_parallel(
     let mut v3_bitmap_fresh: Vec<HashMap<i16, U256>> = vec![HashMap::new(); v3_work.len()];
 
     if !v3_bitmap_refresh_requests.is_empty() {
-        let backend = cache.backend().clone();
+        let backend = cache.unchecked_backend().clone();
         let mut adaptive = adaptive_prefetch::AdaptiveState::new(
             adaptive_prefetch::AdaptivePrefetchConfig::throttle_aware(),
         );
@@ -871,7 +881,7 @@ pub async fn sync_all_pool_state_parallel(
     let mut tick_slot3_results: HashMap<(usize, i32), U256> = HashMap::new();
 
     if !tick_fetch_requests.is_empty() {
-        let backend = cache.backend().clone();
+        let backend = cache.unchecked_backend().clone();
 
         let mut adaptive = adaptive_prefetch::AdaptiveState::new(
             adaptive_prefetch::AdaptivePrefetchConfig::throttle_aware(),
@@ -1304,7 +1314,12 @@ pub fn inject_hot_state_to_evm(
                     cache.purge_pool_slots(addr, &[V2_RESERVES_SLOT]);
                     result.injection_failures.push(addr);
                 } else {
-                    observations.observe(addr, V2_RESERVES_SLOT, packed);
+                    observations.observe(
+                        addr,
+                        V2_RESERVES_SLOT,
+                        packed,
+                        current_observation_time(),
+                    );
                     result.v2_injected += 1;
                 }
             }
@@ -1401,7 +1416,7 @@ fn inject_v3_hot_state(
                 result.injection_failures.push(addr);
                 return;
             }
-            observations.observe(addr, slot0_slot, patched);
+            observations.observe(addr, slot0_slot, patched, current_observation_time());
         }
         Err(e) => {
             // First cycle or cache miss — can't read-modify-write, fall back to purge
@@ -1424,7 +1439,12 @@ fn inject_v3_hot_state(
     // Check if liquidity changed from last observation
     let prev_liquidity = observations.last_value(addr, liquidity_slot);
     let liquidity_changed = prev_liquidity.is_some_and(|prev| prev != liquidity_value);
-    observations.observe(addr, liquidity_slot, liquidity_value);
+    observations.observe(
+        addr,
+        liquidity_slot,
+        liquidity_value,
+        current_observation_time(),
+    );
 
     result.v3_injected += 1;
 
@@ -1473,7 +1493,12 @@ pub fn smart_purge_contract_storage(
     let mut skipped = 0usize;
 
     for slot in &cached_slots {
-        if tracker.should_refetch(addr, *slot) {
+        if tracker.should_refetch(
+            addr,
+            *slot,
+            current_observation_time(),
+            &FreshnessParams::default(),
+        ) {
             cache.purge_pool_slots(addr, &[*slot]);
             purged += 1;
         } else {

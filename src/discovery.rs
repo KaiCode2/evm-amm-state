@@ -533,16 +533,20 @@ pub struct DiscoveredAmmInfo {
     pub fee_or_param: String,
     pub token_symbols: Vec<String>,
     pub liquidity_display: String,
-    pub used_in_opportunity: bool,
+    /// Whether the caller flagged this pool as of interest (see
+    /// `highlighted_amms` in [`build_discovered_amm_info`]).
+    pub highlighted: bool,
 }
 
 /// Build display info for each discovered AMM.
 ///
-/// `opportunity_amms` is the set of AMM addresses used in any found opportunity.
+/// `highlighted_amms` is a caller-supplied set of addresses to mark as of
+/// interest in the resulting rows (e.g. pools that appear in a route the caller
+/// cares about); pass an empty set if not needed.
 pub fn build_discovered_amm_info(
     discovered: &[(Address, LocalAMM)],
     token_metadata: &HashMap<Address, TokenDisplayMetadata>,
-    opportunity_amms: &HashSet<Address>,
+    highlighted_amms: &HashSet<Address>,
 ) -> Vec<DiscoveredAmmInfo> {
     discovered
         .iter()
@@ -580,7 +584,7 @@ pub fn build_discovered_amm_info(
                 fee_or_param,
                 token_symbols,
                 liquidity_display,
-                used_in_opportunity: opportunity_amms.contains(addr),
+                highlighted: highlighted_amms.contains(addr),
             }
         })
         .collect()
@@ -754,18 +758,18 @@ mod tests {
     }
 
     #[test]
-    fn test_per_strategy_token_set_pairs() {
-        // Simulate a strategy that touches {A, B, WETH, C}
-        // Should produce C(4,2) = 6 pairs including the cross-path (A,B) pair
+    fn test_token_set_pairs() {
+        // A token set {A, B, WETH, C} should produce C(4,2) = 6 unique pairs,
+        // including the direct (A,B) pair.
         let a = Address::repeat_byte(0x01);
         let b = Address::repeat_byte(0x02);
         let weth = Address::repeat_byte(0xFF);
         let c = Address::repeat_byte(0x03);
 
-        let strategy_tokens: HashSet<Address> = [a, b, weth, c].into_iter().collect();
+        let token_set: HashSet<Address> = [a, b, weth, c].into_iter().collect();
         let mut pairs = HashSet::new();
 
-        let tokens: Vec<Address> = strategy_tokens.into_iter().collect();
+        let tokens: Vec<Address> = token_set.into_iter().collect();
         for i in 0..tokens.len() {
             for j in (i + 1)..tokens.len() {
                 pairs.insert(canonical_pair(tokens[i], tokens[j]));

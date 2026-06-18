@@ -1,0 +1,154 @@
+//! Protocol storage constants and storage-key helpers.
+
+use alloy_primitives::{U256, keccak256};
+
+/// Storage slot for Uniswap V2 pair reserves.
+pub const V2_RESERVES_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
+
+/// Storage slot for Uniswap V3 `slot0`.
+pub const V3_SLOT0_SLOT: U256 = U256::ZERO;
+
+/// Storage slot for Uniswap V3 global liquidity.
+pub const V3_LIQUIDITY_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
+
+/// Base storage slot for Uniswap V3 `ticks` mapping.
+pub const V3_TICKS_BASE_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
+
+/// Base storage slot for Uniswap V3 `tickBitmap` mapping.
+pub const V3_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Storage slot for PancakeSwap V3 global liquidity.
+pub const PANCAKE_V3_LIQUIDITY_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
+
+/// Base storage slot for PancakeSwap V3 `ticks` mapping.
+pub const PANCAKE_V3_TICKS_BASE_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Base storage slot for PancakeSwap V3 `tickBitmap` mapping.
+pub const PANCAKE_V3_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
+
+/// Storage slot for Slipstream CL `slot0`.
+pub const SLIPSTREAM_SLOT0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Storage slot for Slipstream CL global liquidity.
+pub const SLIPSTREAM_LIQUIDITY_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
+
+/// Base storage slot for Slipstream CL `ticks` mapping.
+pub const SLIPSTREAM_TICKS_BASE_SLOT: U256 = U256::from_limbs([19, 0, 0, 0]);
+
+/// Base storage slot for Slipstream CL `tickBitmap` mapping.
+pub const SLIPSTREAM_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([18, 0, 0, 0]);
+
+/// Storage layout for a V3-style concentrated-liquidity pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct V3StorageLayout {
+    pub slot0_slot: U256,
+    pub liquidity_slot: U256,
+    pub ticks_base_slot: U256,
+    pub tick_bitmap_base_slot: U256,
+    pub tick_spacing: i32,
+}
+
+impl V3StorageLayout {
+    /// Build a V3-style layout from explicit storage slots.
+    pub const fn new(
+        slot0_slot: U256,
+        liquidity_slot: U256,
+        ticks_base_slot: U256,
+        tick_bitmap_base_slot: U256,
+        tick_spacing: i32,
+    ) -> Self {
+        Self {
+            slot0_slot,
+            liquidity_slot,
+            ticks_base_slot,
+            tick_bitmap_base_slot,
+            tick_spacing,
+        }
+    }
+
+    /// Uniswap V3 canonical storage layout.
+    pub const fn uniswap(tick_spacing: i32) -> Self {
+        Self::new(
+            V3_SLOT0_SLOT,
+            V3_LIQUIDITY_SLOT,
+            V3_TICKS_BASE_SLOT,
+            V3_TICK_BITMAP_BASE_SLOT,
+            tick_spacing,
+        )
+    }
+
+    /// PancakeSwap V3 storage layout.
+    pub const fn pancake(tick_spacing: i32) -> Self {
+        Self::new(
+            V3_SLOT0_SLOT,
+            PANCAKE_V3_LIQUIDITY_SLOT,
+            PANCAKE_V3_TICKS_BASE_SLOT,
+            PANCAKE_V3_TICK_BITMAP_BASE_SLOT,
+            tick_spacing,
+        )
+    }
+
+    /// Slipstream CL storage layout.
+    pub const fn slipstream(tick_spacing: i32) -> Self {
+        Self::new(
+            SLIPSTREAM_SLOT0_SLOT,
+            SLIPSTREAM_LIQUIDITY_SLOT,
+            SLIPSTREAM_TICKS_BASE_SLOT,
+            SLIPSTREAM_TICK_BITMAP_BASE_SLOT,
+            tick_spacing,
+        )
+    }
+}
+
+/// Compute the storage key for a Uniswap V3 tick bitmap word.
+pub fn v3_tick_bitmap_storage_key(word_position: i16) -> U256 {
+    v3_tick_bitmap_storage_key_with_base(word_position, V3_TICK_BITMAP_BASE_SLOT)
+}
+
+/// Compute the storage key for a V3-style tick bitmap word with a custom base slot.
+pub fn v3_tick_bitmap_storage_key_with_base(word_position: i16, base_slot: U256) -> U256 {
+    let word_i256 = i256_from_i16(word_position);
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&word_i256);
+    preimage[32..64].copy_from_slice(&base_slot.to_be_bytes::<32>());
+    keccak256(preimage).into()
+}
+
+/// Compute the four storage keys occupied by a Uniswap V3 `Tick.Info` struct.
+pub fn v3_tick_info_storage_keys(tick: i32) -> [U256; 4] {
+    v3_tick_info_storage_keys_with_base(tick, V3_TICKS_BASE_SLOT)
+}
+
+/// Compute the four storage keys occupied by a V3-style `Tick.Info` struct.
+pub fn v3_tick_info_storage_keys_with_base(tick: i32, ticks_slot: U256) -> [U256; 4] {
+    let tick_i256 = i256_from_i24(tick);
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&tick_i256);
+    preimage[32..64].copy_from_slice(&ticks_slot.to_be_bytes::<32>());
+    let base: U256 = keccak256(preimage).into();
+    [
+        base,
+        base + U256::from(1),
+        base + U256::from(2),
+        base + U256::from(3),
+    ]
+}
+
+fn i256_from_i16(value: i16) -> [u8; 32] {
+    let mut result = if value < 0 { [0xFF; 32] } else { [0x00; 32] };
+    let bytes = value.to_be_bytes();
+    result[30] = bytes[0];
+    result[31] = bytes[1];
+    result
+}
+
+fn i256_from_i24(value: i32) -> [u8; 32] {
+    let masked = value & 0x00FF_FFFF;
+    let is_negative = (masked & 0x0080_0000) != 0;
+
+    let mut result = if is_negative { [0xFF; 32] } else { [0x00; 32] };
+    result[29] = ((masked >> 16) & 0xFF) as u8;
+    result[30] = ((masked >> 8) & 0xFF) as u8;
+    result[31] = (masked & 0xFF) as u8;
+    result
+}

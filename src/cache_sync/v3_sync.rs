@@ -3,6 +3,7 @@ use super::v3_bitmap::{
     extract_ticks_from_bitmap_word, needs_tick_resync, tick_to_word,
 };
 use super::*;
+use evm_fork_cache::cache::TickInfo as CacheTickInfo;
 
 /// Result of V3 phase 1 initialization.
 ///
@@ -134,6 +135,36 @@ enum TickCacheStatus {
     },
 }
 
+fn cache_tick_to_info(tick: CacheTickInfo) -> Info {
+    Info {
+        liquidity_gross: tick.liquidity_gross,
+        liquidity_net: tick.liquidity_net,
+        initialized: tick.initialized,
+    }
+}
+
+fn info_to_cache_tick(info: &Info) -> CacheTickInfo {
+    CacheTickInfo {
+        liquidity_gross: info.liquidity_gross,
+        liquidity_net: info.liquidity_net,
+        initialized: info.initialized,
+    }
+}
+
+fn cache_ticks_to_info(ticks: HashMap<i32, CacheTickInfo>) -> HashMap<i32, Info> {
+    ticks
+        .into_iter()
+        .map(|(tick, info)| (tick, cache_tick_to_info(info)))
+        .collect()
+}
+
+fn info_ticks_to_cache(ticks: &HashMap<i32, Info>) -> HashMap<i32, CacheTickInfo> {
+    ticks
+        .iter()
+        .map(|(tick, info)| (*tick, info_to_cache_tick(info)))
+        .collect()
+}
+
 fn can_reuse_v3_tick_snapshot(
     cached_liquidity: u128,
     current_liquidity: u128,
@@ -251,7 +282,7 @@ async fn init_v3_from_cache(
             snapshot.last_liquidity,
             snapshot.last_tick,
             snapshot.to_tick_bitmap(),
-            snapshot.to_ticks(),
+            cache_ticks_to_info(snapshot.to_ticks()),
             snapshot.ticks.len(),
         )
     });
@@ -392,7 +423,8 @@ async fn init_v3_from_cache(
                 }
             }
 
-            match cache.inject_v3_ticks_with_base(address, &pool.ticks, flavor.ticks_base_slot()) {
+            let cache_ticks = info_ticks_to_cache(&pool.ticks);
+            match cache.inject_v3_ticks_with_base(address, &cache_ticks, flavor.ticks_base_slot()) {
                 Ok(count) => ticks_injected = count,
                 Err(e) => {
                     warn!(
@@ -488,9 +520,10 @@ async fn init_v3_from_cache(
 ///
 /// Call this after syncing tick data to persist for future restarts.
 pub fn save_v3_tick_snapshot(cache: &mut EvmCache, pool: &UniswapV3Pool) {
+    let cache_ticks = info_ticks_to_cache(&pool.ticks);
     let snapshot = V3PoolTickSnapshot::from_pool_data(
         &pool.tick_bitmap,
-        &pool.ticks,
+        &cache_ticks,
         pool.liquidity,
         pool.tick,
     );
@@ -610,7 +643,8 @@ pub fn inject_v3_tick_data(
     ) {
         warn!(pool = %address, error = %e, "failed to inject tick bitmap after incremental resync");
     }
-    if let Err(e) = cache.inject_v3_ticks_with_base(address, &pool.ticks, flavor.ticks_base_slot())
+    let cache_ticks = info_ticks_to_cache(&pool.ticks);
+    if let Err(e) = cache.inject_v3_ticks_with_base(address, &cache_ticks, flavor.ticks_base_slot())
     {
         warn!(pool = %address, error = %e, "failed to inject ticks after incremental resync");
     }
@@ -1476,7 +1510,7 @@ async fn batch_fetch_storage_slots(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
 
-            let results = fetcher(pending.clone());
+            let results = fetcher(pending.clone(), None);
             let mut failed_this_round: Vec<(Address, U256, String)> = Vec::new();
 
             for (addr, slot, result) in results {
@@ -1523,7 +1557,9 @@ async fn batch_fetch_storage_slots(
         }
     } else {
         // Fallback: existing SharedBackend path with adaptive throttling
-        let backend = cache.backend().with_blocking_mode(BlockingMode::Block);
+        let backend = cache
+            .unchecked_backend()
+            .with_blocking_mode(BlockingMode::Block);
         let result = super::adaptive_prefetch::run_adaptive_prefetch(
             requests,
             super::adaptive_prefetch::AdaptivePrefetchConfig::throttle_aware(),
@@ -1637,7 +1673,9 @@ pub async fn prefetch_v3_tick_info_slots(
         });
     }
 
-    let backend = cache.backend().with_blocking_mode(BlockingMode::Block);
+    let backend = cache
+        .unchecked_backend()
+        .with_blocking_mode(BlockingMode::Block);
 
     // Phase 1: Read cached bitmaps (with early termination) and extract initialized ticks.
     // Only slots 0 and 3 per tick are needed (liquidityGross/Net + initialized flag).
@@ -1893,7 +1931,9 @@ pub async fn prefetch_v3_incremental_resync_slots(
     let _bitmap_result =
         batch_fetch_storage_slots(cache, &bitmap_requests, "Prefetching incremental bitmaps").await;
 
-    let backend = cache.backend().with_blocking_mode(BlockingMode::Block);
+    let backend = cache
+        .unchecked_backend()
+        .with_blocking_mode(BlockingMode::Block);
 
     // Step 4: Read cached fresh bitmaps and identify ticks to prefetch
     // Compare fresh vs old bitmaps, extract ticks from changed words + hot zone
@@ -2017,6 +2057,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, RwLock};
 
+    use alloy_eips::BlockId;
     use alloy_primitives::Bytes;
     use alloy_primitives::hex;
     use alloy_provider::{RootProvider, network::AnyNetwork};
@@ -2043,7 +2084,7 @@ mod tests {
             EvmCache::from_backend(
                 backend,
                 blockchain_db,
-                None,
+                BlockId::latest(),
                 42161,
                 None,
                 None,
@@ -2079,14 +2120,14 @@ mod tests {
         );
     }
 
-    fn seed_backend_storage(cache: &EvmCache, address: Address, slot: U256, value: U256) {
-        cache
-            .blockchain_db()
-            .storage()
-            .write()
-            .entry(address)
-            .or_default()
-            .insert(slot, value);
+    fn seed_backend_storage(cache: &mut EvmCache, address: Address, slot: U256, value: U256) {
+        cache.with_blockchain_db_mut(|db| {
+            db.storage()
+                .write()
+                .entry(address)
+                .or_default()
+                .insert(slot, value);
+        });
     }
 
     fn seed_v3_metadata(cache: &mut EvmCache, address: Address, token0: Address, token1: Address) {
@@ -2230,13 +2271,13 @@ mod tests {
             pool_address,
             V3PoolTickSnapshot::from_pool_data(
                 &cached_bitmap,
-                &cached_ticks,
+                &info_ticks_to_cache(&cached_ticks),
                 live_liquidity,
                 current_tick,
             ),
         );
         seed_backend_storage(
-            &cache,
+            &mut cache,
             pool_address,
             v3_tick_bitmap_storage_key_with_base(word, V3_TICK_BITMAP_BASE_SLOT),
             bitmap,

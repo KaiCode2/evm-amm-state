@@ -1,0 +1,465 @@
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+
+use alloy_primitives::{Address, B256, U256};
+
+use super::cache::{SlotChange, StateDiff, StateUpdate};
+use super::storage::V3StorageLayout;
+
+/// Protocol family identifier for adapter registrations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProtocolId {
+    UniswapV2,
+    UniswapV3,
+    PancakeV3,
+    Slipstream,
+    SolidlyV2,
+    BalancerV2,
+    BalancerV3,
+    Curve,
+    Erc4626,
+    UniswapV4,
+    Custom(&'static str),
+}
+
+/// Protocol-specific pool identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PoolKey {
+    UniswapV2(Address),
+    UniswapV3(Address),
+    PancakeV3(Address),
+    Slipstream(Address),
+    SolidlyV2(Address),
+    BalancerV2(B256),
+    BalancerV3(Address),
+    Curve(Address),
+    Erc4626(Address),
+    UniswapV4(B256),
+    Custom(CustomPoolKey),
+}
+
+impl PoolKey {
+    /// Return the protocol family for this pool key.
+    pub fn protocol(&self) -> ProtocolId {
+        match self {
+            Self::UniswapV2(_) => ProtocolId::UniswapV2,
+            Self::UniswapV3(_) => ProtocolId::UniswapV3,
+            Self::PancakeV3(_) => ProtocolId::PancakeV3,
+            Self::Slipstream(_) => ProtocolId::Slipstream,
+            Self::SolidlyV2(_) => ProtocolId::SolidlyV2,
+            Self::BalancerV2(_) => ProtocolId::BalancerV2,
+            Self::BalancerV3(_) => ProtocolId::BalancerV3,
+            Self::Curve(_) => ProtocolId::Curve,
+            Self::Erc4626(_) => ProtocolId::Erc4626,
+            Self::UniswapV4(_) => ProtocolId::UniswapV4,
+            Self::Custom(key) => key.protocol(),
+        }
+    }
+
+    /// Return the address identity for address-keyed pools.
+    pub fn address(&self) -> Option<Address> {
+        match self {
+            Self::UniswapV2(address)
+            | Self::UniswapV3(address)
+            | Self::PancakeV3(address)
+            | Self::Slipstream(address)
+            | Self::SolidlyV2(address)
+            | Self::BalancerV3(address)
+            | Self::Curve(address)
+            | Self::Erc4626(address) => Some(*address),
+            Self::Custom(key) => key.address(),
+            Self::BalancerV2(_) | Self::UniswapV4(_) => None,
+        }
+    }
+
+    /// Return the bytes32 identity for bytes32-keyed pools.
+    pub fn bytes32(&self) -> Option<B256> {
+        match self {
+            Self::BalancerV2(id) | Self::UniswapV4(id) => Some(*id),
+            Self::Custom(key) => key.bytes32(),
+            Self::UniswapV2(_)
+            | Self::UniswapV3(_)
+            | Self::PancakeV3(_)
+            | Self::Slipstream(_)
+            | Self::SolidlyV2(_)
+            | Self::BalancerV3(_)
+            | Self::Curve(_)
+            | Self::Erc4626(_) => None,
+        }
+    }
+}
+
+/// Extension point for protocol-specific pool key shapes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CustomPoolKey {
+    Address {
+        protocol: &'static str,
+        address: Address,
+    },
+    Bytes32 {
+        protocol: &'static str,
+        id: B256,
+    },
+    Composite {
+        protocol: &'static str,
+        address: Address,
+        id: B256,
+    },
+}
+
+impl CustomPoolKey {
+    pub fn protocol(&self) -> ProtocolId {
+        match self {
+            Self::Address { protocol, .. }
+            | Self::Bytes32 { protocol, .. }
+            | Self::Composite { protocol, .. } => ProtocolId::Custom(protocol),
+        }
+    }
+
+    pub fn address(&self) -> Option<Address> {
+        match self {
+            Self::Address { address, .. } | Self::Composite { address, .. } => Some(*address),
+            Self::Bytes32 { .. } => None,
+        }
+    }
+
+    pub fn bytes32(&self) -> Option<B256> {
+        match self {
+            Self::Bytes32 { id, .. } | Self::Composite { id, .. } => Some(*id),
+            Self::Address { .. } => None,
+        }
+    }
+}
+
+/// One log emitter and routing rule for a tracked pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventSource {
+    pub emitter: Address,
+    pub topics: Vec<B256>,
+    pub route: EventRoute,
+}
+
+impl EventSource {
+    pub fn direct(emitter: Address, topics: Vec<B256>) -> Self {
+        Self {
+            emitter,
+            topics,
+            route: EventRoute::Direct,
+        }
+    }
+
+    pub fn indexed_address(emitter: Address, topics: Vec<B256>, topic_index: usize) -> Self {
+        Self {
+            emitter,
+            topics,
+            route: EventRoute::IndexedAddress { topic_index },
+        }
+    }
+
+    pub fn indexed_bytes32(emitter: Address, topics: Vec<B256>, topic_index: usize) -> Self {
+        Self {
+            emitter,
+            topics,
+            route: EventRoute::IndexedBytes32 { topic_index },
+        }
+    }
+
+    pub fn adapter_defined(emitter: Address, topics: Vec<B256>) -> Self {
+        Self {
+            emitter,
+            topics,
+            route: EventRoute::AdapterDefined,
+        }
+    }
+}
+
+/// Generic routing rule for a log emitted by an [`EventSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventRoute {
+    Direct,
+    IndexedAddress { topic_index: usize },
+    IndexedBytes32 { topic_index: usize },
+    AdapterDefined,
+}
+
+/// Per-pool sidecar registration owned by `evm-amm-state`.
+#[derive(Clone, Debug)]
+pub struct PoolRegistration {
+    pub key: PoolKey,
+    pub state_addresses: Vec<Address>,
+    pub event_sources: Vec<EventSource>,
+    pub metadata: ProtocolMetadata,
+    pub status: PoolStatus,
+}
+
+impl PoolRegistration {
+    pub fn new(key: PoolKey) -> Self {
+        Self {
+            key,
+            state_addresses: Vec::new(),
+            event_sources: Vec::new(),
+            metadata: ProtocolMetadata::Unknown,
+            status: PoolStatus::Pending,
+        }
+    }
+
+    pub fn protocol(&self) -> ProtocolId {
+        self.key.protocol()
+    }
+
+    pub fn with_state_address(mut self, address: Address) -> Self {
+        self.state_addresses.push(address);
+        self
+    }
+
+    pub fn with_state_addresses(mut self, addresses: impl IntoIterator<Item = Address>) -> Self {
+        self.state_addresses.extend(addresses);
+        self
+    }
+
+    pub fn with_event_source(mut self, source: EventSource) -> Self {
+        self.event_sources.push(source);
+        self
+    }
+
+    pub fn with_event_sources(mut self, sources: impl IntoIterator<Item = EventSource>) -> Self {
+        self.event_sources.extend(sources);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: ProtocolMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_status(mut self, status: PoolStatus) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+/// Protocol metadata known for a tracked pool.
+#[derive(Clone, Default)]
+pub enum ProtocolMetadata {
+    #[default]
+    Unknown,
+    UniswapV2(UniswapV2Metadata),
+    UniswapV3(V3Metadata),
+    PancakeV3(V3Metadata),
+    Slipstream(V3Metadata),
+    BalancerV2(BalancerV2Metadata),
+    Custom(Arc<dyn Any + Send + Sync>),
+}
+
+impl fmt::Debug for ProtocolMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("Unknown"),
+            Self::UniswapV2(metadata) => f.debug_tuple("UniswapV2").field(metadata).finish(),
+            Self::UniswapV3(metadata) => f.debug_tuple("UniswapV3").field(metadata).finish(),
+            Self::PancakeV3(metadata) => f.debug_tuple("PancakeV3").field(metadata).finish(),
+            Self::Slipstream(metadata) => f.debug_tuple("Slipstream").field(metadata).finish(),
+            Self::BalancerV2(metadata) => f.debug_tuple("BalancerV2").field(metadata).finish(),
+            Self::Custom(_) => f.write_str("Custom(..)"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UniswapV2Metadata {
+    pub token0: Option<Address>,
+    pub token1: Option<Address>,
+    pub fee_bps: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct V3Metadata {
+    pub token0: Option<Address>,
+    pub token1: Option<Address>,
+    pub fee: Option<u32>,
+    pub tick_spacing: Option<i32>,
+    pub storage_layout: Option<V3StorageLayout>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BalancerV2Metadata {
+    pub vault: Option<Address>,
+    pub pool_address: Option<Address>,
+    pub tokens: Vec<Address>,
+}
+
+/// Lifecycle status for a tracked pool registration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PoolStatus {
+    #[default]
+    Pending,
+    Cold,
+    Ready,
+    Degraded,
+    Disabled,
+    Unsupported,
+}
+
+/// Adapter-derived semantic event and cache mutations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterEvent {
+    pub pool: PoolKey,
+    pub emitter: Address,
+    pub topic0: B256,
+    pub kind: AdapterEventKind,
+    pub updates: Vec<StateUpdate>,
+    pub quality: UpdateQuality,
+    pub repair: RepairAction,
+}
+
+/// High-level AMM event class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdapterEventKind {
+    Swap,
+    LiquidityAdded,
+    LiquidityRemoved,
+    Sync,
+    Deposit,
+    Withdraw,
+    Unknown,
+}
+
+/// Result of protocol adapter log decoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdapterEventResult {
+    pub event: Option<AdapterEvent>,
+    pub error: Option<AdapterEventError>,
+}
+
+impl AdapterEventResult {
+    pub fn event(event: AdapterEvent) -> Self {
+        Self {
+            event: Some(event),
+            error: None,
+        }
+    }
+
+    pub fn ignored() -> Self {
+        Self::default()
+    }
+
+    pub fn error(error: AdapterEventError) -> Self {
+        Self {
+            event: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Decode-time adapter error vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdapterEventError {
+    MalformedLog(&'static str),
+    MissingState { address: Address, slot: U256 },
+    Unsupported(UnsupportedReason),
+    Custom(String),
+}
+
+/// Quality of the cache update emitted for an adapter event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UpdateQuality {
+    Exact,
+    ExactIfApplied,
+    RequiresRepair,
+    ConservativeInvalidation,
+    Ignored,
+}
+
+/// Adapter-level follow-up work after cold-start or event application.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RepairAction {
+    #[default]
+    None,
+    VerifySlots(Vec<(Address, U256)>),
+    PurgeStorage(Address),
+    PurgeSlots {
+        address: Address,
+        slots: Vec<U256>,
+    },
+    ColdStart {
+        pool: PoolKey,
+        policy: ColdStartPolicy,
+    },
+    V3TickRange {
+        pool: PoolKey,
+        tick_lower: i32,
+        tick_upper: i32,
+    },
+    V3Incremental {
+        pool: PoolKey,
+    },
+    V3Full {
+        pool: PoolKey,
+    },
+}
+
+/// Cold-start strictness and cost policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColdStartPolicy {
+    Strict,
+    Eager,
+    Lazy,
+    HotSlotsOnly,
+}
+
+/// Result of attempting to cold-start a tracked pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColdStartOutcome {
+    Ready(ColdStartReport),
+    ReadyWithDeferred(ColdStartReport, Vec<DeferredWork>),
+    NeedsRepair(ColdStartReport, RepairAction),
+    Unsupported(UnsupportedReason),
+}
+
+/// Inspectable summary of cold-start work performed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdStartReport {
+    pub pool: PoolKey,
+    pub policy: ColdStartPolicy,
+    pub status: PoolStatus,
+    pub verified_slots: Vec<(Address, U256)>,
+    pub changed_slots: Vec<SlotChange>,
+    pub applied: StateDiff,
+    pub deferred: Vec<DeferredWork>,
+}
+
+impl ColdStartReport {
+    pub fn new(pool: PoolKey, policy: ColdStartPolicy) -> Self {
+        Self {
+            pool,
+            policy,
+            status: PoolStatus::Pending,
+            verified_slots: Vec::new(),
+            changed_slots: Vec::new(),
+            applied: StateDiff::default(),
+            deferred: Vec::new(),
+        }
+    }
+}
+
+/// Deferred adapter work that can be scheduled after cold-start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeferredWork {
+    VerifySlots(Vec<(Address, U256)>),
+    Repair(RepairAction),
+    ColdStart {
+        pool: PoolKey,
+        policy: ColdStartPolicy,
+    },
+    Custom(String),
+}
+
+/// Why a protocol state, event, or policy is not supported by the current adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnsupportedReason {
+    Protocol(ProtocolId),
+    MissingMetadata(&'static str),
+    AdapterDefinedRouting,
+    Custom(String),
+}

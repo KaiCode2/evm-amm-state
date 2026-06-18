@@ -1,22 +1,27 @@
-//! TOML-driven AMM configuration loading and lazy V3 tick initialization.
+//! AMM configuration loading and lazy V3 tick initialization.
 //!
-//! This module parses an `amms.toml` config into [`AmmConfigEntry`] records,
-//! optionally filters them by token relevance, and initializes each entry into
-//! a [`crate::amm_wrapper::LocalAMM`] backed by an [`evm_fork_cache::cache::EvmCache`].
+//! An AMM set is described by a list of [`AmmConfigEntry`] records. Build them
+//! programmatically (see [`AmmConfigEntry::new`]) or, with the `toml` feature,
+//! parse them from an `amms.toml` file. Either way they are initialized into
+//! [`crate::amm_wrapper::LocalAMM`] pools backed by an
+//! [`evm_fork_cache::cache::EvmCache`], optionally filtered by token relevance
+//! first ([`filter_amm_entries_by_tokens`]).
 //!
-//! Two loading strategies are provided:
-//! - [`load_configured_amms`] / [`load_configured_amms_from_entries`] fully
-//!   initialize every pool (including the expensive V3 tick scan) in one call.
-//! - [`load_configured_amms_lazy`] initializes V2/Balancer pools and V3
-//!   metadata, deferring V3 tick prefetch into a [`DeferredV3Work`] handle that
-//!   [`complete_deferred_v3_work`] finishes later. This lets a caller load only
-//!   the pools it needs for the current cycle before paying the tick cost.
+//! Two loading paths are provided, each with a TOML-file variant (feature
+//! `toml`) and a TOML-free `*_from_entries` variant:
+//! - [`load_configured_amms_from_entries`] fully initializes every pool
+//!   (including the expensive V3 tick scan) in one call.
+//! - [`load_configured_amms_lazy_from_entries`] initializes V2/Balancer pools
+//!   and V3 metadata, deferring V3 tick prefetch into a [`DeferredV3Work`]
+//!   handle that [`complete_deferred_v3_work`] finishes later. This lets a
+//!   caller load only the pools it currently needs before paying the tick cost.
 
 use alloy_primitives::{Address, B256, U256};
 use serde::Deserialize;
+#[cfg(feature = "toml")]
+use std::path::Path;
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
     time::Instant,
 };
 use tracing::{debug, info, warn};
@@ -221,24 +226,122 @@ pub struct AmmConfigEntry {
     pub balancer_v3_pool_type: Option<BalancerV3PoolType>,
 }
 
+impl AmmConfigEntry {
+    /// Create a minimal entry for `kind` at `address`, with every optional
+    /// field unset. Chain the `with_*` builders to fill in the fields a given
+    /// family needs.
+    ///
+    /// This is the programmatic alternative to parsing `amms.toml`: nothing in
+    /// this crate requires a config file, and entries built this way feed the
+    /// same loaders ([`load_configured_amms_from_entries`],
+    /// [`load_configured_amms_lazy_from_entries`]).
+    ///
+    /// ```
+    /// use alloy_primitives::Address;
+    /// use evm_amm_state::configured_amms::{AmmConfigEntry, AmmType};
+    ///
+    /// let entry = AmmConfigEntry::new(AmmType::UniswapV3, Address::ZERO)
+    ///     .with_tokens(vec![Address::ZERO, Address::repeat_byte(1)])
+    ///     .with_fee_tier(3000);
+    /// ```
+    pub fn new(kind: AmmType, address: Address) -> Self {
+        Self {
+            kind,
+            address,
+            tokens: Vec::new(),
+            fee_tier: None,
+            vault_address: None,
+            pool_id: None,
+            tick_spacing: None,
+            stable: None,
+            factory_address: None,
+            hooks: None,
+            curve_use_uint256: None,
+            balancer_v3_pool_type: None,
+        }
+    }
+
+    /// Set the pool's tokens (used for routing/relevance filtering).
+    pub fn with_tokens(mut self, tokens: Vec<Address>) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    /// Set the fee tier (Uniswap/Pancake V3, in hundredths of a bip).
+    pub fn with_fee_tier(mut self, fee_tier: u32) -> Self {
+        self.fee_tier = Some(fee_tier);
+        self
+    }
+
+    /// Set the Balancer V2 vault address backing this pool.
+    pub fn with_vault_address(mut self, vault_address: Address) -> Self {
+        self.vault_address = Some(vault_address);
+        self
+    }
+
+    /// Set the Balancer V2 pool id.
+    pub fn with_pool_id(mut self, pool_id: B256) -> Self {
+        self.pool_id = Some(pool_id);
+        self
+    }
+
+    /// Set the tick spacing (Slipstream / Uniswap V4).
+    pub fn with_tick_spacing(mut self, tick_spacing: i32) -> Self {
+        self.tick_spacing = Some(tick_spacing);
+        self
+    }
+
+    /// Set whether a Solidly V2 pool is stable (`true`) or volatile (`false`).
+    pub fn with_stable(mut self, stable: bool) -> Self {
+        self.stable = Some(stable);
+        self
+    }
+
+    /// Set the factory address (Solidly V2 / Slipstream).
+    pub fn with_factory_address(mut self, factory_address: Address) -> Self {
+        self.factory_address = Some(factory_address);
+        self
+    }
+
+    /// Set the hooks address (Uniswap V4).
+    pub fn with_hooks(mut self, hooks: Address) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Select Curve index encoding: `false` = stableswap (int128 indices),
+    /// `true` = cryptoswap (uint256 indices).
+    pub fn with_curve_use_uint256(mut self, curve_use_uint256: bool) -> Self {
+        self.curve_use_uint256 = Some(curve_use_uint256);
+        self
+    }
+
+    /// Hint the Balancer V3 pool type to skip auto-detection.
+    pub fn with_balancer_v3_pool_type(mut self, pool_type: BalancerV3PoolType) -> Self {
+        self.balancer_v3_pool_type = Some(pool_type);
+        self
+    }
+}
+
+#[cfg(feature = "toml")]
 #[derive(Debug, Deserialize)]
 struct AmmConfigFile {
     amms: HashMap<String, Vec<AmmConfigEntry>>,
 }
 
-/// Filters AMM config entries to only include those that involve at least one of the active tokens.
+/// Filters AMM config entries to those involving at least one token of interest.
 ///
-/// An AMM is included if ANY of its tokens appear in the `active_tokens` set.
-/// This is a conservative approach that ensures we don't accidentally filter out
-/// pools needed for triangular arbitrage routing.
+/// An AMM is included if ANY of its tokens appear in `relevant_tokens`, or if it
+/// carries no token metadata (conservative — kept to avoid dropping usable
+/// pools). Pass an empty set to keep everything.
 ///
 /// Returns the filtered entries and the count of filtered-out entries.
 pub fn filter_amm_entries_by_tokens(
     entries: &[AmmConfigEntry],
-    active_tokens: &HashSet<Address>,
+    relevant_tokens: &HashSet<Address>,
 ) -> (Vec<AmmConfigEntry>, usize) {
-    if active_tokens.is_empty() {
-        // If no active tokens specified, include all AMMs (conservative)
+    if relevant_tokens.is_empty() {
+        // No tokens specified — keep all AMMs (conservative).
         return (entries.to_vec(), 0);
     }
 
@@ -246,18 +349,16 @@ pub fn filter_amm_entries_by_tokens(
     let mut filtered_count = 0;
 
     for entry in entries {
-        // Check if any of the AMM's tokens are in the active set
-        let has_active_token = entry.tokens.iter().any(|t| active_tokens.contains(t));
+        let has_relevant_token = entry.tokens.iter().any(|t| relevant_tokens.contains(t));
 
-        if has_active_token || entry.tokens.is_empty() {
-            // Include AMMs with active tokens or AMMs without token info (conservative)
+        if has_relevant_token || entry.tokens.is_empty() {
             included.push(entry.clone());
         } else {
             filtered_count += 1;
             debug!(
                 amm = %entry.address,
                 amm_tokens = ?entry.tokens,
-                "filtered out AMM (no token overlap with active strategies)"
+                "filtered out AMM (no overlap with tokens of interest)"
             );
         }
     }
@@ -265,21 +366,22 @@ pub fn filter_amm_entries_by_tokens(
     (included, filtered_count)
 }
 
-/// Filters AMM config entries for swap routing: only pools that can form a valid routing leg.
+/// Filters AMM config entries to pools that can form a routing leg between
+/// tokens of interest.
 ///
-/// A pool is included if it contains at least 2 tokens from the `swap_tokens` set.
-/// For a swap from A→B via WETH, `swap_tokens` should be `{A, B, WETH}`.
-/// This ensures we only load pools that can actually participate in direct or 2-leg routes,
-/// unlike `filter_amm_entries_by_tokens` which includes any pool with just 1 matching token.
+/// A pool is included if it contains at least 2 tokens from `routing_tokens`
+/// (so it can be an intermediate hop), or if it carries no token metadata. For
+/// routing A→B via WETH, pass `{A, B, WETH}`. Unlike
+/// [`filter_amm_entries_by_tokens`], a single-token overlap is not enough.
 ///
 /// Returns the filtered entries and the count of filtered-out entries.
 pub fn filter_amm_entries_for_swap(
     entries: &[AmmConfigEntry],
-    swap_tokens: &HashSet<Address>,
+    routing_tokens: &HashSet<Address>,
 ) -> (Vec<AmmConfigEntry>, usize) {
-    if swap_tokens.len() < 2 {
-        // Need at least 2 tokens for a swap pair filter to make sense
-        return filter_amm_entries_by_tokens(entries, swap_tokens);
+    if routing_tokens.len() < 2 {
+        // Need at least 2 tokens for a routing-leg filter to make sense.
+        return filter_amm_entries_by_tokens(entries, routing_tokens);
     }
 
     let mut included = Vec::with_capacity(entries.len());
@@ -289,12 +391,12 @@ pub fn filter_amm_entries_for_swap(
         let overlap_count = entry
             .tokens
             .iter()
-            .filter(|t| swap_tokens.contains(*t))
+            .filter(|t| routing_tokens.contains(*t))
             .count();
 
         if overlap_count >= 2 || entry.tokens.is_empty() {
-            // Pool has at least 2 swap-relevant tokens (valid routing leg),
-            // or has no token info (conservative — include to avoid missing pools)
+            // Pool has at least 2 routing-relevant tokens (valid leg), or has no
+            // token info (conservative — include to avoid missing pools).
             included.push(entry.clone());
         } else {
             filtered_count += 1;
@@ -302,7 +404,7 @@ pub fn filter_amm_entries_for_swap(
                 amm = %entry.address,
                 amm_tokens = ?entry.tokens,
                 overlap = overlap_count,
-                "filtered out AMM (insufficient token overlap for swap routing)"
+                "filtered out AMM (insufficient token overlap for routing)"
             );
         }
     }
@@ -310,95 +412,15 @@ pub fn filter_amm_entries_for_swap(
     (included, filtered_count)
 }
 
-/// Collects all unique tokens from a list of strategy token sets.
-///
-/// Used to build the active token set for AMM filtering.
-pub fn collect_active_tokens<I, T>(strategy_tokens: I) -> HashSet<Address>
-where
-    I: IntoIterator<Item = T>,
-    T: IntoIterator<Item = Address>,
-{
-    strategy_tokens
-        .into_iter()
-        .flat_map(|tokens| tokens.into_iter())
-        .collect()
-}
-
-/// Result of `build_strategy_amm_ownership`: which AMMs each owner "owns",
-/// and which AMMs are unclaimed by any owner (treated as shared pools).
-#[derive(Debug, Default, Clone)]
-pub struct StrategyAmmOwnership {
-    /// Owner address -> set of AMM addresses whose tokens overlap with the
-    /// owner's token set.
-    pub owned_by_strategy: HashMap<Address, HashSet<Address>>,
-    /// AMMs claimed by no owner. Always loaded when any owner is active.
-    pub unclaimed: HashSet<Address>,
-}
-
-impl StrategyAmmOwnership {
-    /// Compute the active AMM set for a cycle: union of AMMs owned by any
-    /// `ready` owner plus all unclaimed/shared AMMs.
-    pub fn active_amms(&self, ready: &[Address]) -> HashSet<Address> {
-        let mut out: HashSet<Address> = self.unclaimed.clone();
-        for strategy in ready {
-            if let Some(set) = self.owned_by_strategy.get(strategy) {
-                out.extend(set.iter().copied());
-            }
-        }
-        out
-    }
-}
-
-/// Build an owner->AMM ownership map from token-owner pairs and AMM entries.
-///
-/// An owner "owns" an AMM when the AMM's `tokens` overlap with the owner's
-/// token set. AMMs claimed by no owner go into the `unclaimed` set.
-///
-/// The input is intentionally generic so callers can use strategy configs,
-/// token universes, routing groups, or any other address-keyed owner model.
-pub fn build_strategy_amm_ownership<I, T>(
-    owners: I,
-    entries: &[AmmConfigEntry],
-) -> StrategyAmmOwnership
-where
-    I: IntoIterator<Item = (Address, T)>,
-    T: IntoIterator<Item = Address>,
-{
-    let mut owned_by_strategy: HashMap<Address, HashSet<Address>> = HashMap::new();
-    let mut claimed: HashSet<Address> = HashSet::new();
-
-    for (owner, tokens) in owners {
-        let involved: HashSet<Address> = tokens.into_iter().collect();
-        let mut owned: HashSet<Address> = HashSet::new();
-        if !involved.is_empty() {
-            for entry in entries {
-                if entry.tokens.iter().any(|t| involved.contains(t)) {
-                    owned.insert(entry.address);
-                }
-            }
-        }
-        if !owned.is_empty() {
-            claimed.extend(owned.iter().copied());
-        }
-        owned_by_strategy.insert(owner, owned);
-    }
-
-    let unclaimed: HashSet<Address> = entries
-        .iter()
-        .map(|e| e.address)
-        .filter(|addr| !claimed.contains(addr))
-        .collect();
-
-    StrategyAmmOwnership {
-        owned_by_strategy,
-        unclaimed,
-    }
-}
-
 /// Loads AMM config entries from a TOML file for a specific chain.
 ///
 /// This function just parses the config without initializing the AMMs,
 /// allowing for filtering before the expensive RPC calls.
+///
+/// TOML support is optional: this function is only available with the `toml`
+/// feature (enabled by default). Without it, build [`AmmConfigEntry`] values
+/// directly and call the `*_from_entries` loaders.
+#[cfg(feature = "toml")]
 pub fn load_amm_config_entries(
     chain_name: &str,
     file_path: Option<&Path>,
@@ -413,7 +435,8 @@ pub fn load_amm_config_entries(
     Ok(parsed.amms.get(chain_name).cloned().unwrap_or_default())
 }
 
-/// Load and fully initialize every AMM configured for `chain_name`.
+/// Load and fully initialize every AMM configured for `chain_name` from a TOML
+/// file.
 ///
 /// Reads entries from the TOML file at `file_path` (returns an empty map when
 /// `file_path` is `None`), then initializes each pool eagerly — including the
@@ -421,8 +444,9 @@ pub fn load_amm_config_entries(
 /// `default_balancer_vault` is used for Balancer entries that omit an explicit
 /// `vault_address`. Entries that fail to load are recorded as `None`.
 ///
-/// Use [`load_configured_amms_lazy`] instead when you want to defer V3 tick
-/// work until after filtering down to the pools you actually need.
+/// Only available with the `toml` feature. For programmatic config, build
+/// [`AmmConfigEntry`] values and call [`load_configured_amms_from_entries`].
+#[cfg(feature = "toml")]
 pub async fn load_configured_amms(
     cache: &mut EvmCache,
     chain_name: &str,
@@ -433,10 +457,13 @@ pub async fn load_configured_amms(
     load_configured_amms_from_entries(cache, &entries, default_balancer_vault).await
 }
 
-/// Loads configured AMMs from pre-filtered entries.
+/// Load and fully initialize AMMs from in-memory entries (no TOML required).
 ///
-/// Use this when you've already filtered the entries (e.g., by active strategy tokens)
-/// to avoid loading unnecessary AMMs. Fully initializes all pools including V3 tick data.
+/// This is the primary entry point for callers that build their AMM set
+/// programmatically (or load it from any source). Fully initializes all pools,
+/// including V3 tick data. `default_balancer_vault` is used for Balancer
+/// entries that omit an explicit `vault_address`. Entries that fail to load are
+/// recorded as `None`.
 pub async fn load_configured_amms_from_entries(
     cache: &mut EvmCache,
     entries: &[AmmConfigEntry],
@@ -448,12 +475,16 @@ pub async fn load_configured_amms_from_entries(
     Ok(amms)
 }
 
-/// Load AMMs with deferred V3 tick initialization.
+/// Load AMMs from a TOML file with deferred V3 tick initialization.
 ///
 /// V2 and Balancer pools are fully initialized. V3 pools that have
 /// preloaded storage (cache hit) are also fully initialized. V3 pools
 /// needing resync are returned in `DeferredV3Work` — call
 /// `complete_deferred_v3_work()` to finish them before simulation.
+///
+/// Only available with the `toml` feature. For programmatic config, use
+/// [`load_configured_amms_lazy_from_entries`].
+#[cfg(feature = "toml")]
 pub async fn load_configured_amms_lazy(
     cache: &mut EvmCache,
     chain_name: &str,
@@ -462,6 +493,21 @@ pub async fn load_configured_amms_lazy(
 ) -> anyhow::Result<(HashMap<Address, Option<LocalAMM>>, DeferredV3Work)> {
     let entries = load_amm_config_entries(chain_name, file_path)?;
     init_amms_phase1_phase2(cache, &entries, default_balancer_vault).await
+}
+
+/// Load AMMs from in-memory entries with deferred V3 tick initialization (no
+/// TOML required).
+///
+/// The programmatic counterpart to [`load_configured_amms_lazy`]: V2/Balancer
+/// pools and V3 metadata are initialized now, and the expensive V3 tick
+/// prefetch is deferred into the returned [`DeferredV3Work`]. Finish it with
+/// [`complete_deferred_v3_work`] before simulating.
+pub async fn load_configured_amms_lazy_from_entries(
+    cache: &mut EvmCache,
+    entries: &[AmmConfigEntry],
+    default_balancer_vault: Address,
+) -> anyhow::Result<(HashMap<Address, Option<LocalAMM>>, DeferredV3Work)> {
+    init_amms_phase1_phase2(cache, entries, default_balancer_vault).await
 }
 
 /// Phase 1+2: Prefetch accounts and initialize AMMs (V2/Balancer fully, V3 metadata only).
@@ -1091,30 +1137,6 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_active_tokens() {
-        let strategy_tokens: Vec<Vec<Address>> = vec![
-            vec![Address::repeat_byte(0xAA), Address::repeat_byte(0xBB)],
-            vec![Address::repeat_byte(0xBB), Address::repeat_byte(0xCC)], // BB is duplicate
-            vec![Address::repeat_byte(0xDD)],
-        ];
-
-        let active = collect_active_tokens(strategy_tokens);
-
-        assert_eq!(active.len(), 4); // AA, BB, CC, DD (deduplicated)
-        assert!(active.contains(&Address::repeat_byte(0xAA)));
-        assert!(active.contains(&Address::repeat_byte(0xBB)));
-        assert!(active.contains(&Address::repeat_byte(0xCC)));
-        assert!(active.contains(&Address::repeat_byte(0xDD)));
-    }
-
-    #[test]
-    fn test_collect_active_tokens_empty() {
-        let strategy_tokens: Vec<Vec<Address>> = vec![];
-        let active = collect_active_tokens(strategy_tokens);
-        assert!(active.is_empty());
-    }
-
-    #[test]
     fn test_filter_partial_overlap_includes() {
         // If an AMM has tokens [A, B] and only A is active, include it
         let entries = vec![make_entry(0x01, &[0xAA, 0xBB])];
@@ -1126,100 +1148,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    fn make_owner(addr_byte: u8, involved_bytes: &[u8]) -> (Address, Vec<Address>) {
-        (
-            Address::repeat_byte(addr_byte),
-            involved_bytes
-                .iter()
-                .map(|b| Address::repeat_byte(*b))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn test_strategy_amm_ownership_basic_overlap() {
-        // Strategy A uses tokens [BAL, WETH]; strategy B uses [SPELL, WETH, USDC].
-        // AMM 1: BAL/WETH (owned by A only)
-        // AMM 2: SPELL/WETH (owned by B only)
-        // AMM 3: WETH/USDC (owned by B only — A has no USDC)
-        // AMM 4: DAI/USDC (unclaimed — neither strategy involves DAI or USDC alone)
-        //   wait, B has USDC, so AMM 4 IS claimed by B. Use a true unclaimed:
-        // AMM 5: FOO/BAR — unclaimed
-        let strat_a = make_owner(0x10, &[0xBA, 0xEE]); // BAL=BA, WETH=EE
-        let strat_b = make_owner(0x20, &[0x5E, 0xEE, 0xDC]); // SPELL=5E, WETH=EE, USDC=DC
-
-        let amm1 = make_entry(0x01, &[0xBA, 0xEE]);
-        let amm2 = make_entry(0x02, &[0x5E, 0xEE]);
-        let amm3 = make_entry(0x03, &[0xEE, 0xDC]);
-        let amm5 = make_entry(0x05, &[0xF0, 0xF1]); // truly unclaimed
-        let entries = vec![amm1.clone(), amm2.clone(), amm3.clone(), amm5.clone()];
-        let strategies = vec![strat_a.clone(), strat_b.clone()];
-
-        let ownership = build_strategy_amm_ownership(strategies, &entries);
-
-        let owned_a = ownership.owned_by_strategy.get(&strat_a.0).unwrap();
-        let owned_b = ownership.owned_by_strategy.get(&strat_b.0).unwrap();
-
-        // A owns AMM 1 (BAL/WETH) and AMM 3 (WETH/_): WETH overlap
-        assert!(owned_a.contains(&amm1.address));
-        // A owns AMM 2 (SPELL/WETH): WETH overlap
-        assert!(owned_a.contains(&amm2.address));
-        // A owns AMM 3 (WETH/USDC): WETH overlap
-        assert!(owned_a.contains(&amm3.address));
-        // A does NOT own AMM 5 (no token overlap)
-        assert!(!owned_a.contains(&amm5.address));
-
-        // B owns AMM 2 (SPELL/WETH), AMM 3 (WETH/USDC), AMM 1 (WETH overlap)
-        assert!(owned_b.contains(&amm1.address));
-        assert!(owned_b.contains(&amm2.address));
-        assert!(owned_b.contains(&amm3.address));
-        assert!(!owned_b.contains(&amm5.address));
-
-        // Unclaimed: AMM 5 only
-        assert_eq!(ownership.unclaimed.len(), 1);
-        assert!(ownership.unclaimed.contains(&amm5.address));
-    }
-
-    #[test]
-    fn test_strategy_amm_ownership_active_amms_includes_unclaimed() {
-        let strat_a = make_owner(0x10, &[0xAA]);
-        let strat_b = make_owner(0x20, &[0xBB]);
-
-        let amm_a = make_entry(0x01, &[0xAA]);
-        let amm_b = make_entry(0x02, &[0xBB]);
-        let amm_unclaimed = make_entry(0x03, &[0xCC]);
-        let entries = vec![amm_a.clone(), amm_b.clone(), amm_unclaimed.clone()];
-
-        let ownership = build_strategy_amm_ownership([strat_a.clone(), strat_b.clone()], &entries);
-
-        // Only A ready: A's pool + unclaimed, but NOT B's pool.
-        let active = ownership.active_amms(&[strat_a.0]);
-        assert!(active.contains(&amm_a.address));
-        assert!(active.contains(&amm_unclaimed.address));
-        assert!(!active.contains(&amm_b.address));
-
-        // Empty ready set: only unclaimed pools are included.
-        let active_empty = ownership.active_amms(&[]);
-        assert_eq!(active_empty.len(), 1);
-        assert!(active_empty.contains(&amm_unclaimed.address));
-    }
-
-    #[test]
-    fn test_strategy_amm_ownership_strategy_with_no_involved_tokens_owns_nothing() {
-        let strat = make_owner(0x10, &[]);
-        let amm = make_entry(0x01, &[0xAA]);
-        let ownership = build_strategy_amm_ownership([strat.clone()], std::slice::from_ref(&amm));
-
-        assert!(
-            ownership
-                .owned_by_strategy
-                .get(&strat.0)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(ownership.unclaimed.contains(&amm.address));
-    }
-
+    #[cfg(feature = "toml")]
     #[test]
     fn test_pancake_swap_v3_toml_deserialization() {
         let toml_content = r#"
@@ -1239,6 +1168,7 @@ fee_tier = 100
         assert_eq!(entries[0].fee_tier, Some(100));
     }
 
+    #[cfg(feature = "toml")]
     #[test]
     fn test_balancer_toml_deserialization_with_vault_override() {
         let toml_content = r#"
@@ -1340,6 +1270,7 @@ tokens = [
         assert!(matches!(filtered[0].kind, AmmType::PancakeSwapV3));
     }
 
+    #[cfg(feature = "toml")]
     #[test]
     fn test_curve_toml_deserialization_with_use_uint256() {
         let toml_content = r#"
@@ -1361,6 +1292,7 @@ curve_use_uint256 = true
         assert_eq!(entries[0].curve_use_uint256, Some(true));
     }
 
+    #[cfg(feature = "toml")]
     #[test]
     fn test_curve_toml_deserialization_defaults() {
         // Curve entries without explicit curve_use_uint256 should parse with None
@@ -1381,6 +1313,7 @@ tokens = [
         assert!(entries[0].curve_use_uint256.is_none());
     }
 
+    #[cfg(feature = "toml")]
     #[test]
     fn test_balancer_v3_pool_type_hint_deserialization() {
         let toml_content = r#"
@@ -1404,6 +1337,7 @@ tokens = [
         );
     }
 
+    #[cfg(feature = "toml")]
     #[test]
     fn test_balancer_v3_pool_type_hint_defaults_to_none() {
         let toml_content = r#"
