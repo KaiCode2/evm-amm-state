@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Log};
 
-use super::{EventRoute, EventSource, PoolKey, PoolRegistration};
+use super::{AmmAdapter, EventRoute, EventSource, PoolKey, PoolRegistration, ProtocolId};
 
-/// Registry of tracked AMM pools and their event-routing metadata.
-#[derive(Clone, Debug, Default)]
+/// Registry of tracked AMM pools and protocol adapters.
+#[derive(Clone, Default)]
 pub struct AdapterRegistry {
+    adapters: HashMap<ProtocolId, Arc<dyn AmmAdapter>>,
     pools: HashMap<PoolKey, PoolRegistration>,
 }
 
@@ -25,6 +27,24 @@ impl AdapterRegistry {
         Ok(())
     }
 
+    pub fn register_adapter(&mut self, adapter: Arc<dyn AmmAdapter>) -> Result<(), RegistryError> {
+        let protocol = adapter.protocol();
+        if self.adapters.contains_key(&protocol) {
+            return Err(RegistryError::DuplicateAdapter(protocol));
+        }
+
+        self.adapters.insert(protocol, adapter);
+        Ok(())
+    }
+
+    pub fn adapter(&self, protocol: ProtocolId) -> Option<&Arc<dyn AmmAdapter>> {
+        self.adapters.get(&protocol)
+    }
+
+    pub fn adapters(&self) -> impl Iterator<Item = &Arc<dyn AmmAdapter>> {
+        self.adapters.values()
+    }
+
     pub fn pool(&self, key: &PoolKey) -> Option<&PoolRegistration> {
         self.pools.get(key)
     }
@@ -34,6 +54,22 @@ impl AdapterRegistry {
     }
 
     pub fn route_log(&self, log: &Log) -> Option<&PoolRegistration> {
+        if let Some(pool) = self.route_log_generic(log) {
+            return Some(pool);
+        }
+
+        for adapter in self.adapters.values() {
+            if let Some(key) = adapter.route_log(log, self)
+                && let Some(pool) = self.pools.get(&key)
+            {
+                return Some(pool);
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn route_log_generic(&self, log: &Log) -> Option<&PoolRegistration> {
         let topics = log.topics();
         let topic0 = *topics.first()?;
 
@@ -58,6 +94,16 @@ impl AdapterRegistry {
         topics
     }
 
+    pub fn subscription_spec(&self) -> SubscriptionSpec {
+        SubscriptionSpec {
+            sources: self
+                .pools
+                .values()
+                .flat_map(|pool| pool.event_sources.iter().cloned())
+                .collect(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.pools.len()
     }
@@ -65,6 +111,20 @@ impl AdapterRegistry {
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty()
     }
+}
+
+impl fmt::Debug for AdapterRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdapterRegistry")
+            .field("adapter_count", &self.adapters.len())
+            .field("pools", &self.pools)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionSpec {
+    pub sources: Vec<EventSource>,
 }
 
 fn source_matches_filter(source: &EventSource, emitter: Address, topic0: B256) -> bool {
@@ -93,12 +153,16 @@ fn topic_address(topic: &B256) -> Address {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     DuplicatePool(PoolKey),
+    DuplicateAdapter(ProtocolId),
 }
 
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicatePool(key) => write!(f, "pool is already registered: {key:?}"),
+            Self::DuplicateAdapter(protocol) => {
+                write!(f, "adapter is already registered: {protocol:?}")
+            }
         }
     }
 }
