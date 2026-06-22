@@ -126,3 +126,101 @@ implementation.
   post-checkpoint.
 - A genuinely zero-reserve pool would read as an absent slot 8 and surface as
   `NeedsRepair`; acceptable for a degenerate pool.
+
+---
+
+# Phase A3 Tech Spec (slice 2): Uniswap V3 Adapter `cold_start`
+
+Status: design approved; implementation pending.
+
+## Goal
+
+Make `UniswapV3Adapter` a complete adapter by implementing `cold_start` as a
+self-contained, shim-free, synchronous, **bounded** path: warm slot0 +
+liquidity + the tick data in the bitmap word at the current tick, through the
+`AdapterCache` facade. UniswapV3 only (Pancake/Slipstream are a later slice).
+
+## Approved decisions
+
+1. **Current-tick-word tick warm-up.** cold_start warms slot0 + liquidity, then
+   the single `tickBitmap` word containing the current tick and the `{0,3}`
+   info slots of the ticks initialized in that word. The adaptive bitmap scan,
+   `MAX_TICK_DRIFT` snapshot validation, and the complete/inject/incremental/
+   full resync state machine are deferred to **A4**.
+2. **Metadata is config-supplied; no view calls.** V3 `token0`/`token1`/`fee`/
+   `tick_spacing` are not at predictable storage slots, so cold_start does not
+   fetch them — it requires a resolvable `V3StorageLayout`
+   (`V3Metadata.storage_layout` or `tick_spacing`) and preserves the
+   config-supplied metadata. No resolvable layout → `Unsupported`. This keeps
+   the path storage-reads-only and offline-testable, and matches the layout
+   requirement the reactive Swap path already imposes.
+3. Carried over from slice 1: no rewiring of `configured_amms`, no touching the
+   legacy `cache_sync` phase1/phase2 + adaptive machinery (it stays intact
+   alongside the new method), no compat-shim changes, no feature flags, no
+   `LocalAMM`/simulation coupling.
+
+## Behavior
+
+1. Resolve `address` and the `V3StorageLayout` via the existing `layout_for`
+   (metadata variant + storage_layout/tick_spacing). No layout → `Unsupported`.
+2. Round 1: `verify_slots([slot0_slot, liquidity_slot])`. If slot0 is still cold
+   after verification → `NeedsRepair(report, VerifySlots([slot0_slot]))`.
+3. Decode the current tick from slot0 (bits `[160,184)`, 24-bit signed; the
+   adapter already has this decode for Swap).
+4. Round 2: compute the bitmap word = `v3_word_position(tick, tick_spacing)`,
+   `verify_slots([tick_bitmap_key(word)])`, read the word, and extract the
+   initialized ticks (adapter-local bit extraction over the 256-bit word:
+   bit `i` set ⇒ tick `(word*256 + i) * tick_spacing`).
+5. Round 3: `verify_slots` the `{0,3}` info slots of each initialized tick.
+6. Preserve the config `V3Metadata` (do not overwrite tokens/fee/tick_spacing);
+   set `pool.status = Ready`; populate `ColdStartReport`
+   (verified_slots, changed_slots).
+7. `ColdStartPolicy`: `Strict`/`Eager` do all of the above; `HotSlotsOnly` does
+   slot0 + liquidity only (skip the tick word); `Lazy` does slot0 + liquidity
+   now and defers the tick word via `DeferredWork::VerifySlots`.
+
+### Cold-start ↔ reactive synergy
+
+Warming slot0 makes the A2 reactive Swap's masked slot0 write land
+`ExactFromInput` with no resync, preserving the observation high bits
+(`[184,256)`) — the V3 analog of the V2 reserves synergy. (Liquidity is an
+absolute write, always applied.)
+
+## Affected files
+
+`src/adapters/uniswap_v3.rs` (implement `cold_start`; reuse the existing tick
+decode), an adapter-local bitmap-word→ticks extraction helper (in
+`uniswap_v3.rs` or `storage.rs`), `tests/adapter_reactive.rs`, this doc. No
+`cache_sync`/upstream changes.
+
+## Acceptance criteria
+
+1. `Eager` cold-start against a stub fetcher seeded with slot0 (tick T) +
+   liquidity + the bitmap word at `word(T)` (with ticks initialized) + those
+   ticks' `{0,3}` slots returns `Ready`, warms all of them, preserves the
+   config `V3Metadata`, and sets `status = Ready`.
+2. After cold-start, a reactive V3 Swap applies `ExactFromInput` with no resync,
+   preserving slot0 observation high bits.
+3. `V3Metadata` with no resolvable layout → `Unsupported`.
+4. An unfetchable slot0 → `NeedsRepair`, never a silent partial.
+5. Full CI matrix green (fmt; clippy default + no-default-features; test default
+   + no-default-features; `cargo doc -D warnings`).
+
+## Test plan (manager-authored, red-green)
+
+In `tests/adapter_reactive.rs` (reuses `setup_cache`, `stub_fetcher`, the
+reactive runtime + V3 Swap helpers): `v3_cold_start_brings_pool_ready_with_tick_word`,
+`v3_cold_start_then_swap_applies_exact_no_resync`,
+`v3_cold_start_missing_layout_unsupported`,
+`v3_cold_start_missing_slot0_needs_repair`. All red on the `Unsupported`
+baseline, green after implementation.
+
+## Risks & assumptions
+
+- Bounded to the current tick's word; ticks outside it are not pre-warmed (the
+  reactive Mint/Burn resync + lazy RPC + the A4 adaptive scan cover the rest).
+- Assumes canonical V3 slot layout via `layout_for`; non-canonical layouts must
+  supply an explicit `storage_layout`.
+- Adapter-local bitmap extraction must match the contract's tick⇔bit mapping
+  (`tick = (word*256 + bit) * tick_spacing`), mirroring the legacy
+  `extract_ticks_from_bitmap_word` without depending on `cache_sync`.
