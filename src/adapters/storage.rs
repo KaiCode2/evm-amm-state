@@ -1,6 +1,12 @@
 //! Protocol storage constants and storage-key helpers.
 
-use alloy_primitives::{U256, keccak256};
+use alloy_primitives::{Address, U256, keccak256};
+
+/// Storage slot for the Uniswap V2 pair `token0` address.
+pub const V2_TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Storage slot for the Uniswap V2 pair `token1` address.
+pub const V2_TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
 
 /// Storage slot for Uniswap V2 pair reserves.
 pub const V2_RESERVES_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
@@ -98,6 +104,12 @@ impl V3StorageLayout {
             tick_spacing,
         )
     }
+}
+
+/// Decode an EVM address from a right-aligned 32-byte storage word (the low 20
+/// bytes), as used for the `token0`/`token1` address slots of a Uniswap V2 pair.
+pub fn decode_address_slot(word: U256) -> Address {
+    Address::from_slice(&word.to_be_bytes::<32>()[12..])
 }
 
 /// Compute the `tickBitmap` word position for a tick, matching the V3 contract

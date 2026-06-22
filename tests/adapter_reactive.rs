@@ -15,7 +15,8 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    PoolKey, PoolRegistration, ProtocolMetadata, PurgeScope, StateUpdate, UniswapV2Adapter,
+    ColdStartOutcome, ColdStartPolicy, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolMetadata, PurgeScope, StateUpdate, UniswapV2Adapter, UniswapV2Metadata,
     UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
@@ -866,5 +867,222 @@ async fn v3_liquidity_event_missing_layout_falls_back_to_invalidation() -> Resul
     let invalidation = &report.applied[0].invalidations[0];
     assert_eq!(invalidation.address, pool);
     assert!(matches!(invalidation.scope, PurgeScope::AllStorage));
+    Ok(())
+}
+
+// --- Phase A3 (slice 1): Uniswap V2 adapter cold_start ---
+
+const V2_TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+const V2_TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
+
+/// Encode an address as the right-aligned 32-byte storage word a V2 pool stores
+/// for token0/token1 (matches `U256::from_be_slice(addr.as_slice())`).
+fn token_slot_word(addr: Address) -> U256 {
+    U256::from_be_slice(addr.as_slice())
+}
+
+#[tokio::test]
+async fn v2_cold_start_brings_pool_ready() -> Result<()> {
+    let pool = Address::repeat_byte(0x71);
+    let token0 = Address::repeat_byte(0xaa);
+    let token1 = Address::repeat_byte(0xbb);
+    let reserve0 = U256::from(1_000_u64);
+    let reserve1 = U256::from(2_000_u64);
+    let timestamp = U256::from(0x1234_u64);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+        ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+        (
+            (pool, V2_RESERVES_SLOT),
+            reserves_slot(reserve0, reserve1, timestamp),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
+            fee_bps: Some(30),
+            ..Default::default()
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match &registration.metadata {
+        ProtocolMetadata::UniswapV2(metadata) => {
+            assert_eq!(metadata.token0, Some(token0));
+            assert_eq!(metadata.token1, Some(token1));
+            assert_eq!(
+                metadata.fee_bps,
+                Some(30),
+                "config fee_bps must be preserved"
+            );
+        }
+        other => panic!("expected UniswapV2 metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(pool, V2_TOKEN0_SLOT),
+        Some(token_slot_word(token0))
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, V2_TOKEN1_SLOT),
+        Some(token_slot_word(token1))
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, V2_RESERVES_SLOT),
+        Some(reserves_slot(reserve0, reserve1, timestamp))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_cold_start_then_sync_applies_exact_no_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0x72);
+    let token0 = Address::repeat_byte(0xaa);
+    let token1 = Address::repeat_byte(0xbb);
+    let timestamp = U256::from(0xbeef_u64);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+        ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+        (
+            (pool, V2_RESERVES_SLOT),
+            reserves_slot(U256::from(10_u64), U256::from(20_u64), timestamp),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+    adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV2Adapter::default()))
+        .unwrap();
+    registry.register_pool(registration).unwrap();
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let new_reserve0 = U256::from(111_u64);
+    let new_reserve1 = U256::from(222_u64);
+    let log = rpc_log(
+        pool,
+        vec![v2_sync_topic()],
+        abi_words([new_reserve0, new_reserve1]),
+        30,
+        0,
+        0,
+    );
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(30, 0))]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    // Warmed slot 8 means the masked Sync write lands exactly, with no resync.
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput
+    );
+    assert!(report.applied[0].resyncs.is_empty());
+
+    let raw = cache.cached_storage_value(pool, V2_RESERVES_SLOT).unwrap();
+    assert_eq!(raw & low_mask(112), new_reserve0);
+    assert_eq!((raw >> 112) & low_mask(112), new_reserve1);
+    assert_eq!(
+        raw >> 224,
+        timestamp,
+        "blockTimestampLast must be preserved"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_cold_start_lazy_defers_token_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x73);
+    let reserve0 = U256::from(5_u64);
+    let reserve1 = U256::from(6_u64);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, V2_TOKEN0_SLOT),
+            token_slot_word(Address::repeat_byte(0xaa)),
+        ),
+        (
+            (pool, V2_TOKEN1_SLOT),
+            token_slot_word(Address::repeat_byte(0xbb)),
+        ),
+        (
+            (pool, V2_RESERVES_SLOT),
+            reserves_slot(reserve0, reserve1, U256::ZERO),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Lazy)?;
+
+    match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, deferred) => {
+            assert!(
+                deferred.iter().any(|work| matches!(
+                    work,
+                    DeferredWork::VerifySlots(slots)
+                        if slots.contains(&(pool, V2_TOKEN0_SLOT))
+                            && slots.contains(&(pool, V2_TOKEN1_SLOT))
+                )),
+                "Lazy cold-start must defer the token slots"
+            );
+        }
+        other => panic!("expected ReadyWithDeferred under Lazy policy, got {other:?}"),
+    }
+
+    // Reserves are warmed now; token slots are deferred (not yet fetched).
+    assert_eq!(
+        cache.cached_storage_value(pool, V2_RESERVES_SLOT),
+        Some(reserves_slot(reserve0, reserve1, U256::ZERO))
+    );
+    assert_eq!(cache.cached_storage_value(pool, V2_TOKEN0_SLOT), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_cold_start_missing_reserves_needs_repair() -> Result<()> {
+    let pool = Address::repeat_byte(0x74);
+
+    // Fetcher serves the token slots but not reserves (returns ZERO -> not
+    // injected -> reserves slot stays cold).
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, V2_TOKEN0_SLOT),
+            token_slot_word(Address::repeat_byte(0xaa)),
+        ),
+        (
+            (pool, V2_TOKEN1_SLOT),
+            token_slot_word(Address::repeat_byte(0xbb)),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::NeedsRepair(_, _)),
+        "an unfetchable reserves slot must surface as NeedsRepair, not a silent partial"
+    );
+    assert_eq!(cache.cached_storage_value(pool, V2_RESERVES_SLOT), None);
     Ok(())
 }
