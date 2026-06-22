@@ -1,5 +1,5 @@
-//! Lowering of state-affecting [`RepairAction`]s into executable
-//! [`ReactiveEffect`]s.
+//! Lowering of state-affecting [`RepairAction`](super::RepairAction)s into
+//! executable [`ReactiveEffect`]s.
 //!
 //! A1 emits repair *intentions*; this module turns the V3 liquidity-event
 //! intention (`RepairAction::V3TickRange`) into a targeted, hash-pinned
