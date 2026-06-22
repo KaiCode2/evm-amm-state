@@ -23,14 +23,28 @@ sol! {
 const SLOT0_PRICE_TICK_BITS: usize = 184;
 const SLOT0_TICK_SHIFT: usize = 160;
 
+/// Adapter for the Uniswap V3 storage-layout family.
+///
+/// A single instance serves Uniswap V3, Pancake V3, and Slipstream: those
+/// protocols differ only in storage-slot offsets, which `layout_for` resolves
+/// per-pool from the registration metadata. The struct is registered once and
+/// claims all three ids via [`AmmAdapter::protocols`].
 #[derive(Clone, Debug, Default)]
-pub struct UniswapV3Adapter {
+pub struct V3FamilyAdapter {
     _private: (),
 }
 
-impl AmmAdapter for UniswapV3Adapter {
+impl AmmAdapter for V3FamilyAdapter {
     fn protocol(&self) -> ProtocolId {
         ProtocolId::UniswapV3
+    }
+
+    fn protocols(&self) -> Vec<ProtocolId> {
+        vec![
+            ProtocolId::UniswapV3,
+            ProtocolId::PancakeV3,
+            ProtocolId::Slipstream,
+        ]
     }
 
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
@@ -211,7 +225,7 @@ impl AmmAdapter for UniswapV3Adapter {
     }
 }
 
-impl UniswapV3Adapter {
+impl V3FamilyAdapter {
     fn decode_swap(&self, pool: &PoolRegistration, log: &Log) -> AdapterEventResult {
         if Swap::decode_log_data_validate(&log.data).is_err() {
             return AdapterEventResult::error(AdapterEventError::MalformedLog(

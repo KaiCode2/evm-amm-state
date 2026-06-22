@@ -11,6 +11,17 @@ use super::{
 pub trait AmmAdapter: Send + Sync {
     fn protocol(&self) -> ProtocolId;
 
+    /// Every protocol id this adapter serves.
+    ///
+    /// Defaults to `[self.protocol()]`. Override to claim a whole storage-layout
+    /// family from a single adapter instance (e.g. the V3 family adapter serves
+    /// `UniswapV3`, `PancakeV3`, and `Slipstream`). The registry registers the
+    /// adapter `Arc` under every returned id; [`Self::protocol`] remains the
+    /// primary/canonical id.
+    fn protocols(&self) -> Vec<ProtocolId> {
+        vec![self.protocol()]
+    }
+
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
         pool.event_sources.clone()
     }
@@ -19,6 +30,24 @@ pub trait AmmAdapter: Send + Sync {
         registry.route_log_generic(log).map(|pool| pool.key.clone())
     }
 
+    /// Warm a pool's storage and resolve its metadata to a ready state.
+    ///
+    /// # Metadata contract: merge vs. preserve
+    ///
+    /// Adapters fall into two camps depending on where a pool's *immutable*
+    /// metadata lives:
+    ///
+    /// - **Merge** (metadata at known storage slots): if an adapter can read its
+    ///   immutable identity from predictable slots — e.g. Uniswap V2
+    ///   `token0`/`token1` — it MERGES the decoded values into the existing
+    ///   config metadata, decoded fields filling in the on-chain truth while
+    ///   config-only fields (e.g. `fee_bps`) are preserved untouched.
+    /// - **Preserve** (metadata not at predictable slots): if an adapter cannot
+    ///   recover its identity from a fixed slot layout — e.g. V3
+    ///   `token0`/`token1`/`fee`/`tick_spacing` — it PRESERVES the
+    ///   config-supplied metadata unchanged and requires a resolvable storage
+    ///   layout (returning [`ColdStartOutcome::Unsupported`] when none can be
+    ///   derived) rather than overwriting config with guesses.
     fn cold_start(
         &self,
         _pool: &mut PoolRegistration,

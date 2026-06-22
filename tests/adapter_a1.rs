@@ -513,3 +513,23 @@ fn balancer_v2_adapter_routes_vault_swap_by_pool_id() {
         .expect("vault swap should route by pool id");
     assert_eq!(routed.key, PoolKey::BalancerV2(pool_id));
 }
+
+#[test]
+fn v3_family_adapter_claims_pancake_and_slipstream() {
+    // The V3 adapter is registered once but must serve the whole V3 storage-layout
+    // family (Uniswap V3, Pancake V3, Slipstream) so those pools can route to it.
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .unwrap();
+
+    assert!(registry.adapter(ProtocolId::UniswapV3).is_some());
+    assert!(
+        registry.adapter(ProtocolId::PancakeV3).is_some(),
+        "V3-family adapter must claim PancakeV3"
+    );
+    assert!(
+        registry.adapter(ProtocolId::Slipstream).is_some(),
+        "V3-family adapter must claim Slipstream"
+    );
+}

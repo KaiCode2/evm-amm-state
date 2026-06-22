@@ -1,7 +1,7 @@
 use alloy_primitives::Log;
 use anyhow::{Result, anyhow};
 
-use super::{AdapterCache, AdapterEventReport, AdapterRegistry, PoolRegistration, RepairAction};
+use super::{AdapterCache, AdapterEventReport, AdapterRegistry, PoolRegistration};
 
 /// Applies AMM adapter events to an [`AdapterCache`] in caller-provided order.
 #[derive(Clone, Debug)]
@@ -71,7 +71,7 @@ impl AdapterDriver {
 
         let applied = cache.apply_updates(&event.updates);
         let post_apply_repair = adapter.after_apply(pool, &event, &applied);
-        let repair = combine_repair(event.repair.clone(), post_apply_repair);
+        let repair = event.repair.clone().combine(post_apply_repair);
 
         Ok(Some(AdapterEventReport {
             pool: pool.key.clone(),
@@ -79,40 +79,5 @@ impl AdapterDriver {
             applied,
             repair,
         }))
-    }
-}
-
-fn combine_repair(event_repair: RepairAction, post_apply_repair: RepairAction) -> RepairAction {
-    match (event_repair, post_apply_repair) {
-        (RepairAction::None, repair) | (repair, RepairAction::None) => repair,
-        (RepairAction::VerifySlots(mut left), RepairAction::VerifySlots(right)) => {
-            for slot in right {
-                if !left.contains(&slot) {
-                    left.push(slot);
-                }
-            }
-            RepairAction::VerifySlots(left)
-        }
-        (
-            RepairAction::PurgeSlots {
-                address: left_address,
-                slots: mut left_slots,
-            },
-            RepairAction::PurgeSlots {
-                address: right_address,
-                slots: right_slots,
-            },
-        ) if left_address == right_address => {
-            for slot in right_slots {
-                if !left_slots.contains(&slot) {
-                    left_slots.push(slot);
-                }
-            }
-            RepairAction::PurgeSlots {
-                address: left_address,
-                slots: left_slots,
-            }
-        }
-        (_, post_apply_repair) => post_apply_repair,
     }
 }
