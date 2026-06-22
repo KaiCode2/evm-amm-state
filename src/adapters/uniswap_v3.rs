@@ -200,7 +200,7 @@ impl UniswapV3Adapter {
     }
 }
 
-fn layout_for(pool: &PoolRegistration) -> Option<V3StorageLayout> {
+pub(crate) fn layout_for(pool: &PoolRegistration) -> Option<V3StorageLayout> {
     match &pool.metadata {
         ProtocolMetadata::UniswapV3(metadata) => {
             layout_from_metadata(metadata, ProtocolId::UniswapV3)

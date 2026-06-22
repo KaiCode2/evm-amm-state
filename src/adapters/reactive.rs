@@ -108,6 +108,7 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
         );
         effects.extend(repair_effects(
             ctx,
+            pool,
             &event,
             &repair,
             predicted.has_skipped(),
@@ -277,6 +278,7 @@ fn quality_for_event(event: &AdapterEvent, has_predicted_skips: bool) -> StateEf
 
 fn repair_effects(
     ctx: &ReactiveContext,
+    pool: &PoolRegistration,
     event: &AdapterEvent,
     repair: &RepairAction,
     skipped_state_effect: bool,
@@ -317,18 +319,24 @@ fn repair_effects(
             ))]
         }
         RepairAction::V3TickRange {
-            pool,
+            pool: pool_key,
             tick_lower,
             tick_upper,
         } => {
+            // Lower the repair intention into an executable, hash-pinned resync
+            // (or a conservative invalidation when the layout is missing)...
+            let mut effects =
+                super::repair::v3_tick_range_effects(pool, event, *tick_lower, *tick_upper, ctx);
+            // ...then preserve the A1 observability hook alongside it.
             let mut labels = repair_labels(event);
-            labels.push(ReportTag::new("pool", format!("{pool:?}")));
+            labels.push(ReportTag::new("pool", format!("{pool_key:?}")));
             labels.push(ReportTag::new("tick_lower", tick_lower.to_string()));
             labels.push(ReportTag::new("tick_upper", tick_upper.to_string()));
-            vec![ReactiveEffect::Hook(hook_signal(
+            effects.push(ReactiveEffect::Hook(hook_signal(
                 "amm.repair.v3_tick_range",
                 labels,
-            ))]
+            )));
+            effects
         }
         RepairAction::V3Incremental { pool } => {
             let mut labels = repair_labels(event);
@@ -379,7 +387,7 @@ fn verify_slot_resyncs(
         .collect()
 }
 
-fn resync_block(ctx: &ReactiveContext) -> ResyncBlock {
+pub(crate) fn resync_block(ctx: &ReactiveContext) -> ResyncBlock {
     if let Some(block) = context_block(ctx) {
         return ResyncBlock::Hash {
             number: block.number,
@@ -401,7 +409,7 @@ fn context_block(ctx: &ReactiveContext) -> Option<&evm_fork_cache::reactive::Blo
     })
 }
 
-fn resync_id(
+pub(crate) fn resync_id(
     event: &AdapterEvent,
     address: Address,
     slots: &[U256],
