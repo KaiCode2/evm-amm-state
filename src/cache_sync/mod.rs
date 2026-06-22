@@ -13,6 +13,7 @@
 mod adaptive_prefetch;
 mod balancer_sync;
 mod balancer_v3_sync;
+pub(crate) mod compat;
 mod curve_sync;
 mod decode;
 mod freshness;
@@ -65,21 +66,25 @@ use futures::future::join_all;
 use revm::database_interface::DatabaseRef;
 use tracing::{debug, info, instrument, warn};
 
+use self::compat::{
+    BalancerPoolMetadata, EvmCacheProtocolExt, ImmutableDataCacheProtocolExt, V2PoolMetadata,
+    V3PoolMetadata, V3PoolTickSnapshot,
+};
+use crate::adapters::storage::{
+    PANCAKE_V3_LIQUIDITY_SLOT, PANCAKE_V3_TICK_BITMAP_BASE_SLOT, PANCAKE_V3_TICKS_BASE_SLOT,
+    SLIPSTREAM_LIQUIDITY_SLOT, SLIPSTREAM_SLOT0_SLOT, SLIPSTREAM_TICK_BITMAP_BASE_SLOT,
+    SLIPSTREAM_TICKS_BASE_SLOT, V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT,
+    V3_TICK_BITMAP_BASE_SLOT, V3_TICKS_BASE_SLOT, v3_tick_bitmap_storage_key,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
+    v3_tick_info_storage_keys_with_base,
+};
 use crate::amm_wrapper::LocalAMM;
 use crate::balancer_math::WeightedPool;
 use crate::balancer_pool::BalancerPool;
 use crate::data::PoolParams;
 use crate::progress::{finish_with_message, progress_bar};
 use crate::tuning::{SyncSpeedMode, sync_speed_mode};
-use evm_fork_cache::cache::{
-    BalancerPoolMetadata, EvmCache, PANCAKE_V3_LIQUIDITY_SLOT, PANCAKE_V3_TICK_BITMAP_BASE_SLOT,
-    PANCAKE_V3_TICKS_BASE_SLOT, SLIPSTREAM_LIQUIDITY_SLOT, SLIPSTREAM_SLOT0_SLOT,
-    SLIPSTREAM_TICK_BITMAP_BASE_SLOT, SLIPSTREAM_TICKS_BASE_SLOT, SlotObservationTracker,
-    V2_RESERVES_SLOT, V2PoolMetadata, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3_TICK_BITMAP_BASE_SLOT,
-    V3_TICKS_BASE_SLOT, V3PoolMetadata, V3PoolTickSnapshot, v3_tick_bitmap_storage_key,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
-    v3_tick_info_storage_keys_with_base,
-};
+use evm_fork_cache::cache::{EvmCache, SlotObservationTracker};
 use evm_fork_cache::freshness::FreshnessParams;
 
 /// Shared AMM reference type used by synchronization entry points.

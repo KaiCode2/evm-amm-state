@@ -84,6 +84,24 @@ Review decision:
 Goal: make this crate the protocol semantics layer for AMM-aware cache
 synchronization, without requiring `amm-math`.
 
+### Architecture Update (post-A1)
+
+Two decisions made during A0/A1 implementation supersede parts of the phase
+text below:
+
+- **No bespoke plan vocabulary.** Adapters emit `evm_fork_cache::StateUpdate`
+  values directly for cache mutations and read through a narrow cache facade
+  (`AdapterCache: StateView`). The earlier `CacheReadPlan` / `CacheMutationPlan`
+  language is dropped — see `docs/adapter-spec.md` ("Why Not StateReadPlan /
+  StateMutationPlan?").
+- **Reactive runtime as the execution surface.** `evm-fork-cache` now exposes a
+  reactive runtime (`ReactiveHandler` / `ReactiveEffect` / resync + reorg
+  recovery). This crate bridges adapters into it via `AmmReactiveHandler`
+  instead of building a standalone executor and event router. This reshapes
+  A2 and A5 (see those phases).
+
+Status: A0 and A1 are implemented (PR #2). A2 is the current target.
+
 ### Phase A0: Boundary And API Contract
 
 Define the precise interface between `evm-amm-state` and `evm-fork-cache`.
@@ -99,11 +117,13 @@ Deliverables:
 - Decide whether adapters directly mutate `EvmCache` or produce cache mutation
   plans that `evm-fork-cache` executes.
 
-Preferred direction:
+Resolved direction:
 
-- Adapters produce typed plans.
-- `evm-fork-cache` executes plans and owns concurrency, batching, retries, and
-  persistence.
+- Adapters emit `evm_fork_cache::StateUpdate` for mutations and an
+  `AdapterEvent` + `RepairAction` for semantics; they do not define a second
+  mutation-plan type.
+- `evm-fork-cache` (via its reactive runtime) executes the resulting effects
+  and owns concurrency, batching, retries, resync, and persistence.
 
 Acceptance criteria:
 
@@ -121,20 +141,21 @@ Introduce protocol adapter traits and common data types.
 
 Deliverables:
 
-- `ProtocolId` / `AmmProtocol` enum.
-- `PoolAddress` / `PoolKey` model where needed for vault-emitted events.
-- `ProtocolAdapter` trait, likely covering:
+- `ProtocolId` enum.
+- `PoolKey` / `CustomPoolKey` model, incl. bytes32 keys for vault-emitted events.
+- `AmmAdapter` trait, covering:
   - protocol identity
   - event topics
   - log target routing
   - event decoding
   - cold-start sync planning
   - stale-cache validation
-  - cache mutation planning
-- `CacheReadPlan` for account, storage, and view-call requirements.
-- `CacheMutationPlan` for slot inserts, slot patches, purges, and observation
-  updates.
-- `PoolEvent` as a normalized event result independent of simulation models.
+  - cache mutation via emitted `StateUpdate`s
+- `AdapterCache: StateView` facade for account/storage reads and view calls.
+- `AdapterEvent` + `UpdateQuality` + `RepairAction` as the normalized event
+  result, independent of simulation models.
+- `AmmReactiveHandler` bridging the registry into the reactive runtime, plus a
+  synchronous `AdapterDriver` for caller-ordered application.
 - Error types that distinguish decode errors, unsupported protocol state,
   stale cache, and missing cache data.
 
@@ -152,7 +173,10 @@ Review checkpoint:
 
 ### Phase A2: Cache Plan Executor Integration
 
-Connect adapter plans to `evm-fork-cache`.
+Connect adapter reports and repair actions to a cache execution policy on top
+of the reactive runtime. The `AmmReactiveHandler` bridge already emits
+`StateUpdate`s, hash-pinned resyncs, invalidations, and repair hooks; A2 makes
+the repair side concrete and complete.
 
 Deliverables:
 
@@ -659,9 +683,13 @@ Review checkpoint:
 
 ## Initial Open Questions
 
-- Should adapters mutate `EvmCache` directly, or should they only emit plans?
+- ~~Should adapters mutate `EvmCache` directly, or only emit plans?~~ Resolved:
+  adapters emit `StateUpdate`/`ReactiveEffect`s consumed by the reactive
+  runtime; they never mutate `EvmCache` directly.
 - Should `SlotObservationTracker` remain in `evm-fork-cache`, move here, or
-  become a generic cache service with protocol hints from this crate?
+  become a generic cache service with protocol hints from this crate? (Still
+  open: the reactive runtime now owns resync/reorg, but the legacy
+  `cache_sync` path still uses `SlotObservationTracker` directly.)
 - Should `LocalAMM` remain named as-is, or should simulation-facing state be
   renamed to avoid confusing it with adapter-only protocol state?
 - Should protocol feature flags gate both adapter and simulation support, or

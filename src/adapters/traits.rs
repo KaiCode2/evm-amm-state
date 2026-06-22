@@ -16,7 +16,7 @@ pub trait AmmAdapter: Send + Sync {
     }
 
     fn route_log(&self, log: &Log, registry: &AdapterRegistry) -> Option<PoolKey> {
-        registry.route_log(log).map(|pool| pool.key.clone())
+        registry.route_log_generic(log).map(|pool| pool.key.clone())
     }
 
     fn cold_start(

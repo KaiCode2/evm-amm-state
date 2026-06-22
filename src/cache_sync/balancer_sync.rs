@@ -22,7 +22,7 @@ pub async fn init_balancer_from_cache(
 
     // Try to load immutable metadata from cache (tokens, weights, swap_fee)
     let (tokens_vec, weights_vec, swap_fee, cached_last_change_block) =
-        if let Some(metadata) = cache.immutable_cache().get_balancer_pool(pool_id).cloned() {
+        if let Some(metadata) = cache.immutable_cache().get_balancer_pool(pool_id) {
             debug!("using cached Balancer pool metadata");
             (
                 metadata.tokens,
@@ -138,7 +138,6 @@ pub fn refresh_balancer_pool(cache: &mut EvmCache, pool: &mut BalancerPool) -> R
     let metadata = cache
         .immutable_cache()
         .get_balancer_pool(pool.pool_id)
-        .cloned()
         .ok_or_else(|| anyhow!("no cached metadata for Balancer pool {}", pool.pool_id))?;
 
     // Fetch fresh pool tokens data from vault (vault storage should already be purged by caller)

@@ -65,7 +65,7 @@ pub async fn init_uniswap_v2_from_cache(
     );
 
     // Inject immutable metadata (token0, token1) into EVM storage for subsequent calls
-    if let Some(metadata) = cache.immutable_cache().get_v2_pool(address).cloned()
+    if let Some(metadata) = cache.immutable_cache().get_v2_pool(address)
         && let Err(e) = cache.inject_v2_pool_metadata(address, &metadata)
     {
         warn!(

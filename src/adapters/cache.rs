@@ -1,11 +1,13 @@
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::Result;
 use evm_fork_cache::cache::EvmCache;
-pub use evm_fork_cache::{PurgeScope, SlotChange, StateDiff, StateUpdate, StateView};
+pub use evm_fork_cache::{
+    PurgeScope, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff, StateUpdate, StateView,
+};
 use revm::context::result::ExecutionResult;
 
 /// Cache facade used by protocol adapters.
-pub trait AdapterCache {
+pub trait AdapterCache: StateView {
     fn cached_storage(&self, address: Address, slot: U256) -> Option<U256>;
 
     fn apply_updates(&mut self, updates: &[StateUpdate]) -> StateDiff;

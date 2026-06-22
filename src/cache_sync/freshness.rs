@@ -236,10 +236,7 @@ pub fn check_balancer_freshness(
     // and calculate drift against current on-chain balances.
     // We use the on-chain U256 balances directly rather than round-tripping through
     // f64 (which introduces precision noise that would cause false positives).
-    let cached_metadata = cache
-        .immutable_cache()
-        .get_balancer_pool(pool.pool_id)
-        .cloned();
+    let cached_metadata = cache.immutable_cache().get_balancer_pool(pool.pool_id);
 
     // Build a map of fresh balances by token for drift calculation
     let fresh_balance_map: HashMap<Address, U256> = tokens_result

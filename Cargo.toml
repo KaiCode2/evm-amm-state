@@ -27,7 +27,7 @@ toml = ["dep:toml"]
 # private and unpublished. At publish time (order: amm-math, evm-fork-cache,
 # then this crate), drop `git`/`branch` and keep the crates.io `version`.
 amm-math = { git = "ssh://git@github.com/KaiCode2/amm-math.git", branch = "main", version = "0.1" }
-evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", branch = "main", version = "0.1" }
+evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "27ae8762a70092fcc9c4aebf42ae4c8f34bb3526", version = "0.1" }
 
 alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
 

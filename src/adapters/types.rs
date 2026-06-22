@@ -313,6 +313,15 @@ pub struct AdapterEvent {
     pub repair: RepairAction,
 }
 
+/// Structured result of routing, decoding, and applying one adapter event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterEventReport {
+    pub pool: PoolKey,
+    pub event: AdapterEvent,
+    pub applied: StateDiff,
+    pub repair: RepairAction,
+}
+
 /// High-level AMM event class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AdapterEventKind {

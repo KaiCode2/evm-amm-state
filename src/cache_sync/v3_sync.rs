@@ -1,9 +1,9 @@
+use super::compat::TickInfo as CacheTickInfo;
 use super::v3_bitmap::{
     V3Flavor, compute_adaptive_scan_params, extract_initialized_ticks_from_bitmap,
     extract_ticks_from_bitmap_word, needs_tick_resync, tick_to_word,
 };
 use super::*;
-use evm_fork_cache::cache::TickInfo as CacheTickInfo;
 
 /// Result of V3 phase 1 initialization.
 ///
