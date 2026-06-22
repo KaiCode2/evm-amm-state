@@ -6,6 +6,7 @@
 pub mod balancer_v2;
 pub mod cache;
 pub mod driver;
+pub mod reactive;
 pub mod registry;
 pub mod storage;
 pub mod traits;
@@ -19,6 +20,7 @@ pub use cache::{
     StateUpdate, StateView,
 };
 pub use driver::AdapterDriver;
+pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use traits::AmmAdapter;
 pub use types::{

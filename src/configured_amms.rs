@@ -26,6 +26,7 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
+use crate::cache_sync::compat::EvmCacheProtocolExt;
 use crate::cache_sync::{
     V3BitmapPrefetchTarget, V3Flavor, V3InitPhase1Result, V3PrefetchStats,
     compute_adaptive_scan_params, incremental_sync_v3_ticks, init_balancer_from_cache,
