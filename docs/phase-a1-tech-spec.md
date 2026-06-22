@@ -28,6 +28,25 @@ The implemented adapter layer now includes:
 Adapter mutations are expressed directly as `evm_fork_cache::StateUpdate`;
 A1 does not introduce a second mutation-plan vocabulary.
 
+## Reactive Runtime Integration
+
+`AmmReactiveHandler` implements `evm_fork_cache::reactive::ReactiveHandler`,
+bridging the registry into the reactive runtime:
+
+- `interests()` builds `ReactiveInterest::Logs` from each pool's event sources,
+  including adapter-derived sources not stored on the registration, with a
+  `RouteKeySpec` matching the source's `EventRoute`.
+- `handle()` routes the log to a pool, decodes via the adapter against the
+  current `StateView`, then emits `ReactiveEffect`s: `StateUpdate`s for the
+  decoded mutations, hash-pinned `Resync`es for predicted cold-slot skips,
+  `Invalidate` for purge repairs, and `Hook` signals for semantic/repair events.
+- Cold-slot prediction (`predict_cold_skips`) inspects the read-only state view
+  to decide which masked/delta writes the runtime will skip, and requests
+  `VerifySlots` resyncs for them so V2/V3 events self-heal a cold cache.
+
+The synchronous `AdapterDriver` remains for callers that apply logs against an
+`AdapterCache` directly without the runtime.
+
 ## Protocol Proof Adapters
 
 ### Uniswap V2

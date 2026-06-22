@@ -50,6 +50,13 @@ impl AmmAdapter for BalancerV2Adapter {
             ));
         }
 
+        // A1 proves vault-emitted routing only. We surface the swap with
+        // `ConservativeInvalidation` quality but intentionally emit no cache
+        // mutation or repair: a real invalidation needs the vault balance
+        // storage mapping and a conservative repair policy, both deferred to a
+        // later phase (see ROADMAP A3 / docs/phase-a1-tech-spec.md). Until then
+        // Balancer cache state is maintained by the legacy `cache_sync` path,
+        // not this adapter.
         AdapterEventResult::event(AdapterEvent {
             pool: pool.key.clone(),
             emitter: log.address,

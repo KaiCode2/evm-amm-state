@@ -128,7 +128,8 @@ fn v2_registry(pool: Address, store_sources: bool) -> AdapterRegistry {
     let adapter = Arc::new(UniswapV2Adapter::default());
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
     if store_sources {
-        registration = registration.with_event_sources(adapter.event_sources(&registration));
+        let sources = adapter.event_sources(&registration);
+        registration = registration.with_event_sources(sources);
     }
 
     let mut registry = AdapterRegistry::new();
@@ -145,7 +146,8 @@ fn v3_registry(pool: Address) -> AdapterRegistry {
             storage_layout: Some(V3StorageLayout::uniswap(60)),
             ..Default::default()
         }));
-    registration = registration.with_event_sources(adapter.event_sources(&registration));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
 
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(adapter).unwrap();
@@ -165,7 +167,8 @@ fn balancer_registry(vault: Address, pool_ids: impl IntoIterator<Item = B256>) -
                 vault: Some(vault),
                 ..Default::default()
             }));
-        registration = registration.with_event_sources(adapter.event_sources(&registration));
+        let sources = adapter.event_sources(&registration);
+        registration = registration.with_event_sources(sources);
         registry.register_pool(registration).unwrap();
     }
 

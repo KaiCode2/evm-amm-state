@@ -164,28 +164,18 @@ fn route_log<'a>(
     registry: &'a AdapterRegistry,
     log: &alloy_primitives::Log,
 ) -> Option<&'a PoolRegistration> {
+    // First try the registry's own routing (stored event sources plus each
+    // adapter's `route_log`). If that misses, fall back to adapter-*derived*
+    // event sources that are not persisted on the pool registration.
     if let Some(pool) = registry.route_log(log) {
         return Some(pool);
     }
 
-    for pool in registry.pools() {
-        if event_sources_for_pool(registry, pool)
+    registry.pools().find(|pool| {
+        event_sources_for_pool(registry, pool)
             .iter()
             .any(|source| source_matches_pool(source, &pool.key, log))
-        {
-            return Some(pool);
-        }
-    }
-
-    for adapter in registry.adapters() {
-        if let Some(key) = adapter.route_log(log, registry)
-            && let Some(pool) = registry.pool(&key)
-        {
-            return Some(pool);
-        }
-    }
-
-    None
+    })
 }
 
 fn source_matches_pool(source: &EventSource, key: &PoolKey, log: &alloy_primitives::Log) -> bool {

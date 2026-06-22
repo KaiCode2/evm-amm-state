@@ -406,7 +406,8 @@ fn uniswap_v2_sync_updates_reserves_without_clobbering_timestamp() {
 
     let adapter = Arc::new(UniswapV2Adapter::default());
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
-    registration = registration.with_event_sources(adapter.event_sources(&registration));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
 
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(adapter).unwrap();
@@ -450,7 +451,8 @@ fn uniswap_v3_swap_emits_masked_slot0_and_liquidity_update() {
             storage_layout: Some(V3StorageLayout::uniswap(60)),
             ..Default::default()
         }));
-    registration = registration.with_event_sources(adapter.event_sources(&registration));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
 
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(adapter).unwrap();
@@ -498,7 +500,8 @@ fn balancer_v2_adapter_routes_vault_swap_by_pool_id() {
             vault: Some(vault),
             ..Default::default()
         }));
-    registration = registration.with_event_sources(adapter.event_sources(&registration));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
     let swap_topic = registration.event_sources[0].topics[0];
 
     let mut registry = AdapterRegistry::new();

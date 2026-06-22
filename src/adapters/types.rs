@@ -223,10 +223,9 @@ impl PoolRegistration {
         self
     }
 
-    pub fn with_event_sources(&self, sources: impl IntoIterator<Item = EventSource>) -> Self {
-        let mut registration = self.clone();
-        registration.event_sources.extend(sources);
-        registration
+    pub fn with_event_sources(mut self, sources: impl IntoIterator<Item = EventSource>) -> Self {
+        self.event_sources.extend(sources);
+        self
     }
 
     pub fn with_metadata(mut self, metadata: ProtocolMetadata) -> Self {
