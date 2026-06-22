@@ -8,6 +8,7 @@ pub mod cache;
 pub mod driver;
 pub mod reactive;
 pub mod registry;
+pub mod repair;
 pub mod storage;
 pub mod traits;
 pub mod types;

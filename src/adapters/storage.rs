@@ -100,6 +100,15 @@ impl V3StorageLayout {
     }
 }
 
+/// Compute the `tickBitmap` word position for a tick, matching the V3 contract
+/// storage layout: `floor(tick / tick_spacing)` then `.div_euclid(256)`.
+///
+/// `div_euclid` is used for both divisions so negative ticks floor toward
+/// negative infinity exactly as the on-chain `TickBitmap` library does.
+pub fn v3_word_position(tick: i32, tick_spacing: i32) -> i16 {
+    tick.div_euclid(tick_spacing).div_euclid(256) as i16
+}
+
 /// Compute the storage key for a Uniswap V3 tick bitmap word.
 pub fn v3_tick_bitmap_storage_key(word_position: i16) -> U256 {
     v3_tick_bitmap_storage_key_with_base(word_position, V3_TICK_BITMAP_BASE_SLOT)
