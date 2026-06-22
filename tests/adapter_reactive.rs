@@ -1086,3 +1086,234 @@ async fn v2_cold_start_missing_reserves_needs_repair() -> Result<()> {
     assert_eq!(cache.cached_storage_value(pool, V2_RESERVES_SLOT), None);
     Ok(())
 }
+
+// --- Phase A3 (slice 2): Uniswap V3 adapter cold_start ---
+
+/// Pack a V3 `slot0` storage word: sqrtPriceX96[0:160] | tick[160:184] (24-bit
+/// signed) | observation fields[184:256].
+fn v3_slot0_word(sqrt_price: U256, tick: i32, obs_high: U256) -> U256 {
+    let tick24 = U256::from((tick as u32) & 0x00FF_FFFF);
+    sqrt_price | (tick24 << 160) | (obs_high << 184)
+}
+
+#[tokio::test]
+async fn v3_cold_start_brings_pool_ready_with_tick_word() -> Result<()> {
+    let pool = Address::repeat_byte(0x81);
+    let token0 = Address::repeat_byte(0xaa);
+    let token1 = Address::repeat_byte(0xbb);
+    let layout = V3StorageLayout::uniswap(60);
+    let sqrt_price = U256::from(12_345_u64);
+    let liquidity = U256::from(67_890_u64);
+    let current_tick = 0_i32;
+    let obs_high = U256::from(0xabcdef_u64);
+
+    // Bitmap word 0 has ticks 60 (bit 1) and 120 (bit 2) initialized.
+    let bitmap_word = (U256::from(1_u64) << 1) | (U256::from(1_u64) << 2);
+    let init_ticks = [60_i32, 120_i32];
+
+    let mut seed: HashMap<(Address, U256), U256> = HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(sqrt_price, current_tick, obs_high),
+        ),
+        ((pool, layout.liquidity_slot), liquidity),
+        (
+            (
+                pool,
+                v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot),
+            ),
+            bitmap_word,
+        ),
+    ]);
+    for (i, &tick) in init_ticks.iter().enumerate() {
+        let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+        seed.insert((pool, keys[0]), U256::from(1_000 + i as u64));
+        seed.insert((pool, keys[3]), U256::from(1_u64) << 248);
+    }
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(seed));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            token0: Some(token0),
+            token1: Some(token1),
+            fee: Some(500),
+            tick_spacing: Some(60),
+            storage_layout: Some(layout),
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match &registration.metadata {
+        ProtocolMetadata::UniswapV3(metadata) => {
+            assert_eq!(metadata.token0, Some(token0));
+            assert_eq!(metadata.token1, Some(token1));
+            assert_eq!(metadata.fee, Some(500));
+            assert_eq!(metadata.tick_spacing, Some(60));
+        }
+        other => panic!("expected UniswapV3 metadata, got {other:?}"),
+    }
+
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(liquidity)
+    );
+    assert!(
+        cache
+            .cached_storage_value(
+                pool,
+                v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot)
+            )
+            .is_some()
+    );
+    for &tick in &init_ticks {
+        let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+        assert!(
+            cache.cached_storage_value(pool, keys[0]).is_some(),
+            "tick {tick} info slot 0 should be warm"
+        );
+        assert!(
+            cache.cached_storage_value(pool, keys[3]).is_some(),
+            "tick {tick} info slot 3 should be warm"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_then_swap_applies_exact_no_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0x82);
+    let layout = V3StorageLayout::uniswap(60);
+    let obs_high = U256::from(0xfeed_u64);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(500_u64), 0, obs_high),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(600_u64)),
+        (
+            (
+                pool,
+                v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot),
+            ),
+            U256::ZERO,
+        ),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+    adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .unwrap();
+    registry.register_pool(registration).unwrap();
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let new_sqrt = U256::from(777_u64);
+    let log = rpc_log(
+        pool,
+        vec![
+            v3_swap_topic(),
+            topic_address(Address::repeat_byte(0x01)),
+            topic_address(Address::repeat_byte(0x02)),
+        ],
+        abi_words([
+            U256::ZERO,
+            U256::ZERO,
+            new_sqrt,
+            U256::from(888_u64),
+            U256::ZERO,
+        ]),
+        40,
+        0,
+        0,
+    );
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(40, 0))]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput
+    );
+    assert!(report.applied[0].resyncs.is_empty());
+
+    let raw = cache.cached_storage_value(pool, layout.slot0_slot).unwrap();
+    assert_eq!(raw & low_mask(160), new_sqrt);
+    assert_eq!(
+        raw & !low_mask(184),
+        obs_high << 184,
+        "observation high bits must be preserved"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_missing_layout_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0x83);
+    let mut cache = setup_cache().await?;
+
+    let adapter = UniswapV3Adapter::default();
+    // No resolvable layout: default metadata has neither storage_layout nor
+    // tick_spacing.
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata::default()));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(outcome, ColdStartOutcome::Unsupported(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_missing_slot0_needs_repair() -> Result<()> {
+    let pool = Address::repeat_byte(0x84);
+    let layout = V3StorageLayout::uniswap(60);
+
+    // Fetcher serves liquidity but not slot0 (returns ZERO -> not injected ->
+    // slot0 stays cold).
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (pool, layout.liquidity_slot),
+        U256::from(123_u64),
+    )])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(outcome, ColdStartOutcome::NeedsRepair(_, _)));
+    assert_eq!(cache.cached_storage_value(pool, layout.slot0_slot), None);
+    Ok(())
+}
