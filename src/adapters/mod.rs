@@ -32,4 +32,6 @@ pub use types::{
     V3Metadata,
 };
 pub use uniswap_v2::UniswapV2Adapter;
-pub use uniswap_v3::UniswapV3Adapter;
+pub use uniswap_v3::V3FamilyAdapter;
+/// Legacy name for [`V3FamilyAdapter`]; retained for back-compat.
+pub use uniswap_v3::V3FamilyAdapter as UniswapV3Adapter;

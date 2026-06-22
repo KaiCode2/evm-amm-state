@@ -408,6 +408,49 @@ pub enum RepairAction {
     },
 }
 
+impl RepairAction {
+    /// Merge two repair intentions into one, preferring `other` on conflict.
+    ///
+    /// `None` is absorbing (`x.combine(None) == x`, `None.combine(x) == x`),
+    /// matching same-shape variants are unioned (`VerifySlots` by slot,
+    /// same-address `PurgeSlots` by slot), and any other pairing falls through
+    /// to `other`.
+    pub(crate) fn combine(self, other: RepairAction) -> RepairAction {
+        match (self, other) {
+            (RepairAction::None, repair) | (repair, RepairAction::None) => repair,
+            (RepairAction::VerifySlots(mut left), RepairAction::VerifySlots(right)) => {
+                for slot in right {
+                    if !left.contains(&slot) {
+                        left.push(slot);
+                    }
+                }
+                RepairAction::VerifySlots(left)
+            }
+            (
+                RepairAction::PurgeSlots {
+                    address: left_address,
+                    slots: mut left_slots,
+                },
+                RepairAction::PurgeSlots {
+                    address: right_address,
+                    slots: right_slots,
+                },
+            ) if left_address == right_address => {
+                for slot in right_slots {
+                    if !left_slots.contains(&slot) {
+                        left_slots.push(slot);
+                    }
+                }
+                RepairAction::PurgeSlots {
+                    address: left_address,
+                    slots: left_slots,
+                }
+            }
+            (_, other) => other,
+        }
+    }
+}
+
 /// Cold-start strictness and cost policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColdStartPolicy {
@@ -471,4 +514,79 @@ pub enum UnsupportedReason {
     MissingMetadata(&'static str),
     AdapterDefinedRouting,
     Custom(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    #[test]
+    fn combine_none_is_absorbing() {
+        let verify = RepairAction::VerifySlots(vec![(addr(0x11), U256::from(1))]);
+        assert_eq!(RepairAction::None.combine(verify.clone()), verify);
+        assert_eq!(verify.clone().combine(RepairAction::None), verify);
+        assert_eq!(
+            RepairAction::None.combine(RepairAction::None),
+            RepairAction::None
+        );
+    }
+
+    #[test]
+    fn combine_verify_slots_unions_and_dedupes() {
+        let a = addr(0x11);
+        let left = RepairAction::VerifySlots(vec![(a, U256::from(1)), (a, U256::from(2))]);
+        let right = RepairAction::VerifySlots(vec![(a, U256::from(2)), (a, U256::from(3))]);
+        assert_eq!(
+            left.combine(right),
+            RepairAction::VerifySlots(vec![
+                (a, U256::from(1)),
+                (a, U256::from(2)),
+                (a, U256::from(3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn combine_purge_slots_same_address_unions() {
+        let a = addr(0x22);
+        let left = RepairAction::PurgeSlots {
+            address: a,
+            slots: vec![U256::from(1), U256::from(2)],
+        };
+        let right = RepairAction::PurgeSlots {
+            address: a,
+            slots: vec![U256::from(2), U256::from(3)],
+        };
+        assert_eq!(
+            left.combine(right),
+            RepairAction::PurgeSlots {
+                address: a,
+                slots: vec![U256::from(1), U256::from(2), U256::from(3)],
+            }
+        );
+    }
+
+    #[test]
+    fn combine_purge_slots_different_address_prefers_other() {
+        let left = RepairAction::PurgeSlots {
+            address: addr(0x22),
+            slots: vec![U256::from(1)],
+        };
+        let right = RepairAction::PurgeSlots {
+            address: addr(0x33),
+            slots: vec![U256::from(9)],
+        };
+        assert_eq!(left.combine(right.clone()), right);
+    }
+
+    #[test]
+    fn combine_fallthrough_prefers_other() {
+        let left = RepairAction::VerifySlots(vec![(addr(0x11), U256::from(1))]);
+        let right = RepairAction::PurgeStorage(addr(0x44));
+        assert_eq!(left.combine(right.clone()), right);
+    }
 }

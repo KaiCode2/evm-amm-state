@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use alloy_rpc_types_eth::Filter;
 use evm_fork_cache::reactive::{
     HandlerError, HandlerId, HandlerOutcome, HookSignal, InvalidationReason, InvalidationRequest,
@@ -12,7 +12,7 @@ use evm_fork_cache::reactive::{
 };
 
 use super::{
-    AdapterEvent, AdapterRegistry, EventRoute, EventSource, PoolKey, PoolRegistration, PurgeScope,
+    AdapterEvent, AdapterRegistry, EventRoute, EventSource, PoolRegistration, PurgeScope,
     RepairAction, SkippedDelta, SkippedMask, StateDiff, StateUpdate, StateView, UpdateQuality,
 };
 
@@ -93,10 +93,11 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
         let predicted = predict_cold_skips(&event.updates, state);
         let predicted_verify = verify_slots_for_predicted_skips(&predicted);
         let post_apply_repair = adapter.after_apply(pool, &event, &predicted);
-        let repair = combine_repair(
-            combine_repair(event.repair.clone(), post_apply_repair),
-            predicted_verify,
-        );
+        let repair = event
+            .repair
+            .clone()
+            .combine(post_apply_repair)
+            .combine(predicted_verify);
 
         let mut effects = Vec::new();
         effects.extend(
@@ -175,39 +176,8 @@ fn route_log<'a>(
     registry.pools().find(|pool| {
         event_sources_for_pool(registry, pool)
             .iter()
-            .any(|source| source_matches_pool(source, &pool.key, log))
+            .any(|source| super::registry::event_source_matches(source, &pool.key, log))
     })
-}
-
-fn source_matches_pool(source: &EventSource, key: &PoolKey, log: &alloy_primitives::Log) -> bool {
-    if source.emitter != log.address {
-        return false;
-    }
-
-    let topics = log.topics();
-    if !source.topics.is_empty()
-        && !topics
-            .first()
-            .is_some_and(|topic0| source.topics.contains(topic0))
-    {
-        return false;
-    }
-
-    match source.route {
-        EventRoute::Direct => true,
-        EventRoute::IndexedAddress { topic_index } => topics
-            .get(topic_index)
-            .map(topic_address)
-            .is_some_and(|address| key.address() == Some(address)),
-        EventRoute::IndexedBytes32 { topic_index } => topics
-            .get(topic_index)
-            .is_some_and(|topic| key.bytes32() == Some(*topic)),
-        EventRoute::AdapterDefined => false,
-    }
-}
-
-fn topic_address(topic: &B256) -> Address {
-    Address::from_slice(&topic.as_slice()[12..])
 }
 
 fn predict_cold_skips(updates: &[StateUpdate], state: &dyn StateView) -> StateDiff {
@@ -447,40 +417,5 @@ fn hook_signal(kind: &'static str, labels: Vec<ReportTag>) -> HookSignal {
         kind: Cow::Borrowed(kind),
         labels,
         payload: None,
-    }
-}
-
-fn combine_repair(event_repair: RepairAction, post_apply_repair: RepairAction) -> RepairAction {
-    match (event_repair, post_apply_repair) {
-        (RepairAction::None, repair) | (repair, RepairAction::None) => repair,
-        (RepairAction::VerifySlots(mut left), RepairAction::VerifySlots(right)) => {
-            for slot in right {
-                if !left.contains(&slot) {
-                    left.push(slot);
-                }
-            }
-            RepairAction::VerifySlots(left)
-        }
-        (
-            RepairAction::PurgeSlots {
-                address: left_address,
-                slots: mut left_slots,
-            },
-            RepairAction::PurgeSlots {
-                address: right_address,
-                slots: right_slots,
-            },
-        ) if left_address == right_address => {
-            for slot in right_slots {
-                if !left_slots.contains(&slot) {
-                    left_slots.push(slot);
-                }
-            }
-            RepairAction::PurgeSlots {
-                address: left_address,
-                slots: left_slots,
-            }
-        }
-        (_, post_apply_repair) => post_apply_repair,
     }
 }

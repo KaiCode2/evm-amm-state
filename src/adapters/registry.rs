@@ -28,12 +28,19 @@ impl AdapterRegistry {
     }
 
     pub fn register_adapter(&mut self, adapter: Arc<dyn AmmAdapter>) -> Result<(), RegistryError> {
-        let protocol = adapter.protocol();
-        if self.adapters.contains_key(&protocol) {
-            return Err(RegistryError::DuplicateAdapter(protocol));
+        // Validate every claimed id up front so a multi-protocol adapter never
+        // partially inserts when one of its ids collides.
+        let protocols = adapter.protocols();
+        for protocol in &protocols {
+            if self.adapters.contains_key(protocol) {
+                return Err(RegistryError::DuplicateAdapter(*protocol));
+            }
         }
 
-        self.adapters.insert(protocol, adapter);
+        // Same `Arc` stored under every id in the family.
+        for protocol in protocols {
+            self.adapters.insert(protocol, adapter.clone());
+        }
         Ok(())
     }
 
@@ -58,7 +65,16 @@ impl AdapterRegistry {
             return Some(pool);
         }
 
+        // A family adapter is stored under several ids; dedup by pointer so its
+        // `route_log` is consulted at most once.
+        let mut seen: Vec<*const dyn AmmAdapter> = Vec::new();
         for adapter in self.adapters.values() {
+            let ptr = Arc::as_ptr(adapter);
+            if seen.contains(&ptr) {
+                continue;
+            }
+            seen.push(ptr);
+
             if let Some(key) = adapter.route_log(log, self)
                 && let Some(pool) = self.pools.get(&key)
             {
@@ -70,14 +86,11 @@ impl AdapterRegistry {
     }
 
     pub(crate) fn route_log_generic(&self, log: &Log) -> Option<&PoolRegistration> {
-        let topics = log.topics();
-        let topic0 = *topics.first()?;
-
         self.pools.values().find(|registration| {
-            registration.event_sources.iter().any(|source| {
-                source_matches_filter(source, log.address, topic0)
-                    && source_routes_pool(source, &registration.key, topics)
-            })
+            registration
+                .event_sources
+                .iter()
+                .any(|source| event_source_matches(source, &registration.key, log))
         })
     }
 
@@ -127,11 +140,25 @@ pub struct SubscriptionSpec {
     pub sources: Vec<EventSource>,
 }
 
-fn source_matches_filter(source: &EventSource, emitter: Address, topic0: B256) -> bool {
-    source.emitter == emitter && (source.topics.is_empty() || source.topics.contains(&topic0))
-}
+/// Shared per-source routing predicate: does `log` belong to the pool `key` via
+/// the emitter/topic filter and routing rule of `source`?
+///
+/// This is the single source of truth used by both [`AdapterRegistry::route_log_generic`]
+/// and the reactive handler's adapter-derived fallback loop.
+pub(crate) fn event_source_matches(source: &EventSource, key: &PoolKey, log: &Log) -> bool {
+    if source.emitter != log.address {
+        return false;
+    }
 
-fn source_routes_pool(source: &EventSource, key: &PoolKey, topics: &[B256]) -> bool {
+    let topics = log.topics();
+    if !source.topics.is_empty()
+        && !topics
+            .first()
+            .is_some_and(|topic0| source.topics.contains(topic0))
+    {
+        return false;
+    }
+
     match source.route {
         EventRoute::Direct => true,
         EventRoute::IndexedAddress { topic_index } => topics

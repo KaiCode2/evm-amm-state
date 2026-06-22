@@ -1317,3 +1317,185 @@ async fn v3_cold_start_missing_slot0_needs_repair() -> Result<()> {
     assert_eq!(cache.cached_storage_value(pool, layout.slot0_slot), None);
     Ok(())
 }
+
+// --- Module-shape hardening: V3-family consolidation + cold-start policies ---
+
+#[tokio::test]
+async fn pancake_v3_routes_and_applies_through_family_adapter() -> Result<()> {
+    let pool = Address::repeat_byte(0x91);
+    let layout = V3StorageLayout::pancake(60);
+    let sqrt_price = U256::from(123_u64);
+    let liquidity = U256::from(456_u64);
+
+    let adapter = Arc::new(UniswapV3Adapter::default());
+    let mut registration = PoolRegistration::new(PoolKey::PancakeV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::PancakeV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter).unwrap();
+    registry.register_pool(registration).unwrap();
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let log = rpc_log(
+        pool,
+        vec![
+            v3_swap_topic(),
+            topic_address(Address::repeat_byte(0x01)),
+            topic_address(Address::repeat_byte(0x02)),
+        ],
+        abi_words([U256::ZERO, U256::ZERO, sqrt_price, liquidity, U256::ZERO]),
+        50,
+        0,
+        0,
+    );
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(50, 0))]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        tag_value(&report.applied[0].tags, "protocol"),
+        Some("PancakeV3")
+    );
+    // The Swap's absolute liquidity write lands at the PANCAKE liquidity slot,
+    // proving the family adapter decoded against the Pancake layout.
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(liquidity)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_cold_start_hot_slots_only_warms_reserves_only() -> Result<()> {
+    let pool = Address::repeat_byte(0x92);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, V2_TOKEN0_SLOT),
+            token_slot_word(Address::repeat_byte(0xaa)),
+        ),
+        (
+            (pool, V2_TOKEN1_SLOT),
+            token_slot_word(Address::repeat_byte(0xbb)),
+        ),
+        (
+            (pool, V2_RESERVES_SLOT),
+            reserves_slot(U256::from(1_u64), U256::from(2_u64), U256::ZERO),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+
+    let outcome =
+        adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert!(cache.cached_storage_value(pool, V2_RESERVES_SLOT).is_some());
+    assert_eq!(
+        cache.cached_storage_value(pool, V2_TOKEN0_SLOT),
+        None,
+        "HotSlotsOnly must not warm token slots"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_lazy_defers_tick_word() -> Result<()> {
+    let pool = Address::repeat_byte(0x93);
+    let layout = V3StorageLayout::uniswap(60);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(7_u64), 0, U256::ZERO),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(8_u64)),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Lazy)?;
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot);
+    match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, deferred) => {
+            assert!(
+                deferred.iter().any(|work| matches!(
+                    work,
+                    DeferredWork::VerifySlots(slots) if slots.contains(&(pool, bitmap_key))
+                )),
+                "Lazy must defer the tick-bitmap word"
+            );
+        }
+        other => panic!("expected ReadyWithDeferred under Lazy, got {other:?}"),
+    }
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert_eq!(cache.cached_storage_value(pool, bitmap_key), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_hot_slots_only_skips_tick_word() -> Result<()> {
+    let pool = Address::repeat_byte(0x94);
+    let layout = V3StorageLayout::uniswap(60);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(7_u64), 0, U256::ZERO),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(8_u64)),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome =
+        adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.liquidity_slot)
+            .is_some()
+    );
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot);
+    assert_eq!(
+        cache.cached_storage_value(pool, bitmap_key),
+        None,
+        "HotSlotsOnly must not warm the tick word"
+    );
+    Ok(())
+}
