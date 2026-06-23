@@ -134,4 +134,4 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "cold_start_adoption"
-required-features = ["uniswap-v2", "uniswap-v3"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]

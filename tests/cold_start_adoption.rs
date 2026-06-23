@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
@@ -20,11 +20,12 @@ use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, V3StorageLayout,
 };
 use evm_amm_state::adapters::{
-    AdapterRegistry, ColdStartOutcome, ColdStartPolicy, DeferredWork, PoolKey, PoolRegistration,
-    PoolStatus, ProtocolMetadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
-    V3Metadata,
+    AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
+    DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, UniswapV2Adapter,
+    UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use revm::state::{AccountInfo, Bytecode};
 
 // --- helpers (kept local so this manager file owns its fixtures) ---
 
@@ -342,6 +343,156 @@ async fn v3_cold_start_failed_slot0_needs_repair() -> Result<()> {
     assert!(
         matches!(outcome, ColdStartOutcome::NeedsRepair(_, _)),
         "an unfetchable slot0 must need repair, got {outcome:?}"
+    );
+    Ok(())
+}
+
+// --- Balancer V2 (slice 2: discover -> verify access-list cold start) ---
+
+/// A mocked-provider cache plus the asserter, so a test can prove no RPC was
+/// issued (`asserter.read_q().is_empty()`).
+async fn setup_cache_with_asserter() -> Result<(EvmCache, Asserter)> {
+    let asserter = Asserter::new();
+    let client = RpcClient::mocked(asserter.clone());
+    let provider = RootProvider::<AnyNetwork>::new(client);
+    Ok((EvmCache::new(Arc::new(provider)).await, asserter))
+}
+
+fn install_default_account(cache: &mut EvmCache, addr: Address) {
+    cache
+        .db_mut()
+        .insert_account_info(addr, AccountInfo::default());
+}
+
+/// Install the compiled `MockBalancerVault` stub at `vault`. Its
+/// `getPoolTokens(bytes32)` SLOADs fixed slots 0..=4 and returns the
+/// `(address[2], uint256[2], uint256)` tuple built from them.
+fn install_mock_vault(cache: &mut EvmCache, vault: Address) {
+    let runtime = include_str!("fixtures/mock_balancer_vault_runtime.hex");
+    let code = Bytecode::new_raw(Bytes::from(
+        hex::decode(runtime.trim()).expect("valid mock-vault runtime hex"),
+    ));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        vault,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+}
+
+fn balancer_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(BalancerV2Adapter::default()))
+        .unwrap();
+    registry
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balancer_cold_start_discover_verify_ready() -> Result<()> {
+    let vault = Address::repeat_byte(0x31);
+    let pool_id = B256::repeat_byte(0x32);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    // The block beneficiary (default Address::ZERO) is credited gas during the
+    // discover call's transact; install it so the offline run does not fetch it.
+    install_default_account(&mut cache, Address::ZERO);
+    install_mock_vault(&mut cache, vault);
+    // Seed the vault's fixed slots 0..=4 that getPoolTokens SLOADs. Token slots
+    // (0,1) hold the immutable token addresses; balance slots (2,3) hold STALE
+    // values, so the verify round must refresh them to the fetcher's fresh ones.
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(0), token_slot_word(token0))?;
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(1), token_slot_word(token1))?;
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(2), U256::from(1_u64))?;
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(3), U256::from(2_u64))?;
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(4), U256::from(7_u64))?;
+    // Round 2's verify fetcher returns FRESH balances for the discovered slots.
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((vault, U256::from(0)), token_slot_word(token0)),
+            ((vault, U256::from(1)), token_slot_word(token1)),
+            ((vault, U256::from(2)), U256::from(1000_u64)),
+            ((vault, U256::from(3)), U256::from(2000_u64)),
+            ((vault, U256::from(4)), U256::from(7_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = balancer_registry();
+    let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
+        .with_state_address(vault)
+        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
+            vault: Some(vault),
+            ..Default::default()
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "discover->verify should reach Ready, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::BalancerV2(ref m) => {
+            assert_eq!(
+                m.tokens,
+                vec![token0, token1],
+                "tokens decoded from the getPoolTokens return data"
+            );
+            assert_eq!(m.vault, Some(vault));
+        }
+        ref other => panic!("expected BalancerV2 metadata, got {other:?}"),
+    }
+    // The verify round refreshed the discovered balance slots to the fetcher's
+    // fresh values (proving discover -> verify warmed them, not the stale seed).
+    assert_eq!(
+        cache.cached_storage_value(vault, U256::from(2)),
+        Some(U256::from(1000_u64))
+    );
+    assert_eq!(
+        cache.cached_storage_value(vault, U256::from(3)),
+        Some(U256::from(2000_u64))
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the cold start must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balancer_cold_start_missing_vault_is_unsupported() -> Result<()> {
+    let pool_id = B256::repeat_byte(0x33);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+
+    let registry = balancer_registry();
+    // No vault metadata and no state_addresses -> the vault is unresolvable.
+    let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
+        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata::default()));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Unsupported(_)),
+        "a vault-less Balancer pool cannot cold-start, got {outcome:?}"
     );
     Ok(())
 }
