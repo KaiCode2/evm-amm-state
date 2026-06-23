@@ -6,11 +6,11 @@ use super::cache::AdapterCache;
 use super::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AmmAdapter,
     ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, StateDiff,
-    StateUpdate, StateView, UnsupportedReason, UpdateQuality, V3Metadata,
+    PoolRegistration, PoolStatus, ProtocolId, RepairAction, StateDiff, StateUpdate, StateView,
+    UnsupportedReason, UpdateQuality,
 };
 use crate::adapters::storage::{
-    V3StorageLayout, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
+    layout_for, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
     v3_word_position,
 };
 
@@ -332,33 +332,6 @@ impl V3FamilyAdapter {
             },
         })
     }
-}
-
-pub(crate) fn layout_for(pool: &PoolRegistration) -> Option<V3StorageLayout> {
-    match &pool.metadata {
-        ProtocolMetadata::UniswapV3(metadata) => {
-            layout_from_metadata(metadata, ProtocolId::UniswapV3)
-        }
-        ProtocolMetadata::PancakeV3(metadata) => {
-            layout_from_metadata(metadata, ProtocolId::PancakeV3)
-        }
-        ProtocolMetadata::Slipstream(metadata) => {
-            layout_from_metadata(metadata, ProtocolId::Slipstream)
-        }
-        _ => None,
-    }
-}
-
-fn layout_from_metadata(metadata: &V3Metadata, protocol: ProtocolId) -> Option<V3StorageLayout> {
-    metadata.storage_layout.or_else(|| {
-        let spacing = metadata.tick_spacing?;
-        match protocol {
-            ProtocolId::UniswapV3 => Some(V3StorageLayout::uniswap(spacing)),
-            ProtocolId::PancakeV3 => Some(V3StorageLayout::pancake(spacing)),
-            ProtocolId::Slipstream => Some(V3StorageLayout::slipstream(spacing)),
-            _ => None,
-        }
-    })
 }
 
 fn data_word(log: &Log, index: usize) -> Option<U256> {

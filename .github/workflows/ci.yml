@@ -42,17 +42,36 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --no-deps -- -D warnings
 
-      # TOML loading is an optional feature; make sure the crate still builds
-      # and lints cleanly without it.
+      # Adapter-only layer must lint cleanly without amms / amm-math / rayon.
+      - name: Clippy (adapters only)
+        run: cargo clippy --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2 --all-targets --no-deps -- -D warnings
+
+      # Bare adapter build (no protocol adapters) must also compile/lint.
       - name: Clippy (no default features)
         run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
+
+      # Fail if the adapter-only build pulls in a simulation/search dependency.
+      - name: Verify adapter-only build is heavy-dep-free
+        run: |
+          if cargo tree -e normal --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2 \
+              | grep -E '(amms|amm-math|rayon) v[0-9]'; then
+            echo "::error::adapter-only build unexpectedly pulled amms/amm-math/rayon"
+            exit 1
+          fi
+          echo "adapter-only build pulls no amms/amm-math/rayon"
 
       - name: Tests
         run: cargo test
 
+      # Run the adapter integration tests without the heavy simulation deps.
+      - name: Tests (adapters only)
+        run: cargo test --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2
+
       - name: Tests (no default features)
         run: cargo test --no-default-features
 
+      # Docs build on the full default feature set (crate-doc links reference
+      # simulation modules); keep this on default features.
       - name: Docs
         run: cargo doc --no-deps
         env:

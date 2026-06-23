@@ -3,7 +3,7 @@
 //! This module defines the crate-owned contract between AMM protocol semantics
 //! and the generic EVM state cache in `evm-fork-cache`.
 
-pub mod balancer_v2;
+// Protocol-neutral infrastructure — always compiled (no heavy deps).
 pub mod cache;
 pub mod driver;
 pub mod reactive;
@@ -12,10 +12,15 @@ pub mod repair;
 pub mod storage;
 pub mod traits;
 pub mod types;
+
+// Per-protocol adapters — gated by their protocol feature.
+#[cfg(feature = "balancer-v2")]
+pub mod balancer_v2;
+#[cfg(feature = "uniswap-v2")]
 pub mod uniswap_v2;
+#[cfg(feature = "uniswap-v3")]
 pub mod uniswap_v3;
 
-pub use balancer_v2::BalancerV2Adapter;
 pub use cache::{
     AdapterCache, PurgeScope, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff,
     StateUpdate, StateView,
@@ -31,7 +36,13 @@ pub use types::{
     ProtocolMetadata, RepairAction, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
     V3Metadata,
 };
+
+#[cfg(feature = "balancer-v2")]
+pub use balancer_v2::BalancerV2Adapter;
+#[cfg(feature = "uniswap-v2")]
 pub use uniswap_v2::UniswapV2Adapter;
+#[cfg(feature = "uniswap-v3")]
 pub use uniswap_v3::V3FamilyAdapter;
 /// Legacy name for [`V3FamilyAdapter`]; retained for back-compat.
+#[cfg(feature = "uniswap-v3")]
 pub use uniswap_v3::V3FamilyAdapter as UniswapV3Adapter;

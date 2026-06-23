@@ -15,10 +15,9 @@ use evm_fork_cache::reactive::{
 };
 
 use super::storage::{
-    V3StorageLayout, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
-    v3_word_position,
+    V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base, v3_word_position,
 };
-use super::uniswap_v3::layout_for;
 use super::{AdapterEvent, PoolRegistration, PurgeScope};
 
 /// Lower a `RepairAction::V3TickRange` for `pool` into executable effects:
