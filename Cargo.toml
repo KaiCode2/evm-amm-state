@@ -63,7 +63,10 @@ common-protocols = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
 # private and unpublished. At publish time (order: amm-math, evm-fork-cache,
 # then this crate), drop `git`/`branch` and keep the crates.io `version`.
 amm-math = { git = "ssh://git@github.com/KaiCode2/amm-math.git", branch = "main", version = "0.1", optional = true }
-evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "27ae8762a70092fcc9c4aebf42ae4c8f34bb3526", version = "0.1" }
+# INTERIM: pinned to the `cold-start-sync` branch tip (903af3d = base 27ae8762 +
+# the additive cold-start module) while evm-fork-cache#12 is in review. Re-pin to
+# the `main` merge commit before this consumer work merges to evm-amm-state main.
+evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "903af3df887bf5718693d4bacf770552681e5273", version = "0.1" }
 
 alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
 
@@ -128,3 +131,7 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 [[test]]
 name = "adapter_reactive"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+
+[[test]]
+name = "cold_start_adoption"
+required-features = ["uniswap-v2", "uniswap-v3"]

@@ -9,9 +9,9 @@ use evm_amm_state::adapters::storage::{
 use evm_amm_state::adapters::{
     AdapterCache, AdapterDriver, AdapterEvent, AdapterEventError, AdapterEventKind,
     AdapterEventResult, AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, CustomPoolKey, EventSource, PoolKey, PoolRegistration,
-    ProtocolId, ProtocolMetadata, RegistryError, RepairAction, SkippedDelta, SkippedMask,
-    SlotChange, SlotDelta, StateDiff, StateUpdate, StateView, SubscriptionSpec, UniswapV2Adapter,
+    ColdStartPolicy, CustomPoolKey, EventSource, PoolKey, PoolRegistration, ProtocolId,
+    ProtocolMetadata, RegistryError, RepairAction, SkippedDelta, SkippedMask, SlotChange,
+    SlotDelta, StateDiff, StateUpdate, StateView, SubscriptionSpec, UniswapV2Adapter,
     UniswapV3Adapter, UnsupportedReason, UpdateQuality, V3Metadata,
 };
 use revm::context::result::ExecutionResult;
@@ -894,16 +894,16 @@ fn balancer_swap_malformed_data_is_rejected() {
 #[test]
 fn v2_cold_start_non_address_keyed_is_unsupported() {
     let adapter = UniswapV2Adapter::default();
-    let mut registration = PoolRegistration::new(custom_bytes32_key());
-    let mut cache = MockCache::default();
+    let registration = PoolRegistration::new(custom_bytes32_key());
 
-    let outcome = adapter
-        .cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)
-        .expect("cold_start should classify an unsupported key, not error");
-    assert!(matches!(
-        outcome,
-        ColdStartOutcome::Unsupported(UnsupportedReason::Custom(_))
-    ));
+    // A non-address-keyed pool cannot build a planner: the factory rejects it with
+    // a `Custom` reason, which `AdapterRegistry::cold_start` maps to
+    // `ColdStartOutcome::Unsupported(Custom(_))`.
+    let reason = adapter
+        .cold_start_planner(&registration, ColdStartPolicy::Eager)
+        .err()
+        .expect("a non-address-keyed V2 pool must be unsupported");
+    assert!(matches!(reason, UnsupportedReason::Custom(_)));
 }
 
 #[test]
@@ -936,19 +936,19 @@ fn v3_unknown_topic_is_ignored() {
 #[test]
 fn v3_cold_start_non_address_keyed_is_unsupported() {
     let adapter = UniswapV3Adapter::default();
-    let mut registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
+    let registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
         ProtocolMetadata::UniswapV3(V3Metadata {
             storage_layout: Some(V3StorageLayout::uniswap(60)),
             ..Default::default()
         }),
     );
-    let mut cache = MockCache::default();
 
-    let outcome = adapter
-        .cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)
-        .expect("cold_start should classify an unsupported key, not error");
-    assert!(matches!(
-        outcome,
-        ColdStartOutcome::Unsupported(UnsupportedReason::Custom(_))
-    ));
+    // The non-address-keyed check runs ahead of layout resolution, so even with a
+    // resolvable layout the factory rejects the key with a `Custom` reason that
+    // `AdapterRegistry::cold_start` maps to `Unsupported(Custom(_))`.
+    let reason = adapter
+        .cold_start_planner(&registration, ColdStartPolicy::Eager)
+        .err()
+        .expect("a non-address-keyed V3 pool must be unsupported");
+    assert!(matches!(reason, UnsupportedReason::Custom(_)));
 }

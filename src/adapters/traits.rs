@@ -1,10 +1,9 @@
 use alloy_primitives::Log;
-use anyhow::Result;
 
+use super::cold_start::AdapterColdStartPlanner;
 use super::{
-    AdapterCache, AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartOutcome,
-    ColdStartPolicy, EventSource, PoolKey, PoolRegistration, ProtocolId, RepairAction, StateDiff,
-    StateView, UnsupportedReason,
+    AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource, PoolKey,
+    PoolRegistration, ProtocolId, RepairAction, StateDiff, StateView, UnsupportedReason,
 };
 
 /// Protocol adapter contract for AMM-specific routing, cold-start, and decoding.
@@ -30,7 +29,16 @@ pub trait AmmAdapter: Send + Sync {
         registry.route_log_generic(log).map(|pool| pool.key.clone())
     }
 
-    /// Warm a pool's storage and resolve its metadata to a ready state.
+    /// Build a cold-start planner for `pool` under `policy`.
+    ///
+    /// The returned [`AdapterColdStartPlanner`] declares the per-round slot work
+    /// (verify/probe) for [`AdapterRegistry::cold_start`] to drive through
+    /// [`EvmCache::run_cold_start`](evm_fork_cache::cache::EvmCache::run_cold_start),
+    /// then finalizes the pool's metadata/status from the run results. This
+    /// replaces the former imperative `cold_start`: the repair decision is now
+    /// sourced from the per-slot
+    /// [`SlotFetch`](evm_fork_cache::cold_start::SlotFetch) classification rather
+    /// than a `cached_storage(..).is_none()` proxy.
     ///
     /// # Metadata contract: merge vs. preserve
     ///
@@ -46,17 +54,14 @@ pub trait AmmAdapter: Send + Sync {
     ///   recover its identity from a fixed slot layout — e.g. V3
     ///   `token0`/`token1`/`fee`/`tick_spacing` — it PRESERVES the
     ///   config-supplied metadata unchanged and requires a resolvable storage
-    ///   layout (returning [`ColdStartOutcome::Unsupported`] when none can be
+    ///   layout (returning [`UnsupportedReason::MissingMetadata`] when none can be
     ///   derived) rather than overwriting config with guesses.
-    fn cold_start(
+    fn cold_start_planner(
         &self,
-        _pool: &mut PoolRegistration,
-        _cache: &mut dyn AdapterCache,
+        _pool: &PoolRegistration,
         _policy: ColdStartPolicy,
-    ) -> Result<ColdStartOutcome> {
-        Ok(ColdStartOutcome::Unsupported(UnsupportedReason::Protocol(
-            self.protocol(),
-        )))
+    ) -> Result<Box<dyn AdapterColdStartPlanner>, UnsupportedReason> {
+        Err(UnsupportedReason::Protocol(self.protocol()))
     }
 
     fn decode_event(
