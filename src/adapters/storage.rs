@@ -2,6 +2,8 @@
 
 use alloy_primitives::{Address, U256, keccak256};
 
+use super::types::{PoolRegistration, ProtocolId, ProtocolMetadata, V3Metadata};
+
 /// Storage slot for the Uniswap V2 pair `token0` address.
 pub const V2_TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
 
@@ -172,4 +174,36 @@ fn i256_from_i24(value: i32) -> [u8; 32] {
     result[30] = ((masked >> 8) & 0xFF) as u8;
     result[31] = (masked & 0xFF) as u8;
     result
+}
+
+/// Resolve the V3-style storage layout for a pool from its protocol metadata.
+///
+/// Lives here (always-on) rather than in the `uniswap-v3`-gated adapter module
+/// so the always-on repair/reactive path can resolve layouts without depending
+/// on a feature-gated adapter.
+pub(crate) fn layout_for(pool: &PoolRegistration) -> Option<V3StorageLayout> {
+    match &pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata) => {
+            layout_from_metadata(metadata, ProtocolId::UniswapV3)
+        }
+        ProtocolMetadata::PancakeV3(metadata) => {
+            layout_from_metadata(metadata, ProtocolId::PancakeV3)
+        }
+        ProtocolMetadata::Slipstream(metadata) => {
+            layout_from_metadata(metadata, ProtocolId::Slipstream)
+        }
+        _ => None,
+    }
+}
+
+fn layout_from_metadata(metadata: &V3Metadata, protocol: ProtocolId) -> Option<V3StorageLayout> {
+    metadata.storage_layout.or_else(|| {
+        let spacing = metadata.tick_spacing?;
+        match protocol {
+            ProtocolId::UniswapV3 => Some(V3StorageLayout::uniswap(spacing)),
+            ProtocolId::PancakeV3 => Some(V3StorageLayout::pancake(spacing)),
+            ProtocolId::Slipstream => Some(V3StorageLayout::slipstream(spacing)),
+            _ => None,
+        }
+    })
 }

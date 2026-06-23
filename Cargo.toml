@@ -16,17 +16,53 @@ documentation = "https://docs.rs/evm-amm-state"
 [workspace]
 
 [features]
-default = ["toml"]
-# Parse AMM definitions from an `amms.toml` file. When disabled, AMMs are
-# defined programmatically via `AmmConfigEntry` and the `*_from_entries`
-# loaders, and the crate does not depend on the `toml` crate.
+# Back-compat default: the full simulation + search pipeline and all protocols.
+default = ["full-protocols", "simulation", "search", "toml"]
+
+# --- Dependency tiers ---
+# Protocol adapters, event decoding, and cache orchestration. Always compiled;
+# this marker carries no heavy deps (no `amms` / `amm-math` / `rayon`).
+adapters = []
+# Pure-Rust pool math + cache-sync initialization (`LocalAMM`, `*_pool` modules).
+simulation = ["dep:amms", "dep:amm-math"]
+# Parallel multi-leg route/arbitrage search.
+search = ["simulation", "dep:rayon"]
+# Parse AMM definitions from an `amms.toml` file.
 toml = ["dep:toml"]
+
+# --- Per-protocol ADAPTER flags ---
+# These gate the protocol *adapter* modules. Per-protocol gating of the
+# simulation `LocalAMM` enum is deferred to the S2 `LocalAMM` rebuild.
+uniswap-v2 = ["adapters"]
+uniswap-v3 = ["adapters"]
+pancake-v3 = ["uniswap-v3"] # served by the V3-family adapter
+slipstream = ["uniswap-v3"] # served by the V3-family adapter
+solidly-v2 = ["adapters"]
+balancer-v2 = ["adapters"]
+balancer-v3 = ["adapters"]
+curve = ["adapters"]
+erc4626 = ["adapters"]
+uniswap-v4 = ["adapters"]
+
+full-protocols = [
+    "uniswap-v2",
+    "uniswap-v3",
+    "pancake-v3",
+    "slipstream",
+    "solidly-v2",
+    "balancer-v2",
+    "balancer-v3",
+    "curve",
+    "erc4626",
+    "uniswap-v4",
+]
+common-protocols = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
 
 [dependencies]
 # Companion crates. Consumed as git dependencies while the sibling repos are
 # private and unpublished. At publish time (order: amm-math, evm-fork-cache,
 # then this crate), drop `git`/`branch` and keep the crates.io `version`.
-amm-math = { git = "ssh://git@github.com/KaiCode2/amm-math.git", branch = "main", version = "0.1" }
+amm-math = { git = "ssh://git@github.com/KaiCode2/amm-math.git", branch = "main", version = "0.1", optional = true }
 evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "27ae8762a70092fcc9c4aebf42ae4c8f34bb3526", version = "0.1" }
 
 alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
@@ -39,11 +75,11 @@ alloy-provider = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
 
-amms = "0.7.4"
+amms = { version = "0.7.4", optional = true }
 anyhow = "1.0.98"
 foundry-fork-db = "0.22"
 futures = "0.3"
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = { version = "0.9.8", optional = true }
@@ -62,8 +98,33 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bench]]
 name = "simulation"
 harness = false
+required-features = ["search"]
+
+# Examples build on the simulation/search pipeline; gate them so an adapter-only
+# `--no-default-features --all-targets` build skips rather than fails on them.
+[[example]]
+name = "triangular_arbitrage"
+required-features = ["search"]
+
+[[example]]
+name = "programmatic_loading"
+required-features = ["simulation"]
+
+[[example]]
+name = "event_subscription"
+required-features = ["simulation"]
 
 # Loads pools from examples/amms.toml; requires the optional `toml` feature.
 [[example]]
 name = "toml_loading"
-required-features = ["toml"]
+required-features = ["toml", "simulation"]
+
+# Adapter integration tests build against the per-protocol adapters; gate them
+# so the adapter-only build runs them only when those adapters are enabled.
+[[test]]
+name = "adapter_a1"
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+
+[[test]]
+name = "adapter_reactive"
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
