@@ -16,13 +16,16 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
 
+use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, V3StorageLayout,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
     DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, RepairAction,
-    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, UnsupportedReason, V3Metadata,
+    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
+    UnsupportedReason, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use revm::state::{AccountInfo, Bytecode};
@@ -252,6 +255,54 @@ async fn v2_cold_start_lazy_defers_exactly_what_eager_warms() -> Result<()> {
     Ok(())
 }
 
+// A Lazy cold-start records its token slots as deferred work but does not warm
+// them; `run_deferred` must execute that deferred work and warm them.
+#[tokio::test]
+async fn v2_run_deferred_warms_lazy_deferred_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x14);
+    let token0 = Address::repeat_byte(0xb0);
+    let token1 = Address::repeat_byte(0xb1);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+            ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+            (
+                (pool, V2_RESERVES_SLOT),
+                reserves_slot(U256::from(1_u64), U256::from(2_u64), U256::ZERO),
+            ),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v2_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Lazy)?;
+    let deferred = match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, d) => d,
+        other => panic!("Lazy should be ReadyWithDeferred, got {other:?}"),
+    };
+    // Lazy did not warm the token slots up-front.
+    assert_eq!(cache.cached_storage_value(pool, V2_TOKEN0_SLOT), None);
+
+    // Drive the deferred work; the deferred token slots are now warmed.
+    registry.run_deferred(&deferred, &mut cache)?;
+
+    assert!(
+        cache.cached_storage_value(pool, V2_TOKEN0_SLOT).is_some(),
+        "run_deferred must warm deferred token0"
+    );
+    assert!(
+        cache.cached_storage_value(pool, V2_TOKEN1_SLOT).is_some(),
+        "run_deferred must warm deferred token1"
+    );
+    assert!(
+        cache.cached_storage_value(pool, V2_RESERVES_SLOT).is_some(),
+        "reserves stay warm"
+    );
+    Ok(())
+}
+
 // --- Uniswap V3 ---
 
 #[tokio::test]
@@ -295,6 +346,154 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
         cache
             .cached_storage_value(pool, layout.liquidity_slot)
             .is_some()
+    );
+    Ok(())
+}
+
+/// The bitmap bit for `tick` within its word: `floor(tick/spacing) mod 256`.
+fn v3_bit(tick: i32, spacing: i32) -> U256 {
+    let bit = tick.div_euclid(spacing).rem_euclid(256) as u32;
+    U256::from(1) << bit
+}
+
+// Eager cold-start must warm a bounded WINDOW of neighbouring tick-bitmap words
+// (and their initialized ticks), not just the current word — so a moderate
+// tick-crossing swap is offline-pre-warmed. Currently only the current word is
+// warmed, so the W0±1 bitmap + their tick-info slots are unfetched (None) -> red.
+#[tokio::test]
+async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
+    let pool = Address::repeat_byte(0x24);
+    let layout = V3StorageLayout::uniswap(60);
+    let spacing = 60i32;
+
+    // Current tick 0 -> word 0; neighbours -1 and +1.
+    let w0 = v3_word_position(0, spacing);
+    let key_w0 = v3_tick_bitmap_storage_key_with_base(w0, layout.tick_bitmap_base_slot);
+    let key_wp1 = v3_tick_bitmap_storage_key_with_base(w0 + 1, layout.tick_bitmap_base_slot);
+    let key_wm1 = v3_tick_bitmap_storage_key_with_base(w0 - 1, layout.tick_bitmap_base_slot);
+
+    // One initialized tick per word (self-checked placement).
+    let tick_w0 = 60; // word 0, bit 1
+    let tick_wp1 = 256 * 60; // word +1, bit 0
+    let tick_wm1 = -60; // word -1, bit 255
+    assert_eq!(v3_word_position(tick_w0, spacing), w0);
+    assert_eq!(v3_word_position(tick_wp1, spacing), w0 + 1);
+    assert_eq!(v3_word_position(tick_wm1, spacing), w0 - 1);
+
+    let info_w0 = v3_tick_info_storage_keys_with_base(tick_w0, layout.ticks_base_slot);
+    let info_wp1 = v3_tick_info_storage_keys_with_base(tick_wp1, layout.ticks_base_slot);
+    let info_wm1 = v3_tick_info_storage_keys_with_base(tick_wm1, layout.ticks_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            ((pool, key_w0), v3_bit(tick_w0, spacing)),
+            ((pool, key_wp1), v3_bit(tick_wp1, spacing)),
+            ((pool, key_wm1), v3_bit(tick_wm1, spacing)),
+            ((pool, info_w0[0]), U256::from(1_u64)),
+            ((pool, info_w0[3]), U256::from(1_u64)),
+            ((pool, info_wp1[0]), U256::from(1_u64)),
+            ((pool, info_wp1[3]), U256::from(1_u64)),
+            ((pool, info_wm1[0]), U256::from(1_u64)),
+            ((pool, info_wm1[3]), U256::from(1_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+
+    // Current word still warmed (regression).
+    assert!(cache.cached_storage_value(pool, key_w0).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[0]).is_some());
+    // Neighbouring words + their initialized ticks warmed (the new behaviour).
+    assert!(
+        cache.cached_storage_value(pool, key_wp1).is_some(),
+        "word +1 bitmap must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_wm1).is_some(),
+        "word -1 bitmap must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wp1[0]).is_some(),
+        "word +1 tick info must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wm1[0]).is_some(),
+        "word -1 tick info must be warmed"
+    );
+    Ok(())
+}
+
+// Policy boundary: HotSlotsOnly warms only slot0 + liquidity — NO tick bitmap
+// words (current or neighbouring). Guards the multi-word scan from leaking into
+// the hot-only policy.
+#[tokio::test]
+async fn v3_cold_start_hot_slots_only_skips_tick_words() -> Result<()> {
+    let pool = Address::repeat_byte(0x25);
+    let layout = V3StorageLayout::uniswap(60);
+    let key_w0 =
+        v3_tick_bitmap_storage_key_with_base(v3_word_position(0, 60), layout.tick_bitmap_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            ((pool, key_w0), v3_bit(60, 60)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome =
+        registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.liquidity_slot)
+            .is_some()
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_w0).is_none(),
+        "HotSlotsOnly must not warm any tick bitmap word"
     );
     Ok(())
 }
@@ -733,5 +932,229 @@ async fn balancer_cold_start_three_tokens_ready() -> Result<()> {
         Some(U256::from(3000_u64))
     );
     assert!(asserter.read_q().is_empty(), "must be fully offline");
+    Ok(())
+}
+
+// --- Solidly V2 ---
+
+fn solidly_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(SolidlyV2Adapter::default()))
+        .unwrap();
+    registry
+}
+
+// Eager cold-start warms both reserve slots (two separate uint256 slots, unlike
+// V2's packed slot) plus the token slots, and reaches Ready.
+#[tokio::test]
+async fn solidly_cold_start_ready_warms_reserves_and_tokens() -> Result<()> {
+    let pool = Address::repeat_byte(0x51);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+    // Arbitrary test layout — the adapter verifies whatever the layout names.
+    let (r0_slot, r1_slot, t0_slot, t1_slot) = (
+        U256::from(10_u64),
+        U256::from(11_u64),
+        U256::from(12_u64),
+        U256::from(13_u64),
+    );
+    let layout = SolidlyStorageLayout::new(r0_slot, r1_slot, t0_slot, t1_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((pool, r0_slot), U256::from(1_000_u64)),
+            ((pool, r1_slot), U256::from(2_000_u64)),
+            ((pool, t0_slot), token_slot_word(token0)),
+            ((pool, t1_slot), token_slot_word(token1)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = solidly_registry();
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    assert!(cache.cached_storage_value(pool, r0_slot).is_some());
+    assert!(cache.cached_storage_value(pool, r1_slot).is_some());
+    assert!(cache.cached_storage_value(pool, t0_slot).is_some());
+    assert!(cache.cached_storage_value(pool, t1_slot).is_some());
+    Ok(())
+}
+
+// Reserves are mandatory: a genuine on-chain zero (degenerate pool) and an
+// archive miss must produce DISTINCT repairs (the per-slot SlotFetch point),
+// mirroring the V2 adapter.
+#[tokio::test]
+async fn solidly_cold_start_zero_vs_failed_reserves_are_distinct_repairs() -> Result<()> {
+    let pool = Address::repeat_byte(0x52);
+    let layout = SolidlyStorageLayout::new(
+        U256::from(10_u64),
+        U256::from(11_u64),
+        U256::from(12_u64),
+        U256::from(13_u64),
+    );
+    let metadata = || {
+        ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        })
+    };
+
+    // Case A: reserves read a genuine on-chain ZERO (degenerate pool).
+    let mut cache_zero = setup_cache().await?;
+    cache_zero.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+    let mut reg_zero = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(metadata());
+    let zero =
+        solidly_registry().cold_start(&mut reg_zero, &mut cache_zero, ColdStartPolicy::Eager)?;
+
+    // Case B: reserve0 FAILS to fetch (archive / historical miss).
+    let mut cache_fail = setup_cache().await?;
+    cache_fail.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::new(),
+        vec![(pool, layout.reserve0_slot)],
+    ));
+    let mut reg_fail = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(metadata());
+    let fail =
+        solidly_registry().cold_start(&mut reg_fail, &mut cache_fail, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(zero, ColdStartOutcome::NeedsRepair(_, _)),
+        "genuine-zero reserves should need repair, got {zero:?}"
+    );
+    assert!(
+        matches!(fail, ColdStartOutcome::NeedsRepair(_, _)),
+        "archive-miss reserves should need repair, got {fail:?}"
+    );
+    assert_ne!(
+        repair_of(&zero),
+        repair_of(&fail),
+        "a genuine zero and an archive miss must produce different repairs"
+    );
+    Ok(())
+}
+
+// A layout whose slots collide (here reserve0 == token0) is rejected at the
+// planner boundary rather than silently corrupting the verdict / token decode.
+#[tokio::test]
+async fn solidly_cold_start_colliding_layout_is_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0x53);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+    let registry = solidly_registry();
+    // reserve0_slot == token0_slot (both 10) -> colliding.
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(SolidlyStorageLayout::new(
+                U256::from(10_u64),
+                U256::from(11_u64),
+                U256::from(10_u64),
+                U256::from(13_u64),
+            )),
+            ..Default::default()
+        }));
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Unsupported(_)),
+        "a colliding layout must be Unsupported, got {outcome:?}"
+    );
+    Ok(())
+}
+
+// Lazy warms the reserves now and defers exactly the token slots; HotSlotsOnly
+// warms reserves only and does NOT defer.
+#[tokio::test]
+async fn solidly_cold_start_lazy_defers_token_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x54);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+    let (r0, r1, t0, t1) = (
+        U256::from(10_u64),
+        U256::from(11_u64),
+        U256::from(12_u64),
+        U256::from(13_u64),
+    );
+    let layout = SolidlyStorageLayout::new(r0, r1, t0, t1);
+    let seed = || {
+        HashMap::from([
+            ((pool, r0), U256::from(1_000_u64)),
+            ((pool, r1), U256::from(2_000_u64)),
+            ((pool, t0), token_slot_word(token0)),
+            ((pool, t1), token_slot_word(token1)),
+        ])
+    };
+
+    // Lazy: ReadyWithDeferred, reserves warm, tokens deferred (not warm).
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(seed(), Vec::new()));
+    let registry = solidly_registry();
+    let mut reg = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+    let outcome = registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Lazy)?;
+    let deferred = match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, d) => d,
+        other => panic!("Lazy should be ReadyWithDeferred, got {other:?}"),
+    };
+    let deferred_slots: HashSet<(Address, U256)> = deferred
+        .iter()
+        .flat_map(|w| match w {
+            DeferredWork::VerifySlots(slots) => slots.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(deferred_slots.contains(&(pool, t0)) && deferred_slots.contains(&(pool, t1)));
+    assert!(cache.cached_storage_value(pool, r0).is_some());
+    assert_eq!(
+        cache.cached_storage_value(pool, t0),
+        None,
+        "tokens deferred, not warm"
+    );
+
+    // run_deferred warms the deferred token slots.
+    registry.run_deferred(&deferred, &mut cache)?;
+    assert!(cache.cached_storage_value(pool, t0).is_some());
+    assert!(cache.cached_storage_value(pool, t1).is_some());
+
+    // HotSlotsOnly: plain Ready (no defer), reserves warm, tokens not warm.
+    let mut cache_h = setup_cache().await?;
+    cache_h.set_storage_batch_fetcher(fetcher_with_failures(seed(), Vec::new()));
+    let mut reg_h = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+    let outcome_h = registry.cold_start(&mut reg_h, &mut cache_h, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(
+        matches!(outcome_h, ColdStartOutcome::Ready(_)),
+        "HotSlotsOnly should be plain Ready (no defer), got {outcome_h:?}"
+    );
+    assert!(cache_h.cached_storage_value(pool, r0).is_some());
+    assert_eq!(cache_h.cached_storage_value(pool, t0), None);
     Ok(())
 }

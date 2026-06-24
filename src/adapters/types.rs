@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, U256};
 
 use super::cache::{SlotChange, StateDiff, StateUpdate};
-use super::storage::V3StorageLayout;
+use super::storage::{SolidlyStorageLayout, V3StorageLayout};
 
 /// Protocol family identifier for adapter registrations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -249,6 +249,7 @@ pub enum ProtocolMetadata {
     PancakeV3(V3Metadata),
     Slipstream(V3Metadata),
     BalancerV2(BalancerV2Metadata),
+    SolidlyV2(SolidlyV2Metadata),
     Custom(Arc<dyn Any + Send + Sync>),
 }
 
@@ -261,6 +262,7 @@ impl fmt::Debug for ProtocolMetadata {
             Self::PancakeV3(metadata) => f.debug_tuple("PancakeV3").field(metadata).finish(),
             Self::Slipstream(metadata) => f.debug_tuple("Slipstream").field(metadata).finish(),
             Self::BalancerV2(metadata) => f.debug_tuple("BalancerV2").field(metadata).finish(),
+            Self::SolidlyV2(metadata) => f.debug_tuple("SolidlyV2").field(metadata).finish(),
             Self::Custom(_) => f.write_str("Custom(..)"),
         }
     }
@@ -280,6 +282,16 @@ pub struct V3Metadata {
     pub fee: Option<u32>,
     pub tick_spacing: Option<i32>,
     pub storage_layout: Option<V3StorageLayout>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SolidlyV2Metadata {
+    pub token0: Option<Address>,
+    pub token1: Option<Address>,
+    /// `true` for stable (x³y+y³x) pools, `false` for volatile (xy=k). Config-
+    /// supplied; preserved across cold-start.
+    pub stable: Option<bool>,
+    pub storage_layout: Option<SolidlyStorageLayout>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -515,6 +527,27 @@ pub enum DeferredWork {
         policy: ColdStartPolicy,
     },
     Custom(String),
+}
+
+/// Result of running deferred cold-start work via
+/// [`AdapterRegistry::run_deferred`](super::AdapterRegistry::run_deferred).
+///
+/// `verified` accumulates the [`SlotChange`]s produced by warming
+/// [`DeferredWork::VerifySlots`] (and `Repair(VerifySlots)`) entries.
+/// `unhandled` collects, verbatim, any deferred work the driver does not execute
+/// in this item (`ColdStart`, `Custom`, and non-`VerifySlots` repairs) so callers
+/// can route them onward rather than have them silently dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeferredOutcome {
+    pub verified: Vec<SlotChange>,
+    pub unhandled: Vec<DeferredWork>,
+}
+
+impl DeferredOutcome {
+    /// Whether every deferred item was executed (nothing was deferred onward).
+    pub fn is_fully_handled(&self) -> bool {
+        self.unhandled.is_empty()
+    }
 }
 
 /// Why a protocol state, event, or policy is not supported by the current adapter.

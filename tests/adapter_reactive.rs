@@ -10,14 +10,14 @@ use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
 use evm_amm_state::adapters::storage::{
-    V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3StorageLayout,
+    SolidlyStorageLayout, V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3StorageLayout,
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
     ColdStartOutcome, ColdStartPolicy, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolMetadata, PurgeScope, StateUpdate, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    ProtocolMetadata, PurgeScope, SolidlyV2Adapter, SolidlyV2Metadata, StateUpdate,
+    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -1786,6 +1786,120 @@ async fn v3_cold_start_missing_liquidity_is_still_ready() -> Result<()> {
         cache.cached_storage_value(pool, layout.liquidity_slot),
         None,
         "a cold liquidity slot is best-effort, not mandatory"
+    );
+    Ok(())
+}
+
+// --- Solidly V2 reactive ---
+
+fn solidly_sync_topic() -> B256 {
+    keccak256("Sync(uint256,uint256)")
+}
+
+fn solidly_registry(pool: Address, layout: SolidlyStorageLayout) -> AdapterRegistry {
+    let adapter = Arc::new(SolidlyV2Adapter::default());
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter).unwrap();
+    registry.register_pool(registration).unwrap();
+    registry
+}
+
+// A Solidly `Sync(uint256,uint256)` writes the two separate reserve slots exactly
+// from the event payload (no fetch) — the V2-style exact event-sourcing, adapted
+// to Solidly's unpacked reserve layout.
+#[tokio::test]
+async fn solidly_sync_writes_both_reserve_slots_through_runtime() -> Result<()> {
+    let pool = Address::repeat_byte(0x51);
+    let (r0_slot, r1_slot) = (U256::from(10_u64), U256::from(11_u64));
+    let layout =
+        SolidlyStorageLayout::new(r0_slot, r1_slot, U256::from(12_u64), U256::from(13_u64));
+    let reserve0 = U256::from(123_u64);
+    let reserve1 = U256::from(456_u64);
+    let log = rpc_log(
+        pool,
+        vec![solidly_sync_topic()],
+        abi_words([reserve0, reserve1]),
+        11,
+        0,
+        0,
+    );
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(solidly_registry(
+        pool, layout,
+    ))))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(11, 0))]),
+    )?;
+    assert_eq!(report.applied.len(), 1, "the Sync must apply exactly once");
+
+    assert_eq!(
+        cache.cached_storage_value(pool, r0_slot),
+        Some(reserve0),
+        "reserve0 written exactly from the Sync payload"
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, r1_slot),
+        Some(reserve1),
+        "reserve1 written exactly from the Sync payload"
+    );
+    Ok(())
+}
+
+// A Solidly pool registered WITHOUT a storage layout (cold-start would be
+// MissingMetadata) must not have a Sync silently mutate the cache — decode_event
+// errors on the missing layout, so nothing is written.
+#[tokio::test]
+async fn solidly_sync_without_layout_does_not_mutate_cache() -> Result<()> {
+    let pool = Address::repeat_byte(0x52);
+    let adapter = Arc::new(SolidlyV2Adapter::default());
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: None,
+            ..Default::default()
+        }));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter).unwrap();
+    registry.register_pool(registration).unwrap();
+
+    let log = rpc_log(
+        pool,
+        vec![solidly_sync_topic()],
+        abi_words([U256::from(123_u64), U256::from(456_u64)]),
+        11,
+        0,
+        0,
+    );
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    // ingest must not panic, and a layout-less decode must write nothing.
+    let _ = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(11, 0))]),
+    )?;
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::from(10_u64)),
+        None,
+        "a layout-less Solidly Sync must not write any reserve slot"
     );
     Ok(())
 }

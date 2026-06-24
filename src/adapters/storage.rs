@@ -108,6 +108,37 @@ impl V3StorageLayout {
     }
 }
 
+/// Storage layout for a Solidly V2 (Aerodrome / Velodrome V2) reserves pool.
+///
+/// Reserves are two separate `uint256` slots (not packed like Uniswap V2). Slot
+/// indices are fork-specific and config-supplied — there is no derivable default,
+/// so validate a fork's layout with the gated RPC-parity test before relying on
+/// it in production.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SolidlyStorageLayout {
+    pub reserve0_slot: U256,
+    pub reserve1_slot: U256,
+    pub token0_slot: U256,
+    pub token1_slot: U256,
+}
+
+impl SolidlyStorageLayout {
+    /// Build a Solidly V2 layout from explicit storage slots.
+    pub const fn new(
+        reserve0_slot: U256,
+        reserve1_slot: U256,
+        token0_slot: U256,
+        token1_slot: U256,
+    ) -> Self {
+        Self {
+            reserve0_slot,
+            reserve1_slot,
+            token0_slot,
+            token1_slot,
+        }
+    }
+}
+
 /// Decode an EVM address from a right-aligned 32-byte storage word (the low 20
 /// bytes), as used for the `token0`/`token1` address slots of a Uniswap V2 pair.
 pub fn decode_address_slot(word: U256) -> Address {
