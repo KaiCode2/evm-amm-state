@@ -5,6 +5,7 @@
 
 // Protocol-neutral infrastructure — always compiled (no heavy deps).
 pub mod cache;
+pub mod cold_start;
 pub mod driver;
 pub mod reactive;
 pub mod registry;
@@ -25,6 +26,7 @@ pub use cache::{
     AdapterCache, PurgeScope, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff,
     StateUpdate, StateView,
 };
+pub use cold_start::AdapterColdStartPlanner;
 pub use driver::AdapterDriver;
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
