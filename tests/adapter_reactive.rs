@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use alloy_eips::BlockId;
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, hex, keccak256};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::Log as RpcLog;
@@ -15,9 +15,10 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolMetadata, PurgeScope, SolidlyV2Adapter, SolidlyV2Metadata, StateUpdate,
-    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
+    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, DeferredWork, PoolKey,
+    PoolRegistration, PoolStatus, ProtocolMetadata, PurgeScope, SolidlyV2Adapter,
+    SolidlyV2Metadata, StateUpdate, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
+    V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -25,6 +26,7 @@ use evm_fork_cache::reactive::{
     ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, ReactiveReport, ReactiveRuntime,
     ReportTag, ResyncBlock, ResyncReason, ResyncTarget, RouteKey, RouteKeySpec, StateEffectQuality,
 };
+use revm::state::{AccountInfo, Bytecode};
 
 fn rpc_log(
     address: Address,
@@ -1900,6 +1902,205 @@ async fn solidly_sync_without_layout_does_not_mutate_cache() -> Result<()> {
         cache.cached_storage_value(pool, U256::from(10_u64)),
         None,
         "a layout-less Solidly Sync must not write any reserve slot"
+    );
+    Ok(())
+}
+
+// --- Curve StableSwap reactive (resync on TokenExchange) ---
+//
+// A Curve `TokenExchange` carries deltas, not absolute balances, and the
+// `get_dy` read-set (balances + A + fee) lives behind a non-predictable Vyper
+// layout, so the reactive path re-verifies (resyncs) exactly the cold-start
+// `discovered_slots` rather than applying the event payload. These tests cover:
+// (1) a cold-started pool emits a `VerifySlots` resync over its discovered slot,
+// and (2) the batch-robustness guard: an empty-`discovered_slots` pool must not
+// error or mutate (a decode error would fail the whole `ingest_batch`).
+
+fn curve_token_exchange_topic() -> B256 {
+    keccak256("TokenExchange(address,int128,uint256,int128,uint256)")
+}
+
+/// Install `runtime_hex` (a hand-assembled stub) as the deployed bytecode at
+/// `address`, mirroring the cold-start harness so a `get_dy` discover call can
+/// run offline against the reactive cache.
+fn install_runtime(cache: &mut EvmCache, address: Address, runtime_hex: &str) {
+    let code = Bytecode::new_raw(Bytes::from(
+        hex::decode(runtime_hex.trim()).expect("valid mock-pool runtime hex"),
+    ));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        address,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+}
+
+// Cold-start a Curve pool (discover -> verify), re-seed the discovered slot
+// stale, then a `TokenExchange` must emit a hash-pinned resync over exactly the
+// discovered slot (the post-swap re-read), refreshing it to the fresh value.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_token_exchange_resyncs_discovered_slot() -> Result<()> {
+    let pool = Address::repeat_byte(0xc1);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+    let usdt = Address::repeat_byte(0x03);
+    let fresh = U256::from(999_900_u64);
+
+    let mut cache = setup_cache().await?;
+    // The block beneficiary (Address::ZERO) is credited gas during the discover
+    // call's transact; install it so the offline run does not fetch it.
+    cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    // Seed slot 0 so the discover `get_dy` SLOADs it; the fetcher serves the
+    // fresh post-swap value the verify round and the reactive resync re-read.
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, U256::from(1_u64))?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([((pool, U256::ZERO), fresh)])));
+
+    // Cold-start to populate `discovered_slots`.
+    let mut cold_registry = AdapterRegistry::new();
+    cold_registry
+        .register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc, usdt],
+            discovered_slots: Vec::new(),
+        }));
+    let outcome =
+        cold_registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    match &registration.metadata {
+        ProtocolMetadata::Curve(m) => {
+            assert!(
+                m.discovered_slots.contains(&U256::ZERO),
+                "cold-start must have discovered slot 0, got {:?}",
+                m.discovered_slots
+            );
+        }
+        other => panic!("expected Curve metadata, got {other:?}"),
+    }
+
+    let adapter = CurveAdapter::default();
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    registry.register_pool(registration).unwrap();
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let log = rpc_log(
+        pool,
+        vec![curve_token_exchange_topic(), topic_address(dai)],
+        abi_words([
+            U256::ZERO,        // sold_id
+            U256::from(1_u64), // tokens_sold
+            U256::from(1_u64), // bought_id
+            U256::from(1_u64), // tokens_bought
+        ]),
+        60,
+        0,
+        0,
+    );
+    let report = runtime.ingest_batch_with_resync(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(60, 0))]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].resyncs.len(),
+        1,
+        "a TokenExchange must resync"
+    );
+    let [ResyncTarget::StorageSlots { address, slots }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a single storage-slots resync target");
+    };
+    assert_eq!(*address, pool);
+    assert_eq!(
+        slots,
+        &vec![U256::ZERO],
+        "resync must target the discovered slot"
+    );
+    Ok(())
+}
+
+// Batch-robustness guard: a Curve pool with EMPTY `discovered_slots` (cold-start
+// has not run) must route a `TokenExchange` without erroring and without
+// mutating the cache. An error here would fail the whole `ingest_batch` (the
+// Solidly batch-robustness lesson).
+#[tokio::test]
+async fn curve_token_exchange_empty_slots_no_error_no_mutation() -> Result<()> {
+    let pool = Address::repeat_byte(0xc2);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+
+    let mut cache = setup_cache().await?;
+
+    let adapter = CurveAdapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: Vec::new(),
+        }));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    registry.register_pool(registration).unwrap();
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let log = rpc_log(
+        pool,
+        vec![curve_token_exchange_topic(), topic_address(dai)],
+        abi_words([
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::from(1_u64),
+            U256::from(1_u64),
+        ]),
+        61,
+        0,
+        0,
+    );
+    // Must not panic / error, and must not mutate the cold cache.
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(61, 0))]),
+    )?;
+    assert_eq!(report.applied.len(), 1, "the event still routes");
+    assert!(
+        report.applied[0].resyncs.is_empty(),
+        "empty discovered_slots must produce no resync"
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        None,
+        "no discovered slots -> no mutation"
     );
     Ok(())
 }

@@ -18,6 +18,8 @@ pub mod types;
 // Per-protocol adapters — gated by their protocol feature.
 #[cfg(feature = "balancer-v2")]
 pub mod balancer_v2;
+#[cfg(feature = "curve")]
+pub mod curve;
 #[cfg(feature = "solidly-v2")]
 pub mod solidly_v2;
 #[cfg(feature = "uniswap-v2")]
@@ -37,14 +39,16 @@ pub use sim::{SimConfig, SimError, SwapQuote};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
-    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CustomPoolKey,
-    DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolId, ProtocolMetadata, RepairAction, SolidlyV2Metadata, UniswapV2Metadata,
-    UnsupportedReason, UpdateQuality, V3Metadata,
+    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata,
+    CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
+    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SolidlyV2Metadata,
+    UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3Metadata,
 };
 
 #[cfg(feature = "balancer-v2")]
 pub use balancer_v2::BalancerV2Adapter;
+#[cfg(feature = "curve")]
+pub use curve::CurveAdapter;
 #[cfg(feature = "solidly-v2")]
 pub use solidly_v2::SolidlyV2Adapter;
 #[cfg(feature = "uniswap-v2")]

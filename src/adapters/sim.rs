@@ -21,7 +21,8 @@
     feature = "uniswap-v2",
     feature = "uniswap-v3",
     feature = "balancer-v2",
-    feature = "solidly-v2"
+    feature = "solidly-v2",
+    feature = "curve"
 ))]
 use alloy_primitives::Bytes;
 use alloy_primitives::{Address, U256, address};
@@ -30,7 +31,8 @@ use alloy_sol_types::sol;
     feature = "uniswap-v2",
     feature = "uniswap-v3",
     feature = "balancer-v2",
-    feature = "solidly-v2"
+    feature = "solidly-v2",
+    feature = "curve"
 ))]
 use revm::context::result::ExecutionResult;
 
@@ -38,7 +40,8 @@ use revm::context::result::ExecutionResult;
     feature = "uniswap-v2",
     feature = "uniswap-v3",
     feature = "balancer-v2",
-    feature = "solidly-v2"
+    feature = "solidly-v2",
+    feature = "curve"
 ))]
 use super::AdapterCache;
 
@@ -154,7 +157,8 @@ impl SimConfig {
     feature = "uniswap-v2",
     feature = "uniswap-v3",
     feature = "balancer-v2",
-    feature = "solidly-v2"
+    feature = "solidly-v2",
+    feature = "curve"
 ))]
 pub(crate) fn run_quote(
     cache: &mut dyn AdapterCache,
@@ -208,6 +212,15 @@ sol! {
     /// `factory`/`stable`/`token0`/`decimals0`/`decimals1` from pool storage, so
     /// the factory's bytecode + those slots must be reachable (not just reserves).
     function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
+    /// Curve StableSwap (plain pool) `get_dy(i, j, dx)`.
+    ///
+    /// `i`/`j` are the pool's coin indices (the `coins[]` ordering). Applies the
+    /// StableSwap invariant in-EVM against the warmed balances + amplification +
+    /// fee and returns the `j`-coin output for `dx` of coin `i`. `int128` indices
+    /// match classic StableSwap (CryptoSwap / StableSwap-NG use `uint256` — out
+    /// of scope here).
+    function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
 
     /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.
     ///

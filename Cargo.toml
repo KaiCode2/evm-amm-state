@@ -17,7 +17,7 @@ documentation = "https://docs.rs/evm-amm-state"
 
 [features]
 # The adapters pipeline over the finished protocols.
-default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
+default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 # --- Dependency tiers ---
 # Protocol-neutral adapter infrastructure (cold-start, reactive, sim, cache
@@ -32,6 +32,7 @@ pancake-v3 = ["uniswap-v3"] # served by the V3-family adapter
 slipstream = ["uniswap-v3"] # served by the V3-family adapter
 balancer-v2 = ["adapters"]
 solidly-v2 = ["adapters"] # Aerodrome / Velodrome V2 reserves pools
+curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 
 [dependencies]
 # Companion crate. Consumed as a git dependency while the sibling repo is
@@ -81,11 +82,11 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "adapter_reactive"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 [[test]]
 name = "cold_start_adoption"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 [[test]]
 name = "pipeline_e2e"
@@ -93,11 +94,11 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "adapter_swap_sim"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 [[test]]
 name = "adapter_swap_sim_rpc"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 [[test]]
 name = "reactive_ws_e2e"

@@ -45,14 +45,15 @@ use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 
 use evm_amm_state::adapters::sim::{
-    BatchSwapStep, FundManagement, QuoteExactInputSingleParams, getAmountOutCall,
+    BatchSwapStep, FundManagement, QuoteExactInputSingleParams, get_dyCall, getAmountOutCall,
     getAmountsOutCall, queryBatchSwapCall, quoteExactInputSingleCall,
 };
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy, PoolKey,
-    PoolRegistration, ProtocolMetadata, SimConfig, SolidlyV2Adapter, SolidlyV2Metadata,
-    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
+    AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy,
+    CurveAdapter, CurveMetadata, PoolKey, PoolRegistration, ProtocolMetadata, SimConfig,
+    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
+    V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -78,6 +79,11 @@ const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2
 const BALANCER_BAL_WETH_POOL_ID: B256 =
     b256!("5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014");
 const BAL: Address = address!("ba100000625a3754423978a60c9317c58a424e3D");
+
+// --- Curve StableSwap (3pool on Ethereum mainnet, at FORK_BLOCK) ---
+const CURVE_3POOL: Address = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
 
 // --- Solidly V2 (Aerodrome on Base) ---
 //
@@ -435,6 +441,87 @@ async fn solidly_simulate_swap_matches_eth_call() -> Result<()> {
     assert_eq!(
         sim.amount_out, truth,
         "Solidly sim amount_out must match eth_call getAmountOut"
+    );
+    Ok(())
+}
+
+/// Curve StableSwap parity — forks mainnet at FORK_BLOCK, cold-starts the live
+/// 3pool (DAI/USDC/USDT), and asserts:
+///   1. cold-start discovered + persisted a non-empty `get_dy` read-set
+///      (`discovered_slots`),
+///   2. `simulate_swap(DAI, USDC, 1 DAI)` (the pool's `get_dy`) equals the SAME
+///      call via `eth_call` at the fork block (on-chain ground truth).
+///
+/// Validates the real `get_dy` ABI + the discover-based cold-start against a
+/// live deployment (probe ground truth at this block: 999900).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires E2E_RPC_URL archive node; run with --ignored"]
+async fn curve_simulate_swap_matches_eth_call() -> Result<()> {
+    let Some(url) = rpc_url() else {
+        eprintln!("E2E_RPC_URL unset; skipping");
+        return Ok(());
+    };
+
+    // 1 DAI in (18 decimals); DAI (coin 0) -> USDC (coin 1).
+    let amount_in = U256::from(1_000_000_000_000_000_000_u128);
+
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
+    let registry = {
+        let mut r = AdapterRegistry::new();
+        r.register_adapter(Arc::new(CurveAdapter::default()))?;
+        r
+    };
+    let mut registration = PoolRegistration::new(PoolKey::Curve(CURVE_3POOL))
+        .with_state_address(CURVE_3POOL)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![DAI, USDC, USDT],
+            discovered_slots: Vec::new(),
+        }));
+    registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    // (1) Cold-start discovered + persisted the get_dy read-set.
+    let ProtocolMetadata::Curve(meta) = &registration.metadata else {
+        return Err(anyhow!("expected Curve metadata after cold-start"));
+    };
+    assert!(
+        !meta.discovered_slots.is_empty(),
+        "cold-start should discover the get_dy read-set"
+    );
+    assert_eq!(meta.coins, vec![DAI, USDC, USDT], "coins preserved");
+
+    // (2) simulate_swap == eth_call get_dy ground truth.
+    let adapter = CurveAdapter::default();
+    let sim = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            DAI,
+            USDC,
+            amount_in,
+            &SimConfig::default(),
+        )
+        .map_err(|e| anyhow!("curve sim failed: {e}"))?;
+
+    let out = eth_call_at(
+        &url,
+        CURVE_3POOL,
+        Bytes::from(
+            get_dyCall {
+                i: 0i128,
+                j: 1i128,
+                dx: amount_in,
+            }
+            .abi_encode(),
+        ),
+        FORK_BLOCK,
+    )
+    .await?;
+    let truth = get_dyCall::abi_decode_returns_validate(&out)?;
+
+    assert!(truth > U256::ZERO, "ground-truth quote should be non-zero");
+    assert_eq!(
+        sim.amount_out, truth,
+        "Curve sim amount_out must match eth_call get_dy"
     );
     Ok(())
 }
