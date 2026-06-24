@@ -20,7 +20,8 @@
 #[cfg(any(
     feature = "uniswap-v2",
     feature = "uniswap-v3",
-    feature = "balancer-v2"
+    feature = "balancer-v2",
+    feature = "solidly-v2"
 ))]
 use alloy_primitives::Bytes;
 use alloy_primitives::{Address, U256, address};
@@ -28,14 +29,16 @@ use alloy_sol_types::sol;
 #[cfg(any(
     feature = "uniswap-v2",
     feature = "uniswap-v3",
-    feature = "balancer-v2"
+    feature = "balancer-v2",
+    feature = "solidly-v2"
 ))]
 use revm::context::result::ExecutionResult;
 
 #[cfg(any(
     feature = "uniswap-v2",
     feature = "uniswap-v3",
-    feature = "balancer-v2"
+    feature = "balancer-v2",
+    feature = "solidly-v2"
 ))]
 use super::AdapterCache;
 
@@ -150,7 +153,8 @@ impl SimConfig {
 #[cfg(any(
     feature = "uniswap-v2",
     feature = "uniswap-v3",
-    feature = "balancer-v2"
+    feature = "balancer-v2",
+    feature = "solidly-v2"
 ))]
 pub(crate) fn run_quote(
     cache: &mut dyn AdapterCache,
@@ -195,6 +199,15 @@ sol! {
     /// output for the final token in `path`.
     function getAmountsOut(uint256 amountIn, address[] path)
         returns (uint256[] amounts);
+
+    /// Solidly V2 (Velodrome / Aerodrome) `Pool.getAmountOut(amountIn, tokenIn)`.
+    ///
+    /// Subtracts the fee via an external `IPoolFactory(factory).getFee()`
+    /// STATICCALL, then applies the stable (x³y+y³x) or volatile (xy=k) invariant
+    /// in-EVM and returns the `tokenOut` amount. Beyond the reserves it reads
+    /// `factory`/`stable`/`token0`/`decimals0`/`decimals1` from pool storage, so
+    /// the factory's bytecode + those slots must be reachable (not just reserves).
+    function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
 
     /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.
     ///
