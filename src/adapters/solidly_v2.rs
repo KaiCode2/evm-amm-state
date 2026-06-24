@@ -11,7 +11,7 @@ use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
     PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    SolidlyV2Metadata, StateDiff, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
+    SolidlyV2Metadata, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
 };
 
 sol! {
@@ -72,6 +72,24 @@ impl AmmAdapter for SolidlyV2Adapter {
                 "Solidly V2 storage layout",
             ));
         };
+        // reserve0/reserve1/token0/token1 are four distinct storage variables on
+        // a real pool; a colliding layout would silently corrupt the cold-start
+        // verdict and token decode (and clobber one reserve write), so reject it.
+        let slots = [
+            layout.reserve0_slot,
+            layout.reserve1_slot,
+            layout.token0_slot,
+            layout.token1_slot,
+        ];
+        for i in 0..slots.len() {
+            for j in (i + 1)..slots.len() {
+                if slots[i] == slots[j] {
+                    return Err(UnsupportedReason::Custom(
+                        "Solidly V2 storage layout slots must be pairwise distinct".into(),
+                    ));
+                }
+            }
+        }
         Ok(Box::new(SolidlyV2ColdStartPlanner::new(
             address, layout, policy,
         )))
@@ -99,9 +117,11 @@ impl AmmAdapter for SolidlyV2Adapter {
             ));
         };
         let Some(layout) = solidly_layout(pool) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "Solidly V2 storage layout missing",
-            ));
+            // A missing layout is a config issue (the pool was not cold-started),
+            // not a malformed log. Skip the event rather than returning an error
+            // that would fail the whole reactive batch — and without a layout
+            // there are no slots to target anyway.
+            return AdapterEventResult::ignored();
         };
 
         let Some(reserve0) = data_word(log, 0) else {
@@ -131,29 +151,20 @@ impl AmmAdapter for SolidlyV2Adapter {
         })
     }
 
-    fn after_apply(
-        &self,
-        pool: &PoolRegistration,
-        event: &AdapterEvent,
-        diff: &StateDiff,
-    ) -> RepairAction {
-        if event.kind == AdapterEventKind::Sync
-            && diff.has_skipped()
-            && let (Some(address), Some(layout)) = (pool.key.address(), solidly_layout(pool))
-        {
-            RepairAction::VerifySlots(vec![
-                (address, layout.reserve0_slot),
-                (address, layout.reserve1_slot),
-            ])
-        } else {
-            RepairAction::None
-        }
-    }
+    // No `after_apply` override (unlike V2): Solidly stores each reserve in its
+    // own full uint256 slot, so decode_event's absolute `StateUpdate::slot`
+    // writes are always exact — a full Slot write is never cold-skipped (unlike
+    // V2's masked write into a packed slot), so `StateDiff::has_skipped()` can
+    // never be true here and the default `RepairAction::None` is correct. No
+    // cold-slot resync is ever needed.
 
-    /// Quote via the pool's own `getAmountOut(amountIn, tokenIn)`, which applies
-    /// the stable/volatile invariant against the warmed reserves in-EVM (chain
-    /// code, not reimplemented math). `token_out` is implied (the pool's other
-    /// token), so it is not part of the call.
+    /// Quote via the pool's own `getAmountOut(amountIn, tokenIn)` (chain code, no
+    /// reimplemented math). Beyond the warmed reserves the pool also reads its
+    /// `stable` flag + `token0`/`decimals0`/`decimals1` and STATICCALLs the
+    /// factory's `getFee`, so the quote is NOT reproducible from warmed reserves
+    /// alone — those slots and the factory's bytecode must be reachable (lazily
+    /// fetched from a live backend, or installed for offline tests). `token_out`
+    /// is implied (the pool's other token), so it is not part of the call.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,

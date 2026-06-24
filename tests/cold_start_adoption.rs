@@ -1050,3 +1050,111 @@ async fn solidly_cold_start_zero_vs_failed_reserves_are_distinct_repairs() -> Re
     );
     Ok(())
 }
+
+// A layout whose slots collide (here reserve0 == token0) is rejected at the
+// planner boundary rather than silently corrupting the verdict / token decode.
+#[tokio::test]
+async fn solidly_cold_start_colliding_layout_is_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0x53);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+    let registry = solidly_registry();
+    // reserve0_slot == token0_slot (both 10) -> colliding.
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(SolidlyStorageLayout::new(
+                U256::from(10_u64),
+                U256::from(11_u64),
+                U256::from(10_u64),
+                U256::from(13_u64),
+            )),
+            ..Default::default()
+        }));
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Unsupported(_)),
+        "a colliding layout must be Unsupported, got {outcome:?}"
+    );
+    Ok(())
+}
+
+// Lazy warms the reserves now and defers exactly the token slots; HotSlotsOnly
+// warms reserves only and does NOT defer.
+#[tokio::test]
+async fn solidly_cold_start_lazy_defers_token_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x54);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+    let (r0, r1, t0, t1) = (
+        U256::from(10_u64),
+        U256::from(11_u64),
+        U256::from(12_u64),
+        U256::from(13_u64),
+    );
+    let layout = SolidlyStorageLayout::new(r0, r1, t0, t1);
+    let seed = || {
+        HashMap::from([
+            ((pool, r0), U256::from(1_000_u64)),
+            ((pool, r1), U256::from(2_000_u64)),
+            ((pool, t0), token_slot_word(token0)),
+            ((pool, t1), token_slot_word(token1)),
+        ])
+    };
+
+    // Lazy: ReadyWithDeferred, reserves warm, tokens deferred (not warm).
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(seed(), Vec::new()));
+    let registry = solidly_registry();
+    let mut reg = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+    let outcome = registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Lazy)?;
+    let deferred = match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, d) => d,
+        other => panic!("Lazy should be ReadyWithDeferred, got {other:?}"),
+    };
+    let deferred_slots: HashSet<(Address, U256)> = deferred
+        .iter()
+        .flat_map(|w| match w {
+            DeferredWork::VerifySlots(slots) => slots.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(deferred_slots.contains(&(pool, t0)) && deferred_slots.contains(&(pool, t1)));
+    assert!(cache.cached_storage_value(pool, r0).is_some());
+    assert_eq!(
+        cache.cached_storage_value(pool, t0),
+        None,
+        "tokens deferred, not warm"
+    );
+
+    // run_deferred warms the deferred token slots.
+    registry.run_deferred(&deferred, &mut cache)?;
+    assert!(cache.cached_storage_value(pool, t0).is_some());
+    assert!(cache.cached_storage_value(pool, t1).is_some());
+
+    // HotSlotsOnly: plain Ready (no defer), reserves warm, tokens not warm.
+    let mut cache_h = setup_cache().await?;
+    cache_h.set_storage_batch_fetcher(fetcher_with_failures(seed(), Vec::new()));
+    let mut reg_h = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            stable: Some(false),
+            storage_layout: Some(layout),
+            ..Default::default()
+        }));
+    let outcome_h = registry.cold_start(&mut reg_h, &mut cache_h, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(
+        matches!(outcome_h, ColdStartOutcome::Ready(_)),
+        "HotSlotsOnly should be plain Ready (no defer), got {outcome_h:?}"
+    );
+    assert!(cache_h.cached_storage_value(pool, r0).is_some());
+    assert_eq!(cache_h.cached_storage_value(pool, t0), None);
+    Ok(())
+}

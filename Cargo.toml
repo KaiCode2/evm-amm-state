@@ -93,7 +93,7 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "adapter_swap_sim"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 [[test]]
 name = "adapter_swap_sim_rpc"
