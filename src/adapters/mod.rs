@@ -18,6 +18,8 @@ pub mod types;
 // Per-protocol adapters — gated by their protocol feature.
 #[cfg(feature = "balancer-v2")]
 pub mod balancer_v2;
+#[cfg(feature = "solidly-v2")]
+pub mod solidly_v2;
 #[cfg(feature = "uniswap-v2")]
 pub mod uniswap_v2;
 #[cfg(feature = "uniswap-v3")]
@@ -37,12 +39,14 @@ pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
     BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CustomPoolKey,
     DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolId, ProtocolMetadata, RepairAction, UniswapV2Metadata, UnsupportedReason,
-    UpdateQuality, V3Metadata,
+    ProtocolId, ProtocolMetadata, RepairAction, SolidlyV2Metadata, UniswapV2Metadata,
+    UnsupportedReason, UpdateQuality, V3Metadata,
 };
 
 #[cfg(feature = "balancer-v2")]
 pub use balancer_v2::BalancerV2Adapter;
+#[cfg(feature = "solidly-v2")]
+pub use solidly_v2::SolidlyV2Adapter;
 #[cfg(feature = "uniswap-v2")]
 pub use uniswap_v2::UniswapV2Adapter;
 #[cfg(feature = "uniswap-v3")]

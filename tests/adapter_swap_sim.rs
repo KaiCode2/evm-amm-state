@@ -22,10 +22,12 @@ use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
 
+use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
     ColdStartOutcome, ColdStartPolicy, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
-    SimConfig, SimError, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
+    SimConfig, SimError, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
+    UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -587,6 +589,91 @@ async fn balancer_reactive_swap_refreshes_balances_for_resim() -> Result<()> {
         "the re-simulated quote must reflect the refreshed balance"
     );
 
+    assert!(asserter.read_q().is_empty(), "must be fully offline");
+    Ok(())
+}
+
+// --- Solidly V2 offline harness ---
+
+// Solidly's simulate_swap executes the POOL's own getAmountOut(amountIn, tokenIn)
+// against the warmed pool — no router/quoter, no SimConfig target, no layout.
+#[tokio::test(flavor = "multi_thread")]
+async fn solidly_simulate_swap_returns_pool_quote_offline() -> Result<()> {
+    let pool = Address::repeat_byte(0x71);
+    let token_in = Address::repeat_byte(0x01);
+    let token_out = Address::repeat_byte(0x02);
+    let expected_out = U256::from(7_777_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    // Mock pool: getAmountOut returns sload(0); seed it.
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_solidly_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, expected_out)?;
+
+    let adapter = SolidlyV2Adapter::default();
+    let registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            token0: Some(token_in),
+            token1: Some(token_out),
+            stable: Some(false),
+            storage_layout: Some(SolidlyStorageLayout::new(
+                U256::from(10_u64),
+                U256::from(11_u64),
+                U256::from(12_u64),
+                U256::from(13_u64),
+            )),
+        }));
+
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            token_in,
+            token_out,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect("solidly quote should succeed");
+
+    assert_eq!(quote.amount_out, expected_out);
+    assert!(
+        asserter.read_q().is_empty(),
+        "swap sim must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn solidly_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
+    let pool = Address::repeat_byte(0x72);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(&mut cache, pool, REVERT_RUNTIME);
+
+    let adapter = SolidlyV2Adapter::default();
+    let registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata::default()));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("reverting pool must error");
+    assert_eq!(err, SimError::Reverted);
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }

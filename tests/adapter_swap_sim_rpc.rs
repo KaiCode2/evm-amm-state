@@ -24,6 +24,15 @@
 //!   `0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014`,
 //!   vault `0xBA12222222228d8Ba445958a75a0704d566BF2C8`.
 //! - Token amounts use a 1e6 USDC / 1e18 WETH-scaled input as noted per test.
+//!
+//! The Solidly V2 parity test forks **Base** (not Ethereum), block
+//! `47_700_000`, against the Aerodrome WETH/USDC volatile pool
+//! `0xcDAC0d6c6C59727a65F871236188350531885C43`. It uses a Base RPC url —
+//! `E2E_BASE_RPC_URL`, or `E2E_RPC_URL` with the Alchemy `eth-mainnet` host
+//! swapped to `base-mainnet`:
+//! ```text
+//! E2E_RPC_URL=<alchemy-archive-url> cargo test --test adapter_swap_sim_rpc -- --ignored
+//! ```
 
 use std::sync::Arc;
 
@@ -36,15 +45,23 @@ use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 
 use evm_amm_state::adapters::sim::{
-    BatchSwapStep, FundManagement, QuoteExactInputSingleParams, getAmountsOutCall,
-    queryBatchSwapCall, quoteExactInputSingleCall,
+    BatchSwapStep, FundManagement, QuoteExactInputSingleParams, getAmountOutCall,
+    getAmountsOutCall, queryBatchSwapCall, quoteExactInputSingleCall,
 };
+use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy, PoolKey,
-    PoolRegistration, ProtocolMetadata, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    PoolRegistration, ProtocolMetadata, SimConfig, SolidlyV2Adapter, SolidlyV2Metadata,
+    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
+
+alloy_sol_types::sol! {
+    /// Solidly pool reserve view fns — used only to cross-check the empirical
+    /// storage-slot layout against the live pool's authoritative reserves.
+    function reserve0() returns (uint256);
+    function reserve1() returns (uint256);
+}
 
 const FORK_BLOCK: u64 = 20_000_000;
 
@@ -62,31 +79,62 @@ const BALANCER_BAL_WETH_POOL_ID: B256 =
     b256!("5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014");
 const BAL: Address = address!("ba100000625a3754423978a60c9317c58a424e3D");
 
+// --- Solidly V2 (Aerodrome on Base) ---
+//
+// Base mainnet fork block. Aerodrome WETH/USDC volatile pool, discovered from
+// the PoolFactory and verified at this height (see the empirical layout scan
+// baked into `AERO_*_SLOT` below).
+const SOLIDLY_FORK_BLOCK: u64 = 47_700_000;
+const BASE_WETH: Address = address!("4200000000000000000000000000000000000006");
+const BASE_USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+// factory.getPool(WETH, USDC, stable=false) at the fork block.
+const AERODROME_WETH_USDC: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+// Storage layout verified empirically at the fork block by matching
+// eth_getStorageAt against the pool's token0()/token1()/reserve0()/reserve1():
+// token0 -> slot 13, token1 -> slot 14, reserve0 -> slot 20, reserve1 -> slot 21.
+const AERO_RESERVE0_SLOT: u64 = 20;
+const AERO_RESERVE1_SLOT: u64 = 21;
+const AERO_TOKEN0_SLOT: u64 = 13;
+const AERO_TOKEN1_SLOT: u64 = 14;
+
 fn rpc_url() -> Option<String> {
     std::env::var("E2E_RPC_URL").ok()
 }
 
-async fn fork_cache(url: &str) -> Result<EvmCache> {
+/// Base RPC url for the Solidly parity test: an explicit `E2E_BASE_RPC_URL` if
+/// set, otherwise derived from `E2E_RPC_URL` by swapping the Alchemy
+/// `eth-mainnet` host segment for `base-mainnet` (Aerodrome lives on Base, not
+/// Ethereum mainnet). Returns `None` if neither is available.
+fn base_rpc_url() -> Option<String> {
+    if let Ok(url) = std::env::var("E2E_BASE_RPC_URL") {
+        return Some(url);
+    }
+    std::env::var("E2E_RPC_URL")
+        .ok()
+        .map(|url| url.replace("eth-mainnet", "base-mainnet"))
+}
+
+async fn fork_cache(url: &str, block: u64) -> Result<EvmCache> {
     let provider = RootProvider::<AnyNetwork>::connect(url)
         .await
-        .context("connect E2E_RPC_URL")?;
+        .context("connect RPC url")?;
     Ok(EvmCache::at_block(
         Arc::new(provider),
-        BlockId::Number(BlockNumberOrTag::Number(FORK_BLOCK)),
+        BlockId::Number(BlockNumberOrTag::Number(block)),
     )
     .await)
 }
 
 /// Execute `calldata` against `target` via the provider's `eth_call` at the
-/// pinned fork block — the on-chain ground truth.
-async fn eth_call_at_fork(url: &str, target: Address, calldata: Bytes) -> Result<Bytes> {
+/// pinned `block` — the on-chain ground truth.
+async fn eth_call_at(url: &str, target: Address, calldata: Bytes, block: u64) -> Result<Bytes> {
     let provider = RootProvider::<AnyNetwork>::connect(url).await?;
     let tx = TransactionRequest::default()
         .with_to(target)
         .with_input(calldata);
     let out = provider
         .call(tx.into())
-        .block(BlockId::Number(BlockNumberOrTag::Number(FORK_BLOCK)))
+        .block(BlockId::Number(BlockNumberOrTag::Number(block)))
         .await
         .context("eth_call at fork block")?;
     Ok(out)
@@ -103,7 +151,7 @@ async fn v3_simulate_swap_matches_eth_call() -> Result<()> {
     // 1 USDC in (6 decimals).
     let amount_in = U256::from(1_000_000_u64);
 
-    let mut cache = fork_cache(&url).await?;
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
     let registry = {
         let mut r = AdapterRegistry::new();
         r.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
@@ -141,7 +189,7 @@ async fn v3_simulate_swap_matches_eth_call() -> Result<()> {
         }
         .abi_encode(),
     );
-    let out = eth_call_at_fork(&url, V3_QUOTER_V2, calldata).await?;
+    let out = eth_call_at(&url, V3_QUOTER_V2, calldata, FORK_BLOCK).await?;
     let truth = quoteExactInputSingleCall::abi_decode_returns_validate(&out)?;
 
     assert_eq!(
@@ -161,7 +209,7 @@ async fn v2_simulate_swap_matches_eth_call() -> Result<()> {
 
     let amount_in = U256::from(1_000_000_u64); // 1 USDC
 
-    let mut cache = fork_cache(&url).await?;
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
     let registry = {
         let mut r = AdapterRegistry::new();
         r.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
@@ -189,7 +237,7 @@ async fn v2_simulate_swap_matches_eth_call() -> Result<()> {
         }
         .abi_encode(),
     );
-    let out = eth_call_at_fork(&url, V2_ROUTER_02, calldata).await?;
+    let out = eth_call_at(&url, V2_ROUTER_02, calldata, FORK_BLOCK).await?;
     let amounts = getAmountsOutCall::abi_decode_returns_validate(&out)?;
 
     assert_eq!(
@@ -210,7 +258,7 @@ async fn balancer_simulate_swap_matches_eth_call() -> Result<()> {
 
     let amount_in = U256::from(1_000_000_000_000_000_000_u64); // 1 BAL (18 decimals)
 
-    let mut cache = fork_cache(&url).await?;
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
     let registry = {
         let mut r = AdapterRegistry::new();
         r.register_adapter(Arc::new(BalancerV2Adapter::default()))?;
@@ -250,13 +298,143 @@ async fn balancer_simulate_swap_matches_eth_call() -> Result<()> {
         }
         .abi_encode(),
     );
-    let out = eth_call_at_fork(&url, BALANCER_VAULT, calldata).await?;
+    let out = eth_call_at(&url, BALANCER_VAULT, calldata, FORK_BLOCK).await?;
     let deltas = queryBatchSwapCall::abi_decode_returns_validate(&out)?;
     let truth_out = U256::from(deltas[1].unsigned_abs());
 
     assert_eq!(
         sim.amount_out, truth_out,
         "Balancer sim amount_out must match eth_call Vault queryBatchSwap"
+    );
+    Ok(())
+}
+
+/// Solidly V2 (Aerodrome on Base) parity — forks Base at a pinned block,
+/// cold-starts a real Aerodrome WETH/USDC volatile pool, and asserts:
+///   1. cold-start decodes the real `token0`/`token1` from the configured token
+///      slots (proves `AERO_TOKEN0_SLOT`/`AERO_TOKEN1_SLOT`),
+///   2. the configured reserve slots hold the pool's authoritative
+///      `reserve0()`/`reserve1()` (proves `AERO_RESERVE0_SLOT`/`AERO_RESERVE1_SLOT`),
+///   3. `simulate_swap` (the pool's `getAmountOut`) equals the SAME call via
+///      `eth_call` at the fork block (the on-chain ground truth).
+///
+/// Together these validate the real `getAmountOut`/`Sync` ABIs *and* the
+/// `SolidlyStorageLayout` against a live deployment — the thing the offline
+/// `sload(0)` mock cannot exercise.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Base RPC (E2E_BASE_RPC_URL, or E2E_RPC_URL on Alchemy); run with --ignored"]
+async fn solidly_simulate_swap_matches_eth_call() -> Result<()> {
+    let Some(url) = base_rpc_url() else {
+        eprintln!("no Base RPC (E2E_BASE_RPC_URL / E2E_RPC_URL); skipping");
+        return Ok(());
+    };
+
+    // 0.001 WETH in (18 decimals); WETH -> USDC.
+    let amount_in = U256::from(1_000_000_000_000_000_u64);
+
+    let layout = SolidlyStorageLayout::new(
+        U256::from(AERO_RESERVE0_SLOT),
+        U256::from(AERO_RESERVE1_SLOT),
+        U256::from(AERO_TOKEN0_SLOT),
+        U256::from(AERO_TOKEN1_SLOT),
+    );
+
+    let mut cache = fork_cache(&url, SOLIDLY_FORK_BLOCK).await?;
+    let registry = {
+        let mut r = AdapterRegistry::new();
+        r.register_adapter(Arc::new(SolidlyV2Adapter::default()))?;
+        r
+    };
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(AERODROME_WETH_USDC))
+        .with_state_address(AERODROME_WETH_USDC)
+        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
+            token0: None,
+            token1: None,
+            stable: Some(false),
+            storage_layout: Some(layout),
+        }));
+    registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    // (1) Cold-start decoded the real tokens from the configured token slots.
+    let ProtocolMetadata::SolidlyV2(meta) = &registration.metadata else {
+        return Err(anyhow!("expected Solidly metadata after cold-start"));
+    };
+    assert_eq!(
+        meta.token0,
+        Some(BASE_WETH),
+        "token0 decoded from slot {AERO_TOKEN0_SLOT} must be WETH"
+    );
+    assert_eq!(
+        meta.token1,
+        Some(BASE_USDC),
+        "token1 decoded from slot {AERO_TOKEN1_SLOT} must be USDC"
+    );
+
+    // (2) The configured reserve slots hold the pool's authoritative reserves.
+    let provider = RootProvider::<AnyNetwork>::connect(&url).await?;
+    let bid = BlockId::Number(BlockNumberOrTag::Number(SOLIDLY_FORK_BLOCK));
+    let slot0 = provider
+        .get_storage_at(AERODROME_WETH_USDC, U256::from(AERO_RESERVE0_SLOT))
+        .block_id(bid)
+        .await?;
+    let slot1 = provider
+        .get_storage_at(AERODROME_WETH_USDC, U256::from(AERO_RESERVE1_SLOT))
+        .block_id(bid)
+        .await?;
+    let r0 = reserve0Call::abi_decode_returns_validate(
+        &eth_call_at(
+            &url,
+            AERODROME_WETH_USDC,
+            Bytes::from(reserve0Call {}.abi_encode()),
+            SOLIDLY_FORK_BLOCK,
+        )
+        .await?,
+    )?;
+    let r1 = reserve1Call::abi_decode_returns_validate(
+        &eth_call_at(
+            &url,
+            AERODROME_WETH_USDC,
+            Bytes::from(reserve1Call {}.abi_encode()),
+            SOLIDLY_FORK_BLOCK,
+        )
+        .await?,
+    )?;
+    assert_eq!(slot0, r0, "slot {AERO_RESERVE0_SLOT} must hold reserve0()");
+    assert_eq!(slot1, r1, "slot {AERO_RESERVE1_SLOT} must hold reserve1()");
+
+    // (3) simulate_swap == eth_call getAmountOut ground truth.
+    let config = SimConfig::default();
+    let adapter = SolidlyV2Adapter::default();
+    let sim = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            BASE_WETH,
+            BASE_USDC,
+            amount_in,
+            &config,
+        )
+        .map_err(|e| anyhow!("solidly sim failed: {e}"))?;
+
+    let out = eth_call_at(
+        &url,
+        AERODROME_WETH_USDC,
+        Bytes::from(
+            getAmountOutCall {
+                amountIn: amount_in,
+                tokenIn: BASE_WETH,
+            }
+            .abi_encode(),
+        ),
+        SOLIDLY_FORK_BLOCK,
+    )
+    .await?;
+    let truth = getAmountOutCall::abi_decode_returns_validate(&out)?;
+
+    assert!(truth > U256::ZERO, "ground-truth quote should be non-zero");
+    assert_eq!(
+        sim.amount_out, truth,
+        "Solidly sim amount_out must match eth_call getAmountOut"
     );
     Ok(())
 }

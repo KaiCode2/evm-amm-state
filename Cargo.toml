@@ -16,8 +16,8 @@ documentation = "https://docs.rs/evm-amm-state"
 [workspace]
 
 [features]
-# The adapters pipeline over the three finished protocols.
-default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2"]
+# The adapters pipeline over the finished protocols.
+default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 # --- Dependency tiers ---
 # Protocol-neutral adapter infrastructure (cold-start, reactive, sim, cache
@@ -31,6 +31,7 @@ uniswap-v3 = ["adapters"]
 pancake-v3 = ["uniswap-v3"] # served by the V3-family adapter
 slipstream = ["uniswap-v3"] # served by the V3-family adapter
 balancer-v2 = ["adapters"]
+solidly-v2 = ["adapters"] # Aerodrome / Velodrome V2 reserves pools
 
 [dependencies]
 # Companion crate. Consumed as a git dependency while the sibling repo is
@@ -80,11 +81,11 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "adapter_reactive"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 [[test]]
 name = "cold_start_adoption"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 [[test]]
 name = "pipeline_e2e"
@@ -92,11 +93,11 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
 name = "adapter_swap_sim"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 [[test]]
 name = "adapter_swap_sim_rpc"
-required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2"]
 
 [[test]]
 name = "reactive_ws_e2e"
