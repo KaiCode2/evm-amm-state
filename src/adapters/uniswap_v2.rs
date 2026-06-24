@@ -1,14 +1,15 @@
-use alloy_primitives::{Address, Log, U256};
-use alloy_sol_types::{SolEvent, sol};
+use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 use evm_fork_cache::cold_start::{
     ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
 };
 
 use super::cold_start::AdapterColdStartPlanner;
+use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, run_quote};
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::{
-    AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AmmAdapter,
-    ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
+    AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
+    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
     PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
     StateDiff, StateUpdate, StateView, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
 };
@@ -114,6 +115,39 @@ impl AmmAdapter for UniswapV2Adapter {
         } else {
             RepairAction::None
         }
+    }
+
+    /// Quote via `UniswapV2Router02.getAmountsOut(amountIn, [tokenIn, tokenOut])`.
+    ///
+    /// The router runs the on-chain `UniswapV2Library` reserves math against the
+    /// warmed pair reserves (chain code, not reimplemented math); the last
+    /// element of the returned `amounts` array is the output for `tokenOut`.
+    fn simulate_swap(
+        &self,
+        _pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        let calldata = Bytes::from(
+            getAmountsOutCall {
+                amountIn: amount_in,
+                path: vec![token_in, token_out],
+            }
+            .abi_encode(),
+        );
+
+        let output = run_quote(cache, config.v2_router, calldata)?;
+        let amounts = getAmountsOutCall::abi_decode_returns_validate(&output)
+            .map_err(|_| SimError::MalformedOutput("getAmountsOut return"))?;
+
+        amounts
+            .last()
+            .copied()
+            .map(SwapQuote::new)
+            .ok_or(SimError::MalformedOutput("empty getAmountsOut amounts"))
     }
 }
 

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Log};
 
-use super::{AmmAdapter, EventRoute, EventSource, PoolKey, PoolRegistration, ProtocolId};
+use super::{
+    AdapterCache, AmmAdapter, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
+    PoolRegistration, ProtocolId, RepairAction,
+};
 
 /// Registry of tracked AMM pools and protocol adapters.
 #[derive(Clone, Default)]
@@ -123,6 +126,52 @@ impl AdapterRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty()
+    }
+
+    /// Execute the [`DeferredWork`] produced by a `Lazy`
+    /// [`cold_start`](Self::cold_start) (or any other source) against `cache`.
+    ///
+    /// `cold_start` returns
+    /// [`ColdStartOutcome::ReadyWithDeferred`](super::ColdStartOutcome::ReadyWithDeferred)
+    /// for the `Lazy` policy but deliberately leaves the deferred slots unwarmed;
+    /// this driver is the explicit, consumer-invoked step that warms them when the
+    /// consumer is ready.
+    ///
+    /// Handling per variant:
+    /// - [`DeferredWork::VerifySlots`] and
+    ///   [`DeferredWork::Repair`]`(`[`RepairAction::VerifySlots`]`)` →
+    ///   [`AdapterCache::verify_slots`]; the returned [`SlotChange`](super::SlotChange)s
+    ///   accumulate into [`DeferredOutcome::verified`].
+    /// - [`DeferredWork::ColdStart`], [`DeferredWork::Custom`], and any other
+    ///   [`DeferredWork::Repair`] variant are *not* executed here (they need
+    ///   repair execution / re-cold-start-by-key, out of scope for this driver);
+    ///   they are pushed verbatim into [`DeferredOutcome::unhandled`] rather than
+    ///   dropped or panicked on.
+    ///
+    /// Takes `&self`: warming `VerifySlots` mutates only the `cache`, not the
+    /// registry. Errors from `verify_slots` propagate via the returned `Result`.
+    pub fn run_deferred(
+        &self,
+        deferred: &[DeferredWork],
+        cache: &mut dyn AdapterCache,
+    ) -> anyhow::Result<DeferredOutcome> {
+        let mut outcome = DeferredOutcome::default();
+
+        for work in deferred {
+            match work {
+                DeferredWork::VerifySlots(slots)
+                | DeferredWork::Repair(RepairAction::VerifySlots(slots)) => {
+                    outcome.verified.extend(cache.verify_slots(slots)?);
+                }
+                DeferredWork::Repair(_)
+                | DeferredWork::ColdStart { .. }
+                | DeferredWork::Custom(_) => {
+                    outcome.unhandled.push(work.clone());
+                }
+            }
+        }
+
+        Ok(outcome)
     }
 }
 

@@ -1,9 +1,10 @@
-use alloy_primitives::Log;
+use alloy_primitives::{Address, Log, U256};
 
 use super::cold_start::AdapterColdStartPlanner;
+use super::sim::{SimConfig, SimError, SwapQuote};
 use super::{
-    AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource, PoolKey,
-    PoolRegistration, ProtocolId, RepairAction, StateDiff, StateView, UnsupportedReason,
+    AdapterCache, AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource,
+    PoolKey, PoolRegistration, ProtocolId, RepairAction, StateDiff, StateView, UnsupportedReason,
 };
 
 /// Protocol adapter contract for AMM-specific routing, cold-start, and decoding.
@@ -80,5 +81,34 @@ pub trait AmmAdapter: Send + Sync {
         _diff: &StateDiff,
     ) -> RepairAction {
         RepairAction::None
+    }
+
+    /// Simulate `amount_in` of `token_in` swapped to `token_out` for `pool`,
+    /// returning the protocol's canonical `amount_out`.
+    ///
+    /// The implementation builds the protocol's canonical *quote* calldata and
+    /// runs it via [`AdapterCache::call_raw`] with `from = ZERO`,
+    /// `to = <quote target>`, `commit = false` against the cold-start snapshot,
+    /// then decodes `amount_out` from the [`ExecutionResult`] output. The
+    /// deployed contract bytecode does the AMM math — there is no `amm-math` /
+    /// `LocalAMM` / hand-rolled math here. A revert/halt maps to
+    /// [`SimError::Reverted`].
+    ///
+    /// Quote targets are resolved from `config` (Uniswap V3 `QuoterV2`, Uniswap
+    /// V2 `Router02`) with the Balancer vault taken from the pool's metadata.
+    ///
+    /// [`ExecutionResult`]: revm::context::result::ExecutionResult
+    ///
+    /// Defaults to [`SimError::Unsupported`] for protocols without a quote impl.
+    fn simulate_swap(
+        &self,
+        _pool: &PoolRegistration,
+        _cache: &mut dyn AdapterCache,
+        _token_in: Address,
+        _token_out: Address,
+        _amount_in: U256,
+        _config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        Err(SimError::Unsupported(self.protocol()))
     }
 }
