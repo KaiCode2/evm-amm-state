@@ -253,6 +253,54 @@ async fn v2_cold_start_lazy_defers_exactly_what_eager_warms() -> Result<()> {
     Ok(())
 }
 
+// A Lazy cold-start records its token slots as deferred work but does not warm
+// them; `run_deferred` must execute that deferred work and warm them.
+#[tokio::test]
+async fn v2_run_deferred_warms_lazy_deferred_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x14);
+    let token0 = Address::repeat_byte(0xb0);
+    let token1 = Address::repeat_byte(0xb1);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+            ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+            (
+                (pool, V2_RESERVES_SLOT),
+                reserves_slot(U256::from(1_u64), U256::from(2_u64), U256::ZERO),
+            ),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v2_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Lazy)?;
+    let deferred = match outcome {
+        ColdStartOutcome::ReadyWithDeferred(_, d) => d,
+        other => panic!("Lazy should be ReadyWithDeferred, got {other:?}"),
+    };
+    // Lazy did not warm the token slots up-front.
+    assert_eq!(cache.cached_storage_value(pool, V2_TOKEN0_SLOT), None);
+
+    // Drive the deferred work; the deferred token slots are now warmed.
+    registry.run_deferred(&deferred, &mut cache)?;
+
+    assert!(
+        cache.cached_storage_value(pool, V2_TOKEN0_SLOT).is_some(),
+        "run_deferred must warm deferred token0"
+    );
+    assert!(
+        cache.cached_storage_value(pool, V2_TOKEN1_SLOT).is_some(),
+        "run_deferred must warm deferred token1"
+    );
+    assert!(
+        cache.cached_storage_value(pool, V2_RESERVES_SLOT).is_some(),
+        "reserves stay warm"
+    );
+    Ok(())
+}
+
 // --- Uniswap V3 ---
 
 #[tokio::test]

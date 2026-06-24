@@ -36,9 +36,9 @@ pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
     BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CustomPoolKey,
-    DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId,
-    ProtocolMetadata, RepairAction, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
-    V3Metadata,
+    DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolId, ProtocolMetadata, RepairAction, UniswapV2Metadata, UnsupportedReason,
+    UpdateQuality, V3Metadata,
 };
 
 #[cfg(feature = "balancer-v2")]

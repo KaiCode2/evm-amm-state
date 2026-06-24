@@ -517,6 +517,27 @@ pub enum DeferredWork {
     Custom(String),
 }
 
+/// Result of running deferred cold-start work via
+/// [`AdapterRegistry::run_deferred`](super::AdapterRegistry::run_deferred).
+///
+/// `verified` accumulates the [`SlotChange`]s produced by warming
+/// [`DeferredWork::VerifySlots`] (and `Repair(VerifySlots)`) entries.
+/// `unhandled` collects, verbatim, any deferred work the driver does not execute
+/// in this item (`ColdStart`, `Custom`, and non-`VerifySlots` repairs) so callers
+/// can route them onward rather than have them silently dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeferredOutcome {
+    pub verified: Vec<SlotChange>,
+    pub unhandled: Vec<DeferredWork>,
+}
+
+impl DeferredOutcome {
+    /// Whether every deferred item was executed (nothing was deferred onward).
+    pub fn is_fully_handled(&self) -> bool {
+        self.unhandled.is_empty()
+    }
+}
+
 /// Why a protocol state, event, or policy is not supported by the current adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnsupportedReason {
