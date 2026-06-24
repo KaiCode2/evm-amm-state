@@ -196,6 +196,12 @@ sol! {
     function getAmountsOut(uint256 amountIn, address[] path)
         returns (uint256[] amounts);
 
+    /// Solidly V2 (Velodrome / Aerodrome) `Pool.getAmountOut(amountIn, tokenIn)`.
+    ///
+    /// Applies the pool's stable (x³y+y³x) or volatile (xy=k) invariant in-EVM
+    /// against the warmed reserves and returns the `tokenOut` output amount.
+    function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
     /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.
     ///
     /// `kind = 0` is `GIVEN_IN`. Returns the signed asset deltas (per `assets`
