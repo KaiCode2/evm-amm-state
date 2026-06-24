@@ -3,30 +3,35 @@
 //! `EvmCache` + registry. The existing `adapter_reactive.rs` covers reactive
 //! apply in isolation and `cold_start_adoption.rs` covers cold-start in
 //! isolation; this file pins that they compose — the gap the readiness audit
-//! flagged. (WS1b will extend this file with register→cold-start→react→simulate
-//! once the swap-sim surface lands.)
+//! flagged. It also includes full register→cold-start→react→simulate pipeline
+//! tests for V2 and V3 (Balancer's full chain lives in `adapter_swap_sim.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_eips::BlockId;
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, hex, keccak256};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
-use anyhow::Result;
-use evm_amm_state::adapters::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT};
+use anyhow::{Result, anyhow};
+use evm_amm_state::adapters::storage::{
+    V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT,
+    V3StorageLayout,
+};
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartOutcome, ColdStartPolicy, PoolKey,
-    PoolRegistration, PoolStatus, UniswapV2Adapter,
+    PoolRegistration, PoolStatus, ProtocolMetadata, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
+    UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput,
     ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
 };
+use revm::state::{AccountInfo, Bytecode};
 
 // --- harness (mirrors tests/adapter_reactive.rs conventions) ---
 
@@ -194,5 +199,213 @@ async fn v2_cold_start_then_reactive_sync_updates_warmed_reserves() -> Result<()
         cs_timestamp,
         "the masked Sync update preserves the cold-start timestamp bits"
     );
+    Ok(())
+}
+
+// --- Full pipeline (register → cold-start → react → simulate), offline ---
+//
+// These exercise all three legs in one flow as CI-runnable regression coverage.
+// The mock quote contract returns a seeded value (not a reserves-derived
+// computation), so these prove the chain WIRES and runs end-to-end without
+// error; the state-vs-quote correctness is proven separately by the RPC-parity
+// and live-WebSocket tests. (Balancer's full chain — cold-start → Swap refresh →
+// re-simulate — already lives in `tests/adapter_swap_sim.rs`.)
+
+fn install_default_account(cache: &mut EvmCache, addr: Address) {
+    cache
+        .db_mut()
+        .insert_account_info(addr, AccountInfo::default());
+}
+
+/// Install raw runtime bytecode (a compiled mock quote fixture) at `addr`.
+fn install_mock_runtime(cache: &mut EvmCache, addr: Address, runtime: &str) {
+    let code = Bytecode::new_raw(Bytes::from(
+        hex::decode(runtime.trim()).expect("valid mock runtime hex"),
+    ));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        addr,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+}
+
+fn topic_address(address: Address) -> B256 {
+    let mut bytes = [0u8; 32];
+    bytes[12..].copy_from_slice(address.as_slice());
+    B256::from(bytes)
+}
+
+fn v3_swap_topic() -> B256 {
+    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_full_pipeline_cold_start_react_simulate() -> Result<()> {
+    let pool = Address::repeat_byte(0x92);
+    let router = Address::repeat_byte(0xb1);
+    let token0 = Address::repeat_byte(0xa0);
+    let token1 = Address::repeat_byte(0xa1);
+    let quote_out = U256::from(4_242_u64);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    // Mock router: getAmountsOut returns sload(0); seed it.
+    install_mock_runtime(
+        &mut cache,
+        router,
+        include_str!("fixtures/mock_v2_router_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(router, U256::ZERO, quote_out)?;
+    let cs_slot = U256::from(1_000_u64) | (U256::from(2_000_u64) << 112);
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V2_RESERVES_SLOT), cs_slot),
+        ((pool, V2_TOKEN0_SLOT), token_word(token0)),
+        ((pool, V2_TOKEN1_SLOT), token_word(token1)),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
+            token0: Some(token0),
+            token1: Some(token1),
+            fee_bps: Some(30),
+        }));
+
+    // 1) cold-start
+    assert!(matches!(
+        registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?,
+        ColdStartOutcome::Ready(_)
+    ));
+
+    // 2) react: a Sync updates the warmed reserves slot
+    let sources = adapter.event_sources(&registration);
+    registry.register_pool(registration.clone().with_event_sources(sources))?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+    let new_r0 = U256::from(1_500_u64);
+    let new_r1 = U256::from(2_500_u64);
+    let log = rpc_log(pool, vec![v2_sync_topic()], abi_words([new_r0, new_r1]), 12);
+    runtime.ingest_batch(&mut cache, batch(log, 12))?;
+    let raw = cache
+        .cached_storage_value(pool, V2_RESERVES_SLOT)
+        .expect("reserves warm");
+    assert_eq!(raw & low_mask(112), new_r0, "react leg updated reserve0");
+
+    // 3) simulate against the post-event state
+    let config = SimConfig::default().with_v2_router(router);
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            token0,
+            token1,
+            U256::from(1_000_u64),
+            &config,
+        )
+        .map_err(|e| anyhow!("v2 sim failed: {e}"))?;
+    assert_eq!(quote.amount_out, quote_out, "simulate leg returned a quote");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
+    let pool = Address::repeat_byte(0x93);
+    let quoter = Address::repeat_byte(0xb2);
+    let token0 = Address::repeat_byte(0xa2);
+    let token1 = Address::repeat_byte(0xa3);
+    let quote_out = U256::from(9_999_u64);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_mock_runtime(
+        &mut cache,
+        quoter,
+        include_str!("fixtures/mock_v3_quoter_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(quoter, U256::ZERO, quote_out)?;
+    // cold-start warms slot0 (non-zero -> Ready) + liquidity.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V3_SLOT0_SLOT), U256::from(123_456_u64)),
+        ((pool, V3_LIQUIDITY_SLOT), U256::from(67_890_u64)),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            token0: Some(token0),
+            token1: Some(token1),
+            fee: Some(500),
+            tick_spacing: Some(10),
+            storage_layout: Some(V3StorageLayout::uniswap(10)),
+        }));
+
+    // 1) cold-start
+    assert!(matches!(
+        registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?,
+        ColdStartOutcome::Ready(_)
+    ));
+
+    // 2) react: a Swap updates slot0 (sqrtPrice/tick) + liquidity
+    let sources = adapter.event_sources(&registration);
+    registry.register_pool(registration.clone().with_event_sources(sources))?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+    let new_sqrt = U256::from(54_321_u64);
+    let new_liq = U256::from(11_111_u64);
+    let new_tick = U256::from(7_u64);
+    let log = rpc_log(
+        pool,
+        vec![
+            v3_swap_topic(),
+            topic_address(Address::repeat_byte(0x01)),
+            topic_address(Address::repeat_byte(0x02)),
+        ],
+        abi_words([U256::ZERO, U256::ZERO, new_sqrt, new_liq, new_tick]),
+        12,
+    );
+    runtime.ingest_batch(&mut cache, batch(log, 12))?;
+    let raw_slot0 = cache
+        .cached_storage_value(pool, V3_SLOT0_SLOT)
+        .expect("slot0 warm");
+    assert_eq!(
+        raw_slot0 & low_mask(160),
+        new_sqrt,
+        "react leg updated sqrtPrice"
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, V3_LIQUIDITY_SLOT),
+        Some(new_liq),
+        "react leg updated liquidity"
+    );
+
+    // 3) simulate against the post-event state
+    let config = SimConfig::default().with_v3_quoter(quoter);
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            token0,
+            token1,
+            U256::from(1_000_u64),
+            &config,
+        )
+        .map_err(|e| anyhow!("v3 sim failed: {e}"))?;
+    assert_eq!(quote.amount_out, quote_out, "simulate leg returned a quote");
     Ok(())
 }
