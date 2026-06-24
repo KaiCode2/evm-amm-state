@@ -1499,3 +1499,247 @@ async fn v3_cold_start_hot_slots_only_skips_tick_word() -> Result<()> {
     );
     Ok(())
 }
+
+// --- Phase A8: V3-family shifted-layout repair + Strict policy coverage ---
+
+/// Build a single-pool registry served by the V3-family adapter for any V3-family
+/// key + metadata (so Pancake/Slipstream shifted layouts can be exercised).
+fn v3_family_registry(key: PoolKey, metadata: ProtocolMetadata) -> AdapterRegistry {
+    let address = key.address().expect("v3-family pools are address-keyed");
+    let adapter = Arc::new(UniswapV3Adapter::default());
+    let mut registration = PoolRegistration::new(key)
+        .with_state_address(address)
+        .with_metadata(metadata);
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter).unwrap();
+    registry.register_pool(registration).unwrap();
+    registry
+}
+
+#[tokio::test]
+async fn pancake_v3_mint_repair_targets_pancake_layout_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x95);
+    let layout = V3StorageLayout::pancake(60);
+    let tick_lower = 60;
+    let tick_upper = 15_360;
+    let block = 30;
+
+    let registry = v3_family_registry(
+        PoolKey::PancakeV3(pool),
+        ProtocolMetadata::PancakeV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }),
+    );
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, block)),
+            included_context(block, 0),
+        )]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.applied[0].resyncs.len(), 1);
+    let [ResyncTarget::StorageSlots { address, slots }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a single storage-slots resync target");
+    };
+    assert_eq!(*address, pool);
+    let mut got = slots.clone();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got,
+        expected_tick_repair_slots(layout, tick_lower, tick_upper),
+        "repair must target the Pancake layout slots"
+    );
+    // The Pancake slots are genuinely distinct from the Uniswap layout's,
+    // proving the family adapter lowered the repair against the Pancake layout.
+    assert_ne!(
+        got,
+        expected_tick_repair_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slipstream_mint_repair_targets_slipstream_layout_slots() -> Result<()> {
+    let pool = Address::repeat_byte(0x96);
+    let layout = V3StorageLayout::slipstream(60);
+    let tick_lower = 60;
+    let tick_upper = 15_360;
+    let block = 31;
+
+    let registry = v3_family_registry(
+        PoolKey::Slipstream(pool),
+        ProtocolMetadata::Slipstream(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }),
+    );
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, block)),
+            included_context(block, 0),
+        )]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.applied[0].resyncs.len(), 1);
+    let [ResyncTarget::StorageSlots { address, slots }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a single storage-slots resync target");
+    };
+    assert_eq!(*address, pool);
+    let mut got = slots.clone();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got,
+        expected_tick_repair_slots(layout, tick_lower, tick_upper),
+        "repair must target the Slipstream layout slots"
+    );
+    assert_ne!(
+        got,
+        expected_tick_repair_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_cold_start_strict_warms_all_slots_like_eager() -> Result<()> {
+    let pool = Address::repeat_byte(0x97);
+    let token0 = Address::repeat_byte(0xa0);
+    let token1 = Address::repeat_byte(0xa1);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+        ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+        (
+            (pool, V2_RESERVES_SLOT),
+            reserves_slot(U256::from(1_u64), U256::from(2_u64), U256::ZERO),
+        ),
+    ])));
+
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Strict)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    // Strict currently warms the same slot set as Eager (this locks that
+    // behavior so a future Strict-specific divergence is caught).
+    assert!(cache.cached_storage_value(pool, V2_TOKEN0_SLOT).is_some());
+    assert!(cache.cached_storage_value(pool, V2_TOKEN1_SLOT).is_some());
+    assert!(cache.cached_storage_value(pool, V2_RESERVES_SLOT).is_some());
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::UniswapV2(ref metadata) => {
+            assert_eq!(metadata.token0, Some(token0));
+            assert_eq!(metadata.token1, Some(token1));
+        }
+        ref other => panic!("expected merged UniswapV2 metadata, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_strict_warms_hot_slots_like_eager() -> Result<()> {
+    let pool = Address::repeat_byte(0x98);
+    let layout = V3StorageLayout::uniswap(60);
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot);
+    let mut cache = setup_cache().await?;
+    // slot0 carries tick 0 (-> bitmap word 0); the word reads as empty (no
+    // initialized ticks), so the tick-info round is a no-op.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(7_u64), 0, U256::ZERO),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(8_u64)),
+        ((pool, bitmap_key), U256::ZERO),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Strict)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.liquidity_slot)
+            .is_some()
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_cold_start_missing_liquidity_is_still_ready() -> Result<()> {
+    let pool = Address::repeat_byte(0x99);
+    let layout = V3StorageLayout::uniswap(60);
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot);
+    let mut cache = setup_cache().await?;
+    // slot0 is fetchable; the liquidity slot is intentionally cold (reads as
+    // zero). slot0 is the only mandatory slot — liquidity is an absolute write
+    // the next reactive Swap always reapplies — so cold-start still reaches Ready.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(7_u64), 0, U256::ZERO),
+        ),
+        ((pool, bitmap_key), U256::ZERO),
+    ])));
+
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = adapter.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        None,
+        "a cold liquidity slot is best-effort, not mandatory"
+    );
+    Ok(())
+}

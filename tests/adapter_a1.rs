@@ -7,11 +7,12 @@ use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3StorageLayout,
 };
 use evm_amm_state::adapters::{
-    AdapterCache, AdapterDriver, AdapterEvent, AdapterEventKind, AdapterEventResult,
-    AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, EventSource, PoolKey,
-    PoolRegistration, ProtocolId, ProtocolMetadata, RegistryError, RepairAction, SkippedDelta,
-    SkippedMask, SlotChange, SlotDelta, StateDiff, StateUpdate, StateView, SubscriptionSpec,
-    UniswapV2Adapter, UniswapV3Adapter, UpdateQuality, V3Metadata,
+    AdapterCache, AdapterDriver, AdapterEvent, AdapterEventError, AdapterEventKind,
+    AdapterEventResult, AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata,
+    ColdStartOutcome, ColdStartPolicy, CustomPoolKey, EventSource, PoolKey, PoolRegistration,
+    ProtocolId, ProtocolMetadata, RegistryError, RepairAction, SkippedDelta, SkippedMask,
+    SlotChange, SlotDelta, StateDiff, StateUpdate, StateView, SubscriptionSpec, UniswapV2Adapter,
+    UniswapV3Adapter, UnsupportedReason, UpdateQuality, V3Metadata,
 };
 use revm::context::result::ExecutionResult;
 
@@ -532,4 +533,422 @@ fn v3_family_adapter_claims_pancake_and_slipstream() {
         registry.adapter(ProtocolId::Slipstream).is_some(),
         "V3-family adapter must claim Slipstream"
     );
+}
+
+// --- Phase A8: negative / malformed event-decode coverage ---
+//
+// The adapters carry many MalformedLog / Unsupported / ignored branches in
+// `decode_event` that had zero test coverage. These call `decode_event`
+// directly so the exact `AdapterEventResult` is asserted. A `MockCache` stands
+// in for the `&dyn StateView` (no fetch is performed during decode).
+
+fn v3_mint_topic() -> B256 {
+    keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+}
+
+fn v3_burn_topic() -> B256 {
+    keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
+}
+
+fn balancer_swap_topic() -> B256 {
+    keccak256("Swap(bytes32,address,address,uint256,uint256)")
+}
+
+fn topic_i24(value: i32) -> B256 {
+    let mut bytes = if value < 0 { [0xff; 32] } else { [0u8; 32] };
+    let raw = value.to_be_bytes();
+    bytes[29..32].copy_from_slice(&raw[1..4]);
+    B256::from(bytes)
+}
+
+/// A V3 registration with a resolvable Uniswap layout, so decode reaches the
+/// branches after the layout guard.
+fn v3_pool_registration(pool: Address) -> PoolRegistration {
+    PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(V3StorageLayout::uniswap(60)),
+            ..Default::default()
+        }))
+}
+
+/// A non-address-keyed pool key, used to exercise the "pool key is not
+/// address-keyed" guards of adapters that require an address.
+fn custom_bytes32_key() -> PoolKey {
+    PoolKey::Custom(CustomPoolKey::Bytes32 {
+        protocol: CUSTOM_PROTOCOL,
+        id: B256::repeat_byte(0x5a),
+    })
+}
+
+#[test]
+fn v2_sync_wrong_topic_is_ignored() {
+    let pool = Address::repeat_byte(0x21);
+    let adapter = UniswapV2Adapter::default();
+    let registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![B256::repeat_byte(0xee)],
+            abi_words([U256::from(1_u64), U256::from(2_u64)]),
+        ),
+        &view,
+    );
+    assert_eq!(result, AdapterEventResult::ignored());
+}
+
+#[test]
+fn v2_sync_malformed_data_is_rejected() {
+    let pool = Address::repeat_byte(0x22);
+    let adapter = UniswapV2Adapter::default();
+    let registration = PoolRegistration::new(PoolKey::UniswapV2(pool)).with_state_address(pool);
+    let view = MockCache::default();
+
+    // Sync carries two uint112 words (64 bytes of data); 32 bytes is truncated.
+    let result = adapter.decode_event(
+        &registration,
+        &log(pool, vec![v2_sync_topic()], word(U256::from(1_u64))),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "malformed Uniswap V2 Sync log"
+        ))
+    );
+    assert!(result.event.is_none());
+}
+
+#[test]
+fn v2_sync_non_address_keyed_pool_is_rejected() {
+    let adapter = UniswapV2Adapter::default();
+    let registration = PoolRegistration::new(custom_bytes32_key());
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            Address::repeat_byte(0x23),
+            vec![v2_sync_topic()],
+            abi_words([U256::from(1_u64), U256::from(2_u64)]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "Uniswap V2 pool key is not address-keyed"
+        ))
+    );
+}
+
+#[test]
+fn v3_swap_malformed_data_is_rejected() {
+    let pool = Address::repeat_byte(0x24);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    // Swap carries five non-indexed words (160 bytes); 96 bytes is truncated.
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![
+                v3_swap_topic(),
+                topic_address(Address::repeat_byte(0x01)),
+                topic_address(Address::repeat_byte(0x02)),
+            ],
+            abi_words([U256::ZERO, U256::ZERO, U256::from(1_u64)]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog("malformed V3 Swap log"))
+    );
+}
+
+#[test]
+fn v3_swap_missing_layout_is_unsupported() {
+    let pool = Address::repeat_byte(0x25);
+    let adapter = UniswapV3Adapter::default();
+    // No storage_layout and no tick_spacing -> `layout_for` cannot resolve.
+    let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata::default()));
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![
+                v3_swap_topic(),
+                topic_address(Address::repeat_byte(0x01)),
+                topic_address(Address::repeat_byte(0x02)),
+            ],
+            abi_words([
+                U256::ZERO,
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::from(2_u64),
+                U256::from(3_u64),
+            ]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::Unsupported(
+            UnsupportedReason::MissingMetadata("V3 storage layout")
+        ))
+    );
+}
+
+#[test]
+fn v3_swap_non_address_keyed_pool_is_rejected() {
+    let adapter = UniswapV3Adapter::default();
+    let registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
+        ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(V3StorageLayout::uniswap(60)),
+            ..Default::default()
+        }),
+    );
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            Address::repeat_byte(0x26),
+            vec![
+                v3_swap_topic(),
+                topic_address(Address::repeat_byte(0x01)),
+                topic_address(Address::repeat_byte(0x02)),
+            ],
+            abi_words([
+                U256::ZERO,
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::from(2_u64),
+                U256::from(3_u64),
+            ]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "V3 pool key is not address-keyed"
+        ))
+    );
+}
+
+#[test]
+fn v3_mint_malformed_data_is_rejected() {
+    let pool = Address::repeat_byte(0x27);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    // Mint carries four non-indexed words (128 bytes); 64 bytes is truncated.
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![
+                v3_mint_topic(),
+                topic_address(Address::repeat_byte(0x04)),
+                topic_i24(60),
+                topic_i24(120),
+            ],
+            abi_words([U256::from(1_u64), U256::from(2_u64)]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "malformed V3 liquidity log"
+        ))
+    );
+}
+
+#[test]
+fn v3_burn_malformed_data_is_rejected() {
+    let pool = Address::repeat_byte(0x28);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![
+                v3_burn_topic(),
+                topic_address(Address::repeat_byte(0x04)),
+                topic_i24(60),
+                topic_i24(120),
+            ],
+            abi_words([U256::from(1_u64)]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "malformed V3 liquidity log"
+        ))
+    );
+}
+
+#[test]
+fn v3_mint_missing_tick_topics_is_rejected() {
+    let pool = Address::repeat_byte(0x29);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    // tickLower/tickUpper indexed topics are absent. Decoding the indexed
+    // params fails, so the log is rejected as malformed (the explicit per-topic
+    // guards are defensive-in-depth behind this validation).
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            pool,
+            vec![v3_mint_topic(), topic_address(Address::repeat_byte(0x04))],
+            abi_words([
+                U256::ZERO,
+                U256::from(7_u64),
+                U256::from(8_u64),
+                U256::from(9_u64),
+            ]),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "malformed V3 liquidity log"
+        ))
+    );
+}
+
+#[test]
+fn balancer_swap_wrong_topic_is_ignored() {
+    let vault = Address::repeat_byte(0x2a);
+    let adapter = BalancerV2Adapter::default();
+    let registration = PoolRegistration::new(PoolKey::BalancerV2(B256::repeat_byte(0x2b)))
+        .with_state_address(vault);
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            vault,
+            vec![B256::repeat_byte(0xee), B256::repeat_byte(0x2b)],
+            Vec::new(),
+        ),
+        &view,
+    );
+    assert_eq!(result, AdapterEventResult::ignored());
+}
+
+#[test]
+fn balancer_swap_malformed_data_is_rejected() {
+    let vault = Address::repeat_byte(0x2c);
+    let pool_id = B256::repeat_byte(0x2d);
+    let adapter = BalancerV2Adapter::default();
+    let registration =
+        PoolRegistration::new(PoolKey::BalancerV2(pool_id)).with_state_address(vault);
+    let view = MockCache::default();
+
+    // The indexed topics are present (poolId, tokenIn, tokenOut) but the
+    // non-indexed body (amountIn, amountOut) is empty -> malformed.
+    let result = adapter.decode_event(
+        &registration,
+        &log(
+            vault,
+            vec![
+                balancer_swap_topic(),
+                pool_id,
+                topic_address(Address::repeat_byte(0x01)),
+                topic_address(Address::repeat_byte(0x02)),
+            ],
+            Vec::new(),
+        ),
+        &view,
+    );
+    assert_eq!(
+        result.error,
+        Some(AdapterEventError::MalformedLog(
+            "malformed Balancer V2 Swap log"
+        ))
+    );
+}
+
+#[test]
+fn v2_cold_start_non_address_keyed_is_unsupported() {
+    let adapter = UniswapV2Adapter::default();
+    let mut registration = PoolRegistration::new(custom_bytes32_key());
+    let mut cache = MockCache::default();
+
+    let outcome = adapter
+        .cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)
+        .expect("cold_start should classify an unsupported key, not error");
+    assert!(matches!(
+        outcome,
+        ColdStartOutcome::Unsupported(UnsupportedReason::Custom(_))
+    ));
+}
+
+#[test]
+fn v3_no_topics_is_ignored() {
+    let pool = Address::repeat_byte(0x2e);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    let result = adapter.decode_event(&registration, &log(pool, Vec::new(), Vec::new()), &view);
+    assert_eq!(result, AdapterEventResult::ignored());
+}
+
+#[test]
+fn v3_unknown_topic_is_ignored() {
+    let pool = Address::repeat_byte(0x2f);
+    let adapter = UniswapV3Adapter::default();
+    let registration = v3_pool_registration(pool);
+    let view = MockCache::default();
+
+    // A topic that is neither Swap, Mint, nor Burn falls through to ignored.
+    let result = adapter.decode_event(
+        &registration,
+        &log(pool, vec![B256::repeat_byte(0xab)], Vec::new()),
+        &view,
+    );
+    assert_eq!(result, AdapterEventResult::ignored());
+}
+
+#[test]
+fn v3_cold_start_non_address_keyed_is_unsupported() {
+    let adapter = UniswapV3Adapter::default();
+    let mut registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
+        ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(V3StorageLayout::uniswap(60)),
+            ..Default::default()
+        }),
+    );
+    let mut cache = MockCache::default();
+
+    let outcome = adapter
+        .cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)
+        .expect("cold_start should classify an unsupported key, not error");
+    assert!(matches!(
+        outcome,
+        ColdStartOutcome::Unsupported(UnsupportedReason::Custom(_))
+    ));
 }
