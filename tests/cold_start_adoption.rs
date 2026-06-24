@@ -18,6 +18,7 @@ use anyhow::{Result, anyhow};
 
 use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, V3StorageLayout,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
@@ -295,6 +296,154 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
         cache
             .cached_storage_value(pool, layout.liquidity_slot)
             .is_some()
+    );
+    Ok(())
+}
+
+/// The bitmap bit for `tick` within its word: `floor(tick/spacing) mod 256`.
+fn v3_bit(tick: i32, spacing: i32) -> U256 {
+    let bit = tick.div_euclid(spacing).rem_euclid(256) as u32;
+    U256::from(1) << bit
+}
+
+// Eager cold-start must warm a bounded WINDOW of neighbouring tick-bitmap words
+// (and their initialized ticks), not just the current word — so a moderate
+// tick-crossing swap is offline-pre-warmed. Currently only the current word is
+// warmed, so the W0±1 bitmap + their tick-info slots are unfetched (None) -> red.
+#[tokio::test]
+async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
+    let pool = Address::repeat_byte(0x24);
+    let layout = V3StorageLayout::uniswap(60);
+    let spacing = 60i32;
+
+    // Current tick 0 -> word 0; neighbours -1 and +1.
+    let w0 = v3_word_position(0, spacing);
+    let key_w0 = v3_tick_bitmap_storage_key_with_base(w0, layout.tick_bitmap_base_slot);
+    let key_wp1 = v3_tick_bitmap_storage_key_with_base(w0 + 1, layout.tick_bitmap_base_slot);
+    let key_wm1 = v3_tick_bitmap_storage_key_with_base(w0 - 1, layout.tick_bitmap_base_slot);
+
+    // One initialized tick per word (self-checked placement).
+    let tick_w0 = 60; // word 0, bit 1
+    let tick_wp1 = 256 * 60; // word +1, bit 0
+    let tick_wm1 = -60; // word -1, bit 255
+    assert_eq!(v3_word_position(tick_w0, spacing), w0);
+    assert_eq!(v3_word_position(tick_wp1, spacing), w0 + 1);
+    assert_eq!(v3_word_position(tick_wm1, spacing), w0 - 1);
+
+    let info_w0 = v3_tick_info_storage_keys_with_base(tick_w0, layout.ticks_base_slot);
+    let info_wp1 = v3_tick_info_storage_keys_with_base(tick_wp1, layout.ticks_base_slot);
+    let info_wm1 = v3_tick_info_storage_keys_with_base(tick_wm1, layout.ticks_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            ((pool, key_w0), v3_bit(tick_w0, spacing)),
+            ((pool, key_wp1), v3_bit(tick_wp1, spacing)),
+            ((pool, key_wm1), v3_bit(tick_wm1, spacing)),
+            ((pool, info_w0[0]), U256::from(1_u64)),
+            ((pool, info_w0[3]), U256::from(1_u64)),
+            ((pool, info_wp1[0]), U256::from(1_u64)),
+            ((pool, info_wp1[3]), U256::from(1_u64)),
+            ((pool, info_wm1[0]), U256::from(1_u64)),
+            ((pool, info_wm1[3]), U256::from(1_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+
+    // Current word still warmed (regression).
+    assert!(cache.cached_storage_value(pool, key_w0).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[0]).is_some());
+    // Neighbouring words + their initialized ticks warmed (the new behaviour).
+    assert!(
+        cache.cached_storage_value(pool, key_wp1).is_some(),
+        "word +1 bitmap must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_wm1).is_some(),
+        "word -1 bitmap must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wp1[0]).is_some(),
+        "word +1 tick info must be warmed"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wm1[0]).is_some(),
+        "word -1 tick info must be warmed"
+    );
+    Ok(())
+}
+
+// Policy boundary: HotSlotsOnly warms only slot0 + liquidity — NO tick bitmap
+// words (current or neighbouring). Guards the multi-word scan from leaking into
+// the hot-only policy.
+#[tokio::test]
+async fn v3_cold_start_hot_slots_only_skips_tick_words() -> Result<()> {
+    let pool = Address::repeat_byte(0x25);
+    let layout = V3StorageLayout::uniswap(60);
+    let key_w0 =
+        v3_tick_bitmap_storage_key_with_base(v3_word_position(0, 60), layout.tick_bitmap_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            ((pool, key_w0), v3_bit(60, 60)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            storage_layout: Some(layout),
+            tick_spacing: Some(60),
+            ..Default::default()
+        }));
+
+    let outcome =
+        registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.slot0_slot)
+            .is_some()
+    );
+    assert!(
+        cache
+            .cached_storage_value(pool, layout.liquidity_slot)
+            .is_some()
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_w0).is_none(),
+        "HotSlotsOnly must not warm any tick bitmap word"
     );
     Ok(())
 }

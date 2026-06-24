@@ -29,6 +29,23 @@ sol! {
 const SLOT0_PRICE_TICK_BITS: usize = 184;
 const SLOT0_TICK_SHIFT: usize = 160;
 
+/// The minimum/maximum tick a Uniswap V3 pool can reach (`±887272`). Ticks (and
+/// the tick-bitmap words derived from them) outside this range never exist, so
+/// the cold-start window is clamped to it to avoid warming non-existent slots.
+const V3_MIN_TICK: i32 = -887272;
+const V3_MAX_TICK: i32 = 887272;
+
+/// Radius (in tick-bitmap words) of the cold-start tick warm-up window.
+///
+/// The warmed window is `[W0 - R, W0 + R]` — `2R + 1` words centred on the
+/// current-tick word `W0`. One word covers `256 * tick_spacing` of tick range,
+/// so `R = 2` pre-warms ±2 words: generous headroom for a moderate
+/// tick-crossing swap while keeping the warm-up strictly bounded (never more
+/// than `2R + 1` bitmap words plus their initialized ticks). A true
+/// outward-adaptive scan (extend until N consecutive empty words) is a future
+/// refinement; this single named constant is the tuning knob until then.
+pub(crate) const V3_TICK_WORD_RADIUS: i16 = 2;
+
 /// Adapter for the Uniswap V3 storage-layout family.
 ///
 /// A single instance serves Uniswap V3, Pancake V3, and Slipstream: those
@@ -298,28 +315,31 @@ impl V3FamilyAdapter {
 
 /// Cold-start planner for the Uniswap V3 storage-layout family.
 ///
-/// Re-expresses the A3 bounded current-tick warm-up as planner rounds:
+/// Warms a bounded **window** of tick-bitmap words around the current tick as
+/// planner rounds:
 ///
 /// - Round 1 verifies `slot0` + global `liquidity`. `slot0` is mandatory; its
 ///   [`SlotFetch`] verdict decides ready vs. repair. From the warmed `slot0` the
-///   current tick (and so the current `tickBitmap` word) is decoded.
-/// - Round 2 (`Strict`/`Eager` only) verifies the current-tick bitmap word.
+///   current tick — and so the current `tickBitmap` word `W0` — is decoded, then
+///   the window `[W0 - R, W0 + R]` (`R = `[`V3_TICK_WORD_RADIUS`]) is computed,
+///   clamped to the valid V3 word range, and each word's bitmap key resolved.
+/// - Round 2 (`Strict`/`Eager` only) verifies **all** window bitmap words in one
+///   round.
 /// - Round 3 (`Strict`/`Eager` only) verifies the `{0, 3}` info slots of every
-///   tick initialized in that word.
+///   tick initialized across the whole window in one round.
 ///
-/// `HotSlotsOnly` stops after round 1 (slot0 + liquidity). `Lazy` stops after
-/// round 1 and records the bitmap word as deferred work. The multi-word adaptive
-/// scan stays deferred (future rounds, not this slice). Config-supplied V3
-/// metadata is preserved unchanged.
+/// `HotSlotsOnly` stops after round 1 (slot0 + liquidity — no bitmap/tick
+/// warming). `Lazy` stops after round 1 and defers the **window** of bitmap
+/// words. Config-supplied V3 metadata is preserved unchanged.
 struct UniswapV3ColdStartPlanner {
     address: Address,
     layout: V3StorageLayout,
     policy: ColdStartPolicy,
     phase: V3Phase,
-    /// The current-tick bitmap word key, resolved from the warmed slot0.
-    bitmap_key: Option<U256>,
-    /// The current-tick bitmap word position, resolved from the warmed slot0.
-    word: i16,
+    /// The cold-start window: each `(word, bitmap_key)` pair in
+    /// `[W0 - R, W0 + R]` clamped to the valid V3 word range, resolved from the
+    /// warmed slot0. Empty until round 1 decodes the current tick.
+    window: Vec<(i16, U256)>,
     verified_slots: Vec<(Address, U256)>,
     changed_slots: Vec<SlotChange>,
     deferred: Vec<DeferredWork>,
@@ -332,8 +352,8 @@ struct UniswapV3ColdStartPlanner {
 enum V3Phase {
     /// Round 1: slot0 + liquidity (the next `on_results` classifies slot0).
     Slot0Liquidity,
-    /// Round 2: the current-tick bitmap word (the next `on_results` extracts
-    /// the initialized ticks).
+    /// Round 2: the window of bitmap words (the next `on_results` extracts the
+    /// initialized ticks across the whole window).
     BitmapWord,
     /// Round 3: the tick-info slots (the next `on_results` finishes).
     TickInfo,
@@ -346,13 +366,39 @@ impl UniswapV3ColdStartPlanner {
             layout,
             policy,
             phase: V3Phase::Slot0Liquidity,
-            bitmap_key: None,
-            word: 0,
+            window: Vec::new(),
             verified_slots: Vec::new(),
             changed_slots: Vec::new(),
             deferred: Vec::new(),
             slot0_cold: false,
         }
+    }
+
+    /// Resolve the bounded window of bitmap words `[W0 - R, W0 + R]` around the
+    /// current-tick word, clamped to the valid V3 word range, returning each
+    /// `(word, bitmap_key)` pair.
+    ///
+    /// The clamp derives from `MIN_TICK`/`MAX_TICK = ±887272`: words outside the
+    /// pool's reachable word range are skipped. All arithmetic is done in `i32`
+    /// before the final `i16` cast so the radius offset can never overflow.
+    fn resolve_window(&self, current_word: i16) -> Vec<(i16, U256)> {
+        let radius = V3_TICK_WORD_RADIUS as i32;
+        let min_word = v3_word_position(V3_MIN_TICK, self.layout.tick_spacing) as i32;
+        let max_word = v3_word_position(V3_MAX_TICK, self.layout.tick_spacing) as i32;
+
+        let lo = (current_word as i32 - radius).max(min_word);
+        let hi = (current_word as i32 + radius).min(max_word);
+
+        let mut window = Vec::new();
+        let mut word = lo;
+        while word <= hi {
+            let word_i16 = word as i16;
+            let key =
+                v3_tick_bitmap_storage_key_with_base(word_i16, self.layout.tick_bitmap_base_slot);
+            window.push((word_i16, key));
+            word += 1;
+        }
+        window
     }
 }
 
@@ -395,19 +441,21 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 };
 
                 // Decode the current tick from the warm slot0 word (bits
-                // [160, 184), 24-bit signed), reusing the reactive Swap decode.
+                // [160, 184), 24-bit signed), reusing the reactive Swap decode,
+                // then resolve the bounded window of bitmap words around it.
                 let tick = int24_from_word(slot0 >> SLOT0_TICK_SHIFT);
-                let word = v3_word_position(tick, self.layout.tick_spacing);
-                let bitmap_key =
-                    v3_tick_bitmap_storage_key_with_base(word, self.layout.tick_bitmap_base_slot);
-                self.word = word;
-                self.bitmap_key = Some(bitmap_key);
+                let current_word = v3_word_position(tick, self.layout.tick_spacing);
+                self.window = self.resolve_window(current_word);
 
                 match self.policy {
                     ColdStartPolicy::Strict | ColdStartPolicy::Eager => {
-                        // Round 2: warm the bitmap word containing the current tick.
+                        // Round 2: warm every bitmap word in the window in one round.
                         self.phase = V3Phase::BitmapWord;
-                        let verify = vec![(self.address, bitmap_key)];
+                        let verify: Vec<(Address, U256)> = self
+                            .window
+                            .iter()
+                            .map(|(_, key)| (self.address, *key))
+                            .collect();
                         self.verified_slots.extend_from_slice(&verify);
                         ColdStartStep::Continue(ColdStartPlan {
                             verify,
@@ -416,32 +464,43 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                     }
                     ColdStartPolicy::HotSlotsOnly => ColdStartStep::Done,
                     ColdStartPolicy::Lazy => {
-                        // Warm the hot slots now; defer the tick word.
-                        self.deferred
-                            .push(DeferredWork::VerifySlots(vec![(self.address, bitmap_key)]));
+                        // Warm the hot slots now; defer the whole window of bitmap words.
+                        let window_keys: Vec<(Address, U256)> = self
+                            .window
+                            .iter()
+                            .map(|(_, key)| (self.address, *key))
+                            .collect();
+                        self.deferred.push(DeferredWork::VerifySlots(window_keys));
                         ColdStartStep::Done
                     }
                 }
             }
             V3Phase::BitmapWord => {
-                // Round 3: warm the {0, 3} info slots of every tick initialized in
-                // that word. The bitmap word is extracted adapter-locally: bit `i`
-                // set => tick `(word * 256 + i) * tick_spacing`.
-                let bitmap_key = self.bitmap_key.unwrap_or(U256::ZERO);
-                let bitmap = state
-                    .storage(self.address, bitmap_key)
-                    .unwrap_or(U256::ZERO);
+                // Round 3: warm the {0, 3} info slots of every tick initialized
+                // across the whole window. Each window word's bitmap is extracted
+                // adapter-locally: bit `i` set => tick `(word * 256 + i) *
+                // tick_spacing`, skipping any tick outside [MIN_TICK, MAX_TICK].
                 let mut tick_slots: Vec<(Address, U256)> = Vec::new();
-                for bit in 0..256u32 {
-                    if (bitmap >> bit) & U256::from(1) == U256::from(1) {
-                        let tick_i =
-                            (self.word as i32 * 256 + bit as i32) * self.layout.tick_spacing;
-                        let keys = v3_tick_info_storage_keys_with_base(
-                            tick_i,
-                            self.layout.ticks_base_slot,
-                        );
-                        tick_slots.push((self.address, keys[0]));
-                        tick_slots.push((self.address, keys[3]));
+                for (word, bitmap_key) in &self.window {
+                    let bitmap = state
+                        .storage(self.address, *bitmap_key)
+                        .unwrap_or(U256::ZERO);
+                    for bit in 0..256u32 {
+                        if (bitmap >> bit) & U256::from(1) == U256::from(1) {
+                            // Compute the tick index in i32; word/bit/spacing are
+                            // all bounded so this cannot overflow.
+                            let tick_i =
+                                (*word as i32 * 256 + bit as i32) * self.layout.tick_spacing;
+                            if !(V3_MIN_TICK..=V3_MAX_TICK).contains(&tick_i) {
+                                continue;
+                            }
+                            let keys = v3_tick_info_storage_keys_with_base(
+                                tick_i,
+                                self.layout.ticks_base_slot,
+                            );
+                            tick_slots.push((self.address, keys[0]));
+                            tick_slots.push((self.address, keys[3]));
+                        }
                     }
                 }
 
