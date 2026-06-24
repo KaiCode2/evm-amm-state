@@ -287,6 +287,16 @@ pub struct BalancerV2Metadata {
     pub vault: Option<Address>,
     pub pool_address: Option<Address>,
     pub tokens: Vec<Address>,
+    /// Vault balance storage slots discovered during cold-start (the `(vault,
+    /// slot)` pairs the `getPoolTokens` view-call SLOADed; recorded slot-only
+    /// since they all live on `vault`).
+    ///
+    /// Persisting them here lets the reactive `Swap` path refresh (re-verify)
+    /// exactly these slots — keeping the cached vault balances fresh for a
+    /// subsequent `simulate_swap` — without reverse-engineering the vault's
+    /// balance-mapping layout or doing lossy event-delta arithmetic. Empty
+    /// until the discover→verify cold-start runs.
+    pub balance_slots: Vec<U256>,
 }
 
 /// Lifecycle status for a tracked pool registration.

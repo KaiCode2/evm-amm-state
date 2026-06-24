@@ -10,6 +10,7 @@ pub mod driver;
 pub mod reactive;
 pub mod registry;
 pub mod repair;
+pub mod sim;
 pub mod storage;
 pub mod traits;
 pub mod types;
@@ -30,6 +31,7 @@ pub use cold_start::AdapterColdStartPlanner;
 pub use driver::AdapterDriver;
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
+pub use sim::{SimConfig, SimError, SwapQuote};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,

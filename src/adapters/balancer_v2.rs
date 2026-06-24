@@ -5,11 +5,14 @@ use evm_fork_cache::cold_start::{
 };
 
 use super::cold_start::AdapterColdStartPlanner;
+use super::sim::{
+    BatchSwapStep, FundManagement, SimConfig, SimError, SwapQuote, queryBatchSwapCall, run_quote,
+};
 use super::{
-    AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AmmAdapter,
-    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    StateView, UnsupportedReason, UpdateQuality,
+    AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
+    AmmAdapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
+    SlotChange, StateView, UnsupportedReason, UpdateQuality,
 };
 
 sol! {
@@ -93,13 +96,30 @@ impl AmmAdapter for BalancerV2Adapter {
             ));
         }
 
-        // A1 proves vault-emitted routing only. We surface the swap with
-        // `ConservativeInvalidation` quality but intentionally emit no cache
-        // mutation or repair: a real invalidation needs the vault balance
-        // storage mapping and a conservative repair policy, both deferred to a
-        // later phase (see ROADMAP A3 / docs/phase-a1-tech-spec.md). Until then
-        // Balancer cache state is maintained by the legacy `cache_sync` path,
-        // not this adapter.
+        // The vault balances live behind a non-predictable storage mapping, so
+        // the Swap event payload cannot be turned into an exact masked write.
+        // Instead we keep the cached balances fresh by re-verifying the exact
+        // `(vault, slot)` pairs the cold-start `getPoolTokens` discovery found:
+        // a `VerifySlots` repair the reactive runtime lowers into a hash-pinned
+        // resync, re-reading the post-swap balances authoritatively. This stays
+        // consistent with the discover-based cold start and avoids lossy
+        // event-delta arithmetic. The discovered slots are persisted on
+        // `BalancerV2Metadata.balance_slots` by the cold-start `finish`.
+        let repair = match &pool.metadata {
+            ProtocolMetadata::BalancerV2(metadata) => {
+                match (metadata.vault, metadata.balance_slots.as_slice()) {
+                    (Some(vault), slots) if !slots.is_empty() => {
+                        RepairAction::VerifySlots(slots.iter().map(|slot| (vault, *slot)).collect())
+                    }
+                    // Vault known but no discovered slots yet (cold-start has not
+                    // run / found them): fall back to the conservative no-op so
+                    // the routing/observability behavior is preserved.
+                    _ => RepairAction::None,
+                }
+            }
+            _ => RepairAction::None,
+        };
+
         AdapterEventResult::event(AdapterEvent {
             pool: pool.key.clone(),
             emitter: log.address,
@@ -107,8 +127,79 @@ impl AmmAdapter for BalancerV2Adapter {
             kind: AdapterEventKind::Swap,
             updates: Vec::new(),
             quality: UpdateQuality::ConservativeInvalidation,
-            repair: RepairAction::None,
+            repair,
         })
+    }
+
+    /// Quote via `Vault.queryBatchSwap(GIVEN_IN, [swap], assets, funds)`.
+    ///
+    /// The vault simulates the swap against the warmed pool balances and returns
+    /// the signed asset deltas; the negative delta on the `tokenOut` index is
+    /// the (vault-paid-out) output amount, so `amount_out = -delta`. Chain code
+    /// does the math — there is no reimplemented stableswap/weighted formula.
+    fn simulate_swap(
+        &self,
+        pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        _config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        let (vault, pool_id) = match (&pool.metadata, pool.key.bytes32()) {
+            (ProtocolMetadata::BalancerV2(metadata), Some(pool_id)) => {
+                let vault = metadata
+                    .vault
+                    .or_else(|| pool.state_addresses.first().copied())
+                    .ok_or(SimError::MissingMetadata("Balancer vault"))?;
+                (vault, pool_id)
+            }
+            (ProtocolMetadata::BalancerV2(_), None) => {
+                return Err(SimError::MissingMetadata("Balancer poolId"));
+            }
+            _ => return Err(SimError::MissingMetadata("Balancer metadata")),
+        };
+
+        // assets[0] = tokenIn, assets[1] = tokenOut; a single GIVEN_IN step
+        // swaps `amount_in` of asset 0 into asset 1 through `pool_id`.
+        let calldata = Bytes::from(
+            queryBatchSwapCall {
+                kind: 0, // GIVEN_IN
+                swaps: vec![BatchSwapStep {
+                    poolId: pool_id,
+                    assetInIndex: U256::ZERO,
+                    assetOutIndex: U256::from(1),
+                    amount: amount_in,
+                    userData: Bytes::new(),
+                }],
+                assets: vec![token_in, token_out],
+                funds: FundManagement {
+                    sender: Address::ZERO,
+                    fromInternalBalance: false,
+                    recipient: Address::ZERO,
+                    toInternalBalance: false,
+                },
+            }
+            .abi_encode(),
+        );
+
+        let output = run_quote(cache, vault, calldata)?;
+        let asset_deltas = queryBatchSwapCall::abi_decode_returns_validate(&output)
+            .map_err(|_| SimError::MalformedOutput("queryBatchSwap return"))?;
+
+        // assetDeltas[1] is the tokenOut delta: negative = paid out by the vault.
+        let delta_out = asset_deltas
+            .get(1)
+            .copied()
+            .ok_or(SimError::MalformedOutput("missing tokenOut delta"))?;
+        if delta_out.is_positive() {
+            return Err(SimError::MalformedOutput(
+                "tokenOut delta is non-negative (no output)",
+            ));
+        }
+        let amount_out = U256::from(delta_out.unsigned_abs());
+
+        Ok(SwapQuote::new(amount_out))
     }
 }
 
@@ -329,10 +420,19 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
                 // The pool address is the leading 20 bytes of the poolId, matching
                 // Balancer's poolId encoding (`address(20) | nonce/kind`).
                 let pool_address = Address::from_slice(&self.pool_id.as_slice()[..20]);
+                // Persist the discovered balance slots (slot-only; all on the
+                // vault) so the reactive `Swap` path can refresh exactly them.
+                // The discovered set is order-unspecified; sort for a stable,
+                // deduped record.
+                let mut balance_slots: Vec<U256> =
+                    self.verified_slots.iter().map(|(_, slot)| *slot).collect();
+                balance_slots.sort_unstable();
+                balance_slots.dedup();
                 pool.metadata = ProtocolMetadata::BalancerV2(BalancerV2Metadata {
                     vault: Some(self.vault),
                     pool_address: Some(pool_address),
                     tokens: self.tokens.clone(),
+                    balance_slots,
                 });
                 pool.status = PoolStatus::Ready;
                 report.status = PoolStatus::Ready;

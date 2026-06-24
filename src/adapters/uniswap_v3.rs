@@ -1,15 +1,19 @@
-use alloy_primitives::{Address, B256, Log, U256};
-use alloy_sol_types::{SolEvent, sol};
+use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 use evm_fork_cache::cold_start::{
     ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
 };
 
 use super::cold_start::AdapterColdStartPlanner;
+use super::sim::{
+    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quoteExactInputSingleCall,
+    run_quote,
+};
 use super::{
-    AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AmmAdapter,
-    ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, RepairAction, SlotChange, StateDiff, StateUpdate,
-    StateView, UnsupportedReason, UpdateQuality,
+    AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
+    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
+    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
+    StateDiff, StateUpdate, StateView, UnsupportedReason, UpdateQuality, V3Metadata,
 };
 use crate::adapters::storage::{
     V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
@@ -134,6 +138,53 @@ impl AmmAdapter for V3FamilyAdapter {
             RepairAction::VerifySlots(slots)
         }
     }
+
+    /// Quote via `QuoterV2.quoteExactInputSingle((tokenIn, tokenOut, amountIn,
+    /// fee, sqrtPriceLimitX96 = 0))`.
+    ///
+    /// The Quoter executes a real V3 swap against the warmed pool slots and
+    /// returns the encoded `amountOut` (chain code, not reimplemented math). The
+    /// pool `fee` is taken from the V3-family metadata; tick-crossing swaps stay
+    /// correct because the cache lazily fetches any cold tick/bitmap slot from
+    /// the backend.
+    fn simulate_swap(
+        &self,
+        pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
+
+        let params = QuoteExactInputSingleParams {
+            tokenIn: token_in,
+            tokenOut: token_out,
+            amountIn: amount_in,
+            fee: U24::from(fee),
+            sqrtPriceLimitX96: U256::ZERO.to(),
+        };
+        let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
+
+        let output = run_quote(cache, config.v3_quoter, calldata)?;
+        let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
+            .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
+
+        Ok(SwapQuote::new(decoded.amountOut))
+    }
+}
+
+/// Read the pool `fee` (in hundredths of a bip, e.g. `500` for 0.05%) from the
+/// V3-family metadata, regardless of which family variant the pool registered.
+fn v3_fee(pool: &PoolRegistration) -> Option<u32> {
+    let metadata: &V3Metadata = match &pool.metadata {
+        ProtocolMetadata::UniswapV3(m)
+        | ProtocolMetadata::PancakeV3(m)
+        | ProtocolMetadata::Slipstream(m) => m,
+        _ => return None,
+    };
+    metadata.fee
 }
 
 impl V3FamilyAdapter {
