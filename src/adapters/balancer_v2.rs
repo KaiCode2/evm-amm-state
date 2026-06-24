@@ -20,9 +20,8 @@ sol! {
 }
 
 sol! {
-    /// Local Balancer V2 vault ABI for cold-start discovery. Kept here rather than
-    /// reusing the simulation-gated `cache_sync` copy so the planner compiles under
-    /// the `balancer-v2` adapter feature alone.
+    /// Local Balancer V2 vault `getPoolTokens` ABI for cold-start discovery,
+    /// kept beside the adapter so it compiles under the `balancer-v2` feature.
     function getPoolTokens(bytes32 poolId)
         returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock);
 }
@@ -299,8 +298,8 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
                 };
 
                 // Classify off the load-bearing success signal first (mirroring
-                // the V2/V3 planners and cache_sync::call_view) rather than
-                // relying on the decoder to reject a revert/halt payload.
+                // the V2/V3 planners) rather than relying on the decoder to
+                // reject a revert/halt payload.
                 if !call.result.is_success() {
                     self.repair = Some(BalancerRepair::DiscoverFailed);
                     return ColdStartStep::Done;
