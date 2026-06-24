@@ -114,3 +114,29 @@ cargo test --no-default-features --features adapters,uniswap-v2,uniswap-v3,balan
 cargo test --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
+
+## Addendum — post-implementation hardening (audit-driven)
+
+A 23-agent adversarial audit of the slice-2 implementation (15 confirmed
+findings, no high-severity bugs; the happy path verified sound) drove the
+following fixes, all landed on this branch:
+
+- **Verify round now honors per-slot fetch outcomes (the one behavioral fix).**
+  `BalancerPhase::Verify` previously returned `Done` unconditionally, so an
+  archive miss / `FetchFailed` on a discovered balance slot still yielded
+  `Ready`. It now inspects `results.fetched` (like the V2/V3 planners) and, on an
+  unfetchable/never-attempted discovered slot, sets `BalancerRepair::BalancesUnfetched`
+  → `NeedsRepair(VerifySlots(discovered))` / `Degraded`. A genuine `Zero` stays
+  acceptable. This is the per-slot-outcome surfacing A4 exists for.
+- **Empty-capture no longer purges the shared vault.** `NoSlotsDiscovered` now
+  repairs via `ColdStart` (re-discover) instead of `PurgeStorage(vault)`, which
+  on Balancer's shared singleton vault would have wiped every co-tenant pool.
+- **Explicit success check before decode.** The discover arm now branches on
+  `call.result.is_success()` and uses `abi_decode_returns_validate`, instead of
+  relying on the decoder to reject a revert/halt payload.
+- **Coverage + fidelity:** new acceptance tests for the revert→repair,
+  empty-capture→`ColdStart`, verify-slot-fetch-failure→repair, and N=3-token
+  paths (new `MockBalancerVault3` / `MockBalancerVaultNoSlot` / revert fixtures);
+  `pool_address = poolId[..20]` is now asserted (distinct leading-20/trailing-12
+  poolId); the missing-vault test pins `MissingMetadata("Balancer vault")`. Doc
+  comments corrected from `address[2]`/`uint256[2]` to the real dynamic ABI.

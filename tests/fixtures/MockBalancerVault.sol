@@ -6,9 +6,12 @@ pragma solidity ^0.8.23;
 /// `getPoolTokens` SLOADs five FIXED slots (0..=4) — token0, token1, balance0,
 /// balance1, lastChangeBlock — so a `call_raw_with_access_list` captures a
 /// deterministic `(vault, slot)` set, and returns the decoded
-/// `(address[2], uint256[2], uint256)` tuple built from them. The poolId
-/// argument is ignored (the planner is storage-layout-agnostic: it verifies
-/// whatever slots the call touches).
+/// `(address[] tokens, uint256[] balances, uint256 lastChangeBlock)` tuple built
+/// from them. The arrays are DYNAMIC, matching the real Balancer V2 Vault ABI
+/// (`getPoolTokens(bytes32) returns (IERC20[], uint256[], uint256)`); do not
+/// "correct" them to fixed-size `address[2]`/`uint256[2]` (incompatible wire
+/// encoding). The poolId argument is ignored (the planner is
+/// storage-layout-agnostic: it verifies whatever slots the call touches).
 contract MockBalancerVault {
     function getPoolTokens(bytes32)
         external

@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
 use alloy_sol_types::{SolCall, SolEvent, sol};
 use evm_fork_cache::cold_start::{
-    ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
+    ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
 };
 
 use super::cold_start::AdapterColdStartPlanner;
@@ -122,10 +122,13 @@ enum BalancerPhase {
 
 /// Why a Balancer cold start could not reach `Ready`.
 enum BalancerRepair {
-    /// The discover call reverted or returned undecodable data.
+    /// The discover call reverted, halted, or returned undecodable data.
     DiscoverFailed,
     /// The discover call decoded but touched no slots under `restrict_to`.
     NoSlotsDiscovered,
+    /// A discovered vault balance slot could not be fetched in the verify round
+    /// (an archive miss), so the warmed balances are not authoritative.
+    BalancesUnfetched,
 }
 
 /// Cold-start planner for a Balancer V2 pool: a discover → verify access-list run.
@@ -204,13 +207,22 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
                     return ColdStartStep::Done;
                 };
 
-                // Decode the token list from the call's return data. A reverted or
-                // undecodable call is a degraded/unsupported pool, not a panic.
+                // Classify off the load-bearing success signal first (mirroring
+                // the V2/V3 planners and cache_sync::call_view) rather than
+                // relying on the decoder to reject a revert/halt payload.
+                if !call.result.is_success() {
+                    self.repair = Some(BalancerRepair::DiscoverFailed);
+                    return ColdStartStep::Done;
+                }
+                // Decode the token list from the call's return data. Undecodable
+                // data is a degraded/unsupported pool, not a panic. Use the
+                // validating decoder so a malformed payload is rejected, not
+                // best-effort reinterpreted.
                 let Some(output) = call.result.output() else {
                     self.repair = Some(BalancerRepair::DiscoverFailed);
                     return ColdStartStep::Done;
                 };
-                match getPoolTokensCall::abi_decode_returns(output) {
+                match getPoolTokensCall::abi_decode_returns_validate(output) {
                     Ok(decoded) => self.tokens = decoded.tokens,
                     Err(_) => {
                         self.repair = Some(BalancerRepair::DiscoverFailed);
@@ -243,8 +255,28 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
                     ..Default::default()
                 })
             }
-            // Round 2 warmed the discovered balance slots; the run is complete.
-            BalancerPhase::Verify => ColdStartStep::Done,
+            BalancerPhase::Verify => {
+                // The discovered vault slots are the hot state. Source their
+                // verdict from the per-slot `SlotFetch` classification (like the
+                // V2/V3 planners) so an archive miss is not silently accepted as
+                // a warmed `Ready`. A genuine `Zero` is legitimate (a fresh pool
+                // can hold a zero balance), so only an unfetchable / never-
+                // attempted slot forces a repair.
+                let any_unfetched = self.verified_slots.iter().any(|(address, slot)| {
+                    matches!(
+                        results
+                            .fetched
+                            .iter()
+                            .find(|o| o.address == *address && o.slot == *slot)
+                            .map(|o| &o.fetch),
+                        Some(SlotFetch::FetchFailed { .. }) | Some(SlotFetch::NotAttempted) | None
+                    )
+                });
+                if any_unfetched {
+                    self.repair = Some(BalancerRepair::BalancesUnfetched);
+                }
+                ColdStartStep::Done
+            }
         }
     }
 
@@ -272,9 +304,26 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
             }
             Some(BalancerRepair::NoSlotsDiscovered) => {
                 report.status = PoolStatus::Degraded;
-                // Nothing was warmed: purge any stale vault storage so a later
-                // re-discovery starts clean.
-                ColdStartOutcome::NeedsRepair(report, RepairAction::PurgeStorage(self.vault))
+                // The vault is a shared singleton, so a wholesale
+                // PurgeStorage(vault) would wipe every co-tenant Balancer pool's
+                // warmed state. Nothing pool-specific was discovered to scope a
+                // purge to, so re-run discovery instead (as DiscoverFailed does).
+                ColdStartOutcome::NeedsRepair(
+                    report,
+                    RepairAction::ColdStart {
+                        pool: pool.key.clone(),
+                        policy: self.policy,
+                    },
+                )
+            }
+            Some(BalancerRepair::BalancesUnfetched) => {
+                report.status = PoolStatus::Degraded;
+                // Archive-miss repair: re-verify exactly the discovered slots
+                // (mirrors the V2/V3 archive-miss repair).
+                ColdStartOutcome::NeedsRepair(
+                    report,
+                    RepairAction::VerifySlots(self.verified_slots.clone()),
+                )
             }
             None => {
                 // The pool address is the leading 20 bytes of the poolId, matching
