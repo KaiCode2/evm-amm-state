@@ -42,17 +42,23 @@ sol! {
 }
 
 sol! {
-    // CryptoSwap (Curve v2) swap event — the index fields are `uint256`, not the
-    // classic StableSwap `int128`, so its signature hash is DISTINCT from the
-    // StableSwap `TokenExchange` above. Namespaced under an interface so its
-    // generated type does not collide with the top-level int128 `TokenExchange`.
-    // Only the signature hash is used for topic routing; the payload is decode-
-    // validated before emitting a Swap (the reactive path resyncs discovered
-    // slots rather than applying the delta). CryptoSwap LIQUIDITY events are out
-    // of scope (their signatures differ across v2 generations — see the module
-    // non-goals); they are not routed here.
+    // CryptoSwap (Curve v2, e.g. tricrypto2) events. Namespaced under an interface
+    // so the generated types don't collide with the StableSwap ones above. All
+    // signatures verified on-chain against tricrypto2 (eth_getLogs topic0 histogram).
+    // Only `TokenExchange` is decode-validated before emitting a Swap; the
+    // liquidity events route on topic only (the reactive path resyncs discovered
+    // slots, not deltas). Arities are derived from n_coins at routing time; these
+    // N=3 decls are the `#[cfg(test)]` reference for the derived hashes.
+    //
+    // `RemoveLiquidityOne` here is the **3-arg** form (token_amount, coin_index,
+    // coin_amount) — emitted by BOTH CryptoSwap v2 AND StableSwap-NG (classic
+    // StableSwap uses the 2-arg form above), so the StableSwap routing reuses this
+    // hash. CryptoSwap v2 has no RemoveLiquidityImbalance.
     interface CurveCryptoSwapEvents {
         event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought);
+        event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply);
+        event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256 token_supply);
+        event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount);
     }
 }
 
@@ -87,13 +93,11 @@ fn pool_variant(pool: &PoolRegistration) -> CurveVariant {
     }
 }
 
-/// The `AddLiquidity` topic hash for an `n_coins`-coin pool.
-///
-/// The `uint256[N]` array arity IS part of the canonical event signature, so the
-/// topic hash is pool-specific. Derived from `n_coins` (not a fixed N) so routing
-/// is correct for every plain-pool arity. A `#[cfg(test)]` check asserts the N=3
-/// derivation equals the `sol!`-macro `SIGNATURE_HASH` (i.e. the format string is
-/// right) and that arities differ.
+/// The StableSwap `AddLiquidity` topic hash for an `n_coins`-coin pool:
+/// `uint256[N]` token_amounts + `uint256[N]` fees + invariant + supply. The
+/// `uint256[N]` arity IS part of the canonical signature, so the hash is
+/// pool-specific; derived from `n_coins`. A `#[cfg(test)]` check asserts the N=3
+/// derivation equals the `sol!`-macro `SIGNATURE_HASH`.
 fn add_liquidity_topic(n_coins: usize) -> B256 {
     keccak256(
         format!("AddLiquidity(address,uint256[{n_coins}],uint256[{n_coins}],uint256,uint256)")
@@ -101,30 +105,48 @@ fn add_liquidity_topic(n_coins: usize) -> B256 {
     )
 }
 
-/// Topic hashes this adapter routes for an `n_coins`-coin pool of `variant`.
+/// The CryptoSwap (v2) `AddLiquidity` topic hash for an `n_coins`-coin pool:
+/// `uint256[N]` token_amounts + a SINGLE `uint256 fee` + supply (no fees array) —
+/// distinct from the StableSwap shape above.
+fn crypto_add_liquidity_topic(n_coins: usize) -> B256 {
+    keccak256(format!("AddLiquidity(address,uint256[{n_coins}],uint256,uint256)").as_bytes())
+}
+
+/// Topic hashes this adapter routes for an `n_coins`-coin pool of `variant`. All
+/// signatures verified on-chain (docs/curve-slice3-liquidity-events-spec.md).
 ///
-/// **StableSwap** (classic + NG): `TokenExchange(address,int128,uint256,int128,
-/// uint256)` and `RemoveLiquidityOne(address,uint256,uint256)` carry no array
-/// params, so their signature hashes are arity-independent and route for any
-/// pool (`TokenExchange` is the swap event, so swap-driven resync is always
-/// covered). The other three carry `uint256[N]` arrays, so their topic hashes
-/// are derived from `n_coins`. `n_coins == 0` (unconfigured) routes only the
-/// arity-independent topics.
+/// **StableSwap** (classic + NG): `TokenExchange(int128…)` + the fixed-`uint256[N]`
+/// liquidity events (AddLiquidity / RemoveLiquidity / RemoveLiquidityImbalance,
+/// arity-derived) + `RemoveLiquidityOne` in BOTH the 2-arg (classic) and 3-arg
+/// (NG) forms. A pool emits only one RemoveLiquidityOne form, so routing both is
+/// harmless. `n_coins == 0` routes only the arity-independent topics.
 ///
-/// **CryptoSwap** (Curve v2): routes ONLY the CryptoSwap `TokenExchange`
-/// (`uint256` ids) — the dominant resync trigger. CryptoSwap liquidity events
-/// are out of scope (their signatures differ across v2 generations; see the
-/// module non-goals), so they are deliberately not routed; liquidity-driven
-/// staleness persists until the next swap.
+/// **CryptoSwap** (Curve v2): `TokenExchange(uint256…)` + the CryptoSwap liquidity
+/// events — single-fee `AddLiquidity` and fees-array-less `RemoveLiquidity` (both
+/// fixed-`uint256[N]`) + the 3-arg `RemoveLiquidityOne`. (No RemoveLiquidityImbalance.)
 fn curve_event_topics(n_coins: usize, variant: CurveVariant) -> Vec<B256> {
+    // 3-arg RemoveLiquidityOne (token_amount, coin_index, coin_amount): shared by
+    // CryptoSwap v2 and StableSwap-NG.
+    let remove_one_3arg = CurveCryptoSwapEvents::RemoveLiquidityOne::SIGNATURE_HASH;
     match variant {
         CurveVariant::CryptoSwap => {
-            vec![CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH]
+            let mut topics = vec![
+                CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH,
+                remove_one_3arg,
+            ];
+            if n_coins >= 1 {
+                topics.push(crypto_add_liquidity_topic(n_coins));
+                topics.push(keccak256(
+                    format!("RemoveLiquidity(address,uint256[{n_coins}],uint256)").as_bytes(),
+                ));
+            }
+            topics
         }
         CurveVariant::StableSwap => {
             let mut topics = vec![
                 TokenExchange::SIGNATURE_HASH,
-                RemoveLiquidityOne::SIGNATURE_HASH,
+                RemoveLiquidityOne::SIGNATURE_HASH, // 2-arg (classic)
+                remove_one_3arg,                    // 3-arg (NG)
             ];
             if n_coins >= 1 {
                 topics.push(add_liquidity_topic(n_coins));
@@ -200,12 +222,10 @@ impl AmmAdapter for CurveAdapter {
         let Some(topic0) = log.topics().first().copied() else {
             return AdapterEventResult::ignored();
         };
-        // Route against the pool's VARIANT- and ARITY-specific topic set. For
-        // StableSwap the liquidity-event hashes depend on n_coins (the
-        // `uint256[N]` arity is part of the event signature), so a fixed-arity
-        // set would silently drop 2-/4-coin pools' liquidity events. For
-        // CryptoSwap only the uint256-id `TokenExchange` is routed (liquidity
-        // events are out of scope; see `curve_event_topics`).
+        // Route against the pool's VARIANT- and ARITY-specific topic set: the
+        // liquidity-event hashes depend on n_coins (the `uint256[N]` arity is part
+        // of the signature) AND the StableSwap vs CryptoSwap shapes differ, so a
+        // fixed/wrong set would silently drop a pool's liquidity events.
         let n_coins = pool_n_coins(pool);
         let variant = pool_variant(pool);
         if !curve_event_topics(n_coins, variant).contains(&topic0) {
@@ -214,22 +234,27 @@ impl AmmAdapter for CurveAdapter {
 
         // `TokenExchange` is the swap event; validate it decodes against the
         // variant's ABI (a malformed log is a hard decode error, matching
-        // Balancer). The StableSwap liquidity events route on topic only — their
-        // payloads are never decoded, since the reactive path resyncs the
-        // discovered slots rather than applying their deltas. CryptoSwap routes
-        // only its `TokenExchange`, so any matched topic there is the swap.
+        // Balancer). Liquidity events route on topic only — their payloads are
+        // never decoded, since the reactive path resyncs the discovered slots
+        // rather than applying their deltas. Added-vs-Removed is keyed off the
+        // variant-specific AddLiquidity topic.
         let kind = match variant {
             CurveVariant::CryptoSwap => {
-                // The only routed CryptoSwap topic is its uint256-id
-                // TokenExchange; validate it decodes with the CryptoSwap event.
-                if CurveCryptoSwapEvents::TokenExchange::decode_log_data_validate(&log.data)
-                    .is_err()
-                {
-                    return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                        "malformed Curve CryptoSwap TokenExchange log",
-                    ));
+                if topic0 == CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH {
+                    if CurveCryptoSwapEvents::TokenExchange::decode_log_data_validate(&log.data)
+                        .is_err()
+                    {
+                        return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                            "malformed Curve CryptoSwap TokenExchange log",
+                        ));
+                    }
+                    AdapterEventKind::Swap
+                } else if topic0 == crypto_add_liquidity_topic(n_coins) {
+                    AdapterEventKind::LiquidityAdded
+                } else {
+                    // CryptoSwap RemoveLiquidity / RemoveLiquidityOne (3-arg).
+                    AdapterEventKind::LiquidityRemoved
                 }
-                AdapterEventKind::Swap
             }
             CurveVariant::StableSwap => {
                 if topic0 == TokenExchange::SIGNATURE_HASH {
@@ -669,8 +694,10 @@ mod tests {
                     .contains(&TokenExchange::SIGNATURE_HASH)
             );
         }
-        // Unconfigured (n=0) routes only the two arity-independent topics.
-        assert_eq!(curve_event_topics(0, CurveVariant::StableSwap).len(), 2);
+        // Unconfigured (n=0) routes only the arity-independent topics:
+        // TokenExchange + RemoveLiquidityOne in both the 2-arg (classic) and
+        // 3-arg (NG) forms.
+        assert_eq!(curve_event_topics(0, CurveVariant::StableSwap).len(), 3);
     }
 
     // The CryptoSwap (uint256-id) TokenExchange signature hash MUST differ from
@@ -686,27 +713,59 @@ mod tests {
         );
     }
 
-    // The CryptoSwap topic set routes its own `TokenExchange` and NONE of the
-    // StableSwap topics (incl. the int128 TokenExchange) — CryptoSwap liquidity
-    // events are out of scope, and the swap topics must not cross-route.
+    // The CryptoSwap liquidity topics derived from n_coins must equal the `sol!`
+    // macro hashes — proving the hand-written format strings (single-fee
+    // AddLiquidity, fees-array-less RemoveLiquidity, 3-arg RemoveLiquidityOne) are
+    // byte-for-byte correct, anchored to the macro. All verified on-chain too.
     #[test]
-    fn cryptoswap_topics_route_only_cryptoswap_token_exchange() {
+    fn cryptoswap_derived_liquidity_topics_match_sol_macro() {
+        assert_eq!(
+            crypto_add_liquidity_topic(3),
+            CurveCryptoSwapEvents::AddLiquidity::SIGNATURE_HASH,
+            "derived CryptoSwap AddLiquidity hash must match the macro"
+        );
+        assert_eq!(
+            keccak256("RemoveLiquidity(address,uint256[3],uint256)".as_bytes()),
+            CurveCryptoSwapEvents::RemoveLiquidity::SIGNATURE_HASH,
+            "derived CryptoSwap RemoveLiquidity hash must match the macro"
+        );
+        // CryptoSwap vs StableSwap AddLiquidity are distinct shapes.
+        assert_ne!(crypto_add_liquidity_topic(3), add_liquidity_topic(3));
+        // 3-arg (NG/crypto) RemoveLiquidityOne differs from 2-arg (classic).
+        assert_ne!(
+            CurveCryptoSwapEvents::RemoveLiquidityOne::SIGNATURE_HASH,
+            RemoveLiquidityOne::SIGNATURE_HASH,
+        );
+    }
+
+    // Each variant routes its FULL liquidity set, swap topics never cross-route,
+    // and the 3-arg RemoveLiquidityOne is routed by BOTH variants (NG + crypto).
+    #[test]
+    fn variant_topic_sets_are_correct() {
         let crypto = curve_event_topics(3, CurveVariant::CryptoSwap);
-        assert!(
-            crypto.contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH),
-            "CryptoSwap topic set must contain the CryptoSwap TokenExchange topic"
-        );
-        assert!(
-            !crypto.contains(&TokenExchange::SIGNATURE_HASH),
-            "CryptoSwap topic set must NOT contain the StableSwap TokenExchange topic"
-        );
-        // Only the one swap topic is routed (no liquidity events).
-        assert_eq!(crypto.len(), 1);
-        // Conversely, the StableSwap set must not contain the CryptoSwap topic.
-        assert!(
-            !curve_event_topics(3, CurveVariant::StableSwap)
-                .contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH),
-            "StableSwap topic set must NOT contain the CryptoSwap TokenExchange topic"
-        );
+        let stable = curve_event_topics(3, CurveVariant::StableSwap);
+        let remove_one_3arg = CurveCryptoSwapEvents::RemoveLiquidityOne::SIGNATURE_HASH;
+
+        for expected in [
+            CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH,
+            crypto_add_liquidity_topic(3),
+            keccak256("RemoveLiquidity(address,uint256[3],uint256)".as_bytes()),
+            remove_one_3arg,
+        ] {
+            assert!(
+                crypto.contains(&expected),
+                "CryptoSwap set missing {expected:?}"
+            );
+        }
+        // CryptoSwap v2 has no RemoveLiquidityImbalance.
+        assert!(!crypto.contains(&keccak256(
+            "RemoveLiquidityImbalance(address,uint256[3],uint256[3],uint256,uint256)".as_bytes()
+        )));
+        // Swap topics never cross-route.
+        assert!(!crypto.contains(&TokenExchange::SIGNATURE_HASH));
+        assert!(!stable.contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH));
+        // StableSwap routes BOTH RemoveLiquidityOne forms (classic 2-arg + NG 3-arg).
+        assert!(stable.contains(&RemoveLiquidityOne::SIGNATURE_HASH));
+        assert!(stable.contains(&remove_one_3arg));
     }
 }

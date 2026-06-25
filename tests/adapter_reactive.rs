@@ -2106,3 +2106,169 @@ async fn curve_token_exchange_empty_slots_no_error_no_mutation() -> Result<()> {
     );
     Ok(())
 }
+
+/// Cold-start a Curve pool of `variant` (generic mock; discovers slot 0) and
+/// return a reactive runtime wired so a resync re-reads slot 0 as `fresh`. Shared
+/// by the liquidity-event reactive tests below.
+async fn curve_reactive_runtime(
+    pool: Address,
+    coins: Vec<Address>,
+    variant: CurveVariant,
+    fresh: U256,
+) -> Result<(EvmCache, ReactiveRuntime<Ethereum>)> {
+    let mut cache = setup_cache().await?;
+    cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, U256::from(1_u64))?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([((pool, U256::ZERO), fresh)])));
+
+    let mut cold = AdapterRegistry::new();
+    cold.register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    let mut reg = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins,
+            discovered_slots: Vec::new(),
+            variant,
+        }));
+    let outcome = cold.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "cold-start Ready"
+    );
+
+    let sources = CurveAdapter::default().event_sources(&reg);
+    reg = reg.with_event_sources(sources);
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    registry.register_pool(reg).unwrap();
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+    Ok((cache, runtime))
+}
+
+// CryptoSwap liquidity events (single-fee AddLiquidity, fees-array-less
+// RemoveLiquidity, and the 3-arg RemoveLiquidityOne — signatures verified on-chain
+// against tricrypto2) must each route -> resync the discovered slot, keeping
+// cached state fresh after liquidity changes (not just swaps).
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cryptoswap_liquidity_events_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0xc3);
+    let (usdt, wbtc, weth) = (
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        Address::repeat_byte(0x03),
+    );
+    let (mut cache, mut runtime) = curve_reactive_runtime(
+        pool,
+        vec![usdt, wbtc, weth],
+        CurveVariant::CryptoSwap,
+        U256::from(147_348_u64),
+    )
+    .await?;
+
+    let topics = [
+        keccak256("AddLiquidity(address,uint256[3],uint256,uint256)"),
+        keccak256("RemoveLiquidity(address,uint256[3],uint256)"),
+        keccak256("RemoveLiquidityOne(address,uint256,uint256,uint256)"),
+    ];
+    let logs: Vec<_> = topics
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let b = 62 + i as u64;
+            (
+                ReactiveInput::Log(rpc_log(
+                    pool,
+                    vec![*t, topic_address(usdt)],
+                    abi_words([U256::ZERO]),
+                    b,
+                    0,
+                    0,
+                )),
+                included_context(b, 0),
+            )
+        })
+        .collect();
+    let report = runtime.ingest_batch_with_resync(&mut cache, batch(logs))?;
+
+    assert_eq!(
+        report.applied.len(),
+        3,
+        "all 3 CryptoSwap liquidity events must route"
+    );
+    for applied in &report.applied {
+        assert_eq!(applied.resyncs.len(), 1, "each liquidity event must resync");
+        let [ResyncTarget::StorageSlots { address, slots }] = applied.resyncs[0].targets.as_slice()
+        else {
+            panic!("expected a single storage-slots resync target");
+        };
+        assert_eq!(*address, pool);
+        assert_eq!(
+            slots,
+            &vec![U256::ZERO],
+            "resync must target the discovered slot"
+        );
+    }
+    Ok(())
+}
+
+// StableSwap-NG emits the 3-arg RemoveLiquidityOne (classic StableSwap uses the
+// 2-arg form); routing it via the StableSwap variant closes the NG liquidity gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_ng_remove_liquidity_one_3arg_resyncs() -> Result<()> {
+    let pool = Address::repeat_byte(0xc4);
+    let (a, b) = (Address::repeat_byte(0x01), Address::repeat_byte(0x02));
+    let (mut cache, mut runtime) = curve_reactive_runtime(
+        pool,
+        vec![a, b],
+        CurveVariant::StableSwap,
+        U256::from(42_u64),
+    )
+    .await?;
+
+    let log = rpc_log(
+        pool,
+        vec![
+            keccak256("RemoveLiquidityOne(address,uint256,uint256,uint256)"),
+            topic_address(a),
+        ],
+        abi_words([U256::ZERO]),
+        70,
+        0,
+        0,
+    );
+    let report = runtime.ingest_batch_with_resync(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(70, 0))]),
+    )?;
+    assert_eq!(
+        report.applied.len(),
+        1,
+        "the NG 3-arg RemoveLiquidityOne must route"
+    );
+    assert_eq!(report.applied[0].resyncs.len(), 1, "it must resync");
+    let [ResyncTarget::StorageSlots { address, slots }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a single storage-slots resync target");
+    };
+    assert_eq!(*address, pool);
+    assert_eq!(
+        slots,
+        &vec![U256::ZERO],
+        "resync must target the discovered slot"
+    );
+    Ok(())
+}

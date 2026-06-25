@@ -103,3 +103,7 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 [[test]]
 name = "reactive_ws_e2e"
 required-features = ["uniswap-v2"]
+
+[[test]]
+name = "reactive_curve_ws_e2e"
+required-features = ["curve"]
