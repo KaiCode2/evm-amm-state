@@ -765,9 +765,8 @@ async fn curve_simulate_swap_token_not_in_pool_is_error() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("token outside the pool must error");
-    // The exact variant is the implementer's choice (MissingMetadata/Custom);
-    // it must NOT be Reverted (the call must never be built/run).
-    assert_ne!(err, SimError::Reverted);
+    // Specific variant: the call must never be built/run (never Reverted).
+    assert_eq!(err, SimError::MissingMetadata("Curve token not in pool"));
     Ok(())
 }
 
@@ -800,6 +799,80 @@ async fn curve_simulate_swap_without_coins_is_error() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("missing coins must error");
-    assert_ne!(err, SimError::Reverted);
+    assert_eq!(err, SimError::MissingMetadata("Curve coins"));
+    Ok(())
+}
+
+/// A self-swap (token_in == token_out) is a clean adapter error, never built or
+/// run against the pool (would otherwise revert in-EVM).
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
+    let pool = Address::repeat_byte(0xc4);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            dai,
+            dai,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("self-swap must error");
+    assert_eq!(err, SimError::Custom("Curve token_in == token_out".into()));
+    assert!(asserter.read_q().is_empty(), "must not touch the backend");
+    Ok(())
+}
+
+/// A reverting Curve pool surfaces `SimError::Reverted` (sibling-consistent with
+/// the V2/V3/Balancer/Solidly reverting-target tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
+    let pool = Address::repeat_byte(0xc5);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(&mut cache, pool, REVERT_RUNTIME);
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            dai,
+            usdc,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("reverting pool must error");
+    assert_eq!(err, SimError::Reverted);
+    assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }

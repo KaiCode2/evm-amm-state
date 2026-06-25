@@ -15,7 +15,7 @@
 //! metapools / lending pools whose `get_dy` makes external calls (the
 //! `restrict_to=[pool]` discover capture would be incomplete for them).
 
-use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use alloy_sol_types::{SolCall, SolEvent, sol};
 use evm_fork_cache::cold_start::{
     ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
@@ -55,30 +55,55 @@ pub struct CurveAdapter {
     _private: (),
 }
 
-/// Topic hashes this adapter routes (the classic StableSwap state-changing
-/// events).
+/// The coin count for a registration, or 0 if not Curve metadata / unconfigured.
+fn pool_n_coins(pool: &PoolRegistration) -> usize {
+    match &pool.metadata {
+        ProtocolMetadata::Curve(metadata) => metadata.coins.len(),
+        _ => 0,
+    }
+}
+
+/// The `AddLiquidity` topic hash for an `n_coins`-coin pool.
 ///
-/// `TokenExchange(address,int128,uint256,int128,uint256)` has no arrays, so its
-/// signature hash is arity-independent and routes for ANY plain pool — this is
-/// the swap event, so swap-driven resync is universal.
+/// The `uint256[N]` array arity IS part of the canonical event signature, so the
+/// topic hash is pool-specific. Derived from `n_coins` (not a fixed N) so routing
+/// is correct for every plain-pool arity. A `#[cfg(test)]` check asserts the N=3
+/// derivation equals the `sol!`-macro `SIGNATURE_HASH` (i.e. the format string is
+/// right) and that arities differ.
+fn add_liquidity_topic(n_coins: usize) -> B256 {
+    keccak256(
+        format!("AddLiquidity(address,uint256[{n_coins}],uint256[{n_coins}],uint256,uint256)")
+            .as_bytes(),
+    )
+}
+
+/// Topic hashes this adapter routes for an `n_coins`-coin pool.
 ///
-/// `AddLiquidity`/`RemoveLiquidity`/`RemoveLiquidityImbalance` carry
-/// `uint256[N]` arrays whose N (= n_coins) IS part of the canonical event
-/// signature, so their keccak topic hashes differ per arity. This `sol!` block
-/// fixes N=3, so liquidity-event routing is correct for 3-coin pools (e.g.
-/// 3pool, the validated target) but NOT for 2-/4-coin plain pools. SLICE-1
-/// LIMITATION: on a non-3-coin pool a liquidity event is not routed, so the
-/// cached balances can be briefly stale between a liquidity change and the next
-/// swap (the next `TokenExchange` resyncs them). Slice 2 should derive these
-/// topic hashes from `n_coins` (`coins.len()`) at `event_sources` time.
-pub(crate) fn curve_event_topics() -> Vec<alloy_primitives::B256> {
-    vec![
+/// `TokenExchange(address,int128,uint256,int128,uint256)` and
+/// `RemoveLiquidityOne(address,uint256,uint256)` carry no array params, so their
+/// signature hashes are arity-independent and route for any pool (`TokenExchange`
+/// is the swap event, so swap-driven resync is always covered). The other three
+/// carry `uint256[N]` arrays, so their topic hashes are derived from `n_coins`.
+/// `n_coins == 0` (unconfigured) routes only the arity-independent topics.
+fn curve_event_topics(n_coins: usize) -> Vec<B256> {
+    let mut topics = vec![
         TokenExchange::SIGNATURE_HASH,
-        AddLiquidity::SIGNATURE_HASH,
-        RemoveLiquidity::SIGNATURE_HASH,
         RemoveLiquidityOne::SIGNATURE_HASH,
-        RemoveLiquidityImbalance::SIGNATURE_HASH,
-    ]
+    ];
+    if n_coins >= 1 {
+        topics.push(add_liquidity_topic(n_coins));
+        topics.push(keccak256(
+            format!("RemoveLiquidity(address,uint256[{n_coins}],uint256[{n_coins}],uint256)")
+                .as_bytes(),
+        ));
+        topics.push(keccak256(
+            format!(
+                "RemoveLiquidityImbalance(address,uint256[{n_coins}],uint256[{n_coins}],uint256,uint256)"
+            )
+            .as_bytes(),
+        ));
+    }
+    topics
 }
 
 impl AmmAdapter for CurveAdapter {
@@ -87,9 +112,10 @@ impl AmmAdapter for CurveAdapter {
     }
 
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
+        let n_coins = pool_n_coins(pool);
         pool.key
             .address()
-            .map(|address| EventSource::direct(address, curve_event_topics()))
+            .map(|address| EventSource::direct(address, curve_event_topics(n_coins)))
             .into_iter()
             .collect()
     }
@@ -129,7 +155,12 @@ impl AmmAdapter for CurveAdapter {
         let Some(topic0) = log.topics().first().copied() else {
             return AdapterEventResult::ignored();
         };
-        if !curve_event_topics().contains(&topic0) {
+        // Route against the pool's ARITY-SPECIFIC topic set — the liquidity-event
+        // hashes depend on n_coins (the `uint256[N]` arity is part of the event
+        // signature), so a fixed-arity set would silently drop 2-/4-coin pools'
+        // liquidity events.
+        let n_coins = pool_n_coins(pool);
+        if !curve_event_topics(n_coins).contains(&topic0) {
             return AdapterEventResult::ignored();
         }
 
@@ -144,7 +175,7 @@ impl AmmAdapter for CurveAdapter {
                 ));
             }
             AdapterEventKind::Swap
-        } else if topic0 == AddLiquidity::SIGNATURE_HASH {
+        } else if topic0 == add_liquidity_topic(n_coins) {
             AdapterEventKind::LiquidityAdded
         } else {
             // RemoveLiquidity / RemoveLiquidityOne / RemoveLiquidityImbalance.
@@ -228,6 +259,12 @@ impl AmmAdapter for CurveAdapter {
             .iter()
             .position(|coin| *coin == token_out)
             .ok_or(SimError::MissingMetadata("Curve token not in pool"))?;
+
+        // A self-swap (same coin in and out) has no meaningful quote; reject it
+        // cleanly rather than building a get_dy(i, i) call the pool would revert.
+        if i == j {
+            return Err(SimError::Custom("Curve token_in == token_out".into()));
+        }
 
         // Classic StableSwap `get_dy` takes `int128` indices (the `sol!` macro
         // maps `int128` to native `i128`). CryptoSwap / StableSwap-NG use
@@ -468,5 +505,57 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
                 ColdStartOutcome::Ready(report)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The arity-3 topics derived from `n_coins` must equal the `sol!`-macro
+    // SIGNATURE_HASHes — this proves the hand-written signature format strings in
+    // `curve_event_topics`/`add_liquidity_topic` are byte-for-byte correct
+    // (keccak is unforgiving), anchoring the dynamic derivation to the macro.
+    #[test]
+    fn derived_arity_3_topics_match_sol_macro_hashes() {
+        let t3 = curve_event_topics(3);
+        for expected in [
+            TokenExchange::SIGNATURE_HASH,
+            RemoveLiquidityOne::SIGNATURE_HASH,
+            AddLiquidity::SIGNATURE_HASH,
+            RemoveLiquidity::SIGNATURE_HASH,
+            RemoveLiquidityImbalance::SIGNATURE_HASH,
+        ] {
+            assert!(
+                t3.contains(&expected),
+                "derived 3-coin topic set must contain the sol! hash {expected:?}"
+            );
+        }
+        assert_eq!(add_liquidity_topic(3), AddLiquidity::SIGNATURE_HASH);
+    }
+
+    // The `uint256[N]` arity is part of the event signature, so the liquidity
+    // topic hashes MUST differ per coin count — the bug the audit caught was
+    // routing only the N=3 hashes, silently dropping 2-/4-coin pools' events.
+    #[test]
+    fn liquidity_topics_differ_per_arity() {
+        let (t2, t3, t4) = (
+            curve_event_topics(2),
+            curve_event_topics(3),
+            curve_event_topics(4),
+        );
+        assert_ne!(t2, t3, "2-coin and 3-coin topic sets must differ");
+        assert_ne!(t3, t4, "3-coin and 4-coin topic sets must differ");
+        assert_ne!(
+            add_liquidity_topic(2),
+            add_liquidity_topic(3),
+            "AddLiquidity hash must depend on arity"
+        );
+        // The arity-independent swap topic is present at every arity.
+        for n in [0, 2, 3, 4] {
+            assert!(curve_event_topics(n).contains(&TokenExchange::SIGNATURE_HASH));
+        }
+        // Unconfigured (n=0) routes only the two arity-independent topics.
+        assert_eq!(curve_event_topics(0).len(), 2);
     }
 }

@@ -25,12 +25,15 @@ Non-goals (deferred, documented as limitations):
   `TokenExchangeUnderlying`) whose `get_dy` makes external calls — the
   `restrict_to=[pool]` discover capture would be incomplete for them.
 - Discovering `coins` on-chain (slice 1 takes them as config).
-- Arity-independent liquidity-event routing. The `AddLiquidity`/`RemoveLiquidity`/
-  `RemoveLiquidityImbalance` topic hashes depend on `n_coins` (the `uint256[N]`
-  arity is part of the event signature); slice 1 fixes N=3, so liquidity events
-  route for 3-coin pools (3pool, validated) but not 2-/4-coin pools.
-  `TokenExchange` (the swap event, no arrays) routes universally, so swap-driven
-  resync is unaffected. Slice 2: derive the topic hashes from `n_coins`.
+
+Resolved during implementation (audit-driven): the `AddLiquidity`/`RemoveLiquidity`/
+`RemoveLiquidityImbalance` topic hashes depend on `n_coins` (the `uint256[N]`
+arity is part of the event signature). The adapter **derives them from
+`coins.len()`** at `event_sources`/`decode_event` time, so liquidity-event
+routing is correct for every plain-pool arity (not just 3-coin). `TokenExchange`
+(the swap event, no arrays) is arity-independent. A unit test asserts the
+derived N=3 hashes equal the `sol!`-macro `SIGNATURE_HASH`es and that arities
+differ.
 
 ## Behavioral requirements
 
