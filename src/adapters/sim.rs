@@ -249,3 +249,16 @@ sol! {
         bool toInternalBalance;
     }
 }
+
+sol! {
+    /// Curve CryptoSwap (Curve v2, e.g. tricrypto) `get_dy(i, j, dx)` — the
+    /// **uint256-index** variant (classic/NG StableSwap use the `int128`
+    /// `get_dy` above). Namespaced under an interface so its generated
+    /// `CurveCryptoSwap::get_dyCall` does not collide with the top-level
+    /// `int128` `get_dyCall`. Same semantics: chain code applies the CryptoSwap
+    /// invariant against the warmed state; this crate only builds calldata and
+    /// decodes the `uint256` output.
+    interface CurveCryptoSwap {
+        function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
+    }
+}

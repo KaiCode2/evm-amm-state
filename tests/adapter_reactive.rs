@@ -15,8 +15,8 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, DeferredWork, PoolKey,
-    PoolRegistration, PoolStatus, ProtocolMetadata, PurgeScope, SolidlyV2Adapter,
+    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, CurveVariant, DeferredWork,
+    PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, PurgeScope, SolidlyV2Adapter,
     SolidlyV2Metadata, StateUpdate, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
     V3Metadata,
 };
@@ -1979,6 +1979,7 @@ async fn curve_token_exchange_resyncs_discovered_slot() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc, usdt],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
     let outcome =
         cold_registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
@@ -2062,6 +2063,7 @@ async fn curve_token_exchange_empty_slots_no_error_no_mutation() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);

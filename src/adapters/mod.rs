@@ -40,7 +40,7 @@ pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
     BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata,
-    CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
+    CurveVariant, CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
     PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SolidlyV2Metadata,
     UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3Metadata,
 };

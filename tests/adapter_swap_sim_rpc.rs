@@ -45,15 +45,15 @@ use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 
 use evm_amm_state::adapters::sim::{
-    BatchSwapStep, FundManagement, QuoteExactInputSingleParams, get_dyCall, getAmountOutCall,
-    getAmountsOutCall, queryBatchSwapCall, quoteExactInputSingleCall,
+    BatchSwapStep, CurveCryptoSwap, FundManagement, QuoteExactInputSingleParams, get_dyCall,
+    getAmountOutCall, getAmountsOutCall, queryBatchSwapCall, quoteExactInputSingleCall,
 };
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy,
-    CurveAdapter, CurveMetadata, PoolKey, PoolRegistration, ProtocolMetadata, SimConfig,
-    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
-    V3Metadata,
+    CurveAdapter, CurveMetadata, CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata,
+    SimConfig, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
+    UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -84,6 +84,11 @@ const BAL: Address = address!("ba100000625a3754423978a60c9317c58a424e3D");
 const CURVE_3POOL: Address = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
 const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
 const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+// --- Curve CryptoSwap / Curve v2 (tricrypto2 on Ethereum mainnet, at FORK_BLOCK) ---
+// USDT/WBTC/WETH; get_dy uses uint256 indices (int128 reverts on this pool).
+const TRICRYPTO2: Address = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
+const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
 
 // --- Solidly V2 (Aerodrome on Base) ---
 //
@@ -476,6 +481,7 @@ async fn curve_simulate_swap_matches_eth_call() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![DAI, USDC, USDT],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -522,6 +528,95 @@ async fn curve_simulate_swap_matches_eth_call() -> Result<()> {
     assert_eq!(
         sim.amount_out, truth,
         "Curve sim amount_out must match eth_call get_dy"
+    );
+    Ok(())
+}
+
+/// Curve CryptoSwap (Curve v2) parity — forks mainnet at FORK_BLOCK, cold-starts
+/// the live tricrypto2 pool (USDT/WBTC/WETH, uint256-index `get_dy`), and asserts:
+///   1. cold-start discovered + persisted a non-empty `get_dy` read-set
+///      (`discovered_slots`) and preserved `variant: CryptoSwap`,
+///   2. `simulate_swap(USDT, WBTC, 100e6)` (the pool's uint256-index `get_dy`)
+///      equals the SAME call via `eth_call` at the fork block (on-chain ground
+///      truth). Probe ground truth at this block: 147348 (WBTC sats).
+///
+/// Validates the real CryptoSwap (uint256-index) `get_dy` ABI + the variant-aware
+/// discover cold-start against a live deployment — the thing the offline
+/// selector-agnostic mock cannot exercise (it cannot distinguish ABIs).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires E2E_RPC_URL archive node; run with --ignored"]
+async fn curve_cryptoswap_simulate_swap_matches_eth_call() -> Result<()> {
+    let Some(url) = rpc_url() else {
+        eprintln!("E2E_RPC_URL unset; skipping");
+        return Ok(());
+    };
+
+    // 100 USDT in (6 decimals); USDT (coin 0) -> WBTC (coin 1).
+    let amount_in = U256::from(100_000_000_u64);
+
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
+    let registry = {
+        let mut r = AdapterRegistry::new();
+        r.register_adapter(Arc::new(CurveAdapter::default()))?;
+        r
+    };
+    let mut registration = PoolRegistration::new(PoolKey::Curve(TRICRYPTO2))
+        .with_state_address(TRICRYPTO2)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![USDT, WBTC, WETH],
+            discovered_slots: Vec::new(),
+            variant: CurveVariant::CryptoSwap,
+        }));
+    registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    // (1) Cold-start discovered + persisted the get_dy read-set and the variant.
+    let ProtocolMetadata::Curve(meta) = &registration.metadata else {
+        return Err(anyhow!("expected Curve metadata after cold-start"));
+    };
+    assert!(
+        !meta.discovered_slots.is_empty(),
+        "cold-start should discover the CryptoSwap get_dy read-set"
+    );
+    assert_eq!(
+        meta.variant,
+        CurveVariant::CryptoSwap,
+        "cold-start must preserve the CryptoSwap variant"
+    );
+    assert_eq!(meta.coins, vec![USDT, WBTC, WETH], "coins preserved");
+
+    // (2) simulate_swap == eth_call get_dy(uint256,uint256,uint256) ground truth.
+    let adapter = CurveAdapter::default();
+    let sim = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            USDT,
+            WBTC,
+            amount_in,
+            &SimConfig::default(),
+        )
+        .map_err(|e| anyhow!("curve cryptoswap sim failed: {e}"))?;
+
+    let out = eth_call_at(
+        &url,
+        TRICRYPTO2,
+        Bytes::from(
+            CurveCryptoSwap::get_dyCall {
+                i: U256::ZERO,
+                j: U256::from(1),
+                dx: amount_in,
+            }
+            .abi_encode(),
+        ),
+        FORK_BLOCK,
+    )
+    .await?;
+    let truth = CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&out)?;
+
+    assert!(truth > U256::ZERO, "ground-truth quote should be non-zero");
+    assert_eq!(
+        sim.amount_out, truth,
+        "Curve CryptoSwap sim amount_out must match eth_call get_dy"
     );
     Ok(())
 }

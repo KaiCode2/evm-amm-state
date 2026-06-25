@@ -25,9 +25,9 @@ use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, PoolKey, PoolRegistration,
-    PoolStatus, ProtocolMetadata, SimConfig, SimError, SolidlyV2Adapter, SolidlyV2Metadata,
-    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
+    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, CurveVariant, PoolKey,
+    PoolRegistration, PoolStatus, ProtocolMetadata, SimConfig, SimError, SolidlyV2Adapter,
+    SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -708,6 +708,7 @@ async fn curve_simulate_swap_returns_pool_quote_offline() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc, usdt],
             discovered_slots: vec![U256::ZERO],
+            variant: CurveVariant::StableSwap,
         }));
 
     // Swap DAI (index 0) -> USDC (index 1).
@@ -753,6 +754,7 @@ async fn curve_simulate_swap_token_not_in_pool_is_error() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc],
             discovered_slots: vec![U256::ZERO],
+            variant: CurveVariant::StableSwap,
         }));
 
     let err = adapter
@@ -825,6 +827,7 @@ async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc],
             discovered_slots: vec![U256::ZERO],
+            variant: CurveVariant::StableSwap,
         }));
 
     let err = adapter
@@ -839,6 +842,59 @@ async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
         .expect_err("self-swap must error");
     assert_eq!(err, SimError::Custom("Curve token_in == token_out".into()));
     assert!(asserter.read_q().is_empty(), "must not touch the backend");
+    Ok(())
+}
+
+/// CryptoSwap (Curve v2) offline sim: the variant uses `get_dy(uint256,uint256,
+/// uint256)`. The selector-agnostic mock returns `sload(0)` for ANY call (so it
+/// serves the uint256 ABI too — the mock cannot distinguish ABIs; the RPC parity
+/// test gates the real uint256 ABI). This proves the CryptoSwap branch builds +
+/// runs + decodes a quote, distinct from the StableSwap path.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cryptoswap_simulate_swap_returns_pool_quote_offline() -> Result<()> {
+    let pool = Address::repeat_byte(0xc6);
+    let usdt = Address::repeat_byte(0x01);
+    let wbtc = Address::repeat_byte(0x02);
+    let weth = Address::repeat_byte(0x03);
+    let expected_out = U256::from(147_348_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, expected_out)?;
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![usdt, wbtc, weth],
+            discovered_slots: vec![U256::ZERO],
+            variant: CurveVariant::CryptoSwap,
+        }));
+
+    // Swap USDT (index 0) -> WBTC (index 1).
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            usdt,
+            wbtc,
+            U256::from(100_000_000_u64),
+            &SimConfig::default(),
+        )
+        .expect("curve cryptoswap quote should succeed");
+
+    assert_eq!(quote.amount_out, expected_out);
+    assert!(
+        asserter.read_q().is_empty(),
+        "swap sim must be fully offline (no RPC)"
+    );
     Ok(())
 }
 
@@ -860,6 +916,7 @@ async fn curve_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc],
             discovered_slots: vec![U256::ZERO],
+            variant: CurveVariant::StableSwap,
         }));
 
     let err = adapter
