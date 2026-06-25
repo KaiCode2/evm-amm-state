@@ -250,6 +250,7 @@ pub enum ProtocolMetadata {
     Slipstream(V3Metadata),
     BalancerV2(BalancerV2Metadata),
     SolidlyV2(SolidlyV2Metadata),
+    Curve(CurveMetadata),
     Custom(Arc<dyn Any + Send + Sync>),
 }
 
@@ -263,6 +264,7 @@ impl fmt::Debug for ProtocolMetadata {
             Self::Slipstream(metadata) => f.debug_tuple("Slipstream").field(metadata).finish(),
             Self::BalancerV2(metadata) => f.debug_tuple("BalancerV2").field(metadata).finish(),
             Self::SolidlyV2(metadata) => f.debug_tuple("SolidlyV2").field(metadata).finish(),
+            Self::Curve(metadata) => f.debug_tuple("Curve").field(metadata).finish(),
             Self::Custom(_) => f.write_str("Custom(..)"),
         }
     }
@@ -309,6 +311,23 @@ pub struct BalancerV2Metadata {
     /// balance-mapping layout or doing lossy event-delta arithmetic. Empty
     /// until the discover→verify cold-start runs.
     pub balance_slots: Vec<U256>,
+}
+
+/// Metadata for a Curve StableSwap plain pool.
+///
+/// `coins` is config-supplied (the pool's static coin ordering); it drives the
+/// `simulate_swap` token→index mapping for `get_dy`. `discovered_slots` is the
+/// storage read-set the cold-start discover pass captured from a `get_dy` call
+/// (balances + amplification + fee, wherever the Vyper build placed them) — a
+/// real Curve pool has no predictable balance-slot layout, so discovery, not a
+/// hand-coded layout, identifies them. Persisting them lets the reactive
+/// `TokenExchange`/liquidity path re-verify exactly those slots (a resync),
+/// keeping cached state fresh for a later `simulate_swap`. Slot-only; all live
+/// on the pool address. Empty until cold-start runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CurveMetadata {
+    pub coins: Vec<Address>,
+    pub discovered_slots: Vec<U256>,
 }
 
 /// Lifecycle status for a tracked pool registration.

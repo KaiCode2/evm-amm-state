@@ -23,9 +23,9 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
-    DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, RepairAction,
-    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
-    UnsupportedReason, V3Metadata,
+    CurveAdapter, CurveMetadata, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolMetadata, RepairAction, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter,
+    UniswapV2Metadata, UniswapV3Adapter, UnsupportedReason, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use revm::state::{AccountInfo, Bytecode};
@@ -1156,5 +1156,180 @@ async fn solidly_cold_start_lazy_defers_token_slots() -> Result<()> {
     );
     assert!(cache_h.cached_storage_value(pool, r0).is_some());
     assert_eq!(cache_h.cached_storage_value(pool, t0), None);
+    Ok(())
+}
+
+// --- Curve StableSwap (discover -> verify access-list cold start) ---
+//
+// Models the Balancer discover->verify tests above. The mock pool runtime
+// (`mock_curve_pool_runtime.hex`) SLOADs slot 0 for any call and returns it, so
+// the discover `get_dy(0, 1, dx)` captures `(pool, 0)`; the verify round then
+// re-reads it from the fetcher. `coins` is config-supplied and must survive the
+// run unchanged (it is the pool's static coin ordering, not discovered).
+
+fn curve_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(CurveAdapter::default()))
+        .unwrap();
+    registry
+}
+
+// Discover -> verify -> Ready: the discover pass captures the get_dy read-set
+// (slot 0 on this stub), the verify round warms it to the fetcher's fresh value,
+// and `finish` persists `discovered_slots` (containing slot 0) while preserving
+// the config-supplied `coins`.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_discover_verify_ready() -> Result<()> {
+    let pool = Address::repeat_byte(0xc1);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+    let usdt = Address::repeat_byte(0x03);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(999_900_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    // The block beneficiary (Address::ZERO) is credited gas during the discover
+    // call's transact; install it so the offline run does not fetch it.
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    // Seed slot 0 STALE so the discover call has something to SLOAD; the verify
+    // round must refresh it to the fetcher's FRESH value.
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((pool, U256::ZERO), fresh)]),
+        Vec::new(),
+    ));
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc, usdt],
+            discovered_slots: Vec::new(),
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "discover->verify should reach Ready, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::Curve(ref m) => {
+            assert_eq!(
+                m.coins,
+                vec![dai, usdc, usdt],
+                "config coins must be preserved across cold-start"
+            );
+            assert!(
+                !m.discovered_slots.is_empty(),
+                "cold-start must persist the discovered read-set"
+            );
+            assert!(
+                m.discovered_slots.contains(&U256::ZERO),
+                "the get_dy read-set slot 0 must be discovered, got {:?}",
+                m.discovered_slots
+            );
+        }
+        ref other => panic!("expected Curve metadata, got {other:?}"),
+    }
+    // The verify round refreshed the discovered slot to the fetcher's fresh value
+    // (proving discover -> verify warmed it, not the stale seed).
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        Some(fresh),
+        "verify round must refresh the discovered slot to the fresh value"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the cold start must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+// A reverting `get_dy` discover call must be classified as a failed discovery
+// (NeedsRepair via re-discovery), never silently driven to Ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_reverting_discover_needs_repair() -> Result<()> {
+    let pool = Address::repeat_byte(0xc2);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_balancer_vault_revert_runtime.hex"),
+    );
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
+            discovered_slots: Vec::new(),
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(
+            outcome,
+            ColdStartOutcome::NeedsRepair(_, RepairAction::ColdStart { .. })
+        ),
+        "a reverting get_dy discover must need re-discovery, not reach Ready, got {outcome:?}"
+    );
+    assert_ne!(registration.status, PoolStatus::Ready);
+    assert!(asserter.read_q().is_empty(), "must be fully offline");
+    Ok(())
+}
+
+// The verify round warms the discovered read-set. If a discovered slot is
+// unfetchable (an archive miss), the pool must NOT be marked Ready with an
+// unwarmed read-set — it must need a `VerifySlots` repair over the discovered
+// slots, mirroring the Balancer / V2 / V3 archive-miss behavior.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_failed_slot_needs_verify_repair() -> Result<()> {
+    let pool = Address::repeat_byte(0xc3);
+
+    let (mut cache, _asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    // Seed slot 0 so the discover call SLOADs it, but fail it in the verify round.
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, U256::from(1_u64))?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::new(),
+        vec![(pool, U256::ZERO)],
+    ));
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
+            discovered_slots: Vec::new(),
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(
+            outcome,
+            ColdStartOutcome::NeedsRepair(_, RepairAction::VerifySlots(_))
+        ),
+        "an unfetchable discovered slot must need a VerifySlots repair, got {outcome:?}"
+    );
+    assert_ne!(registration.status, PoolStatus::Ready);
     Ok(())
 }

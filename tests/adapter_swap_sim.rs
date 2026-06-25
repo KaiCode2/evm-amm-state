@@ -25,9 +25,9 @@ use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
-    SimConfig, SimError, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, PoolKey, PoolRegistration,
+    PoolStatus, ProtocolMetadata, SimConfig, SimError, SolidlyV2Adapter, SolidlyV2Metadata,
+    UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -669,6 +669,205 @@ async fn solidly_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
             &mut cache,
             Address::repeat_byte(0x01),
             Address::repeat_byte(0x02),
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("reverting pool must error");
+    assert_eq!(err, SimError::Reverted);
+    assert!(asserter.read_q().is_empty(), "must be fully offline");
+    Ok(())
+}
+
+// --- Curve StableSwap offline harness ---
+
+/// `simulate_swap` maps token_in/token_out to coin indices and quotes via the
+/// pool's `get_dy`. The mock pool returns slot 0 for any call, so seeding slot 0
+/// pins the expected output and proves the quote is fully offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_returns_pool_quote_offline() -> Result<()> {
+    let pool = Address::repeat_byte(0xc1);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+    let usdt = Address::repeat_byte(0x03);
+    let expected_out = U256::from(999_900_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, expected_out)?;
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc, usdt],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    // Swap DAI (index 0) -> USDC (index 1).
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            dai,
+            usdc,
+            U256::from(1_000_000_000_000_000_000_u128),
+            &SimConfig::default(),
+        )
+        .expect("curve quote should succeed");
+
+    assert_eq!(quote.amount_out, expected_out);
+    assert!(
+        asserter.read_q().is_empty(),
+        "swap sim must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+/// A token that is not one of the pool's `coins` has no index, so the quote
+/// cannot be built — this is a clean error, never a panic or a wrong index.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_token_not_in_pool_is_error() -> Result<()> {
+    let pool = Address::repeat_byte(0xc2);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+    let stranger = Address::repeat_byte(0x09);
+
+    let (mut cache, _asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            stranger,
+            usdc,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("token outside the pool must error");
+    // Specific variant: the call must never be built/run (never Reverted).
+    assert_eq!(err, SimError::MissingMetadata("Curve token not in pool"));
+    Ok(())
+}
+
+/// Empty `coins` (cold-start never configured them) → simulate_swap errors
+/// rather than guessing indices.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_without_coins_is_error() -> Result<()> {
+    let pool = Address::repeat_byte(0xc3);
+
+    let (mut cache, _asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata::default()));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("missing coins must error");
+    assert_eq!(err, SimError::MissingMetadata("Curve coins"));
+    Ok(())
+}
+
+/// A self-swap (token_in == token_out) is a clean adapter error, never built or
+/// run against the pool (would otherwise revert in-EVM).
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
+    let pool = Address::repeat_byte(0xc4);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            dai,
+            dai,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("self-swap must error");
+    assert_eq!(err, SimError::Custom("Curve token_in == token_out".into()));
+    assert!(asserter.read_q().is_empty(), "must not touch the backend");
+    Ok(())
+}
+
+/// A reverting Curve pool surfaces `SimError::Reverted` (sibling-consistent with
+/// the V2/V3/Balancer/Solidly reverting-target tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
+    let pool = Address::repeat_byte(0xc5);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(&mut cache, pool, REVERT_RUNTIME);
+
+    let adapter = CurveAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![dai, usdc],
+            discovered_slots: vec![U256::ZERO],
+        }));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            dai,
+            usdc,
             U256::from(1_000_u64),
             &SimConfig::default(),
         )
