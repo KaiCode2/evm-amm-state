@@ -62,6 +62,23 @@ sol! {
     }
 }
 
+sol! {
+    // Tricrypto-NG (Curve's newest crypto pools) events — EXTENDED forms with
+    // extra `fee`/`packed_price_scale` fields, so their signature hashes differ
+    // from CryptoSwap v2's. All verified on-chain against tricryptoUSDC + USDT
+    // (eth_getLogs topic0 histogram). `RemoveLiquidity` is identical to v2 (so it
+    // reuses `CurveCryptoSwapEvents::RemoveLiquidity`). `ClaimAdminFee` is routed
+    // because `claim_admin_fees` can update D/price_scale (the crypto read-set).
+    // Arities are derived from n_coins at routing time; these N=3 decls are the
+    // `#[cfg(test)]` reference + the TokenExchange decode-validation type.
+    interface CurveTricryptoNgEvents {
+        event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought, uint256 fee, uint256 packed_price_scale);
+        event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply, uint256 packed_price_scale);
+        event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount, uint256 approx_fee, uint256 packed_price_scale);
+        event ClaimAdminFee(address indexed admin, uint256 tokens);
+    }
+}
+
 /// The `dx` used by the cold-start discover call.
 ///
 /// Its magnitude is irrelevant: `get_dy` SLOADs the full balance set +
@@ -112,6 +129,15 @@ fn crypto_add_liquidity_topic(n_coins: usize) -> B256 {
     keccak256(format!("AddLiquidity(address,uint256[{n_coins}],uint256,uint256)").as_bytes())
 }
 
+/// The Tricrypto-NG `AddLiquidity` topic hash for an `n_coins`-coin pool:
+/// `uint256[N]` token_amounts + fee + token_supply + packed_price_scale (3
+/// trailing scalars) — distinct from CryptoSwap v2's single-fee form.
+fn crypto_ng_add_liquidity_topic(n_coins: usize) -> B256 {
+    keccak256(
+        format!("AddLiquidity(address,uint256[{n_coins}],uint256,uint256,uint256)").as_bytes(),
+    )
+}
+
 /// Topic hashes this adapter routes for an `n_coins`-coin pool of `variant`. All
 /// signatures verified on-chain (docs/curve-slice3-liquidity-events-spec.md).
 ///
@@ -124,10 +150,19 @@ fn crypto_add_liquidity_topic(n_coins: usize) -> B256 {
 /// **CryptoSwap** (Curve v2): `TokenExchange(uint256…)` + the CryptoSwap liquidity
 /// events — single-fee `AddLiquidity` and fees-array-less `RemoveLiquidity` (both
 /// fixed-`uint256[N]`) + the 3-arg `RemoveLiquidityOne`. (No RemoveLiquidityImbalance.)
+///
+/// **CryptoSwapNG** (Tricrypto-NG): the EXTENDED events — 7-arg `TokenExchange`,
+/// 5-arg `AddLiquidity` (extra `packed_price_scale`), 6-arg `RemoveLiquidityOne`,
+/// the shared fees-array-less `RemoveLiquidity`, and `ClaimAdminFee` (routed
+/// because `claim_admin_fees` can move D/price_scale).
 fn curve_event_topics(n_coins: usize, variant: CurveVariant) -> Vec<B256> {
     // 3-arg RemoveLiquidityOne (token_amount, coin_index, coin_amount): shared by
     // CryptoSwap v2 and StableSwap-NG.
     let remove_one_3arg = CurveCryptoSwapEvents::RemoveLiquidityOne::SIGNATURE_HASH;
+    // RemoveLiquidity (uint256[N] token_amounts, supply) is identical for CryptoSwap
+    // v2 and Tricrypto-NG.
+    let crypto_remove_liquidity =
+        |n: usize| keccak256(format!("RemoveLiquidity(address,uint256[{n}],uint256)").as_bytes());
     match variant {
         CurveVariant::CryptoSwap => {
             let mut topics = vec![
@@ -136,9 +171,19 @@ fn curve_event_topics(n_coins: usize, variant: CurveVariant) -> Vec<B256> {
             ];
             if n_coins >= 1 {
                 topics.push(crypto_add_liquidity_topic(n_coins));
-                topics.push(keccak256(
-                    format!("RemoveLiquidity(address,uint256[{n_coins}],uint256)").as_bytes(),
-                ));
+                topics.push(crypto_remove_liquidity(n_coins));
+            }
+            topics
+        }
+        CurveVariant::CryptoSwapNG => {
+            let mut topics = vec![
+                CurveTricryptoNgEvents::TokenExchange::SIGNATURE_HASH, // 7-arg
+                CurveTricryptoNgEvents::RemoveLiquidityOne::SIGNATURE_HASH, // 6-arg
+                CurveTricryptoNgEvents::ClaimAdminFee::SIGNATURE_HASH,
+            ];
+            if n_coins >= 1 {
+                topics.push(crypto_ng_add_liquidity_topic(n_coins)); // 5-arg
+                topics.push(crypto_remove_liquidity(n_coins)); // shared with v2
             }
             topics
         }
@@ -256,6 +301,28 @@ impl AmmAdapter for CurveAdapter {
                     AdapterEventKind::LiquidityRemoved
                 }
             }
+            CurveVariant::CryptoSwapNG => {
+                if topic0 == CurveTricryptoNgEvents::TokenExchange::SIGNATURE_HASH {
+                    if CurveTricryptoNgEvents::TokenExchange::decode_log_data_validate(&log.data)
+                        .is_err()
+                    {
+                        return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                            "malformed Curve Tricrypto-NG TokenExchange log",
+                        ));
+                    }
+                    AdapterEventKind::Swap
+                } else if topic0 == crypto_ng_add_liquidity_topic(n_coins) {
+                    AdapterEventKind::LiquidityAdded
+                } else if topic0 == CurveTricryptoNgEvents::ClaimAdminFee::SIGNATURE_HASH {
+                    // Admin-fee claim: a protocol-internal state update (can move
+                    // D / price_scale), routed conservatively -> resync. Not a
+                    // user swap or liquidity op, so the kind is Unknown.
+                    AdapterEventKind::Unknown
+                } else {
+                    // Tricrypto-NG RemoveLiquidity / RemoveLiquidityOne (6-arg).
+                    AdapterEventKind::LiquidityRemoved
+                }
+            }
             CurveVariant::StableSwap => {
                 if topic0 == TokenExchange::SIGNATURE_HASH {
                     if TokenExchange::decode_log_data_validate(&log.data).is_err() {
@@ -358,9 +425,10 @@ impl AmmAdapter for CurveAdapter {
             return Err(SimError::Custom("Curve token_in == token_out".into()));
         }
 
-        // The index ABI is the only variant axis: classic StableSwap (and NG)
-        // `get_dy` takes `int128` indices (the `sol!` macro maps `int128` to
-        // native `i128`); CryptoSwap (Curve v2) takes `uint256` indices. Both
+        // The index ABI is the only quote-axis: classic StableSwap (and
+        // StableSwap-NG) `get_dy` takes `int128` indices (the `sol!` macro maps
+        // `int128` to native `i128`); CryptoSwap v2 AND Tricrypto-NG both take
+        // `uint256` indices (they differ only in events, not the quote ABI). Both
         // run the pool's own `get_dy` against the warmed state and decode a bare
         // `uint256` output (no reimplemented AMM math).
         let dy = match pool_variant(pool) {
@@ -377,7 +445,7 @@ impl AmmAdapter for CurveAdapter {
                 get_dyCall::abi_decode_returns_validate(&output)
                     .map_err(|_| SimError::MalformedOutput("get_dy return"))?
             }
-            CurveVariant::CryptoSwap => {
+            CurveVariant::CryptoSwap | CurveVariant::CryptoSwapNG => {
                 let calldata = Bytes::from(
                     super::sim::CurveCryptoSwap::get_dyCall {
                         i: U256::from(i),
@@ -482,7 +550,8 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
                 }
                 .abi_encode(),
             ),
-            CurveVariant::CryptoSwap => Bytes::from(
+            // CryptoSwap v2 and Tricrypto-NG share the uint256 get_dy ABI.
+            CurveVariant::CryptoSwap | CurveVariant::CryptoSwapNG => Bytes::from(
                 super::sim::CurveCryptoSwap::get_dyCall {
                     i: U256::ZERO,
                     j: U256::from(1),
@@ -767,5 +836,60 @@ mod tests {
         // StableSwap routes BOTH RemoveLiquidityOne forms (classic 2-arg + NG 3-arg).
         assert!(stable.contains(&RemoveLiquidityOne::SIGNATURE_HASH));
         assert!(stable.contains(&remove_one_3arg));
+    }
+
+    // Tricrypto-NG derived liquidity topics must equal the sol! macro hashes
+    // (extended 5-arg AddLiquidity), and its EXTENDED event signatures must be
+    // distinct from both CryptoSwap v2 and StableSwap. All verified on-chain.
+    #[test]
+    fn cryptoswap_ng_derived_topics_match_sol_macro() {
+        assert_eq!(
+            crypto_ng_add_liquidity_topic(3),
+            CurveTricryptoNgEvents::AddLiquidity::SIGNATURE_HASH,
+            "derived Tricrypto-NG AddLiquidity hash must match the macro"
+        );
+        // NG TokenExchange (7-arg) differs from v2 (5-arg) and StableSwap (int128).
+        assert_ne!(
+            CurveTricryptoNgEvents::TokenExchange::SIGNATURE_HASH,
+            CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH,
+        );
+        assert_ne!(
+            CurveTricryptoNgEvents::TokenExchange::SIGNATURE_HASH,
+            TokenExchange::SIGNATURE_HASH,
+        );
+        // NG RemoveLiquidityOne (6-arg) differs from v2 (3-arg) and classic (2-arg).
+        assert_ne!(
+            CurveTricryptoNgEvents::RemoveLiquidityOne::SIGNATURE_HASH,
+            CurveCryptoSwapEvents::RemoveLiquidityOne::SIGNATURE_HASH,
+        );
+        // NG AddLiquidity (5-arg) differs from v2 (4-arg single-fee).
+        assert_ne!(
+            crypto_ng_add_liquidity_topic(3),
+            crypto_add_liquidity_topic(3)
+        );
+    }
+
+    // The Tricrypto-NG topic set routes its extended events + the shared
+    // RemoveLiquidity + ClaimAdminFee, and never the v2/StableSwap swap topics.
+    #[test]
+    fn cryptoswap_ng_topic_set_correct() {
+        let ng = curve_event_topics(3, CurveVariant::CryptoSwapNG);
+        for expected in [
+            CurveTricryptoNgEvents::TokenExchange::SIGNATURE_HASH,
+            crypto_ng_add_liquidity_topic(3),
+            keccak256("RemoveLiquidity(address,uint256[3],uint256)".as_bytes()), // shared w/ v2
+            CurveTricryptoNgEvents::RemoveLiquidityOne::SIGNATURE_HASH,
+            CurveTricryptoNgEvents::ClaimAdminFee::SIGNATURE_HASH,
+        ] {
+            assert!(
+                ng.contains(&expected),
+                "Tricrypto-NG set missing {expected:?}"
+            );
+        }
+        // No swap-topic cross-routing with v2 or StableSwap.
+        assert!(!ng.contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH));
+        assert!(!ng.contains(&TokenExchange::SIGNATURE_HASH));
+        // NG uses its own AddLiquidity shape, not v2's.
+        assert!(!ng.contains(&crypto_add_liquidity_topic(3)));
     }
 }
