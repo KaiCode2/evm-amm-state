@@ -25,9 +25,9 @@ use super::cold_start::AdapterColdStartPlanner;
 use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, run_quote};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
-    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    StateView, UnsupportedReason, UpdateQuality,
+    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant,
+    EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
+    SlotChange, StateView, UnsupportedReason, UpdateQuality,
 };
 
 sol! {
@@ -39,6 +39,21 @@ sol! {
     event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 token_supply);
     event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_amount);
     event RemoveLiquidityImbalance(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
+}
+
+sol! {
+    // CryptoSwap (Curve v2) swap event — the index fields are `uint256`, not the
+    // classic StableSwap `int128`, so its signature hash is DISTINCT from the
+    // StableSwap `TokenExchange` above. Namespaced under an interface so its
+    // generated type does not collide with the top-level int128 `TokenExchange`.
+    // Only the signature hash is used for topic routing; the payload is decode-
+    // validated before emitting a Swap (the reactive path resyncs discovered
+    // slots rather than applying the delta). CryptoSwap LIQUIDITY events are out
+    // of scope (their signatures differ across v2 generations — see the module
+    // non-goals); they are not routed here.
+    interface CurveCryptoSwapEvents {
+        event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought);
+    }
 }
 
 /// The `dx` used by the cold-start discover call.
@@ -63,6 +78,15 @@ fn pool_n_coins(pool: &PoolRegistration) -> usize {
     }
 }
 
+/// The Curve dialect for a registration, defaulting to `StableSwap` when the
+/// metadata is not Curve (e.g. `Unknown`) — the slice-1 / NG behavior.
+fn pool_variant(pool: &PoolRegistration) -> CurveVariant {
+    match &pool.metadata {
+        ProtocolMetadata::Curve(metadata) => metadata.variant,
+        _ => CurveVariant::StableSwap,
+    }
+}
+
 /// The `AddLiquidity` topic hash for an `n_coins`-coin pool.
 ///
 /// The `uint256[N]` array arity IS part of the canonical event signature, so the
@@ -77,33 +101,49 @@ fn add_liquidity_topic(n_coins: usize) -> B256 {
     )
 }
 
-/// Topic hashes this adapter routes for an `n_coins`-coin pool.
+/// Topic hashes this adapter routes for an `n_coins`-coin pool of `variant`.
 ///
-/// `TokenExchange(address,int128,uint256,int128,uint256)` and
-/// `RemoveLiquidityOne(address,uint256,uint256)` carry no array params, so their
-/// signature hashes are arity-independent and route for any pool (`TokenExchange`
-/// is the swap event, so swap-driven resync is always covered). The other three
-/// carry `uint256[N]` arrays, so their topic hashes are derived from `n_coins`.
-/// `n_coins == 0` (unconfigured) routes only the arity-independent topics.
-fn curve_event_topics(n_coins: usize) -> Vec<B256> {
-    let mut topics = vec![
-        TokenExchange::SIGNATURE_HASH,
-        RemoveLiquidityOne::SIGNATURE_HASH,
-    ];
-    if n_coins >= 1 {
-        topics.push(add_liquidity_topic(n_coins));
-        topics.push(keccak256(
-            format!("RemoveLiquidity(address,uint256[{n_coins}],uint256[{n_coins}],uint256)")
-                .as_bytes(),
-        ));
-        topics.push(keccak256(
-            format!(
-                "RemoveLiquidityImbalance(address,uint256[{n_coins}],uint256[{n_coins}],uint256,uint256)"
-            )
-            .as_bytes(),
-        ));
+/// **StableSwap** (classic + NG): `TokenExchange(address,int128,uint256,int128,
+/// uint256)` and `RemoveLiquidityOne(address,uint256,uint256)` carry no array
+/// params, so their signature hashes are arity-independent and route for any
+/// pool (`TokenExchange` is the swap event, so swap-driven resync is always
+/// covered). The other three carry `uint256[N]` arrays, so their topic hashes
+/// are derived from `n_coins`. `n_coins == 0` (unconfigured) routes only the
+/// arity-independent topics.
+///
+/// **CryptoSwap** (Curve v2): routes ONLY the CryptoSwap `TokenExchange`
+/// (`uint256` ids) — the dominant resync trigger. CryptoSwap liquidity events
+/// are out of scope (their signatures differ across v2 generations; see the
+/// module non-goals), so they are deliberately not routed; liquidity-driven
+/// staleness persists until the next swap.
+fn curve_event_topics(n_coins: usize, variant: CurveVariant) -> Vec<B256> {
+    match variant {
+        CurveVariant::CryptoSwap => {
+            vec![CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH]
+        }
+        CurveVariant::StableSwap => {
+            let mut topics = vec![
+                TokenExchange::SIGNATURE_HASH,
+                RemoveLiquidityOne::SIGNATURE_HASH,
+            ];
+            if n_coins >= 1 {
+                topics.push(add_liquidity_topic(n_coins));
+                topics.push(keccak256(
+                    format!(
+                        "RemoveLiquidity(address,uint256[{n_coins}],uint256[{n_coins}],uint256)"
+                    )
+                    .as_bytes(),
+                ));
+                topics.push(keccak256(
+                    format!(
+                        "RemoveLiquidityImbalance(address,uint256[{n_coins}],uint256[{n_coins}],uint256,uint256)"
+                    )
+                    .as_bytes(),
+                ));
+            }
+            topics
+        }
     }
-    topics
 }
 
 impl AmmAdapter for CurveAdapter {
@@ -113,9 +153,10 @@ impl AmmAdapter for CurveAdapter {
 
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
         let n_coins = pool_n_coins(pool);
+        let variant = pool_variant(pool);
         pool.key
             .address()
-            .map(|address| EventSource::direct(address, curve_event_topics(n_coins)))
+            .map(|address| EventSource::direct(address, curve_event_topics(n_coins, variant)))
             .into_iter()
             .collect()
     }
@@ -136,14 +177,18 @@ impl AmmAdapter for CurveAdapter {
             ));
         };
 
-        // Preserve the config-supplied coins across cold-start so `finish` can
-        // re-emit them alongside the discovered slots.
-        let coins = match &pool.metadata {
-            ProtocolMetadata::Curve(metadata) => metadata.coins.clone(),
-            _ => Vec::new(),
+        // Preserve the config-supplied coins + variant across cold-start so
+        // `finish` can re-emit them alongside the discovered slots. The variant
+        // also drives the discover call's `get_dy` ABI (a CryptoSwap pool
+        // reverts the int128 discover, which would be a spurious DiscoverFailed).
+        let (coins, variant) = match &pool.metadata {
+            ProtocolMetadata::Curve(metadata) => (metadata.coins.clone(), metadata.variant),
+            _ => (Vec::new(), CurveVariant::StableSwap),
         };
 
-        Ok(Box::new(CurveColdStartPlanner::new(address, coins, policy)))
+        Ok(Box::new(CurveColdStartPlanner::new(
+            address, coins, variant, policy,
+        )))
     }
 
     fn decode_event(
@@ -155,31 +200,52 @@ impl AmmAdapter for CurveAdapter {
         let Some(topic0) = log.topics().first().copied() else {
             return AdapterEventResult::ignored();
         };
-        // Route against the pool's ARITY-SPECIFIC topic set — the liquidity-event
-        // hashes depend on n_coins (the `uint256[N]` arity is part of the event
-        // signature), so a fixed-arity set would silently drop 2-/4-coin pools'
-        // liquidity events.
+        // Route against the pool's VARIANT- and ARITY-specific topic set. For
+        // StableSwap the liquidity-event hashes depend on n_coins (the
+        // `uint256[N]` arity is part of the event signature), so a fixed-arity
+        // set would silently drop 2-/4-coin pools' liquidity events. For
+        // CryptoSwap only the uint256-id `TokenExchange` is routed (liquidity
+        // events are out of scope; see `curve_event_topics`).
         let n_coins = pool_n_coins(pool);
-        if !curve_event_topics(n_coins).contains(&topic0) {
+        let variant = pool_variant(pool);
+        if !curve_event_topics(n_coins, variant).contains(&topic0) {
             return AdapterEventResult::ignored();
         }
 
-        // `TokenExchange` is the swap event; validate it decodes (a malformed log
-        // is a hard decode error, matching Balancer). The liquidity events route
-        // on topic only — their payloads are never decoded, since the reactive
-        // path resyncs the discovered slots rather than applying their deltas.
-        let kind = if topic0 == TokenExchange::SIGNATURE_HASH {
-            if TokenExchange::decode_log_data_validate(&log.data).is_err() {
-                return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                    "malformed Curve TokenExchange log",
-                ));
+        // `TokenExchange` is the swap event; validate it decodes against the
+        // variant's ABI (a malformed log is a hard decode error, matching
+        // Balancer). The StableSwap liquidity events route on topic only — their
+        // payloads are never decoded, since the reactive path resyncs the
+        // discovered slots rather than applying their deltas. CryptoSwap routes
+        // only its `TokenExchange`, so any matched topic there is the swap.
+        let kind = match variant {
+            CurveVariant::CryptoSwap => {
+                // The only routed CryptoSwap topic is its uint256-id
+                // TokenExchange; validate it decodes with the CryptoSwap event.
+                if CurveCryptoSwapEvents::TokenExchange::decode_log_data_validate(&log.data)
+                    .is_err()
+                {
+                    return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                        "malformed Curve CryptoSwap TokenExchange log",
+                    ));
+                }
+                AdapterEventKind::Swap
             }
-            AdapterEventKind::Swap
-        } else if topic0 == add_liquidity_topic(n_coins) {
-            AdapterEventKind::LiquidityAdded
-        } else {
-            // RemoveLiquidity / RemoveLiquidityOne / RemoveLiquidityImbalance.
-            AdapterEventKind::LiquidityRemoved
+            CurveVariant::StableSwap => {
+                if topic0 == TokenExchange::SIGNATURE_HASH {
+                    if TokenExchange::decode_log_data_validate(&log.data).is_err() {
+                        return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                            "malformed Curve TokenExchange log",
+                        ));
+                    }
+                    AdapterEventKind::Swap
+                } else if topic0 == add_liquidity_topic(n_coins) {
+                    AdapterEventKind::LiquidityAdded
+                } else {
+                    // RemoveLiquidity / RemoveLiquidityOne / RemoveLiquidityImbalance.
+                    AdapterEventKind::LiquidityRemoved
+                }
+            }
         };
 
         // A Curve event delta is not an exact absolute balance (`get_dy`'s
@@ -262,25 +328,44 @@ impl AmmAdapter for CurveAdapter {
 
         // A self-swap (same coin in and out) has no meaningful quote; reject it
         // cleanly rather than building a get_dy(i, i) call the pool would revert.
+        // (The token->index mapping and these guards are variant-INDEPENDENT.)
         if i == j {
             return Err(SimError::Custom("Curve token_in == token_out".into()));
         }
 
-        // Classic StableSwap `get_dy` takes `int128` indices (the `sol!` macro
-        // maps `int128` to native `i128`). CryptoSwap / StableSwap-NG use
-        // `uint256` indices — out of scope here (a future metadata flag).
-        let calldata = Bytes::from(
-            get_dyCall {
-                i: i as i128,
-                j: j as i128,
-                dx: amount_in,
+        // The index ABI is the only variant axis: classic StableSwap (and NG)
+        // `get_dy` takes `int128` indices (the `sol!` macro maps `int128` to
+        // native `i128`); CryptoSwap (Curve v2) takes `uint256` indices. Both
+        // run the pool's own `get_dy` against the warmed state and decode a bare
+        // `uint256` output (no reimplemented AMM math).
+        let dy = match pool_variant(pool) {
+            CurveVariant::StableSwap => {
+                let calldata = Bytes::from(
+                    get_dyCall {
+                        i: i as i128,
+                        j: j as i128,
+                        dx: amount_in,
+                    }
+                    .abi_encode(),
+                );
+                let output = run_quote(cache, pool_address, calldata)?;
+                get_dyCall::abi_decode_returns_validate(&output)
+                    .map_err(|_| SimError::MalformedOutput("get_dy return"))?
             }
-            .abi_encode(),
-        );
-
-        let output = run_quote(cache, pool_address, calldata)?;
-        let dy = get_dyCall::abi_decode_returns_validate(&output)
-            .map_err(|_| SimError::MalformedOutput("get_dy return"))?;
+            CurveVariant::CryptoSwap => {
+                let calldata = Bytes::from(
+                    super::sim::CurveCryptoSwap::get_dyCall {
+                        i: U256::from(i),
+                        j: U256::from(j),
+                        dx: amount_in,
+                    }
+                    .abi_encode(),
+                );
+                let output = run_quote(cache, pool_address, calldata)?;
+                super::sim::CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&output)
+                    .map_err(|_| SimError::MalformedOutput("CryptoSwap get_dy return"))?
+            }
+        };
         Ok(SwapQuote::new(dy))
     }
 }
@@ -321,6 +406,9 @@ struct CurveColdStartPlanner {
     pool: Address,
     /// Config-supplied coins, preserved across the run and re-emitted on `Ready`.
     coins: Vec<Address>,
+    /// Config-supplied Curve dialect; drives the discover `get_dy` ABI and is
+    /// re-emitted on `Ready` so reactive + later sims keep it.
+    variant: CurveVariant,
     policy: ColdStartPolicy,
     phase: CurvePhase,
     /// The pool slots discovered in round 1 and verified in round 2.
@@ -333,10 +421,16 @@ struct CurveColdStartPlanner {
 }
 
 impl CurveColdStartPlanner {
-    fn new(pool: Address, coins: Vec<Address>, policy: ColdStartPolicy) -> Self {
+    fn new(
+        pool: Address,
+        coins: Vec<Address>,
+        variant: CurveVariant,
+        policy: ColdStartPolicy,
+    ) -> Self {
         Self {
             pool,
             coins,
+            variant,
             policy,
             phase: CurvePhase::Discover,
             verified_slots: Vec::new(),
@@ -350,20 +444,34 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
     fn initial_plan(&mut self, _state: &dyn StateView) -> ColdStartPlan {
         // Round 1: ensure the pool's code, then run `get_dy(0, 1, DISCOVER_DX)`
         // and capture the slots it touches (restricted to the pool so only its
-        // own read-set is collected — plain pools are self-contained).
+        // own read-set is collected — plain pools are self-contained). The
+        // discover calldata MUST use the variant's `get_dy` ABI: a CryptoSwap
+        // pool reverts the int128 `get_dy`, which would mis-classify as a
+        // spurious DiscoverFailed.
+        let calldata = match self.variant {
+            CurveVariant::StableSwap => Bytes::from(
+                get_dyCall {
+                    i: 0i128,
+                    j: 1i128,
+                    dx: DISCOVER_DX,
+                }
+                .abi_encode(),
+            ),
+            CurveVariant::CryptoSwap => Bytes::from(
+                super::sim::CurveCryptoSwap::get_dyCall {
+                    i: U256::ZERO,
+                    j: U256::from(1),
+                    dx: DISCOVER_DX,
+                }
+                .abi_encode(),
+            ),
+        };
         ColdStartPlan {
             accounts: vec![self.pool],
             discover: vec![ColdStartCall {
                 from: Address::ZERO,
                 to: self.pool,
-                calldata: Bytes::from(
-                    get_dyCall {
-                        i: 0i128,
-                        j: 1i128,
-                        dx: DISCOVER_DX,
-                    }
-                    .abi_encode(),
-                ),
+                calldata,
                 restrict_to: Some(vec![self.pool]),
             }],
             ..Default::default()
@@ -499,6 +607,9 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
                 pool.metadata = ProtocolMetadata::Curve(CurveMetadata {
                     coins: self.coins.clone(),
                     discovered_slots,
+                    // Persist the config-supplied variant so the reactive path
+                    // and later sims keep the correct `get_dy` / event ABI.
+                    variant: self.variant,
                 });
                 pool.status = PoolStatus::Ready;
                 report.status = PoolStatus::Ready;
@@ -518,7 +629,7 @@ mod tests {
     // (keccak is unforgiving), anchoring the dynamic derivation to the macro.
     #[test]
     fn derived_arity_3_topics_match_sol_macro_hashes() {
-        let t3 = curve_event_topics(3);
+        let t3 = curve_event_topics(3, CurveVariant::StableSwap);
         for expected in [
             TokenExchange::SIGNATURE_HASH,
             RemoveLiquidityOne::SIGNATURE_HASH,
@@ -540,9 +651,9 @@ mod tests {
     #[test]
     fn liquidity_topics_differ_per_arity() {
         let (t2, t3, t4) = (
-            curve_event_topics(2),
-            curve_event_topics(3),
-            curve_event_topics(4),
+            curve_event_topics(2, CurveVariant::StableSwap),
+            curve_event_topics(3, CurveVariant::StableSwap),
+            curve_event_topics(4, CurveVariant::StableSwap),
         );
         assert_ne!(t2, t3, "2-coin and 3-coin topic sets must differ");
         assert_ne!(t3, t4, "3-coin and 4-coin topic sets must differ");
@@ -553,9 +664,49 @@ mod tests {
         );
         // The arity-independent swap topic is present at every arity.
         for n in [0, 2, 3, 4] {
-            assert!(curve_event_topics(n).contains(&TokenExchange::SIGNATURE_HASH));
+            assert!(
+                curve_event_topics(n, CurveVariant::StableSwap)
+                    .contains(&TokenExchange::SIGNATURE_HASH)
+            );
         }
         // Unconfigured (n=0) routes only the two arity-independent topics.
-        assert_eq!(curve_event_topics(0).len(), 2);
+        assert_eq!(curve_event_topics(0, CurveVariant::StableSwap).len(), 2);
+    }
+
+    // The CryptoSwap (uint256-id) TokenExchange signature hash MUST differ from
+    // the classic StableSwap (int128-id) one — they are distinct ABIs, and a
+    // collision would route the wrong decode/validation. keccak is unforgiving.
+    #[test]
+    fn cryptoswap_token_exchange_topic_differs_from_stableswap() {
+        assert_ne!(
+            CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH,
+            TokenExchange::SIGNATURE_HASH,
+            "CryptoSwap (uint256 ids) and StableSwap (int128 ids) TokenExchange \
+             hashes must differ"
+        );
+    }
+
+    // The CryptoSwap topic set routes its own `TokenExchange` and NONE of the
+    // StableSwap topics (incl. the int128 TokenExchange) — CryptoSwap liquidity
+    // events are out of scope, and the swap topics must not cross-route.
+    #[test]
+    fn cryptoswap_topics_route_only_cryptoswap_token_exchange() {
+        let crypto = curve_event_topics(3, CurveVariant::CryptoSwap);
+        assert!(
+            crypto.contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH),
+            "CryptoSwap topic set must contain the CryptoSwap TokenExchange topic"
+        );
+        assert!(
+            !crypto.contains(&TokenExchange::SIGNATURE_HASH),
+            "CryptoSwap topic set must NOT contain the StableSwap TokenExchange topic"
+        );
+        // Only the one swap topic is routed (no liquidity events).
+        assert_eq!(crypto.len(), 1);
+        // Conversely, the StableSwap set must not contain the CryptoSwap topic.
+        assert!(
+            !curve_event_topics(3, CurveVariant::StableSwap)
+                .contains(&CurveCryptoSwapEvents::TokenExchange::SIGNATURE_HASH),
+            "StableSwap topic set must NOT contain the CryptoSwap TokenExchange topic"
+        );
     }
 }

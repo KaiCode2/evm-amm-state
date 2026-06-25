@@ -313,7 +313,20 @@ pub struct BalancerV2Metadata {
     pub balance_slots: Vec<U256>,
 }
 
-/// Metadata for a Curve StableSwap plain pool.
+/// Which Curve pool dialect a pool speaks — selects the `get_dy` / `TokenExchange`
+/// index ABI (the slice-1 vs slice-2 axis).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CurveVariant {
+    /// Classic StableSwap **and** StableSwap-NG: `get_dy(int128,int128,uint256)`
+    /// and `TokenExchange(address,int128,uint256,int128,uint256)`.
+    #[default]
+    StableSwap,
+    /// CryptoSwap (Curve v2, e.g. tricrypto): `get_dy(uint256,uint256,uint256)`
+    /// and `TokenExchange(address,uint256,uint256,uint256,uint256)`.
+    CryptoSwap,
+}
+
+/// Metadata for a Curve plain pool.
 ///
 /// `coins` is config-supplied (the pool's static coin ordering); it drives the
 /// `simulate_swap` token→index mapping for `get_dy`. `discovered_slots` is the
@@ -324,10 +337,14 @@ pub struct BalancerV2Metadata {
 /// `TokenExchange`/liquidity path re-verify exactly those slots (a resync),
 /// keeping cached state fresh for a later `simulate_swap`. Slot-only; all live
 /// on the pool address. Empty until cold-start runs.
+///
+/// `variant` selects the index ABI (`StableSwap`/NG use `int128`; `CryptoSwap`
+/// uses `uint256`). Defaults to `StableSwap` (slice-1 + NG behavior).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CurveMetadata {
     pub coins: Vec<Address>,
     pub discovered_slots: Vec<U256>,
+    pub variant: CurveVariant,
 }
 
 /// Lifecycle status for a tracked pool registration.

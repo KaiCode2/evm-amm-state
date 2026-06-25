@@ -23,7 +23,7 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
-    CurveAdapter, CurveMetadata, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
+    CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
     ProtocolMetadata, RepairAction, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter,
     UniswapV2Metadata, UniswapV3Adapter, UnsupportedReason, V3Metadata,
 };
@@ -1213,6 +1213,7 @@ async fn curve_cold_start_discover_verify_ready() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![dai, usdc, usdt],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
@@ -1275,6 +1276,7 @@ async fn curve_cold_start_reverting_discover_needs_repair() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
@@ -1320,6 +1322,7 @@ async fn curve_cold_start_failed_slot_needs_verify_repair() -> Result<()> {
         .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
             coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
             discovered_slots: Vec::new(),
+            variant: CurveVariant::StableSwap,
         }));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
@@ -1331,5 +1334,82 @@ async fn curve_cold_start_failed_slot_needs_verify_repair() -> Result<()> {
         "an unfetchable discovered slot must need a VerifySlots repair, got {outcome:?}"
     );
     assert_ne!(registration.status, PoolStatus::Ready);
+    Ok(())
+}
+
+// CryptoSwap (Curve v2) cold-start: same discover -> verify -> Ready machinery,
+// but the discover `get_dy` uses the uint256-index ABI. The generic mock returns
+// slot 0 for ANY selector, so it serves the uint256 ABI too; `finish` must
+// persist `variant: CryptoSwap` alongside the discovered slots and the
+// config-supplied coins.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cryptoswap_cold_start_discover_verify_ready_persists_variant() -> Result<()> {
+    let pool = Address::repeat_byte(0xc7);
+    let usdt = Address::repeat_byte(0x01);
+    let wbtc = Address::repeat_byte(0x02);
+    let weth = Address::repeat_byte(0x03);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(147_348_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((pool, U256::ZERO), fresh)]),
+        Vec::new(),
+    ));
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![usdt, wbtc, weth],
+            discovered_slots: Vec::new(),
+            variant: CurveVariant::CryptoSwap,
+        }));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "CryptoSwap discover->verify should reach Ready, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::Curve(ref m) => {
+            assert_eq!(
+                m.variant,
+                CurveVariant::CryptoSwap,
+                "cold-start must persist the CryptoSwap variant"
+            );
+            assert_eq!(
+                m.coins,
+                vec![usdt, wbtc, weth],
+                "config coins must be preserved across cold-start"
+            );
+            assert!(
+                m.discovered_slots.contains(&U256::ZERO),
+                "the CryptoSwap get_dy read-set slot 0 must be discovered, got {:?}",
+                m.discovered_slots
+            );
+        }
+        ref other => panic!("expected Curve metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        Some(fresh),
+        "verify round must refresh the discovered slot to the fresh value"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the cold start must be fully offline (no RPC)"
+    );
     Ok(())
 }
