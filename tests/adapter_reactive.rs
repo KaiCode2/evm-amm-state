@@ -2272,3 +2272,72 @@ async fn curve_ng_remove_liquidity_one_3arg_resyncs() -> Result<()> {
     );
     Ok(())
 }
+
+// Tricrypto-NG extended events — 7-arg TokenExchange, 5-arg AddLiquidity, 6-arg
+// RemoveLiquidityOne, and ClaimAdminFee (signatures verified on-chain against
+// tricryptoUSDC/USDT) — each route -> resync the discovered slot for a
+// CryptoSwapNG pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_tricrypto_ng_events_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0xc5);
+    let (usdc, wbtc, weth) = (
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        Address::repeat_byte(0x03),
+    );
+    let (mut cache, mut runtime) = curve_reactive_runtime(
+        pool,
+        vec![usdc, wbtc, weth],
+        CurveVariant::CryptoSwapNG,
+        U256::from(1_476_u64),
+    )
+    .await?;
+
+    // The 7-arg NG TokenExchange IS decode-validated (6 non-indexed uint256
+    // words); the others route on topic only. Six zero words satisfy all.
+    let topics = [
+        keccak256("TokenExchange(address,uint256,uint256,uint256,uint256,uint256,uint256)"),
+        keccak256("AddLiquidity(address,uint256[3],uint256,uint256,uint256)"),
+        keccak256("RemoveLiquidityOne(address,uint256,uint256,uint256,uint256,uint256)"),
+        keccak256("ClaimAdminFee(address,uint256)"),
+    ];
+    let logs: Vec<_> = topics
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let b = 80 + i as u64;
+            (
+                ReactiveInput::Log(rpc_log(
+                    pool,
+                    vec![*t, topic_address(usdc)],
+                    abi_words([U256::ZERO; 6]),
+                    b,
+                    0,
+                    0,
+                )),
+                included_context(b, 0),
+            )
+        })
+        .collect();
+    let report = runtime.ingest_batch_with_resync(&mut cache, batch(logs))?;
+
+    assert_eq!(
+        report.applied.len(),
+        4,
+        "all 4 Tricrypto-NG events must route"
+    );
+    for applied in &report.applied {
+        assert_eq!(applied.resyncs.len(), 1, "each NG event must resync");
+        let [ResyncTarget::StorageSlots { address, slots }] = applied.resyncs[0].targets.as_slice()
+        else {
+            panic!("expected a single storage-slots resync target");
+        };
+        assert_eq!(*address, pool);
+        assert_eq!(
+            slots,
+            &vec![U256::ZERO],
+            "resync must target the discovered slot"
+        );
+    }
+    Ok(())
+}

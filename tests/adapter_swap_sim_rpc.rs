@@ -89,6 +89,8 @@ const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
 // USDT/WBTC/WETH; get_dy uses uint256 indices (int128 reverts on this pool).
 const TRICRYPTO2: Address = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
 const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
+// Tricrypto-NG: tricryptoUSDC (USDC/WBTC/WETH) — uint256 get_dy like v2.
+const TRICRYPTO_USDC_NG: Address = address!("7F86Bf177Dd4F3494b841a37e810A34dD56c829B");
 
 // --- Solidly V2 (Aerodrome on Base) ---
 //
@@ -617,6 +619,85 @@ async fn curve_cryptoswap_simulate_swap_matches_eth_call() -> Result<()> {
     assert_eq!(
         sim.amount_out, truth,
         "Curve CryptoSwap sim amount_out must match eth_call get_dy"
+    );
+    Ok(())
+}
+
+/// Tricrypto-NG parity — same uint256 `get_dy` as CryptoSwap v2, but the
+/// CryptoSwapNG variant (its events differ; the quote path is shared). Cold-start
+/// tricryptoUSDC and assert `simulate_swap(USDC, WBTC, 1 USDC)` == `eth_call
+/// get_dy(0,1,1e6)` (probe ground truth at FORK_BLOCK: 1476).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires E2E_RPC_URL archive node; run with --ignored"]
+async fn curve_tricrypto_ng_simulate_swap_matches_eth_call() -> Result<()> {
+    let Some(url) = rpc_url() else {
+        eprintln!("E2E_RPC_URL unset; skipping");
+        return Ok(());
+    };
+
+    // 1 USDC in (6 decimals); USDC (coin 0) -> WBTC (coin 1).
+    let amount_in = U256::from(1_000_000_u64);
+
+    let mut cache = fork_cache(&url, FORK_BLOCK).await?;
+    let registry = {
+        let mut r = AdapterRegistry::new();
+        r.register_adapter(Arc::new(CurveAdapter::default()))?;
+        r
+    };
+    let mut registration = PoolRegistration::new(PoolKey::Curve(TRICRYPTO_USDC_NG))
+        .with_state_address(TRICRYPTO_USDC_NG)
+        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
+            coins: vec![USDC, WBTC, WETH],
+            discovered_slots: Vec::new(),
+            variant: CurveVariant::CryptoSwapNG,
+        }));
+    registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    let ProtocolMetadata::Curve(meta) = &registration.metadata else {
+        return Err(anyhow!("expected Curve metadata after cold-start"));
+    };
+    assert!(
+        !meta.discovered_slots.is_empty(),
+        "cold-start should discover the Tricrypto-NG get_dy read-set"
+    );
+    assert_eq!(
+        meta.variant,
+        CurveVariant::CryptoSwapNG,
+        "cold-start must preserve the CryptoSwapNG variant"
+    );
+
+    let adapter = CurveAdapter::default();
+    let sim = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            USDC,
+            WBTC,
+            amount_in,
+            &SimConfig::default(),
+        )
+        .map_err(|e| anyhow!("curve tricrypto-ng sim failed: {e}"))?;
+
+    let out = eth_call_at(
+        &url,
+        TRICRYPTO_USDC_NG,
+        Bytes::from(
+            CurveCryptoSwap::get_dyCall {
+                i: U256::ZERO,
+                j: U256::from(1),
+                dx: amount_in,
+            }
+            .abi_encode(),
+        ),
+        FORK_BLOCK,
+    )
+    .await?;
+    let truth = CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&out)?;
+
+    assert!(truth > U256::ZERO, "ground-truth quote should be non-zero");
+    assert_eq!(
+        sim.amount_out, truth,
+        "Tricrypto-NG sim amount_out must match eth_call get_dy"
     );
     Ok(())
 }

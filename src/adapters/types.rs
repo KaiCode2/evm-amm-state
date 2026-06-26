@@ -321,9 +321,14 @@ pub enum CurveVariant {
     /// and `TokenExchange(address,int128,uint256,int128,uint256)`.
     #[default]
     StableSwap,
-    /// CryptoSwap (Curve v2, e.g. tricrypto): `get_dy(uint256,uint256,uint256)`
+    /// CryptoSwap (Curve v2, e.g. tricrypto2): `get_dy(uint256,uint256,uint256)`
     /// and `TokenExchange(address,uint256,uint256,uint256,uint256)`.
     CryptoSwap,
+    /// Tricrypto-NG (Curve's newest crypto pools, e.g. tricryptoUSDC/USDT): the
+    /// SAME `uint256` `get_dy` as CryptoSwap, but EXTENDED events (a 7-arg
+    /// `TokenExchange` with `fee`/`packed_price_scale`, a 5-arg `AddLiquidity`, a
+    /// 6-arg `RemoveLiquidityOne`, plus `ClaimAdminFee`).
+    CryptoSwapNG,
 }
 
 /// Metadata for a Curve plain pool.
