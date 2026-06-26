@@ -9,8 +9,9 @@
 //!
 //! The pieces, roughly in pipeline order:
 //!
-//! - [`adapters`] — per-protocol adapters (Uniswap V2/V3, Balancer V2, …) over a
-//!   single [`adapters::AmmAdapter`] trait. Each adapter knows how to cold-start
+//! - [`adapters`] — per-protocol adapters (Uniswap V2, the Uniswap V3 family,
+//!   Balancer V2, Solidly V2, and Curve — StableSwap/NG + CryptoSwap/Tricrypto-NG)
+//!   over a single [`adapters::AmmAdapter`] trait. Each adapter knows how to cold-start
 //!   a pool's storage into an [`evm_fork_cache::cache::EvmCache`], which log
 //!   events to subscribe to, how to apply those events reactively, and how to
 //!   `simulate_swap` against the cached state. The
