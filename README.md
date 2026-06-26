@@ -1,169 +1,139 @@
 # evm-amm-state
 
-`evm-amm-state` is a real-time AMM state and routing engine, built to show how
-two companion crates compose into something larger:
+`evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
+cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
+their on-chain state into the cache, keeps them current **purely from chain log
+events** (no RPC in the hot path), and runs fast, **fully-offline swap
+simulations** against the live-synced state.
 
-- [`evm-fork-cache`] — a forked-EVM state cache, and
-- [`amm-math`] — deterministic, RPC-free pool math.
-
-Together they let you track a set of AMMs, keep them current from chain events,
-and run fast, parallel, fully-offline swap simulations against them — for
-example, searching for 3-leg arbitrage the moment a pool updates.
+The defining design choice: **no reimplemented AMM math.** Every quote runs the
+pool's *own* canonical on-chain quote entrypoint inside a local revm against the
+warmed cache (e.g. Uniswap `QuoterV2`, Curve `get_dy`), then decodes the result.
+There is no `LocalAMM`/`amm-math` formula layer to drift from the real contracts.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
-[`amm-math`]: https://github.com/KaiCode2/amm-math
 
 ## The pipeline
 
-| Stage | Module | What it does |
-| --- | --- | --- |
-| Model | [`amm_wrapper`] | `LocalAMM`, one enum over every pool type implementing the `amms` `AutomatedMarketMaker` trait. |
-| Load | [`configured_amms`] | Initialize a working set of pools from an `EvmCache`, from code or (optionally) `amms.toml`. |
-| Sync | [`cache_sync`] | Initialize and incrementally refresh each pool family from forked storage, incl. adaptive V3 tick scanning. |
-| React | [`events`] | Apply swap / liquidity logs to pools in place (no RPC), then optionally mirror the new state back into the cache. |
-| Route | [`routing`] | Enumerate and evaluate multi-leg routes (e.g. triangular arbitrage) over an immutable snapshot, in parallel and offline. |
-| Discover | [`discovery`] | Find pools for caller-supplied token pairs from configured factories. |
+Each protocol is a single [`AmmAdapter`] implementation; the
+[`AdapterRegistry`] dispatches by pool key.
 
-[`amm_wrapper`]: src/amm_wrapper.rs
-[`configured_amms`]: src/configured_amms.rs
-[`cache_sync`]: src/cache_sync/mod.rs
-[`events`]: src/events/mod.rs
-[`routing`]: src/routing/mod.rs
-[`discovery`]: src/discovery.rs
+| Stage | What it does |
+| --- | --- |
+| **Register** | Describe a pool: a [`PoolKey`] + [`ProtocolMetadata`] (tokens, fee, storage layout / coins, …). |
+| **Cold-start** | `registry.cold_start(pool, cache, policy)` warms the pool's read-set into the [`EvmCache`] from forked storage. Named-slot protocols (Uniswap V2/V3, Solidly) warm known slots; layout-free protocols (Balancer, Curve) **discover → verify** the exact slots a quote call SLOADs. |
+| **Subscribe** | `adapter.event_sources(pool)` lists the log topics to subscribe to over a `wss://` endpoint. |
+| **React** | Decoded logs flow through [`AmmReactiveHandler`] + the `evm_fork_cache` reactive runtime, updating cached state with **no RPC**. Some protocols event-source exact writes (Uniswap V2/Solidly `Sync` carry absolute reserves); others re-verify the affected slots (Balancer/Curve events carry deltas, so the runtime refetches just those slots). |
+| **Simulate** | `adapter.simulate_swap(pool, cache, token_in, token_out, amount_in, &config)` executes the pool's own quote against the cached state and returns a [`SwapQuote`] — fully offline. |
 
-## What it provides
+[`AmmAdapter`]: src/adapters/traits.rs
+[`AdapterRegistry`]: src/adapters/registry.rs
+[`AmmReactiveHandler`]: src/adapters/reactive.rs
+[`PoolKey`]: src/adapters/types.rs
+[`ProtocolMetadata`]: src/adapters/types.rs
+[`EvmCache`]: https://github.com/KaiCode2/evm-fork-cache
+[`SwapQuote`]: src/adapters/sim.rs
 
-- A unified `LocalAMM` enum for Uniswap V2, Uniswap V3, PancakeSwap V3,
-  Balancer V2/V3, Curve (stable & crypto), Solidly V2, Slipstream, ERC4626, and
-  a Uniswap V4 stub — all simulated through one trait.
-- Forked-state initialization and incremental refresh from
-  `evm_fork_cache::cache::EvmCache`, including V3 slot0/liquidity/tick sync with
-  adaptive bitmap scanning and snapshotting.
-- Event-driven updates: decode `Sync` / `Swap` / `Mint` / `Burn` /
-  `TokenExchange` / vault `Swap` / `Deposit` / `Withdraw` logs and apply them to
-  the matching pool in memory, with cache mirroring for EVM-level consistency.
-- Offline, parallel multi-leg routing with optimal-size search, built on the
-  pure pool math so it runs deterministically with no RPC.
-- Programmatic *or* TOML-driven AMM configuration (TOML is an optional,
-  default-on feature).
-- Factory discovery for caller-provided token pairs.
+## Supported protocols
 
-## Features
+| Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
+| --- | --- | --- | --- | --- |
+| Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
+| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + adaptive multi-word tick scan | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
+| Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`) | `Swap` → balance-slot resync |
+| Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
+| **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
-| Feature | Default | Effect |
-| --- | --- | --- |
-| `toml` | on | Parse AMM definitions from an `amms.toml` file. Without it, build `AmmConfigEntry` values in code and use the `*_from_entries` loaders; the `toml` crate is not pulled in. |
-
-## Crate boundaries
-
-This crate owns generic AMM state, synchronization, and routing primitives. It
-deliberately does **not** contain transaction signing, broadcasting, or bundle
-submission, nor any application-specific strategy scheduling. Standard view
-interfaces are declared locally with `alloy_sol_types::sol!`, so the crate
-builds from source without a generated bindings crate.
+All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
+for the Curve adapter in depth.
 
 ## Quickstart
 
-Define a working set of pools in code — no config file required — and simulate a
-swap entirely offline once they're loaded:
+Register a pool, cold-start it into a forked cache, and simulate a swap entirely
+offline once warmed:
 
 ```rust,ignore
 use std::sync::Arc;
 
-use alloy_primitives::{Address, U256, address};
-use alloy_provider::{ProviderBuilder, network::AnyNetwork};
-use amms::amms::amm::AutomatedMarketMaker;
+use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_network::AnyNetwork;
+use alloy_primitives::{U256, address};
+use alloy_provider::{Provider, RootProvider};
 use evm_fork_cache::cache::EvmCache;
-use evm_amm_state::configured_amms::{AmmConfigEntry, AmmType, load_configured_amms_from_entries};
+use evm_amm_state::adapters::{
+    AdapterRegistry, AmmAdapter, ColdStartPolicy, PoolKey, PoolRegistration,
+    ProtocolMetadata, SimConfig, UniswapV3Adapter, V3Metadata,
+};
+use evm_amm_state::adapters::storage::V3StorageLayout;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // AnyNetwork is required by the EvmCache backend (foundry-fork-db).
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .network::<AnyNetwork>()
-            .connect_http("https://eth.llamarpc.com".parse()?),
-    );
-    let mut cache = EvmCache::new(provider, None).await; // None = latest block
+    let provider = Arc::new(RootProvider::<AnyNetwork>::connect("https://eth.llamarpc.com").await?);
+    let block = provider.get_block_number().await?;
+    let mut cache = EvmCache::at_block(provider, BlockId::Number(BlockNumberOrTag::Number(block))).await;
 
-    let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"); // USDC/WETH 0.05%
 
-    let entries = vec![
-        AmmConfigEntry::new(AmmType::UniswapV3, address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"))
-            .with_tokens(vec![usdc, weth])
-            .with_fee_tier(500),
-    ];
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
 
-    let amms = load_configured_amms_from_entries(&mut cache, &entries, Address::ZERO).await?;
+    let mut reg = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
+            token0: Some(usdc),
+            token1: Some(weth),
+            fee: Some(500),
+            tick_spacing: Some(10),
+            storage_layout: Some(V3StorageLayout::uniswap(10)),
+        }));
+    registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
 
-    for amm in amms.values().flatten() {
-        let out = amm.simulate_swap(weth, usdc, U256::from(10).pow(U256::from(18)))?;
-        println!("1 WETH -> {out} USDC (raw)");
-    }
+    // Offline from here: no RPC needed to quote.
+    let out = UniswapV3Adapter::default().simulate_swap(
+        &reg, &mut cache, usdc, weth, U256::from(1_000_000_u64), &SimConfig::default(),
+    )?;
+    println!("1 USDC -> {} WETH (raw)", out.amount_out);
     Ok(())
 }
 ```
 
-The same pools can instead be loaded from `amms.toml` (with the `toml` feature)
-via `load_configured_amms` / `load_amm_config_entries`.
-
-### React to events, then search for arbitrage
-
-```rust,ignore
-use evm_amm_state::events::EventRouter;
-use evm_amm_state::routing::find_triangular_arbitrage;
-
-let router = EventRouter::from_loaded(amms);
-
-// Subscribe to the topics the tracked pools emit.
-let filter = alloy_rpc_types_eth::Filter::new()
-    .event_signature(router.subscription_topics());
-let mut stream = provider.subscribe_logs(&filter).await?.into_stream();
-
-while let Some(log) = stream.next().await {
-    if router.apply(&log)?.is_some() {
-        // Pools now reflect the event. Search an immutable snapshot in parallel.
-        let snapshot = router.snapshot();
-        if let Some(arb) = find_triangular_arbitrage(&snapshot, weth, min_in, max_in) {
-            println!("arb: in {} -> out {} (profit {})", arb.amount_in, arb.amount_out, arb.profit);
-        }
-    }
-}
-```
-
-## Examples
-
-| Example | Needs a node? | Shows |
-| --- | --- | --- |
-| `triangular_arbitrage` | no | The full event → snapshot → parallel offline 3-leg search loop on synthetic pools. The best starting point. |
-| `programmatic_loading` | HTTP | Building `AmmConfigEntry` in code and loading from a fork. |
-| `toml_loading` | HTTP | Loading the same pools from `examples/amms.toml`. |
-| `event_subscription` | WebSocket | A live subscription updating pools and the cache per event. |
+The full **cold-start → WebSocket subscribe → react → simulate** loop is in
+[`examples/adapter_pipeline.rs`](examples/adapter_pipeline.rs):
 
 ```bash
-# Fully offline — always runnable:
-cargo run --example triangular_arbitrage
-
-# Against a node:
-ETH_RPC_URL=https://eth.llamarpc.com cargo run --example programmatic_loading
-ETH_RPC_URL=https://eth.llamarpc.com cargo run --example toml_loading
-ETH_WS_URL=wss://your-node cargo run --example event_subscription
+ETH_WS_URL=wss://your-node cargo run --example adapter_pipeline
+# or derive wss:// from an https endpoint:
+E2E_RPC_URL=https://your-archive-node cargo run --example adapter_pipeline
 ```
 
-## Benchmarks
+## Crate boundaries
 
-Offline benchmarks for the latency-sensitive paths (single-pool simulation,
-event apply, and the parallel triangular search):
-
-```bash
-cargo bench
-```
+This crate owns generic AMM state loading, event-driven synchronization, and
+offline swap simulation. It deliberately does **not** contain transaction
+signing/broadcasting, strategy scheduling, or multi-leg arbitrage routing (the
+legacy routing layer was removed; it is rebuildable on top of `simulate_swap`).
+Standard view interfaces are declared locally with `alloy_sol_types::sol!`, so
+the crate builds from source with no generated bindings crate.
 
 ## Testing
 
 ```bash
-cargo test
+cargo test                       # unit + offline integration tests
+cargo test --no-default-features # protocol-neutral core
+```
+
+Network-dependent tests are env-gated and `#[ignore]`d. With an archive RPC they
+pin a block, cold-start a real pool, and assert `simulate_swap` **equals the
+on-chain quote** at the same block (`eth_call`), plus a live WebSocket soak that
+keeps state in sync from events only:
+
+```bash
+# RPC parity (mainnet pools; Base for Solidly via host-swap):
+E2E_RPC_URL=<archive-url> cargo test --test adapter_swap_sim_rpc -- --ignored
+# Live WS soak (Uniswap V2, and Curve across all dialects):
+E2E_RPC_URL=<archive-url> cargo test --test reactive_ws_e2e --test reactive_curve_ws_e2e -- --ignored --nocapture
 ```
 
 ## License

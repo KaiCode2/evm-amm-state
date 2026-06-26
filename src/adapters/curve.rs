@@ -1,19 +1,36 @@
-//! Curve StableSwap (plain pool) adapter — slice 1.
+//! Curve plain-pool adapter (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG).
 //!
-//! See `docs/curve-stableswap-adapter-spec.md`. The closest analog is
-//! [`BalancerV2Adapter`](super::balancer_v2::BalancerV2Adapter): a
-//! discover→verify cold-start (Curve has no predictable balance-slot layout, so
-//! the planner captures the SLOAD set of a `get_dy` call rather than naming
-//! slots up front) and a resync-on-event reactive path (`TokenExchange` /
-//! liquidity events carry deltas, not absolute balances, so re-verify the
-//! discovered slots instead of doing lossy delta arithmetic). Swap simulation
-//! calls the pool's own `get_dy(i, j, dx)` — no reimplemented StableSwap math.
+//! See [`docs/curve-adapter.md`] for the full guide. The closest analog is
+//! [`BalancerV2Adapter`](super::balancer_v2::BalancerV2Adapter): a discover→verify
+//! cold-start (Curve has no predictable balance-slot layout, so the planner
+//! captures the SLOAD set of a `get_dy` call rather than naming slots up front)
+//! and a resync-on-event reactive path (Curve events carry deltas, not absolute
+//! balances, so re-verify the discovered slots instead of lossy delta math). Swap
+//! simulation calls the pool's own `get_dy` — no reimplemented Curve math.
 //!
-//! Scope (slice 1): classic StableSwap **plain pools** with a self-contained
-//! `get_dy(int128 i, int128 j, uint256 dx)`. Deferred (documented non-goals):
-//! CryptoSwap (Curve v2) / StableSwap-NG (which use `uint256` indices), and
-//! metapools / lending pools whose `get_dy` makes external calls (the
-//! `restrict_to=[pool]` discover capture would be incomplete for them).
+//! ## Dialects ([`CurveVariant`])
+//!
+//! All four supported dialects are **plain pools** (self-contained `get_dy`); a
+//! per-pool [`CurveVariant`] selects the `get_dy` index ABI and the event set.
+//! The variant axes are independent:
+//!
+//! | Variant | `get_dy` indices | `TokenExchange` | Liquidity events |
+//! | --- | --- | --- | --- |
+//! | `StableSwap` (classic **and** NG) | `int128` | `int128` ids | fixed `uint256[N]` arrays; both 2-arg (classic) and 3-arg (NG) `RemoveLiquidityOne` |
+//! | `CryptoSwap` (Curve v2, e.g. tricrypto2) | `uint256` | `uint256` ids (5-arg) | single-fee `AddLiquidity`, 3-arg `RemoveLiquidityOne` (no imbalance) |
+//! | `CryptoSwapNG` (Tricrypto-NG) | `uint256` | extended 7-arg | extended 5-arg `AddLiquidity`, 6-arg `RemoveLiquidityOne`, `ClaimAdminFee` |
+//!
+//! StableSwap and StableSwap-NG share the `int128` quote path (they differ only
+//! in the 3-arg `RemoveLiquidityOne`, routed by both). CryptoSwap v2 and
+//! Tricrypto-NG share the `uint256` quote path (they differ only in events). All
+//! event signatures were verified on-chain before routing.
+//!
+//! ## Out of scope
+//!
+//! Metapools and lending pools, whose `get_dy` makes external calls — the
+//! `restrict_to=[pool]` discover capture would miss the base pool's slots.
+//!
+//! [`docs/curve-adapter.md`]: https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-adapter.md
 
 use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use alloy_sol_types::{SolCall, SolEvent, sol};
