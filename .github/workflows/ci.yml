@@ -7,9 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The companion crates (amm-math, evm-fork-cache) are consumed as git
-  # dependencies from private repos, so cargo must fetch them with the git CLI
-  # (which honours the credential rewrite configured below).
+  # The companion crate (evm-fork-cache) is consumed as a git dependency from a
+  # private repo, so cargo must fetch it with the git CLI (which honours the
+  # credential rewrite configured below).
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
@@ -19,11 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Required while the companion crates live in PRIVATE repos. Add a repo
+      # Required while the companion crate lives in a PRIVATE repo. Add a repo
       # secret `PRIVATE_REPO_TOKEN` = a PAT (or fine-grained token) with read
-      # access to KaiCode2/amm-math and KaiCode2/evm-fork-cache. Once those
-      # crates are published to crates.io and the Cargo.toml deps switch to
-      # plain `version = "..."`, this step can be removed.
+      # access to KaiCode2/evm-fork-cache. Once that crate is published to
+      # crates.io and the Cargo.toml dep switches to a plain `version = "..."`,
+      # this step (and CARGO_NET_GIT_FETCH_WITH_CLI above) can be removed — see
+      # RELEASING.md.
       - name: Authenticate git for private companion crates
         run: |
           git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
@@ -39,40 +40,104 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets --no-deps -- -D warnings
-
-      # Adapter-only layer must lint cleanly without amms / amm-math / rayon.
-      - name: Clippy (adapters only)
-        run: cargo clippy --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2 --all-targets --no-deps -- -D warnings
+      # Lint the whole surface together: every protocol adapter (incl. the
+      # PancakeSwap V3 / Slipstream family flags, which are not in `default`).
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
       # Bare adapter build (no protocol adapters) must also compile/lint.
       - name: Clippy (no default features)
         run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
 
-      # Fail if the adapter-only build pulls in a simulation/search dependency.
-      - name: Verify adapter-only build is heavy-dep-free
+      # The crate is adapters-only (the legacy simulation/search path was cut),
+      # so no build should pull in the old heavy deps. Guard against a
+      # regression that re-introduces them.
+      - name: Verify build is heavy-dep-free
         run: |
-          if cargo tree -e normal --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2 \
+          if cargo tree -e normal --all-features \
               | grep -E '(amms|amm-math|rayon) v[0-9]'; then
-            echo "::error::adapter-only build unexpectedly pulled amms/amm-math/rayon"
+            echo "::error::build unexpectedly pulled amms/amm-math/rayon"
             exit 1
           fi
-          echo "adapter-only build pulls no amms/amm-math/rayon"
+          echo "build pulls no amms/amm-math/rayon"
 
-      - name: Tests
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Tests (default features)
         run: cargo test
-
-      # Run the adapter integration tests without the heavy simulation deps.
-      - name: Tests (adapters only)
-        run: cargo test --no-default-features --features adapters,uniswap-v2,uniswap-v3,balancer-v2
 
       - name: Tests (no default features)
         run: cargo test --no-default-features
 
-      # Docs build on the full default feature set (crate-doc links reference
-      # simulation modules); keep this on default features.
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
+  # together, which can mask a protocol whose code/imports are not correctly
+  # `#[cfg]`-gated on its own feature (a `--features <one-protocol>` build then
+  # fails even though the all-features build is green — exactly the class of bug
+  # the Solidly adapter audit caught). Building/linting each protocol adapter on
+  # its own surfaces that immediately. Clippy `--all-targets` compiles the lib
+  # plus any target whose `required-features` are satisfied by the isolated set
+  # (e.g. the single-protocol `reactive_ws_e2e` / `reactive_curve_ws_e2e` tests
+  # and the `adapter_pipeline` example — desirable extra lint coverage);
+  # multi-protocol integration tests whose `required-features` exceed the
+  # isolated set are skipped, so their behaviour coverage stays in the
+  # all-features `cargo test` above.
+  isolation:
+    name: clippy (isolated · ${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - uniswap-v2
+          - uniswap-v3
+          - pancake-v3
+          - slipstream
+          - balancer-v2
+          - solidly-v2
+          - curve
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate git for private companion crates
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (adapters + ${{ matrix.feature }} only)
+        run: cargo clippy --no-default-features --features adapters,${{ matrix.feature }} --all-targets --no-deps -- -D warnings
+
+  # Guard the declared MSRV (Cargo.toml `rust-version`). The `stable` jobs above
+  # use whatever stable is current, so without this a >1.88 API or a dep MSRV
+  # bump would pass CI yet break downstream consumers pinned to 1.88. `check`
+  # (not test) keeps it cheap; it is the build that the MSRV claim is about.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate git for private companion crates
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        run: cargo check --all-features
