@@ -67,6 +67,10 @@ alloy-transport = "1.0.38"
 # Examples/tests subscribe to a live node over WebSockets; enable the pubsub transport.
 alloy-provider = { version = "1.0.38", features = ["ws"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+# Benchmark harness. `default-features = false` drops criterion's `rayon` +
+# `plotters` deps — keeps the build lean and, since the crate deliberately ships
+# without rayon, avoids reintroducing it even in the dev/bench build.
+criterion = { version = "0.5", default-features = false }
 
 # Runnable adapters-path demo: register -> cold-start -> WS event subscribe ->
 # reactive apply -> simulate_swap. Env-gated; no-ops if the RPC/WS URL is unset.
@@ -107,3 +111,19 @@ required-features = ["uniswap-v2"]
 [[test]]
 name = "reactive_curve_ws_e2e"
 required-features = ["curve"]
+
+# RPC-warmed micro-benchmarks for the offline hot path (simulate_swap per
+# protocol + reactive event apply). Env-gated: no-ops without E2E_RPC_URL.
+[[bench]]
+name = "swap_sim"
+harness = false
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
+
+# End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
+[[example]]
+name = "arbitrage_cross_dex"
+required-features = ["uniswap-v2", "uniswap-v3", "curve"]
+
+[[example]]
+name = "arbitrage_triangular"
+required-features = ["uniswap-v3", "curve"]

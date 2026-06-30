@@ -108,12 +108,43 @@ ETH_WS_URL=wss://your-node cargo run --example adapter_pipeline
 E2E_RPC_URL=https://your-archive-node cargo run --example adapter_pipeline
 ```
 
+### Arbitrage examples
+
+Two end-to-end examples show the canonical use case — pricing swaps across many
+pools offline to find and size a dislocation. Both warm real pools from an
+archive node, then quote entirely offline:
+
+```bash
+# Cross-DEX: quote USDC/WETH across Uniswap V2, V3, and Curve; find the best
+# buy + sell venue and price the round trip.
+E2E_RPC_URL=<archive-url> cargo run --example arbitrage_cross_dex
+# Triangular: walk USDC -> USDT (Curve 3pool) -> WETH (Curve tricrypto2)
+# -> USDC (Uniswap V3) and price the cycle.
+E2E_RPC_URL=<archive-url> cargo run --example arbitrage_triangular
+```
+
+See [`examples/arbitrage_cross_dex.rs`](examples/arbitrage_cross_dex.rs) and
+[`examples/arbitrage_triangular.rs`](examples/arbitrage_triangular.rs).
+
+## Performance
+
+Once warmed, a quote is a fully-offline revm execution of the pool's own quote
+entrypoint: **~8–9 µs** for constant-product pools (Uniswap V2, Solidly) and
+**~40–85 µs** for the heavier Curve / Balancer / Uniswap V3 quotes, on an M1 Pro.
+Applying a `Sync` event is **~250 ns**. That is `eth_call`-grade correctness
+(it runs the real bytecode) at roughly **1000× lower latency than an RPC
+`eth_call`**, with no reimplemented math to drift. Full methodology, the
+per-protocol table, and a comparison to other approaches are in
+[`docs/benchmarks.md`](docs/benchmarks.md); reproduce with
+`E2E_RPC_URL=<archive-url> cargo bench --bench swap_sim`.
+
 ## Crate boundaries
 
 This crate owns generic AMM state loading, event-driven synchronization, and
 offline swap simulation. It deliberately does **not** contain transaction
 signing/broadcasting, strategy scheduling, or multi-leg arbitrage routing (the
-legacy routing layer was removed; it is rebuildable on top of `simulate_swap`).
+legacy routing layer was removed; it is rebuildable on top of `simulate_swap` —
+the arbitrage examples above show exactly that).
 Standard view interfaces are declared locally with `alloy_sol_types::sol!`, so
 the crate builds from source with no generated bindings crate.
 
