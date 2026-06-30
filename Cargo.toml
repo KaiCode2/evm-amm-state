@@ -11,6 +11,19 @@ readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-amm-state"
 documentation = "https://docs.rs/evm-amm-state"
 
+# Ship a lean crate: keep src + runnable examples + the user-facing guides
+# (docs/benchmarks.md, docs/curve-adapter.md), drop the internal test suite,
+# CI config, maintainer docs, and the superseded per-slice/phase design specs.
+# (gitignore-style patterns, relative to the package root.)
+exclude = [
+    "tests/",
+    ".github/",
+    "ROADMAP.md",
+    "RELEASING.md",
+    "docs/*-spec.md",
+    "docs/phase-*.md",
+]
+
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]
