@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
     let from = to.saturating_sub(lookback);
 
     println!(
-        "trace_resync_latency: endpoint={url}, search_blocks={from}..={to}, iterations={iterations}"
+        "trace_resync_latency: endpoint={}, search_blocks={from}..={to}, iterations={iterations}",
+        redact_url(&url)
     );
 
     let Some(log) = find_recent_curve_exchange(provider.clone(), from, to).await? else {
@@ -296,4 +297,14 @@ fn median_duration(samples: &[(Duration, usize, usize)]) -> Duration {
         .get(durations.len() / 2)
         .copied()
         .unwrap_or_default()
+}
+
+fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or(rest);
+            format!("{scheme}://{host}/...")
+        }
+        None => "<redacted>".to_string(),
+    }
 }
