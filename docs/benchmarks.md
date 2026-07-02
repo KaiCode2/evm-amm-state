@@ -103,6 +103,28 @@ Interpretation:
   `debug_traceBlockByNumber` integration should populate it from traces, avoiding
   the view-call discover round and keeping the one-shot refresh path.
 
+### Event-time trace resync
+
+[`examples/trace_resync_latency.rs`](../examples/trace_resync_latency.rs)
+measures the live reactive repair path for a real Curve 3pool event:
+
+```bash
+E2E_RPC_URL=<https-mainnet-rpc> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
+```
+
+The example finds a recent `TokenExchange`, cold-starts the pool at the previous
+block to establish `discovered_slots`, then ingests that historical log through
+`AmmSyncEngine` in two modes:
+
+- **trace-only:** storage fallback returns errors, so success proves the block
+  trace supplied all changed requested slots;
+- **storage-fallback:** trace is disabled, so the configured storage batch
+  fetcher refreshes the known read-set at the event block.
+
+Provider support for `debug_traceBlockByHash` varies. If the trace-only row
+reports failures, that endpoint did not supply enough trace data for the chosen
+event and the production path would rely on the storage fallback instead.
+
 ## How this compares to other tools
 
 Three broad approaches exist for "what does this pool quote?" They trade

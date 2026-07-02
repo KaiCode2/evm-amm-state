@@ -14,6 +14,7 @@ pub mod sim;
 pub mod state;
 pub mod storage;
 pub mod storage_sync;
+pub mod sync_manager;
 pub mod traits;
 pub mod types;
 
@@ -49,6 +50,7 @@ pub use storage_sync::{
     decode_storage_sync, run_and_inject_storage_sync, run_and_inject_storage_syncs,
     run_storage_sync, run_storage_syncs, slot_loader_calldata, storage_sync_spec_for_pool,
 };
+pub use sync_manager::{AmmSyncBatchReport, AmmSyncEngine, AmmSyncError};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,

@@ -118,6 +118,10 @@ name = "adapter_reactive"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
 [[test]]
+name = "adapter_sync_manager"
+required-features = ["curve"]
+
+[[test]]
 name = "cold_start_adoption"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
@@ -172,6 +176,12 @@ required-features = ["uniswap-v3"]
 [[example]]
 name = "sync_latency"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
+
+# Live event-time resync comparison for a real Curve event: trace-only resync
+# versus forced storage-fetch fallback. Env-gated by endpoint availability.
+[[example]]
+name = "trace_resync_latency"
+required-features = ["curve"]
 
 # End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
 [[example]]

@@ -6,12 +6,12 @@
 //!      slots into the cache from forked storage (no further RPC needed to read
 //!      them back).
 //!   3. **Subscribe** to the pool's `Sync` logs over a `wss://` endpoint and
-//!      **apply them reactively** through the real reactive runtime, mutating
-//!      the cached reserves in place with zero storage refetch.
+//!      **apply them reactively** through the resync-capable AMM runtime,
+//!      mutating the cached reserves in place with zero storage refetch.
 //!   4. **`simulate_swap`** against the live-synced cached state.
 //!
 //! This is the same plumbing exercised by `tests/reactive_ws_e2e.rs`
-//! (`EvmCache` + `AdapterRegistry` + `AmmReactiveHandler` + `simulate_swap`),
+//! (`EvmCache` + `AdapterRegistry` + `AmmSyncEngine` + `simulate_swap`),
 //! packaged as a runnable demo.
 //!
 //! Endpoint: set `ETH_WS_URL` to a `wss://`/`ws://` URL, or `E2E_RPC_URL` to an
@@ -28,20 +28,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_network::{AnyNetwork, Ethereum};
+use alloy_network::AnyNetwork;
 use alloy_primitives::{Address, U256, address, keccak256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{Filter, Log as RpcLog};
 use anyhow::{Context, Result, anyhow};
 use evm_amm_state::adapters::storage::V2_RESERVES_SLOT;
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartPolicy, PoolKey, PoolRegistration,
+    AdapterRegistry, AmmAdapter, AmmSyncEngine, ColdStartPolicy, PoolKey, PoolRegistration,
     ProtocolMetadata, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
-    BlockRef, ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput,
-    ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
+    BlockRef, ChainStatus, InputSource, ReactiveContext, ReactiveInput, ReactiveInputBatch,
+    ReactiveInputRecord,
 };
 use futures::StreamExt;
 
@@ -155,8 +155,7 @@ async fn main() -> Result<()> {
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
     registry.register_pool(registration.clone().with_event_sources(sources))?;
-    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
-    runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
+    let mut sync = AmmSyncEngine::new(registry)?;
 
     // Subscribe topic-only to all Uniswap-V2 `Sync` events; the reactive handler
     // routes each log by address, so only the registered pair's Syncs are
@@ -183,8 +182,8 @@ async fn main() -> Result<()> {
                     ReactiveInput::Log(log),
                     ctx,
                 )]);
-                let report = runtime.ingest_batch(&mut cache, batch)?;
-                if !report.applied.is_empty() {
+                let report = sync.ingest_batch(&mut cache, batch)?;
+                if !report.reactive.applied.is_empty() {
                     applied += 1;
                     last_block = block_n;
                     let r = cached_reserves(&cache);

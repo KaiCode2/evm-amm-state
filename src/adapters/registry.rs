@@ -59,6 +59,10 @@ impl AdapterRegistry {
         self.pools.get(key)
     }
 
+    pub fn pool_mut(&mut self, key: &PoolKey) -> Option<&mut PoolRegistration> {
+        self.pools.get_mut(key)
+    }
+
     pub fn pools(&self) -> impl Iterator<Item = &PoolRegistration> {
         self.pools.values()
     }

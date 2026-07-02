@@ -23,11 +23,12 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | **Register** | Describe a pool: a [`PoolKey`] + [`ProtocolMetadata`] (tokens, fee, storage layout / coins, …). |
 | **Cold-start** | `registry.cold_start(pool, cache, policy)` warms the pool's read-set into the [`EvmCache`] from forked storage. Named-slot protocols (Uniswap V2/V3, Solidly) warm known slots; layout-free protocols (Balancer, Curve) **discover → verify** the exact slots a quote call SLOADs. |
 | **Subscribe** | `adapter.event_sources(pool)` lists the log topics to subscribe to over a `wss://` endpoint. |
-| **React** | Decoded logs flow through [`AmmReactiveHandler`] + the `evm_fork_cache` reactive runtime, updating cached state with **no RPC**. Some protocols event-source exact writes (Uniswap V2/Solidly `Sync` carry absolute reserves); others re-verify the affected slots (Balancer/Curve events carry deltas, so the runtime refetches just those slots). |
+| **React** | Decoded logs flow through [`AmmSyncEngine`] / [`AmmReactiveHandler`] + the `evm_fork_cache` reactive runtime. Exact-write protocols update cached state with **no RPC**; protocols whose logs do not carry final storage values emit hash-pinned resync requests that `evm-fork-cache` resolves from block traces, bulk storage, or point-read fallback. |
 | **Simulate** | `adapter.simulate_swap(pool, cache, token_in, token_out, amount_in, &config)` executes the pool's own quote against the cached state and returns a [`SwapQuote`] — fully offline. |
 
 [`AmmAdapter`]: src/adapters/traits.rs
 [`AdapterRegistry`]: src/adapters/registry.rs
+[`AmmSyncEngine`]: src/adapters/sync_manager.rs
 [`AmmReactiveHandler`]: src/adapters/reactive.rs
 [`PoolKey`]: src/adapters/types.rs
 [`ProtocolMetadata`]: src/adapters/types.rs
@@ -120,6 +121,25 @@ ETH_WS_URL=wss://your-node cargo run --example adapter_pipeline
 E2E_RPC_URL=https://your-archive-node cargo run --example adapter_pipeline
 ```
 
+Live sync should use [`AmmSyncEngine`] or, if wiring the upstream runtime
+manually, `ReactiveRuntime::ingest_batch_with_resync`. Plain `ingest_batch`
+decodes and applies direct writes only; it reports Balancer/Curve/V3 repair
+requests without executing the trace/storage resync phase. The boundary and
+fallback policy are documented in
+[`docs/trace-backed-sync.md`](docs/trace-backed-sync.md).
+
+```mermaid
+flowchart LR
+    A["AMM log"] --> B["Adapter decode"]
+    B --> C{"Event carries final values?"}
+    C -->|yes| D["StateUpdate directly into EvmCache"]
+    C -->|no| E["ResyncRequest for known slots"]
+    E --> F["evm-fork-cache: block trace first"]
+    F --> G["bulk storage / point fallback if unresolved"]
+    D --> H["post-block cached state"]
+    G --> H
+```
+
 ### Arbitrage examples
 
 Two end-to-end examples show the canonical use case — pricing swaps across many
@@ -184,6 +204,14 @@ Live public-RPC measurements on July 2, 2026, showed Balancer and Curve refreshe
 dropping from discover→verify cold-starts around 330–350 ms to one-shot storage
 programs around 80–95 ms once their read-set metadata is known. See
 [`docs/benchmarks.md`](docs/benchmarks.md) for the full table and caveats.
+
+For event-time repair specifically, [`examples/trace_resync_latency.rs`](examples/trace_resync_latency.rs)
+compares a real Curve event through `AmmSyncEngine` with trace-only resync versus
+forced storage-fetch fallback:
+
+```bash
+E2E_RPC_URL=<https endpoint> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
+```
 
 ## Performance
 
