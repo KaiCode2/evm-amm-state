@@ -103,6 +103,12 @@ impl From<anyhow::Error> for CacheError {
     }
 }
 
+impl From<evm_fork_cache::CacheError> for CacheError {
+    fn from(err: evm_fork_cache::CacheError) -> Self {
+        Self::Backend(err.to_string())
+    }
+}
+
 /// Cache facade used by protocol adapters.
 pub trait AdapterCache: StateView {
     fn cached_storage(&self, address: Address, slot: U256) -> Option<U256>;

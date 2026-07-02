@@ -62,6 +62,9 @@ impl From<ColdStartPlan> for evm_fork_cache::cold_start::ColdStartPlan {
             probe: plan.probe,
             accounts: plan.accounts,
             discover: plan.discover.into_iter().map(Into::into).collect(),
+            // Root-only account probes (0.2.0, Phase-8 root baseline) are not
+            // yet part of the adapter planner vocabulary.
+            probe_roots: Vec::new(),
         }
     }
 }
@@ -321,6 +324,12 @@ impl From<evm_fork_cache::cold_start::ColdStartError> for ColdStartError {
         use evm_fork_cache::cold_start::ColdStartError as Upstream;
         match err {
             Upstream::NoBatchFetcher => ColdStartError::NoBatchFetcher,
+            // Root-only probes need the 0.2.0 account-proof fetcher; the
+            // adapter planners never declare them, so surface the precondition
+            // as a fetch-layer failure rather than widening the public enum.
+            Upstream::NoAccountProofFetcher => {
+                ColdStartError::Fetch("cold-start requires an account proof fetcher".to_string())
+            }
             Upstream::RoundBudgetExceeded { max_rounds } => {
                 ColdStartError::RoundBudgetExceeded { max_rounds }
             }

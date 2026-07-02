@@ -27,6 +27,8 @@ pub mod solidly_v2;
 pub mod uniswap_v2;
 #[cfg(feature = "uniswap-v3")]
 pub mod uniswap_v3;
+#[cfg(feature = "uniswap-v3")]
+pub mod v3_sync;
 
 pub use cache::{
     AdapterCache, CacheError, CallOutcome, PurgeScope, SkippedDelta, SkippedMask, SlotChange,

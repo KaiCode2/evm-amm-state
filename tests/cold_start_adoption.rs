@@ -14,7 +14,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::storage::{
@@ -46,24 +46,26 @@ fn fetcher_with_failures(
     fail: Vec<(Address, U256)>,
 ) -> StorageBatchFetchFn {
     let fail: HashSet<(Address, U256)> = fail.into_iter().collect();
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(address, slot)| {
-                    if fail.contains(&(address, slot)) {
-                        (address, slot, Err(anyhow!("archive miss")))
-                    } else {
-                        (
-                            address,
-                            slot,
-                            Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
-                        )
-                    }
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(address, slot)| {
+                if fail.contains(&(address, slot)) {
+                    (
+                        address,
+                        slot,
+                        Err(evm_fork_cache::StorageFetchError::custom("archive miss")),
+                    )
+                } else {
+                    (
+                        address,
+                        slot,
+                        Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
+                    )
+                }
+            })
+            .collect()
+    })
 }
 
 fn token_slot_word(addr: Address) -> U256 {

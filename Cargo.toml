@@ -52,10 +52,11 @@ curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 experimental-protocols = []
 
 [dependencies]
-# Companion crate, published on crates.io. The cold-start module and reactive
-# runtime this crate builds on (added via evm-fork-cache#12, formerly only on the
-# `cold-start-sync` branch) shipped in the public 0.1.0 release.
-evm-fork-cache = "0.1"
+# Companion crate. Tracks the local 0.2.0 working copy (bulk storage
+# extraction as the default loader, custom storage programs, typed errors);
+# the path dependency is dropped automatically by `cargo publish` once 0.2.0
+# ships to crates.io.
+evm-fork-cache = { version = "0.2.0", path = "../evm-fork-cache" }
 
 alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
 
@@ -78,6 +79,11 @@ tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 [dev-dependencies]
 alloy-rpc-client = "1.0.38"
 alloy-transport = "1.0.38"
+alloy-transport-http = "1.0.38"
+# Gzip-capable HTTP client for the v3_full_sync example: sync-program
+# responses are hundreds of KB of nonzero storage words and compress ~3x
+# (see evm-fork-cache/docs/bulk-storage-extraction.md).
+reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
 # Examples/tests subscribe to a live node over WebSockets; enable the pubsub transport.
 alloy-provider = { version = "1.0.38", features = ["ws"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
@@ -127,6 +133,17 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 name = "adapter_swap_sim_rpc"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
+# Offline revm execution of the generated V3 one-shot sync programs.
+[[test]]
+name = "v3_sync"
+required-features = ["uniswap-v3"]
+
+# Live parity for the one-shot V3 sync (env-gated, #[ignore]): state, quote,
+# and partial-window equivalence against on-chain ground truth.
+[[test]]
+name = "v3_full_sync_rpc"
+required-features = ["uniswap-v3"]
+
 [[test]]
 name = "reactive_ws_e2e"
 required-features = ["uniswap-v2"]
@@ -141,6 +158,13 @@ required-features = ["curve"]
 name = "swap_sim"
 harness = false
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
+
+# One-shot V3 full-pool sync via a generated eth_call storage program:
+# the whole tick range + observation ring in a single call, quote-parity
+# checked against the classic windowed cold start (env-gated).
+[[example]]
+name = "v3_full_sync"
+required-features = ["uniswap-v3"]
 
 # End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
 [[example]]

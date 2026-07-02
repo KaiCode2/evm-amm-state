@@ -119,17 +119,15 @@ async fn setup_cache() -> Result<EvmCache> {
 }
 
 fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(address, slot)| {
-                    let value = values.get(&(address, slot)).copied().unwrap_or_default();
-                    (address, slot, Ok(value))
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(address, slot)| {
+                let value = values.get(&(address, slot)).copied().unwrap_or_default();
+                (address, slot, Ok(value))
+            })
+            .collect()
+    })
 }
 
 fn v2_registry(pool: Address, store_sources: bool) -> AdapterRegistry {

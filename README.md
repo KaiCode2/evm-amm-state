@@ -39,7 +39,7 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
-| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius) | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
+| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`) | `Swap` → balance-slot resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
@@ -137,6 +137,29 @@ E2E_RPC_URL=<archive-url> cargo run --example arbitrage_triangular
 
 See [`examples/arbitrage_cross_dex.rs`](examples/arbitrage_cross_dex.rs) and
 [`examples/arbitrage_triangular.rs`](examples/arbitrage_triangular.rs).
+
+### One-shot V3 full-pool sync
+
+The [`v3_sync`](src/adapters/v3_sync.rs) module generates a ~360-byte EVM
+program (tick spacing and storage layout baked in as immediates) that is
+injected over a pool's code via an `eth_call` state override
+([`evm-fork-cache`'s bulk-storage transport]) and walks the **entire** tick
+bitmap *inside the EVM* — returning statics, every initialized tick's four
+info words, and the whole observation ring in **one call with zero calldata**.
+Live-measured on the USDC/WETH 0.05% pool: 1,563 ticks + 723 observations →
+7,674 slots injected in ~140 ms for 26 CU (vs ~153k CU as point reads), after
+which a hard multi-tick-crossing quote runs in **~5 ms with zero lazy
+fetches** (vs ~2 s paging ticks over RPC on a windowed cache). A
+calldata-driven **partial** variant refreshes selected bitmap-word ranges
+(the planner-window shape, or dense spacing-1 pools in chunks).
+
+```bash
+E2E_RPC_URL=<https endpoint> cargo run --release --example v3_full_sync
+# live parity suite (state, quote, and partial-window equivalence):
+E2E_RPC_URL=<archive-url> cargo test --test v3_full_sync_rpc -- --ignored
+```
+
+[`evm-fork-cache`'s bulk-storage transport]: https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/bulk-storage-extraction.md
 
 ## Performance
 
