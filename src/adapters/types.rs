@@ -8,6 +8,7 @@ use super::cache::{SlotChange, StateDiff, StateUpdate};
 use super::storage::{SolidlyStorageLayout, V3StorageLayout};
 
 /// Protocol family identifier for adapter registrations.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProtocolId {
     UniswapV2,
@@ -16,14 +17,18 @@ pub enum ProtocolId {
     Slipstream,
     SolidlyV2,
     BalancerV2,
+    #[cfg(feature = "experimental-protocols")]
     BalancerV3,
     Curve,
+    #[cfg(feature = "experimental-protocols")]
     Erc4626,
+    #[cfg(feature = "experimental-protocols")]
     UniswapV4,
     Custom(&'static str),
 }
 
 /// Protocol-specific pool identity.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PoolKey {
     UniswapV2(Address),
@@ -32,9 +37,12 @@ pub enum PoolKey {
     Slipstream(Address),
     SolidlyV2(Address),
     BalancerV2(B256),
+    #[cfg(feature = "experimental-protocols")]
     BalancerV3(Address),
     Curve(Address),
+    #[cfg(feature = "experimental-protocols")]
     Erc4626(Address),
+    #[cfg(feature = "experimental-protocols")]
     UniswapV4(B256),
     Custom(CustomPoolKey),
 }
@@ -49,9 +57,12 @@ impl PoolKey {
             Self::Slipstream(_) => ProtocolId::Slipstream,
             Self::SolidlyV2(_) => ProtocolId::SolidlyV2,
             Self::BalancerV2(_) => ProtocolId::BalancerV2,
+            #[cfg(feature = "experimental-protocols")]
             Self::BalancerV3(_) => ProtocolId::BalancerV3,
             Self::Curve(_) => ProtocolId::Curve,
+            #[cfg(feature = "experimental-protocols")]
             Self::Erc4626(_) => ProtocolId::Erc4626,
+            #[cfg(feature = "experimental-protocols")]
             Self::UniswapV4(_) => ProtocolId::UniswapV4,
             Self::Custom(key) => key.protocol(),
         }
@@ -65,32 +76,37 @@ impl PoolKey {
             | Self::PancakeV3(address)
             | Self::Slipstream(address)
             | Self::SolidlyV2(address)
-            | Self::BalancerV3(address)
-            | Self::Curve(address)
-            | Self::Erc4626(address) => Some(*address),
+            | Self::Curve(address) => Some(*address),
+            #[cfg(feature = "experimental-protocols")]
+            Self::BalancerV3(address) | Self::Erc4626(address) => Some(*address),
             Self::Custom(key) => key.address(),
-            Self::BalancerV2(_) | Self::UniswapV4(_) => None,
+            Self::BalancerV2(_) => None,
+            #[cfg(feature = "experimental-protocols")]
+            Self::UniswapV4(_) => None,
         }
     }
 
     /// Return the bytes32 identity for bytes32-keyed pools.
     pub fn bytes32(&self) -> Option<B256> {
         match self {
-            Self::BalancerV2(id) | Self::UniswapV4(id) => Some(*id),
+            Self::BalancerV2(id) => Some(*id),
+            #[cfg(feature = "experimental-protocols")]
+            Self::UniswapV4(id) => Some(*id),
             Self::Custom(key) => key.bytes32(),
             Self::UniswapV2(_)
             | Self::UniswapV3(_)
             | Self::PancakeV3(_)
             | Self::Slipstream(_)
             | Self::SolidlyV2(_)
-            | Self::BalancerV3(_)
-            | Self::Curve(_)
-            | Self::Erc4626(_) => None,
+            | Self::Curve(_) => None,
+            #[cfg(feature = "experimental-protocols")]
+            Self::BalancerV3(_) | Self::Erc4626(_) => None,
         }
     }
 }
 
 /// Extension point for protocol-specific pool key shapes.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomPoolKey {
     Address {
@@ -133,6 +149,7 @@ impl CustomPoolKey {
 }
 
 /// One log emitter and routing rule for a tracked pool.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventSource {
     pub emitter: Address,
@@ -184,6 +201,7 @@ pub enum EventRoute {
 }
 
 /// Per-pool sidecar registration owned by `evm-amm-state`.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct PoolRegistration {
     pub key: PoolKey,
@@ -240,6 +258,7 @@ impl PoolRegistration {
 }
 
 /// Protocol metadata known for a tracked pool.
+#[non_exhaustive]
 #[derive(Clone, Default)]
 pub enum ProtocolMetadata {
     #[default]
@@ -270,6 +289,7 @@ impl fmt::Debug for ProtocolMetadata {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UniswapV2Metadata {
     pub token0: Option<Address>,
@@ -277,6 +297,27 @@ pub struct UniswapV2Metadata {
     pub fee_bps: Option<u32>,
 }
 
+impl UniswapV2Metadata {
+    /// Set the pool's `token0` address.
+    pub fn with_token0(mut self, token0: Address) -> Self {
+        self.token0 = Some(token0);
+        self
+    }
+
+    /// Set the pool's `token1` address.
+    pub fn with_token1(mut self, token1: Address) -> Self {
+        self.token1 = Some(token1);
+        self
+    }
+
+    /// Set the swap fee in basis points (e.g. `30` = 0.30%).
+    pub fn with_fee_bps(mut self, fee_bps: u32) -> Self {
+        self.fee_bps = Some(fee_bps);
+        self
+    }
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct V3Metadata {
     pub token0: Option<Address>,
@@ -284,8 +325,55 @@ pub struct V3Metadata {
     pub fee: Option<u32>,
     pub tick_spacing: Option<i32>,
     pub storage_layout: Option<V3StorageLayout>,
+    /// The ± radius, in tick-bitmap words, of the cold-start tick-warm window
+    /// around the current word (`Strict`/`Eager` policies).
+    ///
+    /// `None` uses the crate default (`V3_TICK_WORD_RADIUS`, currently 2).
+    /// `Some(0)` warms only the current word. Larger values pre-warm more tick
+    /// data so wider tick-crossing swaps stay fully offline, at higher
+    /// cold-start cost.
+    pub warm_word_radius: Option<i16>,
 }
 
+impl V3Metadata {
+    /// Set the pool's `token0` address.
+    pub fn with_token0(mut self, token0: Address) -> Self {
+        self.token0 = Some(token0);
+        self
+    }
+
+    /// Set the pool's `token1` address.
+    pub fn with_token1(mut self, token1: Address) -> Self {
+        self.token1 = Some(token1);
+        self
+    }
+
+    /// Set the pool fee in hundredths of a bip (e.g. `500` = 0.05%).
+    pub fn with_fee(mut self, fee: u32) -> Self {
+        self.fee = Some(fee);
+        self
+    }
+
+    /// Set the pool's tick spacing.
+    pub fn with_tick_spacing(mut self, tick_spacing: i32) -> Self {
+        self.tick_spacing = Some(tick_spacing);
+        self
+    }
+
+    /// Set the pool's V3 storage layout descriptor.
+    pub fn with_storage_layout(mut self, storage_layout: V3StorageLayout) -> Self {
+        self.storage_layout = Some(storage_layout);
+        self
+    }
+
+    /// Set the cold-start tick-warm ± word radius (see field docs).
+    pub fn with_warm_word_radius(mut self, warm_word_radius: i16) -> Self {
+        self.warm_word_radius = Some(warm_word_radius);
+        self
+    }
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SolidlyV2Metadata {
     pub token0: Option<Address>,
@@ -296,6 +384,33 @@ pub struct SolidlyV2Metadata {
     pub storage_layout: Option<SolidlyStorageLayout>,
 }
 
+impl SolidlyV2Metadata {
+    /// Set the pool's `token0` address.
+    pub fn with_token0(mut self, token0: Address) -> Self {
+        self.token0 = Some(token0);
+        self
+    }
+
+    /// Set the pool's `token1` address.
+    pub fn with_token1(mut self, token1: Address) -> Self {
+        self.token1 = Some(token1);
+        self
+    }
+
+    /// Set whether the pool is stable (`true`) or volatile (`false`).
+    pub fn with_stable(mut self, stable: bool) -> Self {
+        self.stable = Some(stable);
+        self
+    }
+
+    /// Set the pool's Solidly storage layout descriptor.
+    pub fn with_storage_layout(mut self, storage_layout: SolidlyStorageLayout) -> Self {
+        self.storage_layout = Some(storage_layout);
+        self
+    }
+}
+
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BalancerV2Metadata {
     pub vault: Option<Address>,
@@ -313,8 +428,35 @@ pub struct BalancerV2Metadata {
     pub balance_slots: Vec<U256>,
 }
 
+impl BalancerV2Metadata {
+    /// Set the Balancer `Vault` address.
+    pub fn with_vault(mut self, vault: Address) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    /// Set the pool's own contract address.
+    pub fn with_pool_address(mut self, pool_address: Address) -> Self {
+        self.pool_address = Some(pool_address);
+        self
+    }
+
+    /// Set (replace) the pool's token list.
+    pub fn with_tokens(mut self, tokens: impl IntoIterator<Item = Address>) -> Self {
+        self.tokens = tokens.into_iter().collect();
+        self
+    }
+
+    /// Set (replace) the discovered vault balance storage slots.
+    pub fn with_balance_slots(mut self, balance_slots: impl IntoIterator<Item = U256>) -> Self {
+        self.balance_slots = balance_slots.into_iter().collect();
+        self
+    }
+}
+
 /// Which Curve pool dialect a pool speaks — selects the `get_dy` / `TokenExchange`
 /// index ABI (the slice-1 vs slice-2 axis).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CurveVariant {
     /// Classic StableSwap **and** StableSwap-NG: `get_dy(int128,int128,uint256)`
@@ -345,6 +487,7 @@ pub enum CurveVariant {
 ///
 /// `variant` selects the index ABI (`StableSwap`/NG use `int128`; `CryptoSwap`
 /// uses `uint256`). Defaults to `StableSwap` (slice-1 + NG behavior).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CurveMetadata {
     pub coins: Vec<Address>,
@@ -352,7 +495,31 @@ pub struct CurveMetadata {
     pub variant: CurveVariant,
 }
 
+impl CurveMetadata {
+    /// Set (replace) the pool's static coin ordering.
+    pub fn with_coins(mut self, coins: impl IntoIterator<Item = Address>) -> Self {
+        self.coins = coins.into_iter().collect();
+        self
+    }
+
+    /// Set (replace) the discovered storage read-set slots.
+    pub fn with_discovered_slots(
+        mut self,
+        discovered_slots: impl IntoIterator<Item = U256>,
+    ) -> Self {
+        self.discovered_slots = discovered_slots.into_iter().collect();
+        self
+    }
+
+    /// Set the Curve pool dialect (index ABI) variant.
+    pub fn with_variant(mut self, variant: CurveVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+}
+
 /// Lifecycle status for a tracked pool registration.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PoolStatus {
     #[default]
@@ -365,6 +532,7 @@ pub enum PoolStatus {
 }
 
 /// Adapter-derived semantic event and cache mutations.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterEvent {
     pub pool: PoolKey,
@@ -376,7 +544,43 @@ pub struct AdapterEvent {
     pub repair: RepairAction,
 }
 
+impl AdapterEvent {
+    /// Construct an event with no state updates and no repair; chain
+    /// [`with_updates`](Self::with_updates) / [`with_repair`](Self::with_repair)
+    /// to add them.
+    pub fn new(
+        pool: PoolKey,
+        emitter: Address,
+        topic0: B256,
+        kind: AdapterEventKind,
+        quality: UpdateQuality,
+    ) -> Self {
+        Self {
+            pool,
+            emitter,
+            topic0,
+            kind,
+            updates: Vec::new(),
+            quality,
+            repair: RepairAction::None,
+        }
+    }
+
+    /// Set the cache mutations this event emits.
+    pub fn with_updates(mut self, updates: impl IntoIterator<Item = StateUpdate>) -> Self {
+        self.updates = updates.into_iter().collect();
+        self
+    }
+
+    /// Set the follow-up repair action for this event.
+    pub fn with_repair(mut self, repair: RepairAction) -> Self {
+        self.repair = repair;
+        self
+    }
+}
+
 /// Structured result of routing, decoding, and applying one adapter event.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterEventReport {
     pub pool: PoolKey,
@@ -386,6 +590,7 @@ pub struct AdapterEventReport {
 }
 
 /// High-level AMM event class.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AdapterEventKind {
     Swap,
@@ -398,6 +603,7 @@ pub enum AdapterEventKind {
 }
 
 /// Result of protocol adapter log decoding.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdapterEventResult {
     pub event: Option<AdapterEvent>,
@@ -425,6 +631,7 @@ impl AdapterEventResult {
 }
 
 /// Decode-time adapter error vocabulary.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterEventError {
     MalformedLog(&'static str),
@@ -444,6 +651,7 @@ pub enum UpdateQuality {
 }
 
 /// Adapter-level follow-up work after cold-start or event application.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RepairAction {
     #[default]
@@ -524,6 +732,7 @@ pub enum ColdStartPolicy {
 }
 
 /// Result of attempting to cold-start a tracked pool.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColdStartOutcome {
     Ready(ColdStartReport),
@@ -533,6 +742,7 @@ pub enum ColdStartOutcome {
 }
 
 /// Inspectable summary of cold-start work performed.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColdStartReport {
     pub pool: PoolKey,
@@ -559,6 +769,7 @@ impl ColdStartReport {
 }
 
 /// Deferred adapter work that can be scheduled after cold-start.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeferredWork {
     VerifySlots(Vec<(Address, U256)>),
@@ -578,6 +789,7 @@ pub enum DeferredWork {
 /// `unhandled` collects, verbatim, any deferred work the driver does not execute
 /// in this item (`ColdStart`, `Custom`, and non-`VerifySlots` repairs) so callers
 /// can route them onward rather than have them silently dropped.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeferredOutcome {
     pub verified: Vec<SlotChange>,
@@ -592,6 +804,7 @@ impl DeferredOutcome {
 }
 
 /// Why a protocol state, event, or policy is not supported by the current adapter.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnsupportedReason {
     Protocol(ProtocolId),

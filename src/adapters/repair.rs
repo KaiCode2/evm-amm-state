@@ -40,7 +40,7 @@ pub(crate) fn v3_tick_range_effects(
         // Without a layout the protocol-specific slots cannot be named safely,
         // so conservatively invalidate all storage for the pool.
         return vec![ReactiveEffect::Invalidate(InvalidationRequest {
-            scope: PurgeScope::AllStorage,
+            scope: PurgeScope::AllStorage.into(),
             address,
             reason: InvalidationReason::HandlerRequested,
         })];

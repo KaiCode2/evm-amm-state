@@ -51,9 +51,9 @@ use evm_amm_state::adapters::sim::{
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy,
-    CurveAdapter, CurveMetadata, CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata,
-    SimConfig, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata, CurveVariant, PoolKey,
+    PoolRegistration, ProtocolMetadata, SimConfig, SolidlyV2Adapter, SolidlyV2Metadata,
+    UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -167,24 +167,25 @@ async fn v3_simulate_swap_matches_eth_call() -> Result<()> {
     let mut cache = fork_cache(&url, FORK_BLOCK).await?;
     let registry = {
         let mut r = AdapterRegistry::new();
-        r.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
+        r.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
         r
     };
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(V3_USDC_WETH_005))
         .with_state_address(V3_USDC_WETH_005)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            storage_layout: Some(evm_amm_state::adapters::storage::V3StorageLayout::uniswap(
-                10,
-            )),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(evm_amm_state::adapters::storage::V3StorageLayout::uniswap(
+                    10,
+                )),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     let config = SimConfig::default().with_v3_quoter(V3_QUOTER_V2);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let sim = adapter
         .simulate_swap(&registration, &mut cache, USDC, WETH, amount_in, &config)
         .map_err(|e| anyhow!("v3 sim failed: {e}"))?;
@@ -230,11 +231,12 @@ async fn v2_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(V2_USDC_WETH_PAIR))
         .with_state_address(V2_USDC_WETH_PAIR)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee_bps(30),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     let config = SimConfig::default().with_v2_router(V2_ROUTER_02);
@@ -279,10 +281,9 @@ async fn balancer_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(BALANCER_BAL_WETH_POOL_ID))
         .with_state_address(BALANCER_VAULT)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(BALANCER_VAULT),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(BALANCER_VAULT),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     let config = SimConfig::default();
@@ -360,12 +361,11 @@ async fn solidly_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(AERODROME_WETH_USDC))
         .with_state_address(AERODROME_WETH_USDC)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            token0: None,
-            token1: None,
-            stable: Some(false),
-            storage_layout: Some(layout),
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     // (1) Cold-start decoded the real tokens from the configured token slots.
@@ -480,11 +480,12 @@ async fn curve_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::Curve(CURVE_3POOL))
         .with_state_address(CURVE_3POOL)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![DAI, USDC, USDT],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![DAI, USDC, USDT])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     // (1) Cold-start discovered + persisted the get_dy read-set.
@@ -564,11 +565,12 @@ async fn curve_cryptoswap_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::Curve(TRICRYPTO2))
         .with_state_address(TRICRYPTO2)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![USDT, WBTC, WETH],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::CryptoSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![USDT, WBTC, WETH])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     // (1) Cold-start discovered + persisted the get_dy read-set and the variant.
@@ -646,11 +648,12 @@ async fn curve_tricrypto_ng_simulate_swap_matches_eth_call() -> Result<()> {
     };
     let mut registration = PoolRegistration::new(PoolKey::Curve(TRICRYPTO_USDC_NG))
         .with_state_address(TRICRYPTO_USDC_NG)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![USDC, WBTC, WETH],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::CryptoSwapNG,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![USDC, WBTC, WETH])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::CryptoSwapNG),
+        ));
     registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     let ProtocolMetadata::Curve(meta) = &registration.metadata else {

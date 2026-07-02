@@ -5,8 +5,8 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, Log};
 
 use super::{
-    AdapterCache, AmmAdapter, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
-    PoolRegistration, ProtocolId, RepairAction,
+    AdapterCache, AmmAdapter, CacheError, DeferredOutcome, DeferredWork, EventRoute, EventSource,
+    PoolKey, PoolRegistration, ProtocolId, RepairAction,
 };
 
 /// Registry of tracked AMM pools and protocol adapters.
@@ -154,7 +154,7 @@ impl AdapterRegistry {
         &self,
         deferred: &[DeferredWork],
         cache: &mut dyn AdapterCache,
-    ) -> anyhow::Result<DeferredOutcome> {
+    ) -> Result<DeferredOutcome, CacheError> {
         let mut outcome = DeferredOutcome::default();
 
         for work in deferred {
@@ -184,9 +184,17 @@ impl fmt::Debug for AdapterRegistry {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionSpec {
     pub sources: Vec<EventSource>,
+}
+
+impl SubscriptionSpec {
+    /// Construct a subscription spec from a set of event sources.
+    pub fn new(sources: Vec<EventSource>) -> Self {
+        Self { sources }
+    }
 }
 
 /// Shared per-source routing predicate: does `log` belong to the pool `key` via
@@ -226,6 +234,7 @@ fn topic_address(topic: &B256) -> Address {
 }
 
 /// Errors raised while mutating an [`AdapterRegistry`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     DuplicatePool(PoolKey),

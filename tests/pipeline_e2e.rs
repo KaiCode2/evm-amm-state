@@ -22,9 +22,9 @@ use evm_amm_state::adapters::storage::{
     V3StorageLayout,
 };
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartOutcome, ColdStartPolicy, PoolKey,
-    PoolRegistration, PoolStatus, ProtocolMetadata, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartOutcome, ColdStartPolicy,
+    ConcentratedLiquidityAdapter, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
+    SimConfig, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -276,11 +276,12 @@ async fn v2_full_pipeline_cold_start_react_simulate() -> Result<()> {
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(token0),
-            token1: Some(token1),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(token0)
+                .with_token1(token1)
+                .with_fee_bps(30),
+        ));
 
     // 1) cold-start
     assert!(matches!(
@@ -342,18 +343,19 @@ async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
         ((pool, V3_LIQUIDITY_SLOT), U256::from(67_890_u64)),
     ])));
 
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let mut registry = AdapterRegistry::new();
-    registry.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
+    registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(token0),
-            token1: Some(token1),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            storage_layout: Some(V3StorageLayout::uniswap(10)),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(token0)
+                .with_token1(token1)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(V3StorageLayout::uniswap(10)),
+        ));
 
     // 1) cold-start
     assert!(matches!(

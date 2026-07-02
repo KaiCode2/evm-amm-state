@@ -39,13 +39,25 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
-| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + fixed-radius multi-word tick scan | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
+| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius) | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`) | `Swap` → balance-slot resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
 All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
+
+### Extending with a new AMM
+
+You can add a brand-new AMM from *outside* the crate — no fork, no `src/` edit —
+via the `Custom` protocol id / pool key / metadata hatches and a minimal
+[`AmmAdapter`] (only `protocol()` + `simulate_swap()`). See the runnable,
+self-contained demo [`examples/custom_adapter.rs`](examples/custom_adapter.rs)
+(`cargo run --example custom_adapter`) and the guide
+[`docs/writing-an-adapter.md`](docs/writing-an-adapter.md).
+
+The V3 cold-start tick-scan radius is per-pool configurable via
+`V3Metadata.warm_word_radius` (default ±2 tick-bitmap words).
 
 ## Quickstart
 
@@ -62,7 +74,7 @@ use alloy_provider::{Provider, RootProvider};
 use evm_fork_cache::cache::EvmCache;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, ColdStartPolicy, PoolKey, PoolRegistration,
-    ProtocolMetadata, SimConfig, UniswapV3Adapter, V3Metadata,
+    ProtocolMetadata, SimConfig, ConcentratedLiquidityAdapter, V3Metadata,
 };
 use evm_amm_state::adapters::storage::V3StorageLayout;
 
@@ -77,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"); // USDC/WETH 0.05%
 
     let mut registry = AdapterRegistry::new();
-    registry.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
+    registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
 
     let mut reg = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
@@ -91,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
 
     // Offline from here: no RPC needed to quote.
-    let out = UniswapV3Adapter::default().simulate_swap(
+    let out = ConcentratedLiquidityAdapter::default().simulate_swap(
         &reg, &mut cache, usdc, weth, U256::from(1_000_000_u64), &SimConfig::default(),
     )?;
     println!("1 USDC -> {} WETH (raw)", out.amount_out);

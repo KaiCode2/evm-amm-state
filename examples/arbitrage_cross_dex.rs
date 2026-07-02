@@ -39,9 +39,9 @@ use anyhow::{Result, anyhow};
 
 use evm_amm_state::adapters::storage::V3StorageLayout;
 use evm_amm_state::adapters::{
-    AdapterRegistry, ColdStartPolicy, CurveAdapter, CurveMetadata, CurveVariant, PoolKey,
-    PoolRegistration, ProtocolMetadata, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    AdapterRegistry, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
+    CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata, SimConfig, UniswapV2Adapter,
+    UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     // --- 1. Register adapters for every protocol we will touch. ---
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
-    registry.register_adapter(Arc::new(UniswapV3Adapter::default()))?;
+    registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
     registry.register_adapter(Arc::new(CurveAdapter::default()))?;
 
     // --- 2. One shared cache, forked at a pinned block. ---
@@ -88,33 +88,36 @@ async fn main() -> Result<()> {
             "Uniswap V2",
             PoolRegistration::new(PoolKey::UniswapV2(V2_USDC_WETH_PAIR))
                 .with_state_address(V2_USDC_WETH_PAIR)
-                .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-                    token0: Some(USDC),
-                    token1: Some(WETH),
-                    fee_bps: Some(30),
-                })),
+                .with_metadata(ProtocolMetadata::UniswapV2(
+                    UniswapV2Metadata::default()
+                        .with_token0(USDC)
+                        .with_token1(WETH)
+                        .with_fee_bps(30),
+                )),
         ),
         (
             "Uniswap V3 0.05%",
             PoolRegistration::new(PoolKey::UniswapV3(V3_USDC_WETH_005))
                 .with_state_address(V3_USDC_WETH_005)
-                .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-                    token0: Some(USDC),
-                    token1: Some(WETH),
-                    fee: Some(500),
-                    tick_spacing: Some(10),
-                    storage_layout: Some(V3StorageLayout::uniswap(10)),
-                })),
+                .with_metadata(ProtocolMetadata::UniswapV3(
+                    V3Metadata::default()
+                        .with_token0(USDC)
+                        .with_token1(WETH)
+                        .with_fee(500)
+                        .with_tick_spacing(10)
+                        .with_storage_layout(V3StorageLayout::uniswap(10)),
+                )),
         ),
         (
             "Curve tricryptoUSDC",
             PoolRegistration::new(PoolKey::Curve(TRICRYPTO_USDC_NG))
                 .with_state_address(TRICRYPTO_USDC_NG)
-                .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-                    coins: vec![USDC, WBTC, WETH],
-                    discovered_slots: Vec::new(),
-                    variant: CurveVariant::CryptoSwapNG,
-                })),
+                .with_metadata(ProtocolMetadata::Curve(
+                    CurveMetadata::default()
+                        .with_coins(vec![USDC, WBTC, WETH])
+                        .with_discovered_slots(Vec::new())
+                        .with_variant(CurveVariant::CryptoSwapNG),
+                )),
         ),
     ];
 

@@ -132,11 +132,12 @@ async fn main() -> Result<()> {
     // 2. Register + cold-start the pair (warms reserves + token slots at B0).
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(V2_USDC_WETH_PAIR))
         .with_state_address(V2_USDC_WETH_PAIR)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee_bps(30),
+        ));
     {
         let mut cold = AdapterRegistry::new();
         cold.register_adapter(Arc::new(UniswapV2Adapter::default()))?;

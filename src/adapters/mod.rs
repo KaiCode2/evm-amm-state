@@ -11,6 +11,7 @@ pub mod reactive;
 pub mod registry;
 pub mod repair;
 pub mod sim;
+pub mod state;
 pub mod storage;
 pub mod traits;
 pub mod types;
@@ -28,14 +29,17 @@ pub mod uniswap_v2;
 pub mod uniswap_v3;
 
 pub use cache::{
-    AdapterCache, PurgeScope, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff,
-    StateUpdate, StateView,
+    AdapterCache, CacheError, CallOutcome, PurgeScope, SkippedDelta, SkippedMask, SlotChange,
+    SlotDelta, StateDiff, StateUpdate, StateView,
 };
-pub use cold_start::AdapterColdStartPlanner;
-pub use driver::AdapterDriver;
+pub use cold_start::{
+    AdapterColdStartPlanner, ColdStartCall, ColdStartCallResult, ColdStartError, ColdStartPlan,
+    ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch, SlotOutcome, StorageAccessList,
+};
+pub use driver::{AdapterDriver, DriverError};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
-pub use sim::{SimConfig, SimError, SwapQuote};
+pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
@@ -54,7 +58,4 @@ pub use solidly_v2::SolidlyV2Adapter;
 #[cfg(feature = "uniswap-v2")]
 pub use uniswap_v2::UniswapV2Adapter;
 #[cfg(feature = "uniswap-v3")]
-pub use uniswap_v3::V3FamilyAdapter;
-/// Legacy name for [`V3FamilyAdapter`]; retained for back-compat.
-#[cfg(feature = "uniswap-v3")]
-pub use uniswap_v3::V3FamilyAdapter as UniswapV3Adapter;
+pub use uniswap_v3::ConcentratedLiquidityAdapter;

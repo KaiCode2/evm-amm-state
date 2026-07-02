@@ -47,14 +47,15 @@ balancer-v2 = ["adapters"]
 solidly-v2 = ["adapters"] # Aerodrome / Velodrome V2 reserves pools
 curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 
+# Reserved protocol identities (BalancerV3 / Erc4626 / UniswapV4) with no adapter
+# yet; off by default so the default surface only advertises implemented protocols.
+experimental-protocols = []
+
 [dependencies]
-# Companion crate. Consumed as a git dependency while the sibling repo is
-# private and unpublished. At publish time drop `git`/`rev` and keep the
-# crates.io `version`.
-# INTERIM: pinned to the `cold-start-sync` branch tip (903af3d = base 27ae8762 +
-# the additive cold-start module) while evm-fork-cache#12 is in review. Re-pin to
-# the `main` merge commit before this consumer work merges to evm-amm-state main.
-evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "903af3df887bf5718693d4bacf770552681e5273", version = "0.1" }
+# Companion crate, published on crates.io. The cold-start module and reactive
+# runtime this crate builds on (added via evm-fork-cache#12, formerly only on the
+# `cold-start-sync` branch) shipped in the public 0.1.0 release.
+evm-fork-cache = "0.1"
 
 alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
 
@@ -90,6 +91,15 @@ criterion = { version = "0.5", default-features = false }
 [[example]]
 name = "adapter_pipeline"
 required-features = ["uniswap-v2"]
+
+# From-scratch third-party-adapter demo: define a novel AMM (Custom protocol id /
+# pool key / metadata) entirely outside the crate, register it, and quote. Fully
+# self-contained — local math, no RPC, no env vars. Only needs the `adapters`
+# marker (all types used are always-compiled core), so it builds under `default`
+# and is correctly skipped when `adapters` is off.
+[[example]]
+name = "custom_adapter"
+required-features = ["adapters"]
 
 # Adapter integration tests build against the per-protocol adapters; gate them
 # so the adapter-only build runs them only when those adapters are enabled.

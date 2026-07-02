@@ -7,10 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The companion crate (evm-fork-cache) is consumed as a git dependency from a
-  # private repo, so cargo must fetch it with the git CLI (which honours the
-  # credential rewrite configured below).
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   check:
@@ -18,16 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Required while the companion crate lives in a PRIVATE repo. Add a repo
-      # secret `PRIVATE_REPO_TOKEN` = a PAT (or fine-grained token) with read
-      # access to KaiCode2/evm-fork-cache. Once that crate is published to
-      # crates.io and the Cargo.toml dep switches to a plain `version = "..."`,
-      # this step (and CARGO_NET_GIT_FETCH_WITH_CLI above) can be removed — see
-      # RELEASING.md.
-      - name: Authenticate git for private companion crates
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,6 +61,11 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      # The reserved (unimplemented) protocol variants live behind an
+      # off-by-default feature; make sure enabling it still compiles.
+      - name: Check (experimental protocols)
+        run: cargo check --features experimental-protocols
+
   # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
   # together, which can mask a protocol whose code/imports are not correctly
   # `#[cfg]`-gated on its own feature (a `--features <one-protocol>` build then
@@ -104,10 +95,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Authenticate git for private companion crates
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -128,10 +115,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Authenticate git for private companion crates
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88

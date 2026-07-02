@@ -11,6 +11,7 @@ use evm_fork_cache::reactive::{
     RouteKeySpec, StateEffectQuality,
 };
 
+use super::state::UpstreamStateView;
 use super::{
     AdapterEvent, AdapterRegistry, EventRoute, EventSource, PoolRegistration, PurgeScope,
     RepairAction, SkippedDelta, SkippedMask, StateDiff, StateUpdate, StateView, UpdateQuality,
@@ -60,8 +61,13 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
         &self,
         ctx: &ReactiveContext,
         input: &ReactiveInput<Ethereum>,
-        state: &dyn StateView,
+        state: &dyn evm_fork_cache::StateView,
     ) -> Result<HandlerOutcome, HandlerError> {
+        // Wrap the upstream state view once; adapter code (`decode_event`,
+        // `predict_cold_skips`) speaks the crate-owned `StateView`.
+        let state = UpstreamStateView(state);
+        let state: &dyn StateView = &state;
+
         let ReactiveInput::Log(rpc_log) = input else {
             return Ok(HandlerOutcome::empty(StateEffectQuality::NoStateEffect));
         };
@@ -105,7 +111,7 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
                 .updates
                 .iter()
                 .cloned()
-                .map(ReactiveEffect::StateUpdate),
+                .map(|update| ReactiveEffect::StateUpdate(update.into())),
         );
         effects.extend(repair_effects(
             ctx,
@@ -267,14 +273,14 @@ fn repair_effects(
         ),
         RepairAction::PurgeStorage(address) => {
             vec![ReactiveEffect::Invalidate(InvalidationRequest {
-                scope: PurgeScope::AllStorage,
+                scope: PurgeScope::AllStorage.into(),
                 address: *address,
                 reason: InvalidationReason::HandlerRequested,
             })]
         }
         RepairAction::PurgeSlots { address, slots } => {
             vec![ReactiveEffect::Invalidate(InvalidationRequest {
-                scope: PurgeScope::Slots(slots.clone()),
+                scope: PurgeScope::Slots(slots.clone()).into(),
                 address: *address,
                 reason: InvalidationReason::HandlerRequested,
             })]

@@ -18,6 +18,42 @@ The roadmap is split into two deliverables:
 No phase below should be treated as final API design. Each phase has a review
 checkpoint before implementation.
 
+## Release Plan
+
+### 0.1.0 (current)
+
+The adapters-and-cache-orchestration deliverable, feature-complete for five
+protocol families (Uniswap V2, the concentrated-liquidity family — Uniswap V3 /
+PancakeSwap V3 / Slipstream — Balancer V2, Solidly V2, and Curve) plus the
+offline `simulate_swap` surface. Pools are supplied by the consumer
+(`register_pool`); the crate does not yet discover them.
+
+### 0.2.0: Factory discovery (planned)
+
+**Goal:** let consumers discover new pools automatically from protocol factories
+instead of hand-registering every address. This is the single most-requested
+capability gap after 0.1.0 and is a natural, *additive* extension of the
+existing event-routing machinery (see Phase A7 below for the broader design).
+
+Concrete design direction (to be reviewed before implementation):
+
+- Extend `AmmAdapter` with two **defaulted** (hence non-breaking) methods:
+  - `fn factory_sources(&self) -> Vec<EventSource>` — the factory address(es)
+    and the `PairCreated`/`PoolCreated` topic(s) the adapter watches.
+  - `fn decode_pool_created(&self, log: &Log) -> Option<PoolRegistration>` —
+    turn a factory creation log (which carries the new pool address, tokens, and
+    fee/tick-spacing) directly into a ready-to-register `PoolRegistration`.
+- Wire factory subscriptions into the reactive runtime alongside pool
+  subscriptions: a decoded creation log auto-registers the new pool and,
+  optionally, cold-starts it on first sight.
+- Optionally expose a one-shot `allPairs`/`allPairsLength` (and V3/Slipstream
+  equivalents) enumeration path for backfilling existing pools, distinct from
+  the live `PairCreated` stream.
+
+Because the trait methods are defaulted, existing adapters and third-party
+adapters compile unchanged; factory support is opt-in per adapter. This ships in
+0.2.0, after the 0.1.0 release.
+
 ## Scope
 
 ### This crate should own

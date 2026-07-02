@@ -21,16 +21,313 @@
 //! a mandatory slot's verdict from `Value` / `Zero` / `FetchFailed`, so a genuine
 //! on-chain zero and a transient archive miss become *distinguishable* repairs.
 
+use alloy_primitives::{Address, Bytes, U256};
 use evm_fork_cache::cache::EvmCache;
-use evm_fork_cache::cold_start::{
-    ColdStartConfig, ColdStartError, ColdStartPlan, ColdStartResults, ColdStartRunReport,
-    ColdStartStep,
+use evm_fork_cache::cold_start::ColdStartConfig;
+
+use super::state::UpstreamStateView;
+use super::{
+    AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, PoolRegistration, SlotChange,
+    StateView, UnsupportedReason,
 };
 
-use super::{
-    AdapterRegistry, ColdStartOutcome, ColdStartPolicy, PoolRegistration, StateView,
-    UnsupportedReason,
-};
+// ---------------------------------------------------------------------------
+// Crate-owned mirrors of the `evm_fork_cache::cold_start` vocabulary.
+//
+// Each mirror keeps upstream's variant / field NAMES so planner call-sites read
+// the same; the `From` conversions bridge to/from upstream at the driver seam.
+// ---------------------------------------------------------------------------
+
+/// A single round of cold-start work, declared by an
+/// [`AdapterColdStartPlanner`].
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartPlan`]. All four
+/// phases are optional; an empty plan is a valid no-op round.
+#[derive(Clone, Debug, Default)]
+pub struct ColdStartPlan {
+    /// Slots to authoritatively re-fetch, classify, and inject when changed.
+    pub verify: Vec<(Address, U256)>,
+    /// Slots to classify at the pinned block without injecting.
+    pub probe: Vec<(Address, U256)>,
+    /// Accounts to pre-seed into the cache before discovery.
+    pub accounts: Vec<Address>,
+    /// View-calls whose touched slots and accounts are captured.
+    pub discover: Vec<ColdStartCall>,
+}
+
+impl From<ColdStartPlan> for evm_fork_cache::cold_start::ColdStartPlan {
+    fn from(plan: ColdStartPlan) -> Self {
+        evm_fork_cache::cold_start::ColdStartPlan {
+            verify: plan.verify,
+            probe: plan.probe,
+            accounts: plan.accounts,
+            discover: plan.discover.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// A read-only view-call whose touched storage and accounts are captured during
+/// the discover phase.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartCall`].
+#[derive(Clone, Debug)]
+pub struct ColdStartCall {
+    /// Transaction sender.
+    pub from: Address,
+    /// Call target.
+    pub to: Address,
+    /// Calldata.
+    pub calldata: Bytes,
+    /// When set, filters captured slots and accounts to these addresses.
+    pub restrict_to: Option<Vec<Address>>,
+}
+
+impl From<ColdStartCall> for evm_fork_cache::cold_start::ColdStartCall {
+    fn from(call: ColdStartCall) -> Self {
+        evm_fork_cache::cold_start::ColdStartCall {
+            from: call.from,
+            to: call.to,
+            calldata: call.calldata,
+            restrict_to: call.restrict_to,
+        }
+    }
+}
+
+/// The outcome of executing one [`ColdStartPlan`] round.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartResults`].
+/// `fetched` / `probed` carry one [`SlotOutcome`] per declared verify / probe
+/// slot; `verified` carries only the slots whose value changed; `discovered`
+/// carries one [`ColdStartCallResult`] per discover call.
+#[derive(Clone, Debug, Default)]
+pub struct ColdStartResults {
+    /// Slots whose value changed and were injected (one per change).
+    pub verified: Vec<SlotChange>,
+    /// One outcome per declared verify slot (`Value` / `Zero` / `FetchFailed`).
+    pub fetched: Vec<SlotOutcome>,
+    /// One outcome per declared probe slot (classified, not injected).
+    pub probed: Vec<SlotOutcome>,
+    /// One result per discover call.
+    pub discovered: Vec<ColdStartCallResult>,
+}
+
+impl From<evm_fork_cache::cold_start::ColdStartResults> for ColdStartResults {
+    fn from(results: evm_fork_cache::cold_start::ColdStartResults) -> Self {
+        Self {
+            verified: results.verified.into_iter().map(SlotChange::from).collect(),
+            fetched: results.fetched.into_iter().map(SlotOutcome::from).collect(),
+            probed: results.probed.into_iter().map(SlotOutcome::from).collect(),
+            discovered: results
+                .discovered
+                .into_iter()
+                .map(ColdStartCallResult::from)
+                .collect(),
+        }
+    }
+}
+
+/// The result of one discover view-call: the classified EVM execution outcome and
+/// the storage/account access list it touched.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartCallResult`].
+#[derive(Clone, Debug)]
+pub struct ColdStartCallResult {
+    /// The classified outcome of the view-call.
+    pub result: CallOutcome,
+    /// The storage slots and accounts the call touched (after `restrict_to`).
+    pub access: StorageAccessList,
+}
+
+impl From<evm_fork_cache::cold_start::ColdStartCallResult> for ColdStartCallResult {
+    fn from(call: evm_fork_cache::cold_start::ColdStartCallResult) -> Self {
+        Self {
+            result: CallOutcome::from(call.result),
+            access: StorageAccessList::from(call.access),
+        }
+    }
+}
+
+/// The storage slots and accounts a discover view-call touched.
+///
+/// Crate-owned mirror of `evm_fork_cache`'s `StorageAccessList` (the access-set
+/// surface a discover call captures).
+#[derive(Clone, Debug, Default)]
+pub struct StorageAccessList {
+    /// Accounts the call touched.
+    pub accounts: Vec<Address>,
+    /// Storage `(address, slot)` pairs the call touched.
+    pub slots: Vec<(Address, U256)>,
+}
+
+impl From<evm_fork_cache::access_set::StorageAccessList> for StorageAccessList {
+    fn from(access: evm_fork_cache::access_set::StorageAccessList) -> Self {
+        Self {
+            accounts: access.accounts.into_iter().collect(),
+            slots: access.slots.into_iter().collect(),
+        }
+    }
+}
+
+/// The classified result of an individual slot fetch.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::SlotFetch`].
+/// `#[non_exhaustive]` — an open classification vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SlotFetch {
+    /// The slot was fetched and holds a non-zero value.
+    Value(U256),
+    /// The slot was fetched and holds a genuine on-chain zero.
+    Zero,
+    /// The fetcher returned an error for this slot; `reason` is its description.
+    FetchFailed {
+        /// Human-readable description of why the fetch failed.
+        reason: String,
+    },
+    /// The slot was declared but never reached because the round short-circuited.
+    NotAttempted,
+}
+
+impl From<evm_fork_cache::cold_start::SlotFetch> for SlotFetch {
+    fn from(fetch: evm_fork_cache::cold_start::SlotFetch) -> Self {
+        use evm_fork_cache::cold_start::SlotFetch as Upstream;
+        match fetch {
+            Upstream::Value(value) => SlotFetch::Value(value),
+            Upstream::Zero => SlotFetch::Zero,
+            Upstream::FetchFailed { reason } => SlotFetch::FetchFailed { reason },
+            Upstream::NotAttempted => SlotFetch::NotAttempted,
+        }
+    }
+}
+
+/// The classified outcome of fetching a single storage slot.
+///
+/// Crate-owned mirror of `evm_fork_cache`'s `SlotOutcome`: produced for **every**
+/// requested verify / probe slot (unlike [`SlotChange`], which records only
+/// changed slots).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotOutcome {
+    /// Contract whose storage slot was fetched.
+    pub address: Address,
+    /// Storage slot key.
+    pub slot: U256,
+    /// The classified result of fetching this slot.
+    pub fetch: SlotFetch,
+}
+
+impl From<evm_fork_cache::cold_start::SlotOutcome> for SlotOutcome {
+    fn from(outcome: evm_fork_cache::cold_start::SlotOutcome) -> Self {
+        Self {
+            address: outcome.address,
+            slot: outcome.slot,
+            fetch: outcome.fetch.into(),
+        }
+    }
+}
+
+/// The planner's decision after a round completes.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartStep`].
+/// `#[non_exhaustive]` — an open control vocabulary.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ColdStartStep {
+    /// Stop the cold-start loop; the run succeeds.
+    Done,
+    /// Execute the carried plan as the next round.
+    Continue(ColdStartPlan),
+}
+
+impl From<ColdStartStep> for evm_fork_cache::cold_start::ColdStartStep {
+    fn from(step: ColdStartStep) -> Self {
+        match step {
+            ColdStartStep::Done => evm_fork_cache::cold_start::ColdStartStep::Done,
+            ColdStartStep::Continue(plan) => {
+                evm_fork_cache::cold_start::ColdStartStep::Continue(plan.into())
+            }
+        }
+    }
+}
+
+/// Summary of a completed cold-start run.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartRunReport`],
+/// carrying the accumulated per-run counters.
+#[derive(Clone, Debug, Default)]
+pub struct ColdStartRunReport {
+    /// Number of rounds executed.
+    pub rounds: usize,
+    /// Total verify slots requested across all rounds.
+    pub verified_slots: usize,
+    /// Total slots that changed and were injected.
+    pub changed_slots: usize,
+    /// Total accounts touched by discover calls, summed across calls and rounds.
+    pub discovered_accounts: usize,
+    /// Total slots touched by discover calls, summed across calls and rounds.
+    pub discovered_slots: usize,
+    /// Total verify + probe slots whose fetch failed.
+    pub failed_slots: usize,
+}
+
+impl From<evm_fork_cache::cold_start::ColdStartRunReport> for ColdStartRunReport {
+    fn from(report: evm_fork_cache::cold_start::ColdStartRunReport) -> Self {
+        Self {
+            rounds: report.rounds,
+            verified_slots: report.verified_slots,
+            changed_slots: report.changed_slots,
+            discovered_accounts: report.discovered_accounts,
+            discovered_slots: report.discovered_slots,
+            failed_slots: report.failed_slots,
+        }
+    }
+}
+
+/// A hard error that aborts a cold-start round or run.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartError`], so the
+/// public surface does not leak the upstream error. `#[non_exhaustive]` — an open
+/// error vocabulary.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ColdStartError {
+    /// A round declared verify/probe slots but the cache has no storage batch
+    /// fetcher configured.
+    NoBatchFetcher,
+    /// The planner kept returning `Continue` past `max_rounds` executed rounds.
+    RoundBudgetExceeded {
+        /// The configured maximum number of executed rounds.
+        max_rounds: usize,
+    },
+    /// A composed fetch/call error, carrying the underlying cause as a string.
+    Fetch(String),
+}
+
+impl std::fmt::Display for ColdStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBatchFetcher => write!(f, "cold-start requires a storage batch fetcher"),
+            Self::RoundBudgetExceeded { max_rounds } => {
+                write!(f, "cold-start round budget exceeded ({max_rounds})")
+            }
+            Self::Fetch(err) => write!(f, "cold-start fetch error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ColdStartError {}
+
+impl From<evm_fork_cache::cold_start::ColdStartError> for ColdStartError {
+    fn from(err: evm_fork_cache::cold_start::ColdStartError) -> Self {
+        use evm_fork_cache::cold_start::ColdStartError as Upstream;
+        match err {
+            Upstream::NoBatchFetcher => ColdStartError::NoBatchFetcher,
+            Upstream::RoundBudgetExceeded { max_rounds } => {
+                ColdStartError::RoundBudgetExceeded { max_rounds }
+            }
+            Upstream::Fetch(cause) => ColdStartError::Fetch(cause.to_string()),
+        }
+    }
+}
 
 /// An adapter cold-start planner.
 ///
@@ -68,12 +365,22 @@ pub trait AdapterColdStartPlanner {
 struct Bridge<'a>(&'a mut dyn AdapterColdStartPlanner);
 
 impl evm_fork_cache::cold_start::ColdStartPlanner for Bridge<'_> {
-    fn initial_plan(&mut self, state: &dyn StateView) -> ColdStartPlan {
-        self.0.initial_plan(state)
+    fn initial_plan(
+        &mut self,
+        state: &dyn evm_fork_cache::StateView,
+    ) -> evm_fork_cache::cold_start::ColdStartPlan {
+        self.0.initial_plan(&UpstreamStateView(state)).into()
     }
 
-    fn on_results(&mut self, results: &ColdStartResults, state: &dyn StateView) -> ColdStartStep {
-        self.0.on_results(results, state)
+    fn on_results(
+        &mut self,
+        results: &evm_fork_cache::cold_start::ColdStartResults,
+        state: &dyn evm_fork_cache::StateView,
+    ) -> evm_fork_cache::cold_start::ColdStartStep {
+        let results = ColdStartResults::from(results.clone());
+        self.0
+            .on_results(&results, &UpstreamStateView(state))
+            .into()
     }
 }
 
@@ -111,8 +418,11 @@ impl AdapterRegistry {
 
         let report = {
             let mut bridge = Bridge(planner.as_mut());
-            cache.run_cold_start(&mut bridge, ColdStartConfig::default())?
+            cache
+                .run_cold_start(&mut bridge, ColdStartConfig::default())
+                .map_err(ColdStartError::from)?
         };
+        let report = ColdStartRunReport::from(report);
 
         Ok(planner.finish(pool, &report))
     }

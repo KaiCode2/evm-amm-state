@@ -32,20 +32,19 @@
 //!
 //! [`docs/curve-adapter.md`]: https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-adapter.md
 
-use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
-use evm_fork_cache::cold_start::{
-    ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
+use super::cold_start::{
+    AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
+    ColdStartStep, SlotFetch,
 };
-
-use super::cold_start::AdapterColdStartPlanner;
-use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, run_quote};
+use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, quote_via_call};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant,
     EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
     SlotChange, StateView, UnsupportedReason, UpdateQuality,
 };
+use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 
 sol! {
     // Classic Curve StableSwap plain-pool events. Only the signature hashes are
@@ -458,7 +457,7 @@ impl AmmAdapter for CurveAdapter {
                     }
                     .abi_encode(),
                 );
-                let output = run_quote(cache, pool_address, calldata)?;
+                let output = quote_via_call(cache, pool_address, calldata)?;
                 get_dyCall::abi_decode_returns_validate(&output)
                     .map_err(|_| SimError::MalformedOutput("get_dy return"))?
             }
@@ -471,7 +470,7 @@ impl AmmAdapter for CurveAdapter {
                     }
                     .abi_encode(),
                 );
-                let output = run_quote(cache, pool_address, calldata)?;
+                let output = quote_via_call(cache, pool_address, calldata)?;
                 super::sim::CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&output)
                     .map_err(|_| SimError::MalformedOutput("CryptoSwap get_dy return"))?
             }

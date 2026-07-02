@@ -1,11 +1,8 @@
-use alloy_primitives::{Address, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
-use evm_fork_cache::cold_start::{
-    ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
+use super::cold_start::{
+    AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
+    SlotFetch,
 };
-
-use super::cold_start::AdapterColdStartPlanner;
-use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, run_quote};
+use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, quote_via_call};
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -13,6 +10,8 @@ use super::{
     PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
     StateDiff, StateUpdate, StateView, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
 };
+use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 
 sol! {
     event Sync(uint112 reserve0, uint112 reserve1);
@@ -139,7 +138,7 @@ impl AmmAdapter for UniswapV2Adapter {
             .abi_encode(),
         );
 
-        let output = run_quote(cache, config.v2_router, calldata)?;
+        let output = quote_via_call(cache, config.v2_router, calldata)?;
         let amounts = getAmountsOutCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("getAmountsOut return"))?;
 
