@@ -200,9 +200,11 @@ storage words into `EvmCache`.
 E2E_RPC_URL=<https endpoint> SYNC_BENCH_ITERS=7 cargo run --release --example sync_latency
 ```
 
-Live public-RPC measurements on July 2, 2026, showed Balancer and Curve refreshes
-dropping from discover→verify cold-starts around 330–350 ms to one-shot storage
-programs around 80–95 ms once their read-set metadata is known. See
+Live paid Alchemy RPC measurements on July 2, 2026, showed Balancer and Curve
+refreshes dropping from discover→verify cold-starts around 330–360 ms to
+one-shot storage programs around 75–76 ms once their read-set metadata is known.
+The same run measured Uniswap V3 full-pool loading at 124.8 ms, while loading
+7,670 slots. See
 [`docs/benchmarks.md`](docs/benchmarks.md) for the full table and caveats.
 
 For event-time repair specifically, [`examples/trace_resync_latency.rs`](examples/trace_resync_latency.rs)
@@ -212,6 +214,10 @@ forced storage-fetch fallback:
 ```bash
 E2E_RPC_URL=<https endpoint> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
 ```
+
+On the same paid Alchemy endpoint, a single Curve 3pool event measured 155.7 ms
+through trace-only resync versus 26.7 ms through direct storage fallback; the
+trace path is expected to amortize across many stale slots in the same block.
 
 ## Performance
 

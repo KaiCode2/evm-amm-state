@@ -80,15 +80,16 @@ E2E_RPC_URL=<https-mainnet-rpc> SYNC_BENCH_ITERS=7 cargo run --release --example
 If `E2E_RPC_URL` is unset, the example falls back to
 `https://ethereum.publicnode.com`; use a paid/archive endpoint for lower jitter.
 
-Measured on July 2, 2026, using `https://ethereum.publicnode.com` at block
-`25_445_700`, seven iterations per path:
+Measured on July 2, 2026, using a paid Alchemy mainnet endpoint with the
+benchmark's gzip-enabled `reqwest` client at block `25_446_111`, seven
+iterations per path:
 
 | Pool | Prior median | New median | Relative | Scope |
 | --- | ---: | ---: | ---: | --- |
-| Uniswap V3 USDC/WETH 0.05% | 185.8 ms | **142.5 ms** | **1.30× faster** | prior warms the active tick window; new loads full pool: 7,670 slots, 1,562 ticks, 723 observations |
-| Uniswap V2 USDC/WETH | 96.5 ms | **96.8 ms** | same | both paths load the same 3 slots |
-| Balancer V2 80BAL/20WETH | 331.9 ms | **93.5 ms** | **3.55× faster** | prior discover→verify; new refreshes 5 known vault slots |
-| Curve 3pool StableSwap | 352.6 ms | **82.7 ms** | **4.27× faster** | prior discover→verify; new refreshes 6 known pool slots |
+| Uniswap V3 USDC/WETH 0.05% | 150.4 ms | **124.8 ms** | **1.21× faster** | prior warms the active tick window; new loads full pool: 7,670 slots, 1,562 ticks, 723 observations |
+| Uniswap V2 USDC/WETH | 74.6 ms | **73.0 ms** | **1.02× faster** | both paths load the same 3 slots |
+| Balancer V2 80BAL/20WETH | 333.3 ms | **76.4 ms** | **4.36× faster** | prior discover→verify; new refreshes 5 known vault slots |
+| Curve 3pool StableSwap | 361.3 ms | **74.7 ms** | **4.84× faster** | prior discover→verify; new refreshes 6 known pool slots |
 
 Interpretation:
 
@@ -124,6 +125,23 @@ block to establish `discovered_slots`, then ingests that historical log through
 Provider support for `debug_traceBlockByHash` varies. If the trace-only row
 reports failures, that endpoint did not supply enough trace data for the chosen
 event and the production path would rely on the storage fallback instead.
+
+Measured on July 2, 2026, using the same paid Alchemy mainnet endpoint with gzip
+enabled, seven iterations against a Curve 3pool `TokenExchange` at block
+`25_446_103`:
+
+| Path | Median | Min..max | Slots | Resync updates | Failures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Trace-only | 155.7 ms | 146.2..189.1 ms | 6 | 2 | 0 |
+| Storage fallback | 26.7 ms | 22.6..28.7 ms | 6 | 6 | 0 |
+
+For a single Curve pool, six direct storage reads are faster than tracing the
+whole block. The trace path is still important for live multi-AMM syncing because
+`evm-fork-cache` dedupes all stale-slot requests pinned to the same block into
+one block trace, so the trace cost amortizes across many pools and slots.
+Trace-only may apply fewer updates than the requested slot count because block
+traces contain changed slots; unchanged requested slots can remain valid from the
+pre-event cache state.
 
 ## How this compares to other tools
 
