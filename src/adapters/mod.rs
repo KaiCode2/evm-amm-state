@@ -13,6 +13,7 @@ pub mod repair;
 pub mod sim;
 pub mod state;
 pub mod storage;
+pub mod storage_sync;
 pub mod traits;
 pub mod types;
 
@@ -42,6 +43,12 @@ pub use driver::{AdapterDriver, DriverError};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
+pub use storage_sync::{
+    CALLDATA_SLOT_LOADER_CODE, StorageSyncEncoding, StorageSyncError, StorageSyncSnapshot,
+    StorageSyncSpec, build_calldata_slot_loader_program, build_slot_loader_program,
+    decode_storage_sync, run_and_inject_storage_sync, run_and_inject_storage_syncs,
+    run_storage_sync, run_storage_syncs, slot_loader_calldata, storage_sync_spec_for_pool,
+};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,

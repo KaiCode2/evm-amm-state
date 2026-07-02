@@ -166,6 +166,13 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 name = "v3_full_sync"
 required-features = ["uniswap-v3"]
 
+# Live sync-latency comparison for prior cold-start versus one-shot storage
+# programs across V3, V2, Balancer, and Curve. Env-gated; defaults to a public
+# Ethereum endpoint when E2E_RPC_URL is unset.
+[[example]]
+name = "sync_latency"
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
+
 # End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
 [[example]]
 name = "arbitrage_cross_dex"

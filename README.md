@@ -161,6 +161,30 @@ E2E_RPC_URL=<archive-url> cargo test --test v3_full_sync_rpc -- --ignored
 
 [`evm-fork-cache`'s bulk-storage transport]: https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/bulk-storage-extraction.md
 
+### One-shot flat-slot sync
+
+The [`storage_sync`](src/adapters/storage_sync.rs) module covers adapters whose
+hot state is already known as a slot list:
+
+- **Uniswap V2**: canonical `token0`, `token1`, and packed reserves slots.
+- **Solidly V2**: config-supplied reserve/token slot layout.
+- **Balancer V2**: vault balance slots discovered by cold-start or trace data.
+- **Curve**: pool read-set slots discovered by cold-start or trace data.
+
+Small fixed layouts use generated no-calldata bytecode with slots baked in.
+Larger discovered read-sets use a reusable calldata-driven loader. Both execute
+through the same `eth_call` code-override transport as V3 and inject the returned
+storage words into `EvmCache`.
+
+```bash
+E2E_RPC_URL=<https endpoint> SYNC_BENCH_ITERS=7 cargo run --release --example sync_latency
+```
+
+Live public-RPC measurements on July 2, 2026, showed Balancer and Curve refreshes
+dropping from discover→verify cold-starts around 330–350 ms to one-shot storage
+programs around 80–95 ms once their read-set metadata is known. See
+[`docs/benchmarks.md`](docs/benchmarks.md) for the full table and caveats.
+
 ## Performance
 
 Once warmed, a quote is a fully-offline revm execution of the pool's own quote

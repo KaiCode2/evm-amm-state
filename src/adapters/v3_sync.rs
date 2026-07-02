@@ -521,7 +521,7 @@ pub struct V3PoolSnapshot {
 }
 
 fn words_of(output: &[u8]) -> Result<Vec<U256>, V3SyncError> {
-    if output.len() % 32 != 0 {
+    if !output.len().is_multiple_of(32) {
         return Err(V3SyncError::Malformed(format!(
             "output length {} is not word-aligned",
             output.len()
