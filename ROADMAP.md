@@ -34,12 +34,16 @@ offline `simulate_swap` surface. Pools are supplied by the consumer
 ("the WETH/USDC 0.3% V3 pool", "every pool between WBTC/WETH") instead of
 hand-registering addresses. Two halves over one vocabulary:
 
-- **Pull (primary UX):** query the factory/registry's *own bytecode* for
-  existing pools through the pinned cache — `getPair` / `getPool(fee)` /
-  `getPool(tickSpacing)` / `getPool(stable)` / Curve MetaRegistry
-  `find_pools_for_coins` — returning cold-start-ready `PoolRegistration`s.
-  Balancer (no on-chain pair index) backfills via a Vault log scan helper.
-  Fully unblocked today; needs nothing from the upstream interests work.
+- **Pull (primary UX):** resolve existing pools **derive-first** for the hot
+  protocols — compute the factory's `getPair`/`getPool` mapping slot in Rust
+  and point-read it (batchable; bulk watchlists ride the `storage_sync`
+  loader), with CREATE2 derivation as the zero-I/O path + cross-check —
+  falling back to executing the factory's own view function in revm for the
+  protocols that are hard to recreate (Curve MetaRegistry
+  `find_pools_for_coins`, unknown forks). Balancer (no on-chain pair index)
+  backfills via a Vault log scan helper. Returns cold-start-ready
+  `PoolRegistration`s. Fully unblocked today; needs nothing from the
+  upstream interests work.
 - **Push:** subscribe to factory creation events (`PairCreated` /
   `PoolCreated` / Vault `PoolRegistered`) and admit new pools between batches
   via `AmmSyncEngine::register_pools` (rebuild-based now; incremental once the
