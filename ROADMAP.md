@@ -28,31 +28,31 @@ PancakeSwap V3 / Slipstream — Balancer V2, Solidly V2, and Curve) plus the
 offline `simulate_swap` surface. Pools are supplied by the consumer
 (`register_pool`); the crate does not yet discover them.
 
-### 0.2.0: Factory discovery (planned)
+### 0.2.0: Factory discovery (planned — full design in [docs/factory-discovery-spec.md](docs/factory-discovery-spec.md))
 
-**Goal:** let consumers discover new pools automatically from protocol factories
-instead of hand-registering every address. This is the single most-requested
-capability gap after 0.1.0 and is a natural, *additive* extension of the
-existing event-routing machinery (see Phase A7 below for the broader design).
+**Goal:** make pool discovery **declarative** — consumers say *what* they want
+("the WETH/USDC 0.3% V3 pool", "every pool between WBTC/WETH") instead of
+hand-registering addresses. Two halves over one vocabulary:
 
-Concrete design direction (to be reviewed before implementation):
+- **Pull (primary UX):** query the factory/registry's *own bytecode* for
+  existing pools through the pinned cache — `getPair` / `getPool(fee)` /
+  `getPool(tickSpacing)` / `getPool(stable)` / Curve MetaRegistry
+  `find_pools_for_coins` — returning cold-start-ready `PoolRegistration`s.
+  Balancer (no on-chain pair index) backfills via a Vault log scan helper.
+  Fully unblocked today; needs nothing from the upstream interests work.
+- **Push:** subscribe to factory creation events (`PairCreated` /
+  `PoolCreated` / Vault `PoolRegistered`) and admit new pools between batches
+  via `AmmSyncEngine::register_pools` (rebuild-based now; incremental once the
+  `evm-fork-cache` interests-refresh API lands).
 
-- Extend `AmmAdapter` with two **defaulted** (hence non-breaking) methods:
-  - `fn factory_sources(&self) -> Vec<EventSource>` — the factory address(es)
-    and the `PairCreated`/`PoolCreated` topic(s) the adapter watches.
-  - `fn decode_pool_created(&self, log: &Log) -> Option<PoolRegistration>` —
-    turn a factory creation log (which carries the new pool address, tokens, and
-    fee/tick-spacing) directly into a ready-to-register `PoolRegistration`.
-- Wire factory subscriptions into the reactive runtime alongside pool
-  subscriptions: a decoded creation log auto-registers the new pool and,
-  optionally, cold-starts it on first sight.
-- Optionally expose a one-shot `allPairs`/`allPairsLength` (and V3/Slipstream
-  equivalents) enumeration path for backfilling existing pools, distinct from
-  the live `PairCreated` stream.
-
-Because the trait methods are defaulted, existing adapters and third-party
-adapters compile unchanged; factory support is opt-in per adapter. This ships in
-0.2.0, after the 0.1.0 release.
+Shape: a `PoolFactory` trait (queries + creation decode) built per protocol by
+a **defaulted** `AmmAdapter::pool_factory(&FactoryConfig)` hook, fronted by
+`PoolDiscovery::{find, find_all, creation_sources, decode_creation}`.
+`FactoryConfig` mirrors `SimConfig` (mainnet defaults + `with_*` overrides).
+Everything additive/`#[non_exhaustive]`; third-party adapters compile
+unchanged. Bonus: Curve variant detection becomes registry *provenance*
+instead of a heuristic. Slicing, per-protocol mechanics, and open questions
+live in the spec.
 
 ## Scope
 
