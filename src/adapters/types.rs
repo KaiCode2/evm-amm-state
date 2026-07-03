@@ -644,6 +644,21 @@ pub enum AdapterEventError {
     Custom(String),
 }
 
+impl fmt::Display for AdapterEventError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedLog(what) => write!(f, "malformed log: {what}"),
+            Self::MissingState { address, slot } => {
+                write!(f, "missing state at {address}:{slot}")
+            }
+            Self::Unsupported(reason) => write!(f, "unsupported: {reason:?}"),
+            Self::Custom(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for AdapterEventError {}
+
 /// Quality of the cache update emitted for an adapter event.
 ///
 /// Deliberately exhaustive (unlike most enums in this crate): this is a closed

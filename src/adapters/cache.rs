@@ -83,8 +83,11 @@ impl From<revm::context::result::ExecutionResult> for CallOutcome {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum CacheError {
-    /// A host / backend / execution error from the underlying cache.
-    Backend(String),
+    /// A host / backend / execution error from the underlying cache, carrying
+    /// the un-flattened cause. Downcast the payload (or walk
+    /// [`source`](std::error::Error::source)) — e.g. to
+    /// [`evm_fork_cache::CacheError`] — for typed handling.
+    Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 impl std::fmt::Display for CacheError {
@@ -95,11 +98,17 @@ impl std::fmt::Display for CacheError {
     }
 }
 
-impl std::error::Error for CacheError {}
+impl std::error::Error for CacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
 
 impl From<evm_fork_cache::CacheError> for CacheError {
     fn from(err: evm_fork_cache::CacheError) -> Self {
-        Self::Backend(err.to_string())
+        Self::Backend(Box::new(err))
     }
 }
 

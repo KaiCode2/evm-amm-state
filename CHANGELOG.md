@@ -134,6 +134,17 @@ affected slots (Uniswap V3 tick ranges, Balancer / Curve `VerifySlots`).
   `StorageSyncError`, `V3SyncError`, `AmmSyncError`).
 - docs.rs builds with `all-features` so the `uniswap-v3`-gated `v3_sync`
   module and `experimental-protocols` identities render.
+- Error facades no longer flatten their causes: `CacheError::Backend`,
+  `ColdStartError::Fetch`, `V3SyncError::Program`, and
+  `StorageSyncError::Program` carry the boxed source error instead of a
+  string — walk [`source`](https://doc.rust-lang.org/std/error/trait.Error.html#method.source)
+  or downcast (e.g. to `evm_fork_cache::{CacheError, StorageFetchError}`) for
+  typed handling. `ColdStartError` gained the `NoAccountProofFetcher` variant
+  it previously folded into a stringly `Fetch`; `AdapterEventError` now
+  implements `Display`/`Error` and is chained as `DriverError::Decode`'s
+  source; `AmmSyncError` exposes its upstream cause through `source()`.
+  `StorageSyncError` dropped its `Clone`/`PartialEq`/`Eq` derives (boxed
+  payloads are not comparable).
 
 ### Fixed
 

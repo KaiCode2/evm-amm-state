@@ -189,7 +189,7 @@ impl StorageSyncSnapshot {
 }
 
 /// Error resolving, running, or decoding a storage sync program.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum StorageSyncError {
     /// The protocol is served by another sync path or has no loader yet.
@@ -202,8 +202,11 @@ pub enum StorageSyncError {
     EmptyReadSet(&'static str),
     /// A protocol-specific layout is malformed.
     InvalidLayout(&'static str),
-    /// The provider rejected or failed the storage program call.
-    Program(String),
+    /// The provider rejected or failed the storage program call, carrying the
+    /// un-flattened cause. Downcast the payload (or walk
+    /// [`source`](std::error::Error::source)) — e.g. to
+    /// [`evm_fork_cache::StorageFetchError`] — for typed handling.
+    Program(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Program output did not match the requested slot list.
     Malformed(String),
 }
@@ -224,7 +227,14 @@ impl fmt::Display for StorageSyncError {
     }
 }
 
-impl std::error::Error for StorageSyncError {}
+impl std::error::Error for StorageSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Program(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+            _ => None,
+        }
+    }
+}
 
 /// Generate a no-calldata loader with slot keys baked into bytecode.
 ///
@@ -372,7 +382,7 @@ pub async fn run_storage_sync<P: Provider<AnyNetwork>>(
 ) -> Result<StorageSyncSnapshot, StorageSyncError> {
     let output = run_storage_program(provider, block, &spec.program())
         .await
-        .map_err(|err| StorageSyncError::Program(err.to_string()))?;
+        .map_err(|err| StorageSyncError::Program(Box::new(err)))?;
     decode_storage_sync(spec, &output)
 }
 
@@ -390,7 +400,7 @@ pub async fn run_storage_syncs<P: Provider<AnyNetwork>>(
         .zip(specs)
         .map(|(result, spec)| match result {
             Ok(output) => decode_storage_sync(spec, &output),
-            Err(err) => Err(StorageSyncError::Program(err.to_string())),
+            Err(err) => Err(StorageSyncError::Program(Box::new(err))),
         })
         .collect()
 }

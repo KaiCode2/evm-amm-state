@@ -46,7 +46,14 @@ impl fmt::Display for AmmSyncError {
     }
 }
 
-impl std::error::Error for AmmSyncError {}
+impl std::error::Error for AmmSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Register(err) => Some(err),
+            Self::Reactive(err) => Some(err),
+        }
+    }
+}
 
 impl From<RegisterError> for AmmSyncError {
     fn from(err: RegisterError) -> Self {

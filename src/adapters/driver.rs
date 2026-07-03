@@ -33,7 +33,14 @@ impl std::fmt::Display for DriverError {
     }
 }
 
-impl std::error::Error for DriverError {}
+impl std::error::Error for DriverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Applies AMM adapter events to an [`AdapterCache`] in caller-provided order.
 #[derive(Clone, Debug)]

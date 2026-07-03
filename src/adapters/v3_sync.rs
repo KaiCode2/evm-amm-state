@@ -543,8 +543,11 @@ pub fn partial_sync_calldata(words: &[i16]) -> Bytes {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum V3SyncError {
-    /// The `eth_call` transport/provider layer failed.
-    Program(String),
+    /// The `eth_call` transport/provider layer failed, carrying the
+    /// un-flattened cause. Downcast the payload (or walk
+    /// [`source`](std::error::Error::source)) — e.g. to
+    /// [`evm_fork_cache::StorageFetchError`] — for typed handling.
+    Program(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// The program output did not match the expected layout.
     Malformed(String),
 }
@@ -558,7 +561,14 @@ impl std::fmt::Display for V3SyncError {
     }
 }
 
-impl std::error::Error for V3SyncError {}
+impl std::error::Error for V3SyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Program(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+            _ => None,
+        }
+    }
+}
 
 /// One initialized tick: its index and the four raw `Tick.Info` words.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -848,7 +858,7 @@ pub async fn run_full_sync<P: Provider<AnyNetwork>>(
 ) -> Result<V3PoolSnapshot, V3SyncError> {
     let output = run_storage_program(provider, block, &full_sync_program(pool, spec))
         .await
-        .map_err(|err| V3SyncError::Program(err.to_string()))?;
+        .map_err(|err| V3SyncError::Program(Box::new(err)))?;
     decode_full_sync(spec, &output)
 }
 
@@ -862,7 +872,7 @@ pub async fn run_partial_sync<P: Provider<AnyNetwork>>(
 ) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
     let output = run_storage_program(provider, block, &partial_sync_program(pool, spec, words))
         .await
-        .map_err(|err| V3SyncError::Program(err.to_string()))?;
+        .map_err(|err| V3SyncError::Program(Box::new(err)))?;
     decode_partial_sync(&output)
 }
 

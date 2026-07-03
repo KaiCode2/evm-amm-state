@@ -196,19 +196,19 @@ fn pool_storage_sync_specs_cover_supported_flat_slot_protocols() {
 #[test]
 fn pool_storage_sync_spec_rejects_unavailable_layouts() {
     let v3 = PoolRegistration::new(PoolKey::UniswapV3(POOL));
-    assert_eq!(
+    assert!(matches!(
         storage_sync_spec_for_pool(&v3),
         Err(StorageSyncError::UnsupportedProtocol(ProtocolId::UniswapV3))
-    );
+    ));
 
     let balancer = PoolRegistration::new(PoolKey::BalancerV2(B256::repeat_byte(0x77)))
         .with_metadata(ProtocolMetadata::BalancerV2(
             BalancerV2Metadata::default().with_vault(Address::repeat_byte(0x44)),
         ));
-    assert_eq!(
+    assert!(matches!(
         storage_sync_spec_for_pool(&balancer),
         Err(StorageSyncError::EmptyReadSet("Balancer V2 vault balance"))
-    );
+    ));
 
     let duplicate_layout =
         SolidlyStorageLayout::new(U256::from(20), U256::from(20), U256::from(6), U256::from(7));
@@ -216,19 +216,19 @@ fn pool_storage_sync_spec_rejects_unavailable_layouts() {
         PoolRegistration::new(PoolKey::SolidlyV2(POOL)).with_metadata(ProtocolMetadata::SolidlyV2(
             SolidlyV2Metadata::default().with_storage_layout(duplicate_layout),
         ));
-    assert_eq!(
+    assert!(matches!(
         storage_sync_spec_for_pool(&solidly),
         Err(StorageSyncError::InvalidLayout("Solidly V2 storage"))
-    );
+    ));
 }
 
 #[test]
 fn decode_rejects_malformed_output() {
     let spec = StorageSyncSpec::new(POOL, [U256::from(1), U256::from(2)]);
-    assert_eq!(
-        decode_storage_sync(&spec, &[0u8; 32]),
-        Err(StorageSyncError::Malformed(
-            "output has 32 bytes, expected 64".to_string()
-        ))
-    );
+    match decode_storage_sync(&spec, &[0u8; 32]) {
+        Err(StorageSyncError::Malformed(message)) => {
+            assert_eq!(message, "output has 32 bytes, expected 64");
+        }
+        other => panic!("expected Malformed error, got {other:?}"),
+    }
 }

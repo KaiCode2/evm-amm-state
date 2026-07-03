@@ -156,3 +156,19 @@ fn apply_log_returns_structured_driver_error() {
         other => panic!("expected DriverError::Decode, got {other:?}"),
     }
 }
+
+#[test]
+fn errors_preserve_their_source_chain() {
+    // The boxed cause survives un-flattened and is reachable via source().
+    let cache_err = CacheError::Backend("backend blew up".into());
+    let source = std::error::Error::source(&cache_err).expect("CacheError keeps its cause");
+    assert_eq!(source.to_string(), "backend blew up");
+
+    // DriverError::Decode chains the structured adapter error as its source.
+    let driver_err = DriverError::Decode {
+        protocol: ProtocolId::UniswapV2,
+        error: AdapterEventError::MalformedLog("boom"),
+    };
+    let source = std::error::Error::source(&driver_err).expect("DriverError keeps its cause");
+    assert_eq!(source.to_string(), "malformed log: boom");
+}

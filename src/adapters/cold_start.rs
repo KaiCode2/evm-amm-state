@@ -296,19 +296,27 @@ pub enum ColdStartError {
     /// A round declared verify/probe slots but the cache has no storage batch
     /// fetcher configured.
     NoBatchFetcher,
+    /// A round declared probe-roots accounts but the cache has no account
+    /// proof fetcher configured.
+    NoAccountProofFetcher,
     /// The planner kept returning `Continue` past `max_rounds` executed rounds.
     RoundBudgetExceeded {
         /// The configured maximum number of executed rounds.
         max_rounds: usize,
     },
-    /// A composed fetch/call error, carrying the underlying cause as a string.
-    Fetch(String),
+    /// A composed fetch/call error, carrying the un-flattened cause. Downcast
+    /// the payload (or walk [`source`](std::error::Error::source)) — e.g. to
+    /// [`evm_fork_cache::CacheError`] — for typed handling.
+    Fetch(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 impl std::fmt::Display for ColdStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoBatchFetcher => write!(f, "cold-start requires a storage batch fetcher"),
+            Self::NoAccountProofFetcher => {
+                write!(f, "cold-start requires an account proof fetcher")
+            }
             Self::RoundBudgetExceeded { max_rounds } => {
                 write!(f, "cold-start round budget exceeded ({max_rounds})")
             }
@@ -317,23 +325,25 @@ impl std::fmt::Display for ColdStartError {
     }
 }
 
-impl std::error::Error for ColdStartError {}
+impl std::error::Error for ColdStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fetch(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+            _ => None,
+        }
+    }
+}
 
 impl From<evm_fork_cache::cold_start::ColdStartError> for ColdStartError {
     fn from(err: evm_fork_cache::cold_start::ColdStartError) -> Self {
         use evm_fork_cache::cold_start::ColdStartError as Upstream;
         match err {
             Upstream::NoBatchFetcher => ColdStartError::NoBatchFetcher,
-            // Root-only probes need the 0.2.0 account-proof fetcher; the
-            // adapter planners never declare them, so surface the precondition
-            // as a fetch-layer failure rather than widening the public enum.
-            Upstream::NoAccountProofFetcher => {
-                ColdStartError::Fetch("cold-start requires an account proof fetcher".to_string())
-            }
+            Upstream::NoAccountProofFetcher => ColdStartError::NoAccountProofFetcher,
             Upstream::RoundBudgetExceeded { max_rounds } => {
                 ColdStartError::RoundBudgetExceeded { max_rounds }
             }
-            Upstream::Fetch(cause) => ColdStartError::Fetch(cause.to_string()),
+            Upstream::Fetch(cause) => ColdStartError::Fetch(Box::new(cause)),
         }
     }
 }
