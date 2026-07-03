@@ -70,13 +70,16 @@ alloy-provider = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
 
-anyhow = "1.0.98"
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
 
 [dev-dependencies]
 alloy-rpc-client = "1.0.38"
 alloy-transport = "1.0.38"
 alloy-transport-http = "1.0.38"
+# Tests/examples use anyhow::Result as their top-level error; the library's
+# public surface is typed (CacheError / DriverError / SimError / ...) and has
+# no anyhow anywhere in its normal dependency graph.
+anyhow = "1.0.98"
 # Examples/tests drive async subscriptions and stream combinators.
 futures = "0.3"
 # Gzip-capable HTTP client for the v3_full_sync example: sync-program

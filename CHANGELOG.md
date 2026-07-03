@@ -124,8 +124,14 @@ affected slots (Uniswap V3 tick ranges, Balancer / Curve `VerifySlots`).
   exhaustive (closed control vocabularies) — now documented as such.
 - Slimmed `[dependencies]` to what `src/` actually uses: dropped the unused
   `alloy-contract`, `alloy-transport-balancer`, `foundry-fork-db`, `serde`,
-  and `tracing`; `futures` and `tokio` are dev-only (consumers no longer pull
-  a tokio runtime).
+  and `tracing`; `futures`, `tokio`, and `anyhow` are dev-only (consumers no
+  longer pull a tokio runtime, and `anyhow` is absent from the crate's entire
+  normal dependency graph).
+- Removed `impl From<anyhow::Error> for CacheError` — dead since the
+  `evm-fork-cache` 0.2.0 upgrade moved every consumed API to typed errors;
+  the crate's error surface is fully typed (`CacheError`, `DriverError`,
+  `SimError`, `RegistryError`, `AdapterEventError`, `ColdStartError`,
+  `StorageSyncError`, `V3SyncError`, `AmmSyncError`).
 - docs.rs builds with `all-features` so the `uniswap-v3`-gated `v3_sync`
   module and `experimental-protocols` identities render.
 

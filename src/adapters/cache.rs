@@ -79,7 +79,7 @@ impl From<revm::context::result::ExecutionResult> for CallOutcome {
 /// Error from a fallible [`AdapterCache`] operation.
 ///
 /// Crate-owned mirror of the underlying host/backend failure, so the public
-/// surface does not leak `anyhow::Error`.
+/// surface does not leak the upstream error type.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum CacheError {
@@ -96,12 +96,6 @@ impl std::fmt::Display for CacheError {
 }
 
 impl std::error::Error for CacheError {}
-
-impl From<anyhow::Error> for CacheError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Backend(err.to_string())
-    }
-}
 
 impl From<evm_fork_cache::CacheError> for CacheError {
     fn from(err: evm_fork_cache::CacheError) -> Self {
