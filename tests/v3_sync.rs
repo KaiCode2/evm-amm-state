@@ -113,9 +113,11 @@ fn synthetic_uniswap_pool() -> SyntheticPool {
     let ticks: Vec<V3TickSnapshot> = tick_indices
         .iter()
         .enumerate()
-        .map(|(i, tick)| V3TickSnapshot {
-            tick: *tick,
-            info: std::array::from_fn(|k| U256::from(10_000 + (i as u64) * 100 + k as u64)),
+        .map(|(i, tick)| {
+            V3TickSnapshot::new(
+                *tick,
+                std::array::from_fn(|k| U256::from(10_000 + (i as u64) * 100 + k as u64)),
+            )
         })
         .collect();
 
@@ -151,16 +153,15 @@ fn synthetic_uniswap_pool() -> SyntheticPool {
         seeds.push((U256::from(8 + i as u64), *value));
     }
 
-    let expected = V3PoolSnapshot {
-        statics: spec
-            .static_slots
+    let expected = V3PoolSnapshot::new(
+        spec.static_slots
             .iter()
             .copied()
             .zip(statics_values)
             .collect(),
         ticks,
         observations,
-    };
+    );
     SyntheticPool {
         spec,
         seeds,
@@ -317,7 +318,7 @@ async fn pancake_layout_core_spec_uses_its_own_slot_bases() -> Result<()> {
             (layout.liquidity_slot, U256::from(4_242u64)),
         ],
     );
-    assert_eq!(snapshot.ticks, vec![V3TickSnapshot { tick, info }]);
+    assert_eq!(snapshot.ticks, vec![V3TickSnapshot::new(tick, info)]);
     assert!(snapshot.observations.is_empty(), "core spec has no ring");
     Ok(())
 }

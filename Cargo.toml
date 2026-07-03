@@ -11,6 +11,11 @@ readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-amm-state"
 documentation = "https://docs.rs/evm-amm-state"
 
+# Build docs.rs with every feature enabled so the `uniswap-v3`-gated `v3_sync`
+# module and the `experimental-protocols` identities render.
+[package.metadata.docs.rs]
+all-features = true
+
 # Ship a lean crate: keep src + runnable examples + the user-facing guides
 # (docs/benchmarks.md, docs/curve-adapter.md), drop the internal test suite,
 # CI config, maintainer docs, and the superseded per-slice/phase design specs.
@@ -58,9 +63,6 @@ experimental-protocols = []
 # ships to crates.io.
 evm-fork-cache = { version = "0.2.0", path = "../evm-fork-cache" }
 
-alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
-
-alloy-contract = "1.0.38"
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
 alloy-primitives = { version = "1.4", features = ["map"] }
@@ -69,17 +71,14 @@ alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
 
 anyhow = "1.0.98"
-foundry-fork-db = "0.22"
-futures = "0.3"
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
-serde = { version = "1.0.228", features = ["derive"] }
-tracing = "0.1.41"
-tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 alloy-rpc-client = "1.0.38"
 alloy-transport = "1.0.38"
 alloy-transport-http = "1.0.38"
+# Examples/tests drive async subscriptions and stream combinators.
+futures = "0.3"
 # Gzip-capable HTTP client for the v3_full_sync example: sync-program
 # responses are hundreds of KB of nonzero storage words and compress ~3x
 # (see evm-fork-cache/docs/bulk-storage-extraction.md).

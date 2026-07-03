@@ -45,6 +45,15 @@
 //! provider `eth_call` allowances. See `tests/v3_sync.rs` for the offline
 //! revm execution suite and `examples/v3_full_sync.rs` for the live
 //! end-to-end demonstration.
+//!
+//! # Not a cold-start replacement
+//!
+//! This module **warms the cache only**. It never touches a pool's
+//! [`PoolStatus`](super::types::PoolStatus) or metadata — resolving/validating
+//! the storage layout, decoding tokens, and transitioning the pool to `Ready`
+//! remain the job of [`AdapterRegistry::cold_start`](super::AdapterRegistry).
+//! Use it *alongside* cold-start (or explicit metadata) as a bulk-warming
+//! accelerator, not instead of it.
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256};
@@ -79,6 +88,7 @@ const UNISWAP_CARDINALITY_SHIFT: u32 = 200;
 
 /// Where a pool's observation ring lives and how to size it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct V3ObservationsSpec {
     /// Storage slot of `observations[0]` (entries are laid out sequentially).
     pub array_slot: U256,
@@ -87,10 +97,26 @@ pub struct V3ObservationsSpec {
     pub cardinality_shift: u32,
 }
 
+impl V3ObservationsSpec {
+    /// Describe an observation ring at `array_slot` whose cardinality lives at
+    /// bits `[cardinality_shift, cardinality_shift + 16)` of `slot0`.
+    pub const fn new(array_slot: U256, cardinality_shift: u32) -> Self {
+        Self {
+            array_slot,
+            cardinality_shift,
+        }
+    }
+}
+
 /// Everything the program generator needs to know about one pool class:
 /// the storage layout (slots + tick spacing), which static slots to emit,
 /// the bitmap word range, and (optionally) the observation ring.
+///
+/// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::core`], or
+/// [`V3SyncSpec::new`] — the struct is `#[non_exhaustive]` so fields can be
+/// added for further V3-family variants without a breaking release.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct V3SyncSpec {
     /// Slot positions and tick spacing for this V3-family variant.
     pub layout: V3StorageLayout,
@@ -107,6 +133,10 @@ pub struct V3SyncSpec {
 }
 
 /// The full bitmap word range reachable by a pool with this tick spacing.
+///
+/// # Panics
+///
+/// Panics if `tick_spacing` is not positive (see [`v3_word_position`]).
 pub fn full_word_range(tick_spacing: i32) -> (i16, i16) {
     (
         v3_word_position(V3_MIN_TICK, tick_spacing),
@@ -115,6 +145,40 @@ pub fn full_word_range(tick_spacing: i32) -> (i16, i16) {
 }
 
 impl V3SyncSpec {
+    /// Build a spec from explicit parts, scanning the full word range for the
+    /// layout's tick spacing. Narrow the scan afterwards with
+    /// [`with_word_range`](Self::with_word_range).
+    ///
+    /// `static_slots` must contain the layout's `slot0_slot` whenever
+    /// `observations` is set (the ring's cardinality is decoded from it).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout's `tick_spacing` is not positive.
+    pub fn new(
+        layout: V3StorageLayout,
+        static_slots: Vec<U256>,
+        observations: Option<V3ObservationsSpec>,
+    ) -> Self {
+        let (min_word, max_word) = full_word_range(layout.tick_spacing);
+        Self {
+            static_slots,
+            observations,
+            min_word,
+            max_word,
+            layout,
+        }
+    }
+
+    /// Restrict the full-sync scan to `[min_word, max_word]` (inclusive).
+    /// [`V3PoolSnapshot::storage_entries`] reconstructs bitmap words over the
+    /// same range, so narrowed specs also narrow what gets injected.
+    pub fn with_word_range(mut self, min_word: i16, max_word: i16) -> Self {
+        self.min_word = min_word;
+        self.max_word = max_word;
+        self
+    }
+
     /// Canonical Uniswap V3 spec: statics `slot0`, `feeGrowthGlobal0/1X128`,
     /// `protocolFees`, `liquidity`; observations at slot 8 with the
     /// cardinality at `slot0` bits `[200, 216)`; the full word range for the
@@ -498,6 +562,7 @@ impl std::error::Error for V3SyncError {}
 
 /// One initialized tick: its index and the four raw `Tick.Info` words.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct V3TickSnapshot {
     /// Tick index (always a multiple of the pool's tick spacing).
     pub tick: i32,
@@ -507,9 +572,17 @@ pub struct V3TickSnapshot {
     pub info: [U256; 4],
 }
 
+impl V3TickSnapshot {
+    /// Build a tick snapshot from its index and raw `Tick.Info` words.
+    pub const fn new(tick: i32, info: [U256; 4]) -> Self {
+        Self { tick, info }
+    }
+}
+
 /// A pool's full concentrated-liquidity state as returned by the sync
 /// programs, still in raw storage-word form.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct V3PoolSnapshot {
     /// `(slot, value)` for each of the spec's static slots, in spec order.
     pub statics: Vec<(U256, U256)>,
@@ -518,6 +591,22 @@ pub struct V3PoolSnapshot {
     /// The observation ring (`observations[0..cardinality]`), when the spec
     /// includes it.
     pub observations: Vec<U256>,
+}
+
+impl V3PoolSnapshot {
+    /// Assemble a snapshot from already-decoded parts (fixtures, tests, or a
+    /// custom decode path).
+    pub const fn new(
+        statics: Vec<(U256, U256)>,
+        ticks: Vec<V3TickSnapshot>,
+        observations: Vec<U256>,
+    ) -> Self {
+        Self {
+            statics,
+            ticks,
+            observations,
+        }
+    }
 }
 
 fn words_of(output: &[u8]) -> Result<Vec<U256>, V3SyncError> {

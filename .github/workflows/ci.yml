@@ -62,9 +62,12 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
 
       # The reserved (unimplemented) protocol variants live behind an
-      # off-by-default feature; make sure enabling it still compiles.
+      # off-by-default feature; make sure enabling it still compiles — both on
+      # top of the default adapters and on the bare no-default surface.
       - name: Check (experimental protocols)
         run: cargo check --features experimental-protocols
+      - name: Check (experimental protocols, no default features)
+        run: cargo check --no-default-features --features experimental-protocols
 
   # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
   # together, which can mask a protocol whose code/imports are not correctly

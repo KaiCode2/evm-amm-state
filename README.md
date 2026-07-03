@@ -196,6 +196,10 @@ Larger discovered read-sets use a reusable calldata-driven loader. Both execute
 through the same `eth_call` code-override transport as V3 and inject the returned
 storage words into `EvmCache`.
 
+One-shot syncs (V3 and flat-slot) **warm the cache only** — pool status and
+metadata still come from `registry.cold_start`, and the Balancer/Curve loaders
+require a previously discovered read-set.
+
 ```bash
 E2E_RPC_URL=<https endpoint> SYNC_BENCH_ITERS=7 cargo run --release --example sync_latency
 ```

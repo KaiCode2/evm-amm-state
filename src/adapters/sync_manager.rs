@@ -1,8 +1,9 @@
 //! AMM-owned live sync driver around the generic reactive runtime.
 //!
 //! `evm-fork-cache` owns the expensive part of resync execution: grouping
-//! [`ResyncRequest`]s by block, resolving them from block traces when possible,
-//! falling back to storage fetchers, and applying authoritative values to
+//! [`ResyncRequest`](evm_fork_cache::reactive::ResyncRequest)s by block,
+//! resolving them from block traces when possible, falling back to storage
+//! fetchers, and applying authoritative values to
 //! [`EvmCache`]. This module keeps the AMM-specific part local to this crate:
 //! callers get a runtime that always executes resyncs, and failed storage repairs
 //! are translated back into pool lifecycle status.
@@ -24,7 +25,11 @@ use super::{
 };
 
 /// Error constructing or running [`AmmSyncEngine`].
+///
+/// `#[non_exhaustive]`: variants track the upstream runtime's failure modes
+/// and may grow — match with a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AmmSyncError {
     /// The AMM reactive handler could not be registered.
     Register(RegisterError),
@@ -57,6 +62,7 @@ impl From<ReactiveError> for AmmSyncError {
 
 /// Summary returned by [`AmmSyncEngine::ingest_batch`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AmmSyncBatchReport {
     /// Full upstream reactive report, including applied effects and resync
     /// details.
@@ -64,6 +70,12 @@ pub struct AmmSyncBatchReport {
     /// Pools marked degraded because at least one of their requested authoritative
     /// resync targets failed.
     pub degraded_pools: Vec<PoolKey>,
+    /// Previously-degraded pools marked [`PoolStatus::Ready`] again because an
+    /// authoritative resync refreshed at least one of their covered slots this
+    /// batch and none of their targets failed. Pools degraded by a failed
+    /// cold-start with no covered slots (e.g. an empty discovered read-set)
+    /// never match a resync and stay degraded until cold-start is re-run.
+    pub recovered_pools: Vec<PoolKey>,
     /// Number of authoritative state updates produced by executed resync reports.
     pub resync_state_updates: usize,
     /// Number of failed resync targets reported by the runtime.
@@ -118,6 +130,12 @@ impl AmmSyncEngine {
     /// `AmmReactiveHandler` owns a clone of the registry at registration time, so
     /// callers that add pools or update read-set metadata should replace the
     /// registry through this method rather than mutating a detached clone.
+    ///
+    /// Rebuilding is not free: the engine constructs a **fresh**
+    /// [`ReactiveRuntime`], so any state the previous runtime accumulated
+    /// across batches (reorg tracking, pending work) is discarded. Call this
+    /// between batches — never mid-stream — and prefer batching several
+    /// registry changes into one replacement.
     pub fn replace_registry(&mut self, registry: AdapterRegistry) -> Result<(), AmmSyncError> {
         let runtime = runtime_for(&registry, self.config.clone())?;
         self.registry = registry;
@@ -130,6 +148,11 @@ impl AmmSyncEngine {
     /// This deliberately calls `ingest_batch_with_resync`, not plain
     /// `ingest_batch`: Balancer, Curve, and V3 liquidity events rely on the
     /// resync phase to refresh slots whose final values are not carried in logs.
+    ///
+    /// Pool status tracks the resync outcomes both ways: a pool whose target
+    /// failed is marked [`PoolStatus::Degraded`], and a degraded pool whose
+    /// covered slots were authoritatively refreshed (with no failed targets
+    /// this batch) is marked [`PoolStatus::Ready`] again.
     pub fn ingest_batch(
         &mut self,
         cache: &mut EvmCache,
@@ -139,10 +162,12 @@ impl AmmSyncEngine {
         let resync_state_updates = resync_state_update_count(&reactive);
         let resync_failures = resync_failure_count(&reactive);
         let degraded_pools = self.mark_failed_resync_pools(&reactive);
+        let recovered_pools = self.recover_resynced_pools(&reactive, &degraded_pools);
 
         Ok(AmmSyncBatchReport {
             reactive,
             degraded_pools,
+            recovered_pools,
             resync_state_updates,
             resync_failures,
         })
@@ -161,6 +186,40 @@ impl AmmSyncEngine {
             }
         }
         degraded
+    }
+
+    /// Flip degraded pools back to [`PoolStatus::Ready`] when this batch's
+    /// resync phase authoritatively refreshed at least one slot they cover and
+    /// none of their targets failed. Conservative by construction: a pool
+    /// degraded by cold-start with no persisted read-set covers no slots, so
+    /// no resync can vouch for it and it stays degraded.
+    fn recover_resynced_pools(
+        &mut self,
+        report: &ReactiveBatchReport<Ethereum>,
+        degraded_now: &[PoolKey],
+    ) -> Vec<PoolKey> {
+        let refreshed: Vec<(Address, U256)> = resynced_slot_writes(report).collect();
+        if refreshed.is_empty() {
+            return Vec::new();
+        }
+        let recovered: Vec<PoolKey> = self
+            .registry
+            .pools()
+            .filter(|pool| pool.status == PoolStatus::Degraded)
+            .filter(|pool| !degraded_now.contains(&pool.key))
+            .filter(|pool| {
+                refreshed
+                    .iter()
+                    .any(|(address, slot)| pool_covers_storage_slot(pool, *address, *slot))
+            })
+            .map(|pool| pool.key.clone())
+            .collect();
+        for key in &recovered {
+            if let Some(pool) = self.registry.pool_mut(key) {
+                pool.status = PoolStatus::Ready;
+            }
+        }
+        recovered
     }
 }
 
@@ -195,6 +254,24 @@ fn resync_failures(report: &ReactiveBatchReport<Ethereum>) -> impl Iterator<Item
         .flat_map(|report| match report.as_ref() {
             ReactiveReport::Resynced(report) => report.failed.iter(),
             _ => [].iter(),
+        })
+}
+
+/// `(address, slot)` pairs authoritatively refreshed by this batch's executed
+/// resync reports.
+fn resynced_slot_writes(
+    report: &ReactiveBatchReport<Ethereum>,
+) -> impl Iterator<Item = (Address, U256)> + '_ {
+    report
+        .reports
+        .iter()
+        .flat_map(|report| match report.as_ref() {
+            ReactiveReport::Resynced(report) => report.state_updates.as_slice(),
+            _ => &[],
+        })
+        .filter_map(|update| match update {
+            evm_fork_cache::StateUpdate::Slot { address, slot, .. } => Some((*address, *slot)),
+            _ => None,
         })
 }
 

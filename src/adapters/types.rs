@@ -192,6 +192,10 @@ impl EventSource {
 }
 
 /// Generic routing rule for a log emitted by an [`EventSource`].
+///
+/// Deliberately exhaustive (unlike most enums in this crate): this is a closed
+/// routing vocabulary the engine matches on — a new route kind changes
+/// dispatch semantics and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventRoute {
     Direct,
@@ -641,6 +645,10 @@ pub enum AdapterEventError {
 }
 
 /// Quality of the cache update emitted for an adapter event.
+///
+/// Deliberately exhaustive (unlike most enums in this crate): this is a closed
+/// quality ladder consumers are expected to match in full — a new rung changes
+/// what callers must handle and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UpdateQuality {
     Exact,
@@ -723,6 +731,10 @@ impl RepairAction {
 }
 
 /// Cold-start strictness and cost policy.
+///
+/// Deliberately exhaustive (unlike most enums in this crate): every planner
+/// must define behavior for every policy, so a new policy is a semantic
+/// change to all adapters and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColdStartPolicy {
     Strict,

@@ -105,16 +105,20 @@ fn curve_log(pool: Address, buyer: Address, block: u64) -> RpcLog {
     )
 }
 
-fn curve_registry(pool: Address, slot: U256) -> Result<AdapterRegistry> {
+fn curve_registry_with_status(
+    pool: Address,
+    slots: Vec<U256>,
+    status: PoolStatus,
+) -> Result<AdapterRegistry> {
     let dai = Address::repeat_byte(0x01);
     let usdc = Address::repeat_byte(0x02);
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_status(PoolStatus::Ready)
+        .with_status(status)
         .with_metadata(ProtocolMetadata::Curve(
             CurveMetadata::default()
                 .with_coins([dai, usdc])
-                .with_discovered_slots([slot])
+                .with_discovered_slots(slots)
                 .with_variant(CurveVariant::StableSwap),
         ));
     let adapter = CurveAdapter::default();
@@ -125,6 +129,10 @@ fn curve_registry(pool: Address, slot: U256) -> Result<AdapterRegistry> {
     registry.register_adapter(Arc::new(CurveAdapter::default()))?;
     registry.register_pool(registration)?;
     Ok(registry)
+}
+
+fn curve_registry(pool: Address, slot: U256) -> Result<AdapterRegistry> {
+    curve_registry_with_status(pool, vec![slot], PoolStatus::Ready)
 }
 
 fn diff_for_slot(address: Address, slot: U256, value: U256) -> BlockStateDiff {
@@ -232,6 +240,76 @@ async fn sync_engine_marks_pool_degraded_when_resync_fails() -> Result<()> {
     assert_eq!(report.resync_failures, 1);
     assert_eq!(report.degraded_pools, vec![PoolKey::Curve(pool)]);
     assert_eq!(cache.cached_storage_value(pool, slot), None);
+    assert_eq!(
+        engine
+            .registry()
+            .pool(&PoolKey::Curve(pool))
+            .expect("registered pool")
+            .status,
+        PoolStatus::Degraded
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_engine_recovers_degraded_pool_after_successful_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0xc3);
+    let slot = U256::from(9);
+    let fresh = U256::from(1_234_567_u64);
+    let mut cache = setup_cache().await?;
+    cache
+        .set_block_state_diff_fetcher(Arc::new(move |_block| Ok(diff_for_slot(pool, slot, fresh))));
+
+    // A pool previously marked Degraded (e.g. a transient resync failure)
+    // whose next event resync succeeds must flip back to Ready.
+    let registry = curve_registry_with_status(pool, vec![slot], PoolStatus::Degraded)?;
+    let mut engine = AmmSyncEngine::new(registry)?;
+
+    let report = engine.ingest_batch(
+        &mut cache,
+        batch(curve_log(pool, Address::repeat_byte(0x01), 93), 93),
+    )?;
+
+    assert_eq!(report.resync_failures, 0);
+    assert!(report.degraded_pools.is_empty());
+    assert_eq!(report.recovered_pools, vec![PoolKey::Curve(pool)]);
+    assert_eq!(cache.cached_storage_value(pool, slot), Some(fresh));
+    assert_eq!(
+        engine
+            .registry()
+            .pool(&PoolKey::Curve(pool))
+            .expect("registered pool")
+            .status,
+        PoolStatus::Ready
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_engine_leaves_degraded_pool_without_read_set_untouched() -> Result<()> {
+    let pool = Address::repeat_byte(0xc4);
+    let mut cache = setup_cache().await?;
+    cache.set_block_state_diff_fetcher(Arc::new(|_block| {
+        Ok(BlockStateDiff {
+            accounts: Vec::new(),
+        })
+    }));
+
+    // Degraded from a failed cold-start: no discovered slots, so its events
+    // carry no repair and no resync can vouch for it — it must stay Degraded.
+    let registry = curve_registry_with_status(pool, Vec::new(), PoolStatus::Degraded)?;
+    let mut engine = AmmSyncEngine::new(registry)?;
+
+    let report = engine.ingest_batch(
+        &mut cache,
+        batch(curve_log(pool, Address::repeat_byte(0x01), 94), 94),
+    )?;
+
+    assert_eq!(report.reactive.applied.len(), 1);
+    assert_eq!(report.resync_state_updates, 0);
+    assert!(report.recovered_pools.is_empty());
     assert_eq!(
         engine
             .registry()

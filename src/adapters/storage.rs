@@ -150,7 +150,17 @@ pub fn decode_address_slot(word: U256) -> Address {
 ///
 /// `div_euclid` is used for both divisions so negative ticks floor toward
 /// negative infinity exactly as the on-chain `TickBitmap` library does.
+///
+/// # Panics
+///
+/// Panics if `tick_spacing` is not positive. Layouts resolved from pool
+/// metadata are validated before they reach this function; the assert guards
+/// direct callers passing a hand-built layout.
 pub fn v3_word_position(tick: i32, tick_spacing: i32) -> i16 {
+    assert!(
+        tick_spacing > 0,
+        "V3 tick_spacing must be positive, got {tick_spacing}"
+    );
     tick.div_euclid(tick_spacing).div_euclid(256) as i16
 }
 
@@ -228,7 +238,7 @@ pub(crate) fn layout_for(pool: &PoolRegistration) -> Option<V3StorageLayout> {
 }
 
 fn layout_from_metadata(metadata: &V3Metadata, protocol: ProtocolId) -> Option<V3StorageLayout> {
-    metadata.storage_layout.or_else(|| {
+    let layout = metadata.storage_layout.or_else(|| {
         let spacing = metadata.tick_spacing?;
         match protocol {
             ProtocolId::UniswapV3 => Some(V3StorageLayout::uniswap(spacing)),
@@ -236,5 +246,40 @@ fn layout_from_metadata(metadata: &V3Metadata, protocol: ProtocolId) -> Option<V
             ProtocolId::Slipstream => Some(V3StorageLayout::slipstream(spacing)),
             _ => None,
         }
-    })
+    })?;
+    // A non-positive tick spacing cannot describe a real V3-family pool and
+    // would divide by zero in the bitmap-word math (`v3_word_position`); treat
+    // the layout as unresolvable so cold-start reports Unsupported and the
+    // repair path falls back to conservative whole-storage invalidation.
+    (layout.tick_spacing > 0).then_some(layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::types::{PoolKey, PoolRegistration, ProtocolMetadata, V3Metadata};
+
+    fn v3_pool(metadata: V3Metadata) -> PoolRegistration {
+        PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x11)))
+            .with_metadata(ProtocolMetadata::UniswapV3(metadata))
+    }
+
+    #[test]
+    fn layout_rejects_zero_and_negative_derived_spacing() {
+        assert!(layout_for(&v3_pool(V3Metadata::default().with_tick_spacing(0))).is_none());
+        assert!(layout_for(&v3_pool(V3Metadata::default().with_tick_spacing(-10))).is_none());
+        assert!(layout_for(&v3_pool(V3Metadata::default().with_tick_spacing(10))).is_some());
+    }
+
+    #[test]
+    fn layout_rejects_zero_spacing_in_explicit_layout() {
+        let explicit = V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(0));
+        assert!(layout_for(&v3_pool(explicit)).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "tick_spacing must be positive")]
+    fn word_position_panics_loudly_on_zero_spacing() {
+        v3_word_position(0, 0);
+    }
 }

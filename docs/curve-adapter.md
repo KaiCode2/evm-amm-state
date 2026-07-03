@@ -13,11 +13,13 @@ Like every adapter in this crate, swaps are quoted by running the pool's **own
 `get_dy`** in a local revm against the warmed cache — there is **no
 reimplemented Curve math**.
 
-> Implementation history (per-slice specs): [stableswap](curve-stableswap-adapter-spec.md),
-> [cryptoswap](curve-slice2-cryptoswap-spec.md),
-> [liquidity events](curve-slice3-liquidity-events-spec.md),
-> [tricrypto-ng](curve-slice4-tricrypto-ng-spec.md). This document is the
-> consolidated reference.
+> Implementation history (per-slice specs, repository-only — not shipped in the
+> crate package):
+> [stableswap](https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-stableswap-adapter-spec.md),
+> [cryptoswap](https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-slice2-cryptoswap-spec.md),
+> [liquidity events](https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-slice3-liquidity-events-spec.md),
+> [tricrypto-ng](https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-slice4-tricrypto-ng-spec.md).
+> This document is the consolidated reference.
 
 ## Configuration — `CurveMetadata`
 

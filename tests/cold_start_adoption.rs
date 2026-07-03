@@ -666,6 +666,29 @@ async fn v3_cold_start_missing_layout_is_unsupported() -> Result<()> {
 }
 
 #[tokio::test]
+async fn v3_cold_start_zero_tick_spacing_is_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0x2a);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+
+    let registry = v3_registry();
+    // tick_spacing 0 must be rejected as an unresolvable layout, not divide by
+    // zero inside the planner's bitmap-word math.
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_tick_spacing(0),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Unsupported(_)),
+        "zero tick spacing should be Unsupported, got {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn v3_cold_start_failed_slot0_needs_repair() -> Result<()> {
     let pool = Address::repeat_byte(0x23);
     let layout = V3StorageLayout::uniswap(60);
