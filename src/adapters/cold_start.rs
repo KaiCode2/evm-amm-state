@@ -299,6 +299,9 @@ pub enum ColdStartError {
     /// A round declared probe-roots accounts but the cache has no account
     /// proof fetcher configured.
     NoAccountProofFetcher,
+    /// The cache holds pending code seeds but has no account-fields fetcher
+    /// to verify them with (fires only for pending-bearing rounds).
+    NoAccountFieldsFetcher,
     /// The planner kept returning `Continue` past `max_rounds` executed rounds.
     RoundBudgetExceeded {
         /// The configured maximum number of executed rounds.
@@ -316,6 +319,12 @@ impl std::fmt::Display for ColdStartError {
             Self::NoBatchFetcher => write!(f, "cold-start requires a storage batch fetcher"),
             Self::NoAccountProofFetcher => {
                 write!(f, "cold-start requires an account proof fetcher")
+            }
+            Self::NoAccountFieldsFetcher => {
+                write!(
+                    f,
+                    "cold-start code-seed verification requires an account fields fetcher"
+                )
             }
             Self::RoundBudgetExceeded { max_rounds } => {
                 write!(f, "cold-start round budget exceeded ({max_rounds})")
@@ -340,6 +349,7 @@ impl From<evm_fork_cache::cold_start::ColdStartError> for ColdStartError {
         match err {
             Upstream::NoBatchFetcher => ColdStartError::NoBatchFetcher,
             Upstream::NoAccountProofFetcher => ColdStartError::NoAccountProofFetcher,
+            Upstream::NoAccountFieldsFetcher => ColdStartError::NoAccountFieldsFetcher,
             Upstream::RoundBudgetExceeded { max_rounds } => {
                 ColdStartError::RoundBudgetExceeded { max_rounds }
             }
