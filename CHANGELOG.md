@@ -111,6 +111,15 @@ affected slots (Uniswap V3 tick ranges, Balancer / Curve `VerifySlots`).
   no-default-features), tests (all-features / default / no-default), doc
   (`-D warnings`), and a heavy-dependency leak guard.
 
+**Mid-lifecycle pool management** — the tracked working set is no longer fixed
+at startup: `AdapterRegistry::{unregister_pool, unregister_adapter}` (the
+latter refuses while any registered pool still dispatches to the adapter), and
+on the live engine `AmmSyncEngine::register_pools` /
+`unregister_pools` / `unregister_pools_evicting` apply batched registry
+changes with one runtime rebuild per call. The evicting variant purges cache
+state owned exclusively by the removed pools — a shared address (e.g. the
+Balancer vault) only loses read-set slots no remaining pool covers.
+
 ### Changed
 
 - The one-shot sync and sync-engine types (`V3SyncSpec`, `V3ObservationsSpec`,

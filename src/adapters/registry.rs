@@ -30,6 +30,16 @@ impl AdapterRegistry {
         Ok(())
     }
 
+    /// Remove a pool registration, returning it if it was present.
+    ///
+    /// The inverse of [`register_pool`](Self::register_pool). Removal only
+    /// stops routing/dispatch from this registry — cache state warmed for the
+    /// pool is untouched (`AmmSyncEngine::unregister_pools_evicting` also
+    /// releases that).
+    pub fn unregister_pool(&mut self, key: &PoolKey) -> Option<PoolRegistration> {
+        self.pools.remove(key)
+    }
+
     pub fn register_adapter(&mut self, adapter: Arc<dyn AmmAdapter>) -> Result<(), RegistryError> {
         // Validate every claimed id up front so a multi-protocol adapter never
         // partially inserts when one of its ids collides.
@@ -45,6 +55,37 @@ impl AdapterRegistry {
             self.adapters.insert(protocol, adapter.clone());
         }
         Ok(())
+    }
+
+    /// Remove an adapter — under **every** protocol id it serves — returning
+    /// it. The inverse of [`register_adapter`](Self::register_adapter).
+    ///
+    /// Fails with [`RegistryError::AdapterInUse`] while any registered pool
+    /// still dispatches to one of those ids (unregister the pools first), so
+    /// a registry can never route a pool to a missing adapter. Returns
+    /// `Ok(None)` when nothing is registered under `protocol`.
+    pub fn unregister_adapter(
+        &mut self,
+        protocol: ProtocolId,
+    ) -> Result<Option<Arc<dyn AmmAdapter>>, RegistryError> {
+        let Some(adapter) = self.adapters.get(&protocol).cloned() else {
+            return Ok(None);
+        };
+        let served = adapter.protocols();
+        if let Some(pool) = self
+            .pools
+            .values()
+            .find(|pool| served.contains(&pool.key.protocol()))
+        {
+            return Err(RegistryError::AdapterInUse {
+                protocol: pool.key.protocol(),
+                pool: pool.key.clone(),
+            });
+        }
+        for id in served {
+            self.adapters.remove(&id);
+        }
+        Ok(Some(adapter))
     }
 
     pub fn adapter(&self, protocol: ProtocolId) -> Option<&Arc<dyn AmmAdapter>> {
@@ -243,6 +284,14 @@ fn topic_address(topic: &B256) -> Address {
 pub enum RegistryError {
     DuplicatePool(PoolKey),
     DuplicateAdapter(ProtocolId),
+    /// The adapter still serves at least one registered pool and cannot be
+    /// unregistered until those pools are removed.
+    AdapterInUse {
+        /// A protocol id (of the adapter's served set) with a live pool.
+        protocol: ProtocolId,
+        /// One of the pools still dispatching to the adapter.
+        pool: PoolKey,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -251,6 +300,9 @@ impl fmt::Display for RegistryError {
             Self::DuplicatePool(key) => write!(f, "pool is already registered: {key:?}"),
             Self::DuplicateAdapter(protocol) => {
                 write!(f, "adapter is already registered: {protocol:?}")
+            }
+            Self::AdapterInUse { protocol, pool } => {
+                write!(f, "adapter for {protocol:?} still serves pool {pool:?}")
             }
         }
     }

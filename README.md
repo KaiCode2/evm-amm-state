@@ -128,6 +128,13 @@ requests without executing the trace/storage resync phase. The boundary and
 fallback policy are documented in
 [`docs/trace-backed-sync.md`](docs/trace-backed-sync.md).
 
+The tracked working set can change mid-lifecycle: `AmmSyncEngine::register_pools`
+adds pools (cold-start them first) and `unregister_pools` /
+`unregister_pools_evicting` remove them — the evicting variant also purges cache
+state owned exclusively by the removed pools, sparing shared-emitter state such
+as the Balancer vault. Each call rebuilds the runtime between batches, so batch
+changes rather than looping.
+
 ```mermaid
 flowchart LR
     A["AMM log"] --> B["Adapter decode"]

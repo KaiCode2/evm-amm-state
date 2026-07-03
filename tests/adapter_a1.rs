@@ -943,3 +943,70 @@ fn v3_cold_start_non_address_keyed_is_unsupported() {
         .expect("a non-address-keyed V3 pool must be unsupported");
     assert!(matches!(reason, UnsupportedReason::Custom(_)));
 }
+
+#[test]
+fn registry_unregister_pool_and_adapter_lifecycle() {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV2Adapter::default()))
+        .expect("adapter registers");
+    let key = PoolKey::UniswapV2(Address::repeat_byte(0x51));
+    registry
+        .register_pool(PoolRegistration::new(key.clone()))
+        .expect("pool registers");
+
+    // An adapter with a live pool cannot be unregistered.
+    assert!(matches!(
+        registry.unregister_adapter(ProtocolId::UniswapV2),
+        Err(RegistryError::AdapterInUse { .. })
+    ));
+
+    // Unregistering the pool returns its registration and stops tracking it.
+    let removed = registry
+        .unregister_pool(&key)
+        .expect("registration returned");
+    assert_eq!(removed.key, key);
+    assert!(registry.pool(&key).is_none());
+    assert!(registry.unregister_pool(&key).is_none());
+
+    // With no pools left the adapter can go; a second call is a clean no-op.
+    let adapter = registry
+        .unregister_adapter(ProtocolId::UniswapV2)
+        .expect("no pools reference it")
+        .expect("adapter was registered");
+    assert_eq!(adapter.protocol(), ProtocolId::UniswapV2);
+    assert!(registry.adapter(ProtocolId::UniswapV2).is_none());
+    assert!(
+        registry
+            .unregister_adapter(ProtocolId::UniswapV2)
+            .expect("no-op")
+            .is_none()
+    );
+}
+
+#[test]
+fn registry_unregister_family_adapter_removes_every_served_id() {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
+        .expect("family adapter registers");
+
+    // A pool on ANY served id blocks unregistration through any other id.
+    let key = PoolKey::PancakeV3(Address::repeat_byte(0x52));
+    registry
+        .register_pool(PoolRegistration::new(key.clone()))
+        .expect("pool registers");
+    assert!(matches!(
+        registry.unregister_adapter(ProtocolId::UniswapV3),
+        Err(RegistryError::AdapterInUse { .. })
+    ));
+
+    registry.unregister_pool(&key).expect("pool removed");
+    registry
+        .unregister_adapter(ProtocolId::UniswapV3)
+        .expect("removable once pools are gone")
+        .expect("adapter was registered");
+    assert!(registry.adapter(ProtocolId::UniswapV3).is_none());
+    assert!(registry.adapter(ProtocolId::PancakeV3).is_none());
+    assert!(registry.adapter(ProtocolId::Slipstream).is_none());
+}

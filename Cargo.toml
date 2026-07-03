@@ -121,7 +121,7 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 
 [[test]]
 name = "adapter_sync_manager"
-required-features = ["curve"]
+required-features = ["curve", "balancer-v2"]
 
 [[test]]
 name = "cold_start_adoption"

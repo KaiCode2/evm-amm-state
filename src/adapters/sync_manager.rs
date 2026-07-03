@@ -20,8 +20,8 @@ use evm_fork_cache::reactive::{
 };
 
 use super::{
-    AdapterRegistry, AmmReactiveHandler, PoolKey, PoolRegistration, PoolStatus, ProtocolId,
-    ProtocolMetadata,
+    AdapterCache, AdapterRegistry, AmmReactiveHandler, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolId, ProtocolMetadata, RegistryError,
 };
 
 /// Error constructing or running [`AmmSyncEngine`].
@@ -35,6 +35,8 @@ pub enum AmmSyncError {
     Register(RegisterError),
     /// The underlying reactive ingest failed.
     Reactive(ReactiveError),
+    /// A registry mutation (mid-lifecycle pool registration) failed.
+    Registry(RegistryError),
 }
 
 impl fmt::Display for AmmSyncError {
@@ -42,6 +44,7 @@ impl fmt::Display for AmmSyncError {
         match self {
             Self::Register(err) => write!(f, "failed to register AMM sync handler: {err}"),
             Self::Reactive(err) => write!(f, "AMM reactive ingest failed: {err}"),
+            Self::Registry(err) => write!(f, "AMM registry mutation failed: {err}"),
         }
     }
 }
@@ -51,7 +54,14 @@ impl std::error::Error for AmmSyncError {
         match self {
             Self::Register(err) => Some(err),
             Self::Reactive(err) => Some(err),
+            Self::Registry(err) => Some(err),
         }
+    }
+}
+
+impl From<RegistryError> for AmmSyncError {
+    fn from(err: RegistryError) -> Self {
+        Self::Registry(err)
     }
 }
 
@@ -148,6 +158,67 @@ impl AmmSyncEngine {
         self.registry = registry;
         self.runtime = runtime;
         Ok(())
+    }
+
+    /// Register additional pools into the live engine.
+    ///
+    /// Atomic: on a duplicate key nothing changes. Rebuilds the runtime once
+    /// for the whole batch (see [`replace_registry`](Self::replace_registry)
+    /// for the cost), so prefer one call with many pools over many calls.
+    ///
+    /// Registration alone warms no state: cold-start the registrations first
+    /// (or supply explicit read-set metadata), and widen the consumer-owned
+    /// provider subscription if it filters by address.
+    pub fn register_pools(
+        &mut self,
+        pools: impl IntoIterator<Item = PoolRegistration>,
+    ) -> Result<(), AmmSyncError> {
+        let mut registry = self.registry.clone();
+        for pool in pools {
+            registry.register_pool(pool)?;
+        }
+        self.replace_registry(registry)
+    }
+
+    /// Stop tracking pools, returning the removed registrations.
+    ///
+    /// Unknown keys are skipped; when nothing was removed the runtime is not
+    /// rebuilt. Cache state the pools warmed stays in place — use
+    /// [`unregister_pools_evicting`](Self::unregister_pools_evicting) to also
+    /// release it. A consumer-owned provider subscription that filters by
+    /// address is not updated by this call.
+    pub fn unregister_pools(
+        &mut self,
+        keys: &[PoolKey],
+    ) -> Result<Vec<PoolRegistration>, AmmSyncError> {
+        let mut registry = self.registry.clone();
+        let removed: Vec<PoolRegistration> = keys
+            .iter()
+            .filter_map(|key| registry.unregister_pool(key))
+            .collect();
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+        self.replace_registry(registry)?;
+        Ok(removed)
+    }
+
+    /// [`unregister_pools`](Self::unregister_pools), then purge cache state
+    /// owned exclusively by the removed pools.
+    ///
+    /// Conservative by construction: an address is purged wholesale only when
+    /// no remaining pool references it; a shared address (e.g. the Balancer
+    /// vault) only loses the removed pool's read-set slots that no remaining
+    /// pool covers. State that cannot be provably attributed (e.g. lazily
+    /// fetched quote-target bytecode) is left in place.
+    pub fn unregister_pools_evicting(
+        &mut self,
+        keys: &[PoolKey],
+        cache: &mut dyn AdapterCache,
+    ) -> Result<Vec<PoolRegistration>, AmmSyncError> {
+        let removed = self.unregister_pools(keys)?;
+        evict_exclusive_state(cache, &removed, &self.registry);
+        Ok(removed)
     }
 
     /// Ingest one batch and execute all emitted slot repairs.
@@ -280,6 +351,69 @@ fn resynced_slot_writes(
             evm_fork_cache::StateUpdate::Slot { address, slot, .. } => Some((*address, *slot)),
             _ => None,
         })
+}
+
+/// Purge cache state owned exclusively by `removed` pools, sparing anything a
+/// `remaining` pool still references.
+fn evict_exclusive_state(
+    cache: &mut dyn AdapterCache,
+    removed: &[PoolRegistration],
+    remaining: &AdapterRegistry,
+) {
+    for pool in removed {
+        for address in pool_state_addresses(pool) {
+            let shared = remaining
+                .pools()
+                .any(|other| pool_state_addresses(other).contains(&address));
+            if !shared {
+                cache.purge_storage(address);
+                continue;
+            }
+            let exclusive: Vec<U256> = pool_covered_slots_at(pool, address)
+                .into_iter()
+                .filter(|slot| {
+                    !remaining
+                        .pools()
+                        .any(|other| pool_covers_storage_slot(other, address, *slot))
+                })
+                .collect();
+            if !exclusive.is_empty() {
+                cache.purge_slots(address, &exclusive);
+            }
+        }
+    }
+}
+
+/// The addresses a pool's state lives at: its own key address plus any
+/// configured state addresses (deduped).
+fn pool_state_addresses(pool: &PoolRegistration) -> Vec<Address> {
+    let mut addresses: Vec<Address> = pool.key.address().into_iter().collect();
+    for address in &pool.state_addresses {
+        if !addresses.contains(address) {
+            addresses.push(*address);
+        }
+    }
+    addresses
+}
+
+/// The slots `pool`'s metadata explicitly claims at `address` — the
+/// attributable subset of what [`pool_covers_storage_slot`] recognizes, used
+/// for slot-level eviction at shared addresses.
+fn pool_covered_slots_at(pool: &PoolRegistration, address: Address) -> Vec<U256> {
+    match &pool.metadata {
+        ProtocolMetadata::BalancerV2(metadata)
+            if metadata
+                .vault
+                .or_else(|| pool.state_addresses.first().copied())
+                == Some(address) =>
+        {
+            metadata.balance_slots.clone()
+        }
+        ProtocolMetadata::Curve(metadata) if pool.key.address() == Some(address) => {
+            metadata.discovered_slots.clone()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn pools_for_failure(registry: &AdapterRegistry, failure: &ResyncFailure) -> Vec<PoolKey> {
