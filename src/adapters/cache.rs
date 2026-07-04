@@ -126,6 +126,16 @@ pub trait AdapterCache: StateView {
 
     fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256, CacheError>;
 
+    /// Read many storage slots, returning one value per input slot in the SAME
+    /// order. The default loops [`read_storage_slot`]; cache backends that can
+    /// fetch in bulk should override this to collapse N reads into one round-trip.
+    fn read_storage_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<U256>, CacheError> {
+        slots
+            .iter()
+            .map(|(address, slot)| self.read_storage_slot(*address, *slot))
+            .collect()
+    }
+
     fn call_raw(
         &mut self,
         from: Address,
@@ -176,6 +186,44 @@ impl AdapterCache for EvmCache {
 
     fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256, CacheError> {
         EvmCache::read_storage_slot(self, address, slot).map_err(CacheError::from)
+    }
+
+    fn read_storage_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<U256>, CacheError> {
+        // No batch fetcher (e.g. `from_backend` with no provider): fall back to
+        // the per-slot loop rather than failing outright.
+        let Some(fetcher) = self.storage_batch_fetcher().cloned() else {
+            return slots
+                .iter()
+                .map(|(address, slot)| {
+                    EvmCache::read_storage_slot(self, *address, *slot).map_err(CacheError::from)
+                })
+                .collect();
+        };
+
+        // ONE round-trip for every slot, pinned to the cache's current block.
+        // This is a read: results are correlated back to input order without
+        // injecting them into the cache.
+        let results = fetcher(slots.to_vec(), self.block());
+
+        // The fetcher returns one tuple per requested slot but in an unspecified
+        // order, so index by `(address, slot)` to restore input order.
+        let mut by_slot: std::collections::HashMap<(Address, U256), U256> =
+            std::collections::HashMap::with_capacity(results.len());
+        for (address, slot, result) in results {
+            let value = result.map_err(|err| CacheError::Backend(Box::new(err)))?;
+            by_slot.insert((address, slot), value);
+        }
+
+        slots
+            .iter()
+            .map(|(address, slot)| {
+                by_slot.get(&(*address, *slot)).copied().ok_or_else(|| {
+                    CacheError::Backend(Box::from(format!(
+                        "storage batch fetcher returned no value for slot ({address:?}, {slot})"
+                    )))
+                })
+            })
+            .collect()
     }
 
     fn call_raw(

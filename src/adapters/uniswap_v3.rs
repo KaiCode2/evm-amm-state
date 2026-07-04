@@ -1,7 +1,9 @@
+use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError, v3_code_seed_from_metadata};
 use super::cold_start::{
     AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     SlotFetch,
 };
+use super::factory::{FactoryConfig, PoolFactory, UniswapV3Factory};
 use super::sim::{
     QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call,
     quoteExactInputSingleCall,
@@ -86,6 +88,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             .collect()
     }
 
+    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        config
+            .uniswap_v3
+            .iter()
+            .map(|factory| {
+                Box::new(UniswapV3Factory::new(factory.clone(), config.verify_derivations))
+                    as Box<dyn PoolFactory>
+            })
+            .collect()
+    }
+
     fn cold_start_planner(
         &self,
         pool: &PoolRegistration,
@@ -111,6 +124,19 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         Ok(Box::new(UniswapV3ColdStartPlanner::new(
             address, layout, policy, radius,
         )))
+    }
+
+    fn code_seeds(
+        &self,
+        pool: &PoolRegistration,
+    ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        let Some(address) = pool.key.address() else {
+            return Ok(Vec::new());
+        };
+        let Some(metadata) = v3_metadata(pool) else {
+            return Ok(Vec::new());
+        };
+        v3_code_seed_from_metadata(address, metadata).map(|opt| opt.into_iter().collect())
     }
 
     fn decode_event(

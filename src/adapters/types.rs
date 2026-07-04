@@ -328,6 +328,10 @@ pub struct V3Metadata {
     pub token1: Option<Address>,
     pub fee: Option<u32>,
     pub tick_spacing: Option<i32>,
+    /// Factory/deployer address embedded as an immutable in canonical Uniswap V3
+    /// pool bytecode. Factory discovery fills this; manual registrations can set
+    /// it explicitly when they want bytecode seeding.
+    pub factory: Option<Address>,
     pub storage_layout: Option<V3StorageLayout>,
     /// The ± radius, in tick-bitmap words, of the cold-start tick-warm window
     /// around the current word (`Strict`/`Eager` policies).
@@ -361,6 +365,12 @@ impl V3Metadata {
     /// Set the pool's tick spacing.
     pub fn with_tick_spacing(mut self, tick_spacing: i32) -> Self {
         self.tick_spacing = Some(tick_spacing);
+        self
+    }
+
+    /// Set the pool factory/deployer address.
+    pub fn with_factory(mut self, factory: Address) -> Self {
+        self.factory = Some(factory);
         self
     }
 
@@ -779,6 +789,10 @@ pub struct ColdStartReport {
     pub changed_slots: Vec<SlotChange>,
     pub applied: StateDiff,
     pub deferred: Vec<DeferredWork>,
+    /// Verified-code-seed results, when seeding ran for this cold-start (an
+    /// account-fields fetcher was present, seeding was enabled, and the adapter
+    /// produced at least one seed). `None` when no seeding was attempted.
+    pub code_seeds: Option<crate::adapters::cold_start::CodeSeedReport>,
 }
 
 impl ColdStartReport {
@@ -791,6 +805,7 @@ impl ColdStartReport {
             changed_slots: Vec::new(),
             applied: StateDiff::default(),
             deferred: Vec::new(),
+            code_seeds: None,
         }
     }
 }

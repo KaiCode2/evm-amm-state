@@ -21,7 +21,7 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Stage | What it does |
 | --- | --- |
 | **Register** | Describe a pool: a [`PoolKey`] + [`ProtocolMetadata`] (tokens, fee, storage layout / coins, …). |
-| **Cold-start** | `registry.cold_start(pool, cache, policy)` warms the pool's read-set into the [`EvmCache`] from forked storage. Named-slot protocols (Uniswap V2/V3, Solidly) warm known slots; layout-free protocols (Balancer, Curve) **discover → verify** the exact slots a quote call SLOADs. |
+| **Cold-start** | `registry.cold_start(pool, cache, policy)` warms the pool's read-set into the [`EvmCache`] from forked storage. Named-slot protocols (Uniswap V2/V3, Solidly) warm known slots; layout-free protocols (Balancer, Curve) **discover → verify** the exact slots a quote call SLOADs. Known AMM runtime bytecodes can be seeded first and verified once by `evm-fork-cache` against on-chain `EXTCODEHASH`. |
 | **Subscribe** | `adapter.event_sources(pool)` lists the log topics to subscribe to over a `wss://` endpoint. |
 | **React** | Decoded logs flow through [`AmmSyncEngine`] / [`AmmReactiveHandler`] + the `evm_fork_cache` reactive runtime. Exact-write protocols update cached state with **no RPC**; protocols whose logs do not carry final storage values emit hash-pinned resync requests that `evm-fork-cache` resolves from block traces, bulk storage, or point-read fallback. |
 | **Simulate** | `adapter.simulate_swap(pool, cache, token_in, token_out, amount_in, &config)` executes the pool's own quote against the cached state and returns a [`SwapQuote`] — fully offline. |
@@ -47,6 +47,70 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 
 All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
+
+### Verified Pool Bytecode Seeding
+
+Known pool runtime bytecodes live in [`src/adapters/bytecodes`](src/adapters/bytecodes)
+as embedded binary artifacts. Before cold-start, an adapter's `code_seeds` returns
+canonical `AdapterCodeSeed`s built by plain functions: `uniswap_v2_pair_code_seed`
+returns the shared pair runtime and its precomputed code hash, and
+`v3_code_seed_from_metadata` renders the V3 pool template from a pool's immutables.
+No per-pool bytecode fields are attached to metadata.
+
+When the cache has an account-fields fetcher available (and seeding is enabled),
+`AdapterRegistry::cold_start` writes these seeds into `EvmCache` with
+`seed_account_code`; `evm-fork-cache` verifies the code hash once against the
+chain. Seeding is a pure optimization: a pool's own runtime code is otherwise
+lazily fetched at first simulate. A code-hash mismatch (or an unverifiable seed)
+is purged and the pool falls back to lazily fetching its real code — it stays
+`Ready`, is never left `Degraded`, and no repair is raised. Verification results
+are surfaced on the cold-start report's `code_seeds` field. Disable seeding
+entirely with `AdapterRegistry::with_code_seeding(false)`.
+
+Uniswap V3 has an embedded pool template and an explicit `uniswap_v3_code_seed`
+helper for callers that already know the pool immutables. Factory-discovered
+Uniswap V3 registrations carry the factory immutable in metadata, allowing
+automatic V3 seeding without assuming a chain-global factory address. Balancer
+and Curve pool bytecode seeding are also in scope for this bytecode workstream
+before it is considered complete.
+
+### Factory-backed Discovery
+
+`PoolDiscovery` can build cold-start-ready registrations from configured
+factories instead of requiring callers to paste pool addresses. `FactoryConfig`
+is empty by default: callers opt in with explicit factory addresses, e.g.
+`FactoryConfig::default().with_uniswap_v3_factory(factory)`, so chain- and
+fork-specific deployments never inherit an assumed factory.
+
+Discovery supports Uniswap V2 and canonical Uniswap V3 style factories through
+derived mapping-slot reads (`getPair` / `getPool`) plus creation-log decoding
+(`PairCreated` / `PoolCreated`). V3-discovered registrations carry
+`V3Metadata.factory`, which gives bytecode seeding the factory immutable it
+needs to render and verify the expected pool runtime. `PoolQuery` only carries
+the common token pair; protocol-specific selectors use typed query structs such
+as `UniswapV3PoolQuery`. Multiple factories of the same protocol coexist (keyed
+by `(protocol, factory_address)`), and external `PoolFactory`s can be added via
+`PoolDiscovery::with_factory`.
+
+**Token-basket discovery.** `PoolDiscovery::find_pairs_among(&tokens)` is the
+declarative "give me every pool joining any pair of this basket" query: it
+expands the `C(n, 2)` pairs (× all V3 fee tiers), collects every factory mapping
+slot, and resolves them in a **single bulk `eth_call`**. Request count scales
+with the number of factories, not pairs or basket size — a 5-token mainnet
+basket resolves 49 pools in one round-trip (~20× faster than per-pair scans; see
+[`examples/token_basket_bench.rs`](examples/token_basket_bench.rs)).
+
+### Fast multi-pool bootstrap
+
+`AdapterRegistry::cold_start_many(pools, cache, provider, policy)` warms many
+pools at once: it seeds + verifies all one-shot-eligible pools' code in one
+account-fields call, hydrates them through a single bundled `run_storage_programs`
+`eth_call` (V3 full-sync / V2 flat-slot), and finalizes them `Ready`, falling
+back per pool to the conservative per-pool `cold_start` for anything without a
+one-shot program or whose hydration fails. `supports_one_shot_hydration`
+reports which pools take the fast path. Combined with token-basket discovery,
+the happy path is `find_pairs_among → cold_start_many → register`, with request
+count driven by bootstrap phases rather than pool count.
 
 ### Extending with a new AMM
 
@@ -94,13 +158,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut reg = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(usdc),
-            token1: Some(weth),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            storage_layout: Some(V3StorageLayout::uniswap(10)),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(usdc)
+                .with_token1(weth)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(V3StorageLayout::uniswap(10)),
+        ));
     registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
 
     // Offline from here: no RPC needed to quote.

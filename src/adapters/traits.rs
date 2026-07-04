@@ -1,6 +1,8 @@
 use alloy_primitives::{Address, Log, U256};
 
+use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError};
 use super::cold_start::AdapterColdStartPlanner;
+use super::factory::{FactoryConfig, PoolFactory};
 use super::sim::{SimConfig, SimError, SwapQuote};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource,
@@ -28,6 +30,13 @@ pub trait AmmAdapter: Send + Sync {
 
     fn route_log(&self, log: &Log, registry: &AdapterRegistry) -> Option<PoolKey> {
         registry.route_log_generic(log).map(|pool| pool.key.clone())
+    }
+
+    /// Build factory drivers backed by `config`, if this adapter supports
+    /// declarative pool discovery. Defaults to none so third-party adapters and
+    /// protocols without discovery support are unaffected.
+    fn pool_factories(&self, _config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        Vec::new()
     }
 
     /// Build a cold-start planner for `pool` under `policy`.
@@ -63,6 +72,21 @@ pub trait AmmAdapter: Send + Sync {
         _policy: ColdStartPolicy,
     ) -> Result<Box<dyn AdapterColdStartPlanner>, UnsupportedReason> {
         Err(UnsupportedReason::Protocol(self.protocol()))
+    }
+
+    /// Return canonical runtime bytecode seeds that should be written into
+    /// `EvmCache` before the cold-start run. The cache verifies these seeds
+    /// against on-chain code hashes during its `verify_code` phase.
+    ///
+    /// A pool that is simply not seedable (wrong pool-key shape, missing or
+    /// incomplete metadata, wrong protocol) returns `Ok(vec![])`. Only a
+    /// genuine template render failure returns `Err(BytecodeTemplateError)`;
+    /// the facade treats that as a safe skip (no seeding for that pool).
+    fn code_seeds(
+        &self,
+        _pool: &PoolRegistration,
+    ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        Ok(Vec::new())
     }
 
     fn decode_event(

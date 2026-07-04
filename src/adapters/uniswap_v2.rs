@@ -1,7 +1,9 @@
+use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError, uniswap_v2_pair_code_seed};
 use super::cold_start::{
     AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     SlotFetch,
 };
+use super::factory::{FactoryConfig, PoolFactory, UniswapV2Factory};
 use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, quote_via_call};
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::{
@@ -35,6 +37,17 @@ impl AmmAdapter for UniswapV2Adapter {
             .collect()
     }
 
+    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        config
+            .uniswap_v2
+            .iter()
+            .map(|factory| {
+                Box::new(UniswapV2Factory::new(factory.clone(), config.verify_derivations))
+                    as Box<dyn PoolFactory>
+            })
+            .collect()
+    }
+
     fn cold_start_planner(
         &self,
         pool: &PoolRegistration,
@@ -46,6 +59,19 @@ impl AmmAdapter for UniswapV2Adapter {
             ));
         };
         Ok(Box::new(UniswapV2ColdStartPlanner::new(address, policy)))
+    }
+
+    fn code_seeds(
+        &self,
+        pool: &PoolRegistration,
+    ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        let Some(address) = pool.key.address() else {
+            return Ok(Vec::new());
+        };
+        let ProtocolMetadata::UniswapV2(_) = &pool.metadata else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![uniswap_v2_pair_code_seed(address)])
     }
 
     fn decode_event(

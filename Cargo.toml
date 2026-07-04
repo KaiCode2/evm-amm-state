@@ -116,6 +116,30 @@ name = "adapter_a1"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
+name = "factory_discovery"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+[[test]]
+name = "bytecode_golden"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+[[test]]
+name = "code_seed_semantics"
+required-features = ["uniswap-v2"]
+
+[[test]]
+name = "factory_batch"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "bootstrap_many"
+required-features = ["uniswap-v2", "uniswap-v3", "curve"]
+
+[[test]]
+name = "token_basket"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+[[test]]
 name = "adapter_reactive"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
@@ -171,6 +195,25 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 [[example]]
 name = "v3_full_sync"
 required-features = ["uniswap-v3"]
+
+# Manual live proof that embedded AMM bytecodes can be seeded into EvmCache and
+# verified once against on-chain code hashes.
+[[example]]
+name = "verified_bytecode_seed"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Benchmark: declarative token-basket pool discovery (one bulk eth_call for all
+# pairs across both factories) vs naive per-pair scans. Env-gated on E2E_RPC_URL.
+[[example]]
+name = "token_basket_bench"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Live factory discovery -> cold-start -> reactive subscription demo for
+# Ethereum Uniswap V2 + V3 USDC/WETH pools. Env-gated; no-ops without
+# E2E_RPC_URL.
+[[example]]
+name = "factory_discovery_live"
+required-features = ["uniswap-v2", "uniswap-v3"]
 
 # Live sync-latency comparison for prior cold-start versus one-shot storage
 # programs across V3, V2, Balancer, and Curve. Env-gated; defaults to a public

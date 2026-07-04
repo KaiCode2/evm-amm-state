@@ -120,6 +120,50 @@ changes with one runtime rebuild per call. The evicting variant purges cache
 state owned exclusively by the removed pools — a shared address (e.g. the
 Balancer vault) only loses read-set slots no remaining pool covers.
 
+**Verified pool bytecode seeding (`adapters::bytecode`)** — adapters seed a
+pool's canonical runtime bytecode into `EvmCache` at cold-start (via
+`evm-fork-cache` 0.2.0's `seed_account_code`), so it is verified once against
+the on-chain `EXTCODEHASH` instead of paying an `eth_getCode`. Uniswap V2 shares
+one embedded pair runtime across every pair; Uniswap V3 patches the pool's
+Solidity immutables (factory, token0/1, fee, tickSpacing, maxLiquidityPerTick,
+and the `NoDelegateCall` self-address) into an embedded template. Seeding is a
+pure optimization: a hash mismatch, an unverifiable seed, a warm-cache code
+conflict, or a template render error all degrade to lazily fetching the real
+code — never a fatal error or a permanently `Degraded` pool — and every seeded
+address ends `Verified` or unmarked, never left `Pending`. Verification results
+surface on `ColdStartReport.code_seeds`; opt out with
+`AdapterRegistry::with_code_seeding(false)`. Embedded artifacts and the V3 patch
+offsets are pinned to chain-truth code hashes across tickSpacings 1/10/60
+(`tests/bytecode_golden.rs`) and live-proven in
+`examples/verified_bytecode_seed.rs`.
+
+**Factory-backed pool discovery (`adapters::factory`)** — build
+cold-start-ready `PoolRegistration`s from configured factories instead of pasted
+addresses. `PoolDiscovery` resolves Uniswap V2 (`getPair`) and V3 (`getPool` +
+`feeAmountTickSpacing`) mapping slots and decodes `PairCreated`/`PoolCreated`
+creation logs; `FactoryConfig` is empty by default (callers opt into explicit
+factory addresses). Multiple factories of one protocol coexist — keyed by
+`(protocol, factory_address)`, so Uniswap and a Sushi-style fork both resolve —
+and an external `PoolFactory` can be added through the `with_factory` open
+channel. V3 discovery resolves all fee-tier slots in one batched read
+(`AdapterCache::read_storage_slots`), and the declarative
+`PoolDiscovery::find_pairs_among(tokens)` expands a token basket into all
+`C(n, 2)` pairs (× all V3 fee tiers) and resolves every factory mapping slot in
+a **single bulk `eth_call`** — request count scales with factory count, not
+pairs, fee tiers, or basket size (a 5-token mainnet basket: 49 pools in 1
+round-trip vs 20, ~20× faster; `examples/token_basket_bench.rs`). Discovery is
+read-only: it produces registrations, and callers still decide when to
+cold-start them.
+
+**Bundled multi-pool bootstrap (`AdapterRegistry::cold_start_many`)** — the fast
+default for warming many pools at once: it seeds + verifies every
+one-shot-eligible pool's code in one account-fields call, hydrates them all
+through a single bundled `run_storage_programs` `eth_call` (V3 full-sync / V2
+flat-slot), and finalizes `Ready` — falling back per pool to the normal
+`cold_start` for anything without a one-shot program or whose hydration fails.
+`supports_one_shot_hydration` reports eligibility. `examples/factory_discovery_live.rs`
+uses the `find → cold_start_many → register` path.
+
 ### Changed
 
 - The one-shot sync and sync-engine types (`V3SyncSpec`, `V3ObservationsSpec`,

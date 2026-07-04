@@ -15,7 +15,11 @@ get cold-start-ready registrations back:
 ```rust
 // "Give me the pool for WETH/USDC at the 0.3% fee tier."
 let pools = discovery.find(&mut cache, ProtocolId::UniswapV3,
-    PoolQuery::pair(WETH, USDC).with_fee(3_000))?;
+    PoolQuery::pair(WETH, USDC))?;
+
+// "Give me the WETH/USDC Uniswap V3 pool at the 0.3% fee tier."
+let pools = discovery.find_uniswap_v3(&mut cache,
+    UniswapV3PoolQuery::pair(WETH, USDC).with_fee_tier(3_000))?;
 
 // "Give me all Uniswap V3 pools between WBTC/WETH."
 let pools = discovery.find(&mut cache, ProtocolId::UniswapV3,
@@ -64,10 +68,10 @@ query runs at the pinned block and the event stream starts there.
   this ships in 0.2.0 as a semver-minor addition.
 - **Config over heuristics.** Factory addresses, init-code hashes, and
   mapping base slots are per-chain config (`FactoryConfig`, mirroring
-  `SimConfig`: canonical mainnet defaults, `with_*` overrides, `Option` for
-  protocols with no canonical mainnet deployment). Curve variant detection
-  becomes **provenance, not heuristic**: the registry/factory that answers
-  for a pool determines its `CurveVariant`.
+  `SimConfig` but with empty defaults). Callers opt into explicit factories
+  or named presets; no protocol assumes a chain-global factory address. Curve
+  variant detection becomes **provenance, not heuristic**: the registry/factory
+  that answers for a pool determines its `CurveVariant`.
 
 ## 3. Vocabulary (new types, all `#[non_exhaustive]`)
 
@@ -77,25 +81,23 @@ pub struct PoolQuery {
     /// The (unordered) token pair. `PoolQuery::pair` normalizes order, so
     /// callers never care about token0/token1 sorting.
     pub tokens: (Address, Address),
-    /// Which variant(s) of the pair to resolve.
-    pub variant: PoolVariant,
 }
 
 impl PoolQuery {
-    pub fn pair(a: Address, b: Address) -> Self;          // variant = Any
-    pub fn with_fee(self, fee: u32) -> Self;              // V3 family fee tier
-    pub fn with_tick_spacing(self, spacing: i32) -> Self; // Slipstream
-    pub fn with_stable(self, stable: bool) -> Self;       // Solidly
+    pub fn pair(a: Address, b: Address) -> Self;
 }
 
-/// Protocol-specific variant selector.
-pub enum PoolVariant {
-    /// Every variant the factory knows for the pair (fee tiers, tick
-    /// spacings, stable+volatile, all matching Curve pools).
+/// Uniswap V3-specific query. Future protocol selectors should follow this
+/// pattern instead of adding protocol-specific knobs to `PoolQuery`.
+pub struct UniswapV3PoolQuery {
+    pub tokens: (Address, Address),
+    pub variant: UniswapV3PoolVariant,
+}
+
+pub enum UniswapV3PoolVariant {
+    /// Every configured fee tier for the pair.
     Any,
     FeeTier(u32),
-    TickSpacing(i32),
-    Stable(bool),
 }
 
 /// A pool located by query or creation event, ready for admission.
@@ -171,11 +173,12 @@ pub fn v3_pool_address(deployer: Address, init_code_hash: B256,
                        token0: Address, token1: Address, fee: u32) -> Address;
 ```
 
-Canonical constants ship as `FactoryConfig` defaults and are **verified, not
-trusted**: the gated parity tests assert, at a pinned block, that
+Canonical constants do not install factory addresses through `Default`. They
+are **verified, not trusted** when a caller opts into a known factory config or
+named preset: the gated parity tests assert, at a pinned block, that
 `DerivedSlot`, `Create2`, and `ViewCall` all agree with each other and with
-known pool addresses for every shipped default. Getting a fork's config wrong
-is the real risk of derive-first, so:
+known pool addresses for each shipped preset. Getting a fork's config wrong is
+the real risk of derive-first, so:
 
 - `FactoryConfig::verify_derivations(bool)` (default **on**): when a driver
   has both a mapping answer and a CREATE2 config, the first successful
@@ -206,7 +209,7 @@ pub trait PoolFactory: Send + Sync {
     fn find_pools(
         &self,
         cache: &mut dyn AdapterCache,
-        query: &PoolQuery,
+        query: &FactoryQuery,
     ) -> Result<Vec<DiscoveredPool>, DiscoveryError>;
 
     /// Factory emitters + creation topics for the live (push) half.
@@ -237,17 +240,18 @@ fork ABIs) that the chain-neutral adapter deliberately doesn't. Third parties
 can also implement `PoolFactory` directly for custom AMMs without touching
 their adapter.
 
-`FactoryConfig` (mirrors `SimConfig`): `v2_factory`, `v3_factory`,
-`pancake_v3_factory`, `balancer_vault`, `curve_meta_registry` default to the
-canonical Ethereum-mainnet deployments, now joined by the derivation
-constants — `v2_init_code_hash`, `v2_get_pair_base_slot`,
-`v3_pool_init_code_hash`, `v3_get_pool_base_slot`, `pancake_v3_deployer` +
-hash + slot — all defaulted to the canonical values and verified by the gated
-tests. `slipstream_factory` and `solidly_factory` are `Option<Address>` (their
-canonical homes are Base/OP — no honest mainnet default) plus a `solidly_abi`
-fork selector (`getPool(address,address,bool)` vs legacy `getPair`), optional
-Slipstream implementation address + clone init hash for its CREATE2 path, and
-the existing per-fork `SolidlyStorageLayout` hook.
+`FactoryConfig` (mirrors `SimConfig` shape, but with no assumed addresses):
+`v2_factory`, `v3_factory`, `pancake_v3_factory`, `balancer_vault`,
+`curve_meta_registry`, and fork-specific factories are all opt-in. Convenience
+constructors can install canonical mapping slots and tier lists once the caller
+has supplied the factory address; named presets may be added for known chains,
+but `Default` remains empty. Derivation constants such as
+`v2_get_pair_base_slot`, `v3_get_pool_base_slot`, `pancake_v3_deployer` + hash
++ slot are verified by gated tests rather than trusted. `slipstream_factory`
+and `solidly_factory` are `Option<Address>` plus a `solidly_abi` fork selector
+(`getPool(address,address,bool)` vs legacy `getPair`), optional Slipstream
+implementation address + clone init hash for its CREATE2 path, and the existing
+per-fork `SolidlyStorageLayout` hook.
 
 ## 6. The `PoolDiscovery` front-end
 
@@ -261,6 +265,10 @@ impl PoolDiscovery {
 
     /// One protocol, one query.
     pub fn find(&self, cache: &mut dyn AdapterCache, protocol: ProtocolId, query: PoolQuery)
+        -> Result<Vec<DiscoveredPool>, DiscoveryError>;
+
+    /// Uniswap V3-specific query with a typed fee-tier selector.
+    pub fn find_uniswap_v3(&self, cache: &mut dyn AdapterCache, query: UniswapV3PoolQuery)
         -> Result<Vec<DiscoveredPool>, DiscoveryError>;
 
     /// Same query fanned across every configured protocol.
@@ -278,11 +286,12 @@ impl PoolDiscovery {
 End-to-end, the declarative flow the feature exists for:
 
 ```rust
-let discovery = PoolDiscovery::for_registry(engine.registry(), FactoryConfig::default());
+let config = FactoryConfig::default().with_uniswap_v3_factory(my_v3_factory);
+let discovery = PoolDiscovery::for_registry(engine.registry(), config);
 
 // Declare the pool; get it tracked.
-for found in discovery.find(&mut cache, ProtocolId::UniswapV3,
-    PoolQuery::pair(WETH, USDC).with_fee(3_000))? {
+for found in discovery.find_uniswap_v3(&mut cache,
+    UniswapV3PoolQuery::pair(WETH, USDC).with_fee_tier(3_000))? {
     let mut registration = found.registration;
     registry_view.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     engine.register_pools([registration])?;
@@ -417,9 +426,10 @@ resolution ("WETH" → address is the consumer's lookup).
 2. Should `find_all` fan out sequentially per protocol (simple, proposed) or
    take a concurrency knob? Derived-slot batching already collapses the
    dominant cost; sequential seems fine at this fan-out.
-3. `PoolQuery` today models pairs. Add `PoolQuery::tokens([..])` (exact-set
+3. `PoolQuery` today models pairs only. Add `PoolQuery::tokens([..])` (exact-set
    match, ≥2 tokens) now or when someone needs it? Proposed: builder-ready,
-   implemented later — the type is `#[non_exhaustive]`.
+   implemented later — the type is `#[non_exhaustive]`. Protocol-specific
+   selectors should remain on protocol-specific query types.
 4. Does `DiscoveryDriver` belong in this crate or the consumer's loop until
    the interests-refresh API lands? Proposed: ship it here but document the
    rebuild cost, same stance as `register_pools`.

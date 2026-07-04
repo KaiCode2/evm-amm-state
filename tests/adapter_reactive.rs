@@ -18,13 +18,15 @@ use evm_amm_state::adapters::{
     ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
     CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
     SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
+    uniswap_v2_pair_runtime_code_hash,
 };
 // The reactive-runtime seam these tests exercise (raw `EvmCache::apply_updates`
 // and the upstream `ResyncedReport`/`InvalidationRequest`) speaks the upstream
 // state vocabulary, so these are the `evm_fork_cache` types, not the crate mirrors.
+use evm_fork_cache::AccountFieldsSample;
 use evm_fork_cache::PurgeScope;
 use evm_fork_cache::StateUpdate;
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::cache::{AccountFieldsFetchFn, EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, HandlerId, InputSource, ReactiveConfig, ReactiveInput,
     ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, ReactiveReport, ReactiveRuntime,
@@ -127,6 +129,18 @@ fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
                 (address, slot, Ok(value))
             })
             .collect()
+    })
+}
+
+fn account_fields_fetcher(samples: HashMap<Address, (U256, B256)>) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        Ok(addresses
+            .into_iter()
+            .map(|address| {
+                let (balance, code_hash) = samples.get(&address).copied().unwrap_or_default();
+                (address, AccountFieldsSample { balance, code_hash })
+            })
+            .collect())
     })
 }
 
@@ -901,6 +915,11 @@ async fn v2_cold_start_brings_pool_ready() -> Result<()> {
             reserves_slot(reserve0, reserve1, timestamp),
         ),
     ])));
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+    cache.set_account_fields_fetcher(account_fields_fetcher(HashMap::from([(
+        pool,
+        (U256::ZERO, expected_hash),
+    )])));
 
     let mut registry = AdapterRegistry::new();
     registry
@@ -1146,6 +1165,13 @@ async fn v3_cold_start_brings_pool_ready_with_tick_word() -> Result<()> {
         seed.insert((pool, keys[3]), U256::from(1_u64) << 248);
     }
 
+    let metadata = V3Metadata::default()
+        .with_token0(token0)
+        .with_token1(token1)
+        .with_fee(500)
+        .with_tick_spacing(60)
+        .with_storage_layout(layout);
+
     let mut cache = setup_cache().await?;
     cache.set_storage_batch_fetcher(stub_fetcher(seed));
 
@@ -1155,14 +1181,7 @@ async fn v3_cold_start_brings_pool_ready_with_tick_word() -> Result<()> {
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(
-            V3Metadata::default()
-                .with_token0(token0)
-                .with_token1(token1)
-                .with_fee(500)
-                .with_tick_spacing(60)
-                .with_storage_layout(layout),
-        ));
+        .with_metadata(ProtocolMetadata::UniswapV3(metadata));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 

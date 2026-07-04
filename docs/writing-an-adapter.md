@@ -152,6 +152,27 @@ If you do want the crate to warm state for you, implement `cold_start_planner` t
 return a boxed [`AdapterColdStartPlanner`](../src/adapters/cold_start.rs). The
 planner declares per-round slot work (verify/probe) that
 `AdapterRegistry::cold_start` drives, then finalizes the pool's metadata/status.
+If the adapter also knows the pool's canonical deployed runtime bytecode,
+override `code_seeds` to return [`AdapterCodeSeed`](../src/adapters/bytecode.rs)
+entries. `AdapterRegistry::cold_start` writes those bytes into `EvmCache` before
+the first round; `evm-fork-cache` verifies pending code seeds against on-chain
+code hashes before any cold-start simulation runs.
+
+When the bytecode can be derived from existing metadata, build the seed with a
+plain function rather than adding bytecode fields to the metadata. The built-in
+adapters are the template: Uniswap V2's `code_seeds` returns
+`uniswap_v2_pair_code_seed(address)` (the shared pair runtime plus its
+precomputed code hash), and Uniswap V3's returns
+`v3_code_seed_from_metadata(address, metadata)` — both in
+[`src/adapters/bytecode.rs`](../src/adapters/bytecode.rs), with the runtime
+artifacts under [`src/adapters/bytecodes`](../src/adapters/bytecodes). A pool
+that is simply not seedable (missing/incomplete metadata, wrong protocol)
+returns `Ok(vec![])`; only a genuine template render failure returns
+`Err(BytecodeTemplateError)`, which the facade treats as a safe skip. V3
+automatic seeding is enabled only when metadata includes the factory/deployer
+context, which factory discovery supplies without assuming a chain-global
+address.
+
 The built-in planners are the template:
 [`SolidlyV2ColdStartPlanner`](../src/adapters/solidly_v2.rs) is the simplest
 (a single verify-only round over named slots); the Balancer and Curve adapters

@@ -10,15 +10,40 @@ use super::{
 };
 
 /// Registry of tracked AMM pools and protocol adapters.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AdapterRegistry {
     adapters: HashMap<ProtocolId, Arc<dyn AmmAdapter>>,
     pools: HashMap<PoolKey, PoolRegistration>,
+    /// Whether [`cold_start`](Self::cold_start) seeds and verifies adapter
+    /// runtime bytecode (an optimization over the lazy real-code fetch).
+    /// Defaults to `true`; opt out via [`with_code_seeding`](Self::with_code_seeding).
+    pub(crate) code_seeding: bool,
+}
+
+impl Default for AdapterRegistry {
+    fn default() -> Self {
+        Self {
+            adapters: HashMap::new(),
+            pools: HashMap::new(),
+            code_seeding: true,
+        }
+    }
 }
 
 impl AdapterRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable or disable verified-code-seeding during
+    /// [`cold_start`](Self::cold_start).
+    ///
+    /// When `false`, cold-start performs no seeding and no verification call;
+    /// the pool's runtime code is fetched lazily at first simulate as usual.
+    /// Defaults to `true`.
+    pub fn with_code_seeding(mut self, enabled: bool) -> Self {
+        self.code_seeding = enabled;
+        self
     }
 
     pub fn register_pool(&mut self, registration: PoolRegistration) -> Result<(), RegistryError> {

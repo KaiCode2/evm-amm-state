@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, hex};
@@ -25,9 +26,12 @@ use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
     ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey,
     PoolRegistration, PoolStatus, ProtocolMetadata, RepairAction, SolidlyV2Adapter,
-    SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UnsupportedReason, V3Metadata,
+    SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UnsupportedReason,
+    V3ImmutablePatchValues, V3Metadata, uniswap_v2_pair_runtime_code_hash, uniswap_v3_code_seed,
+    uniswap_v3_max_liquidity_per_tick,
 };
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::AccountFieldsSample;
+use evm_fork_cache::cache::{AccountFieldsFetchFn, CodeSeedState, EvmCache, StorageBatchFetchFn};
 use revm::state::{AccountInfo, Bytecode};
 
 // --- helpers (kept local so this manager file owns its fixtures) ---
@@ -65,6 +69,29 @@ fn fetcher_with_failures(
                 }
             })
             .collect()
+    })
+}
+
+fn account_fields_fetcher(
+    values: HashMap<Address, (U256, B256)>,
+    calls: Arc<AtomicUsize>,
+) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(addresses
+            .into_iter()
+            .filter_map(|address| {
+                values.get(&address).map(|(balance, code_hash)| {
+                    (
+                        address,
+                        AccountFieldsSample {
+                            balance: *balance,
+                            code_hash: *code_hash,
+                        },
+                    )
+                })
+            })
+            .collect())
     })
 }
 
@@ -122,6 +149,11 @@ async fn v2_cold_start_value_reserves_is_ready() -> Result<()> {
             ),
         ]),
         Vec::new(),
+    ));
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::ZERO, expected_hash))]),
+        Arc::new(AtomicUsize::new(0)),
     ));
 
     let registry = v2_registry();
@@ -304,6 +336,59 @@ async fn v2_run_deferred_warms_lazy_deferred_slots() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_cold_start_seeds_and_verifies_runtime_bytecode_once() -> Result<()> {
+    let pool = Address::repeat_byte(0x15);
+    let token0 = Address::repeat_byte(0xb2);
+    let token1 = Address::repeat_byte(0xb3);
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+            ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+            (
+                (pool, V2_RESERVES_SLOT),
+                reserves_slot(U256::from(3_u64), U256::from(4_u64), U256::ZERO),
+            ),
+        ]),
+        Vec::new(),
+    ));
+    let account_field_calls = Arc::new(AtomicUsize::new(0));
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::from(99_u64), expected_hash))]),
+        account_field_calls.clone(),
+    ));
+
+    let registry = v2_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default().with_fee_bps(30),
+        ));
+
+    let first = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(first, ColdStartOutcome::Ready(_)), "got {first:?}");
+    assert_eq!(account_field_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        cache.code_seed_state(&pool),
+        Some(CodeSeedState::Verified { code_hash, .. }) if *code_hash == expected_hash
+    ));
+
+    let second = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(second, ColdStartOutcome::Ready(_)),
+        "got {second:?}"
+    );
+    assert_eq!(
+        account_field_calls.load(Ordering::SeqCst),
+        1,
+        "verified code seeds must not be reverified on later cold-starts"
+    );
+    Ok(())
+}
+
 // --- Uniswap V3 ---
 
 #[tokio::test]
@@ -348,6 +433,43 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
             .cached_storage_value(pool, layout.liquidity_slot)
             .is_some()
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v3_bytecode_template_patches_immutables_with_explicit_factory() -> Result<()> {
+    let pool = Address::repeat_byte(0x2c);
+    let factory = Address::repeat_byte(0xf0);
+    let token0 = Address::repeat_byte(0xc2);
+    let token1 = Address::repeat_byte(0xc3);
+    let fee = 500u32;
+    let tick_spacing = 60;
+    let seed = uniswap_v3_code_seed(
+        pool,
+        &V3ImmutablePatchValues {
+            pool_address: Some(pool),
+            factory: Some(factory),
+            token0: Some(token0),
+            token1: Some(token1),
+            fee: Some(fee),
+            tick_spacing: Some(tick_spacing),
+            max_liquidity_per_tick: uniswap_v3_max_liquidity_per_tick(tick_spacing),
+        },
+    )?;
+    let expected_hash = seed.code_hash;
+
+    let mut cache = setup_cache().await?;
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::from(1_u64), expected_hash))]),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    cache.seed_account_code(seed.address, seed.runtime_bytecode)?;
+    let report = cache.verify_code_seeds()?;
+    assert_eq!(report.verified, vec![pool]);
+    assert!(matches!(
+        cache.code_seed_state(&pool),
+        Some(CodeSeedState::Verified { code_hash, .. }) if *code_hash == expected_hash
+    ));
     Ok(())
 }
 

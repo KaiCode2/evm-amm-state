@@ -21,15 +21,22 @@
 //! a mandatory slot's verdict from `Value` / `Zero` / `FetchFailed`, so a genuine
 //! on-chain zero and a transient archive miss become *distinguishable* repairs.
 
-use alloy_primitives::{Address, Bytes, U256};
-use evm_fork_cache::cache::EvmCache;
+use alloy_primitives::{Address, B256, Bytes, U256};
+use evm_fork_cache::CacheError as UpstreamCacheError;
+use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_programs};
+use evm_fork_cache::cache::{CodeSeedState, EvmCache};
 use evm_fork_cache::cold_start::ColdStartConfig;
 
+use super::bytecode::AdapterCodeSeed;
 use super::state::UpstreamStateView;
+use super::storage_sync::{StorageSyncSpec, decode_storage_sync, storage_sync_spec_for_pool};
 use super::{
-    AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, PoolRegistration, SlotChange,
-    StateView, UnsupportedReason,
+    AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    PoolRegistration, PoolStatus, SlotChange, StateView, UnsupportedReason,
 };
+
+#[cfg(feature = "uniswap-v3")]
+use super::v3_sync::{V3SyncError, V3SyncSpec, decode_full_sync, full_sync_program};
 
 // ---------------------------------------------------------------------------
 // Crate-owned mirrors of the `evm_fork_cache::cold_start` vocabulary.
@@ -37,6 +44,66 @@ use super::{
 // Each mirror keeps upstream's variant / field NAMES so planner call-sites read
 // the same; the `From` conversions bridge to/from upstream at the driver seam.
 // ---------------------------------------------------------------------------
+
+/// Verified-code-seed results surfaced through a [`ColdStartReport`].
+///
+/// Crate-owned mirror of [`evm_fork_cache::cache::CodeVerifyReport`], so the
+/// public surface does not leak the upstream report. `verified` seeds are
+/// confirmed against chain code; `mismatched` / `not_deployed` / `codeless`
+/// seeds were contradicted and purged by upstream; `unverifiable` seeds could
+/// not be checked (transport error / no sample) — the facade purges those too,
+/// so the pool falls back to lazily fetching its real code.
+///
+/// [`ColdStartReport`]: super::ColdStartReport
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeSeedReport {
+    /// Seeds confirmed against on-chain code (`CodeSeedState::Verified`).
+    pub verified: Vec<Address>,
+    /// Seeds contradicted by a differing on-chain code hash (purged upstream).
+    pub mismatched: Vec<CodeSeedMismatch>,
+    /// Seeded addresses with no code at the pinned block (purged upstream).
+    pub not_deployed: Vec<Address>,
+    /// Seeded addresses that exist but hold no code / are EOAs (purged upstream).
+    pub codeless: Vec<Address>,
+    /// Seeds whose verification could not complete, with the reason (purged by
+    /// the facade so the pool never simulates over unverified code).
+    pub unverifiable: Vec<(Address, String)>,
+}
+
+impl From<evm_fork_cache::cache::CodeVerifyReport> for CodeSeedReport {
+    fn from(report: evm_fork_cache::cache::CodeVerifyReport) -> Self {
+        Self {
+            verified: report.verified,
+            mismatched: report.mismatched.into_iter().map(Into::into).collect(),
+            not_deployed: report.not_deployed,
+            codeless: report.codeless,
+            unverifiable: report.unverifiable,
+        }
+    }
+}
+
+/// One contradicted code-seed claim from verification.
+///
+/// Crate-owned mirror of [`evm_fork_cache::cache::CodeMismatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeSeedMismatch {
+    /// The seeded address.
+    pub address: Address,
+    /// The hash the seed claimed (keccak256 of the seeded bytes).
+    pub expected: B256,
+    /// The on-chain `EXTCODEHASH` observed at the pinned block.
+    pub actual: B256,
+}
+
+impl From<evm_fork_cache::cache::CodeMismatch> for CodeSeedMismatch {
+    fn from(mismatch: evm_fork_cache::cache::CodeMismatch) -> Self {
+        Self {
+            address: mismatch.address,
+            expected: mismatch.expected,
+            actual: mismatch.actual,
+        }
+    }
+}
 
 /// A single round of cold-start work, declared by an
 /// [`AdapterColdStartPlanner`].
@@ -413,6 +480,166 @@ impl evm_fork_cache::cold_start::ColdStartPlanner for Bridge<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// One-shot bulk hydration (the fast multi-pool bootstrap default).
+// ---------------------------------------------------------------------------
+
+/// How to hydrate one pool's whole hot state in a **single** storage program
+/// (`eth_call` with a code override), used by
+/// [`cold_start_many`](AdapterRegistry::cold_start_many).
+///
+/// Two shapes cover every fast-eligible pool:
+///
+/// - `V3` — a concentrated-liquidity full sync ([`v3_sync`](super::v3_sync)),
+///   which walks the entire tick bitmap in-program (only under the
+///   `uniswap-v3` feature).
+/// - `Flat` — a fixed / discovered flat read-set
+///   ([`storage_sync`](super::storage_sync)) for V2, Solidly, and (once
+///   discovered) Balancer/Curve.
+enum HydrationKind {
+    /// Concentrated-liquidity one-shot full sync for a V3-family pool.
+    #[cfg(feature = "uniswap-v3")]
+    V3 {
+        /// The pool whose storage the program reads.
+        pool: Address,
+        /// The full-sync spec derived from the pool's storage layout.
+        spec: V3SyncSpec,
+    },
+    /// Flat-slot one-shot sync for a pool with a known read-set.
+    Flat {
+        /// The flat read-set spec for the pool.
+        spec: StorageSyncSpec,
+    },
+}
+
+impl HydrationKind {
+    /// The single storage program that hydrates the pool's whole hot state.
+    fn program(&self) -> StorageProgram {
+        match self {
+            #[cfg(feature = "uniswap-v3")]
+            HydrationKind::V3 { pool, spec } => full_sync_program(*pool, spec),
+            HydrationKind::Flat { spec } => spec.program(),
+        }
+    }
+
+    /// Decode `output` and inject the hydrated state into `cache`, returning how
+    /// many slots were written. A decode failure is surfaced (un-flattened) so
+    /// the caller can fall the pool back to the multi-round cold-start.
+    fn apply(&self, cache: &mut EvmCache, output: &Bytes) -> Result<usize, HydrationError> {
+        match self {
+            #[cfg(feature = "uniswap-v3")]
+            HydrationKind::V3 { pool, spec } => {
+                let snapshot = decode_full_sync(spec, output).map_err(HydrationError::V3)?;
+                Ok(snapshot.inject(cache, *pool, spec))
+            }
+            HydrationKind::Flat { spec } => {
+                let snapshot = decode_storage_sync(spec, output).map_err(HydrationError::Flat)?;
+                Ok(snapshot.inject(cache))
+            }
+        }
+    }
+}
+
+/// Classify how — if at all — `pool` can be hydrated by a single one-shot
+/// storage program.
+///
+/// - No pool address → `None`.
+/// - A V3-family pool (`UniswapV3`/`PancakeV3`/`Slipstream`) that carries a
+///   `storage_layout` → a [`HydrationKind::V3`] full sync (only when the
+///   `uniswap-v3` feature is enabled).
+/// - Otherwise, any pool whose flat read-set resolves via
+///   [`storage_sync_spec_for_pool`] → a [`HydrationKind::Flat`] sync.
+/// - Everything else → `None`.
+///
+/// [`supports_one_shot_hydration`] is exactly `hydration_kind(pool).is_some()`,
+/// so classification and execution can never disagree.
+fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
+    let address = pool.key.address()?;
+
+    #[cfg(feature = "uniswap-v3")]
+    if let Some(layout) = v3_storage_layout(pool) {
+        return Some(HydrationKind::V3 {
+            pool: address,
+            spec: V3SyncSpec::uniswap(layout),
+        });
+    }
+    // Without the `uniswap-v3` feature the V3 full-sync path is uncompiled, so
+    // `storage_sync_spec_for_pool` (which rejects V3-family protocols) is the
+    // only classifier; the address is validated above regardless.
+    let _ = address;
+
+    storage_sync_spec_for_pool(pool)
+        .ok()
+        .map(|spec| HydrationKind::Flat { spec })
+}
+
+/// Borrow the explicit V3 `storage_layout` for a V3-family pool, if present.
+///
+/// Unlike [`layout_for`](super::storage::layout_for), this does **not** derive a
+/// layout from `tick_spacing`: one-shot hydration is offered only when the
+/// layout is explicitly carried, matching [`hydration_kind`]'s contract.
+#[cfg(feature = "uniswap-v3")]
+fn v3_storage_layout(pool: &PoolRegistration) -> Option<super::storage::V3StorageLayout> {
+    use super::ProtocolMetadata;
+    match &pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata)
+        | ProtocolMetadata::PancakeV3(metadata)
+        | ProtocolMetadata::Slipstream(metadata) => metadata.storage_layout,
+        _ => None,
+    }
+}
+
+/// Whether `pool` can be hydrated by a single one-shot storage program (the fast
+/// multi-pool bootstrap path used by
+/// [`cold_start_many`](AdapterRegistry::cold_start_many)).
+///
+/// Uniswap V2 (and any flat-read-set protocol) and V3-family pools that carry a
+/// `storage_layout` qualify; a V3 pool without a layout, an addressless pool, or
+/// a protocol with no persisted read-set (e.g. Curve before discovery) do not.
+///
+/// Defined as `hydration_kind(pool).is_some()`, so it always agrees with what
+/// `cold_start_many` will actually attempt.
+pub fn supports_one_shot_hydration(pool: &PoolRegistration) -> bool {
+    hydration_kind(pool).is_some()
+}
+
+/// A failure hydrating one pool from a one-shot storage program's output.
+///
+/// Used only to decide per-pool fallback inside
+/// [`cold_start_many`](AdapterRegistry::cold_start_many); it is never returned
+/// to the caller in this cycle. Keeps the upstream cause reachable through
+/// [`source`](std::error::Error::source) — the cause is not stringified.
+/// `#[non_exhaustive]` — an open error vocabulary.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum HydrationError {
+    /// Decoding a V3 full-sync program's output failed.
+    #[cfg(feature = "uniswap-v3")]
+    V3(V3SyncError),
+    /// Decoding a flat-slot sync program's output failed.
+    Flat(super::storage_sync::StorageSyncError),
+}
+
+impl std::fmt::Display for HydrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "uniswap-v3")]
+            Self::V3(_) => write!(f, "one-shot V3 hydration failed"),
+            Self::Flat(_) => write!(f, "one-shot flat-slot hydration failed"),
+        }
+    }
+}
+
+impl std::error::Error for HydrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "uniswap-v3")]
+            Self::V3(err) => Some(err as &(dyn std::error::Error + 'static)),
+            Self::Flat(err) => Some(err as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
+
 impl AdapterRegistry {
     /// Cold-start `pool` through its adapter's planner.
     ///
@@ -445,6 +672,19 @@ impl AdapterRegistry {
             Err(reason) => return Ok(ColdStartOutcome::Unsupported(reason)),
         };
 
+        // Seeding is a pure optimization over the lazy real-code fetch at first
+        // simulate (see `sim.rs`), so an adapter render error is a safe skip
+        // (no seeding for this pool), never a failure. `code_seeds` stays `None`
+        // when nothing was seeded.
+        let code_seed_report = if self.code_seeding && cache.account_fields_fetcher().is_some() {
+            match adapter.code_seeds(pool) {
+                Ok(seeds) if !seeds.is_empty() => Some(seed_and_verify(cache, seeds)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let report = {
             let mut bridge = Bridge(planner.as_mut());
             cache
@@ -453,6 +693,243 @@ impl AdapterRegistry {
         };
         let report = ColdStartRunReport::from(report);
 
-        Ok(planner.finish(pool, &report))
+        let outcome = planner.finish(pool, &report);
+        Ok(attach_code_seeds(outcome, code_seed_report))
+    }
+
+    /// Cold-start many pools at once, making the high-performance one-shot
+    /// storage load the **default** for multi-pool bootstrap.
+    ///
+    /// Where the per-pool [`cold_start`](Self::cold_start) runs a bounded
+    /// multi-round planner for every pool — so requests scale with pool count —
+    /// this path collapses the fast-eligible pools into a fixed number of
+    /// phases:
+    ///
+    /// 1. **Classify.** Each pool is `fast` when its adapter is registered and
+    ///    [`supports_one_shot_hydration`] holds; everything else is `fallback`.
+    /// 2. **Batched seed + verify.** Every fast pool's [`code_seeds`] are seeded
+    ///    together (same skip rules as the single-pool path) and, if any are
+    ///    pending, verified in **one** account-fields call — unverifiable seeds
+    ///    are purged so no address is left `Pending`.
+    /// 3. **Bundled hydration.** One [`run_storage_programs`] call hydrates all
+    ///    fast pools (distinct targets bundle into a single multicall
+    ///    `eth_call`). A pool whose program errored or failed to decode is moved
+    ///    to the fallback set.
+    /// 4. **Fallback.** Every fallback pool (originally classified plus any
+    ///    fast-hydration failure) is finalized through the normal
+    ///    [`cold_start`](Self::cold_start); its seeding is a no-op for anything
+    ///    already `Verified` in step 2.
+    ///
+    /// Returns one [`ColdStartOutcome`] per input pool, in **input order**. An
+    /// empty slice returns `Ok(vec![])` without touching `provider`.
+    ///
+    /// Fast hydration needs a live provider; over an empty/offline provider
+    /// every `eth_call` errors and every fast pool gracefully falls back — never
+    /// a panic. An upstream cold-start error from the fallback path (e.g. a
+    /// missing batch fetcher) still propagates as `Err`.
+    ///
+    /// [`code_seeds`]: super::AmmAdapter::code_seeds
+    pub async fn cold_start_many<P>(
+        &self,
+        pools: &mut [PoolRegistration],
+        cache: &mut EvmCache,
+        provider: &P,
+        policy: ColdStartPolicy,
+    ) -> Result<Vec<ColdStartOutcome>, ColdStartError>
+    where
+        P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+    {
+        if pools.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 1: partition into fast (adapter present AND one-shot-eligible)
+        // and fallback. `fast` carries the pool index and its hydration kind;
+        // `is_fallback` marks every index not (yet) on the fast path.
+        let mut fast: Vec<(usize, HydrationKind)> = Vec::new();
+        let mut is_fallback = vec![true; pools.len()];
+        for (index, pool) in pools.iter().enumerate() {
+            if self.adapter(pool.protocol()).is_none() {
+                continue;
+            }
+            if let Some(kind) = hydration_kind(pool) {
+                is_fallback[index] = false;
+                fast.push((index, kind));
+            }
+        }
+
+        // Step 2: seed + verify every fast pool's code claims in one batch,
+        // then a single verify pass. Mirrors the single-pool gating exactly.
+        if self.code_seeding && cache.account_fields_fetcher().is_some() {
+            let mut any_pending = false;
+            for (index, _) in &fast {
+                let pool = &pools[*index];
+                if let Some(adapter) = self.adapter(pool.protocol()) {
+                    // An adapter render error is a safe skip (no seeds for this
+                    // pool), never a failure — matching the single-pool path.
+                    if let Ok(seeds) = adapter.code_seeds(pool) {
+                        any_pending |= seed_batch(cache, seeds);
+                    }
+                }
+            }
+            if any_pending {
+                // The report is not surfaced here (fast outcomes leave
+                // `code_seeds = None`); this call's job is to leave no address
+                // `Pending`, purging any it cannot verify.
+                let _ = verify_pending_seeds(cache);
+            }
+        }
+
+        // Step 3: build one program per fast pool (stable order) and hydrate
+        // them all in a single bundled call.
+        let mut outcomes: Vec<Option<ColdStartOutcome>> = (0..pools.len()).map(|_| None).collect();
+        if !fast.is_empty() {
+            let programs: Vec<StorageProgram> =
+                fast.iter().map(|(_, kind)| kind.program()).collect();
+            let results = run_storage_programs(provider, cache.block(), &programs).await;
+
+            for ((index, kind), result) in fast.iter().zip(results) {
+                match result.map(|output| kind.apply(cache, &output)) {
+                    Ok(Ok(_slots)) => {
+                        let pool = &mut pools[*index];
+                        pool.status = PoolStatus::Ready;
+                        let mut report = ColdStartReport::new(pool.key.clone(), policy);
+                        report.status = PoolStatus::Ready;
+                        outcomes[*index] = Some(ColdStartOutcome::Ready(report));
+                    }
+                    // Either the program call errored (offline / gas / transport)
+                    // or its output failed to decode: fall this pool back.
+                    _ => is_fallback[*index] = true,
+                }
+            }
+        }
+
+        // Step 4: finalize every fallback pool through the normal cold-start.
+        for (index, pool) in pools.iter_mut().enumerate() {
+            if is_fallback[index] {
+                outcomes[index] = Some(self.cold_start(pool, cache, policy)?);
+            }
+        }
+
+        // Step 5: every slot is now populated (fast success or fallback).
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every pool is fast-hydrated or fell back"))
+            .collect())
+    }
+}
+
+/// Attach the verified-code-seed results to the [`ColdStartReport`] carried by a
+/// report-bearing outcome. `Unsupported` carries no report, so it is unchanged.
+///
+/// [`ColdStartReport`]: super::ColdStartReport
+fn attach_code_seeds(
+    outcome: ColdStartOutcome,
+    code_seed_report: Option<CodeSeedReport>,
+) -> ColdStartOutcome {
+    match outcome {
+        ColdStartOutcome::Ready(mut report) => {
+            report.code_seeds = code_seed_report;
+            ColdStartOutcome::Ready(report)
+        }
+        ColdStartOutcome::ReadyWithDeferred(mut report, deferred) => {
+            report.code_seeds = code_seed_report;
+            ColdStartOutcome::ReadyWithDeferred(report, deferred)
+        }
+        ColdStartOutcome::NeedsRepair(mut report, repair) => {
+            report.code_seeds = code_seed_report;
+            ColdStartOutcome::NeedsRepair(report, repair)
+        }
+        ColdStartOutcome::Unsupported(reason) => ColdStartOutcome::Unsupported(reason),
+    }
+}
+
+/// Seed each adapter code claim, then verify — leaving every seeded address
+/// either `Verified` or unmarked (never `Pending`).
+///
+/// Infallible: seeding is an optimization over the lazy real-code fetch, so a
+/// conflict, an empty seed, an unverifiable seed, or a verify error all degrade
+/// to "purge / skip and fall back to lazy real code" rather than an error.
+///
+/// The two phases are factored into [`seed_batch`] and [`verify_pending_seeds`]
+/// so the batched [`cold_start_many`](AdapterRegistry::cold_start_many) path can
+/// seed many pools' claims and then verify them all in **one** call.
+fn seed_and_verify(cache: &mut EvmCache, seeds: Vec<AdapterCodeSeed>) -> CodeSeedReport {
+    let any_pending = seed_batch(cache, seeds);
+    if !any_pending {
+        return CodeSeedReport::default();
+    }
+    verify_pending_seeds(cache)
+}
+
+/// Seed a batch of adapter code claims into `cache`, applying the same skip
+/// rules the single-pool path uses (skip a `Verified` same-hash claim, never
+/// overwrite an `Etched` claim, treat an identical `Pending` claim as already
+/// queued; catch `CodeSeedConflict`/`CodeSeedEmpty`/any other seed error as a
+/// safe skip). Returns whether any address is now `Pending` and so needs a
+/// [`verify_pending_seeds`] pass.
+fn seed_batch(cache: &mut EvmCache, seeds: impl IntoIterator<Item = AdapterCodeSeed>) -> bool {
+    let mut any_pending = false;
+    for seed in seeds {
+        match cache.code_seed_state(&seed.address) {
+            // Already confirmed with the same hash: never re-seed / re-verify.
+            Some(CodeSeedState::Verified { code_hash, .. }) if *code_hash == seed.code_hash => {
+                continue;
+            }
+            // A deliberate local etch is authoritative: never overwrite it.
+            Some(CodeSeedState::Etched { .. }) => continue,
+            // Idempotent: an identical pending claim is already queued to verify.
+            Some(CodeSeedState::Pending { code_hash }) if *code_hash == seed.code_hash => {
+                any_pending = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        match cache.seed_account_code(seed.address, seed.runtime_bytecode) {
+            Ok(_) => {
+                // A warm-cache same-hash match marks `Verified` immediately; only
+                // a genuinely new claim lands `Pending` and needs verification.
+                if matches!(
+                    cache.code_seed_state(&seed.address),
+                    Some(CodeSeedState::Pending { .. })
+                ) {
+                    any_pending = true;
+                }
+            }
+            // The cache already holds authoritative RPC-origin code with a
+            // different hash, or the seed was empty: skip (existing code wins).
+            Err(UpstreamCacheError::CodeSeedConflict { .. })
+            | Err(UpstreamCacheError::CodeSeedEmpty { .. }) => {}
+            // Any other seeding error is non-fatal too: skip, fall back to lazy.
+            Err(_) => {}
+        }
+    }
+    any_pending
+}
+
+/// Verify every pending code seed in `cache` in one call, purging any address
+/// that could not be confirmed so no unverified bytes are left behind, and
+/// return the resulting [`CodeSeedReport`].
+///
+/// Call only when [`seed_batch`] reported at least one pending seed.
+fn verify_pending_seeds(cache: &mut EvmCache) -> CodeSeedReport {
+    match cache.verify_code_seeds() {
+        Ok(report) => {
+            // Upstream leaves an unverifiable seed `Pending`; purging it prevents
+            // simulating over unverified code (it falls back to lazy real code).
+            for (address, _reason) in &report.unverifiable {
+                cache.purge_account(*address);
+            }
+            CodeSeedReport::from(report)
+        }
+        Err(_) => {
+            // Verification could not run: purge every still-pending seed so no
+            // unverified bytes remain, and report nothing.
+            for address in cache.pending_code_seeds() {
+                cache.purge_account(address);
+            }
+            CodeSeedReport::default()
+        }
     }
 }

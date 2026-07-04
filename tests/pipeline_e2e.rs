@@ -24,9 +24,10 @@ use evm_amm_state::adapters::storage::{
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartOutcome, ColdStartPolicy,
     ConcentratedLiquidityAdapter, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
-    SimConfig, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
+    SimConfig, UniswapV2Adapter, UniswapV2Metadata, V3Metadata, uniswap_v2_pair_runtime_code_hash,
 };
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::AccountFieldsSample;
+use evm_fork_cache::cache::{AccountFieldsFetchFn, EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput,
     ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
@@ -95,6 +96,18 @@ fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
                 (address, slot, Ok(value))
             })
             .collect()
+    })
+}
+
+fn account_fields_fetcher(samples: HashMap<Address, (U256, B256)>) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        Ok(addresses
+            .into_iter()
+            .map(|address| {
+                let (balance, code_hash) = samples.get(&address).copied().unwrap_or_default();
+                (address, AccountFieldsSample { balance, code_hash })
+            })
+            .collect())
     })
 }
 
@@ -268,6 +281,11 @@ async fn v2_full_pipeline_cold_start_react_simulate() -> Result<()> {
         ((pool, V2_TOKEN0_SLOT), token_word(token0)),
         ((pool, V2_TOKEN1_SLOT), token_word(token1)),
     ])));
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+    cache.set_account_fields_fetcher(account_fields_fetcher(HashMap::from([(
+        pool,
+        (U256::ZERO, expected_hash),
+    )])));
 
     let adapter = UniswapV2Adapter::default();
     let mut registry = AdapterRegistry::new();
@@ -325,6 +343,13 @@ async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
     let token1 = Address::repeat_byte(0xa3);
     let quote_out = U256::from(9_999_u64);
 
+    let metadata = V3Metadata::default()
+        .with_token0(token0)
+        .with_token1(token1)
+        .with_fee(500)
+        .with_tick_spacing(10)
+        .with_storage_layout(V3StorageLayout::uniswap(10));
+
     let mut cache = setup_cache().await?;
     install_default_account(&mut cache, Address::ZERO);
     install_mock_runtime(
@@ -346,14 +371,7 @@ async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
     registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(
-            V3Metadata::default()
-                .with_token0(token0)
-                .with_token1(token1)
-                .with_fee(500)
-                .with_tick_spacing(10)
-                .with_storage_layout(V3StorageLayout::uniswap(10)),
-        ));
+        .with_metadata(ProtocolMetadata::UniswapV3(metadata));
 
     // 1) cold-start
     assert!(matches!(
