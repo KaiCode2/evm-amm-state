@@ -1909,6 +1909,8 @@ dependencies = [
 [[package]]
 name = "evm-fork-cache"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78bd6942590fe9538370add7be5661e14428a69544084b5b2b5fd8b0dc7a93c2"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
