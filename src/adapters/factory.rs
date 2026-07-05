@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use alloy_primitives::{Address, Log, U256};
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 use alloy_primitives::B256;
+use alloy_primitives::{Address, Log, U256};
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 use alloy_sol_types::{SolEvent, sol};
 
@@ -990,8 +990,12 @@ impl PoolFactory for UniswapV3Factory {
                     self.config.fee_amount_tick_spacing_base_slot,
                     fee,
                 );
-                let tick_spacing =
-                    i24_from_word(values.get(&(self.config.factory, tick_slot)).copied().unwrap_or_default());
+                let tick_spacing = i24_from_word(
+                    values
+                        .get(&(self.config.factory, tick_slot))
+                        .copied()
+                        .unwrap_or_default(),
+                );
                 if tick_spacing <= 0 {
                     return Err(DiscoveryError::Malformed(
                         "V3 feeAmountTickSpacing returned a non-positive spacing",

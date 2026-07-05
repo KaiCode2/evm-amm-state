@@ -52,12 +52,12 @@ pub use cold_start::{
 pub use driver::{AdapterDriver, DriverError};
 #[cfg(feature = "uniswap-v2")]
 pub use factory::UniswapV2FactoryConfig;
+#[cfg(feature = "uniswap-v3")]
+pub use factory::UniswapV3FactoryConfig;
 pub use factory::{
     CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, FactoryConfig,
     PoolDiscovery, PoolFactory, PoolQuery,
 };
-#[cfg(feature = "uniswap-v3")]
-pub use factory::UniswapV3FactoryConfig;
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};

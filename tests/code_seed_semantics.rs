@@ -182,7 +182,10 @@ async fn verified_seed_is_confirmed_once() -> Result<()> {
     assert_eq!(calls.load(Ordering::SeqCst), 1, "seed verified once");
 
     let second = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
-    assert!(matches!(second, ColdStartOutcome::Ready(_)), "got {second:?}");
+    assert!(
+        matches!(second, ColdStartOutcome::Ready(_)),
+        "got {second:?}"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -252,7 +255,10 @@ async fn etched_code_is_never_overwritten() -> Result<()> {
     let registry = v2_registry();
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
-    assert!(matches!(outcome, ColdStartOutcome::Ready(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
     assert!(
         matches!(
             cache.code_seed_state(&pool),
@@ -284,7 +290,10 @@ async fn unverifiable_seed_is_purged_and_non_fatal() -> Result<()> {
     let registry = v2_registry();
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
-    assert!(matches!(outcome, ColdStartOutcome::Ready(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
     assert_eq!(
         registration.status,
         PoolStatus::Ready,
@@ -319,7 +328,10 @@ async fn code_seeding_can_be_disabled() -> Result<()> {
     let registry = registry.with_code_seeding(false);
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
-    assert!(matches!(outcome, ColdStartOutcome::Ready(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
     assert!(
         cache.code_seed_state(&pool).is_none(),
         "seeding disabled means the address stays unmarked"

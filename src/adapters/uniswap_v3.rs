@@ -93,8 +93,10 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             .uniswap_v3
             .iter()
             .map(|factory| {
-                Box::new(UniswapV3Factory::new(factory.clone(), config.verify_derivations))
-                    as Box<dyn PoolFactory>
+                Box::new(UniswapV3Factory::new(
+                    factory.clone(),
+                    config.verify_derivations,
+                )) as Box<dyn PoolFactory>
             })
             .collect()
     }

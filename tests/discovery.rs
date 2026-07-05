@@ -15,10 +15,10 @@ use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::factory::derive;
 use evm_amm_state::adapters::{
     AdapterCache, AdapterRegistry, CacheError, CallOutcome, ConcentratedLiquidityAdapter,
-    CreationLogContext, DiscoveredPool, DiscoverySource, DiscoveryError, EventSource, FactoryConfig,
-    PoolDiscovery, PoolFactory, PoolKey, PoolQuery, PoolRegistration, ProtocolId, ProtocolMetadata,
-    SlotChange, StateDiff, StateUpdate, StateView, UniswapV2Adapter, UniswapV2FactoryConfig,
-    UniswapV2Metadata, UniswapV3FactoryConfig,
+    CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, EventSource,
+    FactoryConfig, PoolDiscovery, PoolFactory, PoolKey, PoolQuery, PoolRegistration, ProtocolId,
+    ProtocolMetadata, SlotChange, StateDiff, StateUpdate, StateView, UniswapV2Adapter,
+    UniswapV2FactoryConfig, UniswapV2Metadata, UniswapV3FactoryConfig,
 };
 
 // --- counting cache ---
@@ -125,8 +125,16 @@ fn find_pair_resolves_all_protocols_in_one_read() -> Result<()> {
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
-    cache.set(v2_factory, derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, t0, t1), word(v2_pair));
-    cache.set(v3_factory, derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500), word(v3_pool));
+    cache.set(
+        v2_factory,
+        derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, t0, t1),
+        word(v2_pair),
+    );
+    cache.set(
+        v3_factory,
+        derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500),
+        word(v3_pool),
+    );
     cache.set(
         v3_factory,
         derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
@@ -135,7 +143,9 @@ fn find_pair_resolves_all_protocols_in_one_read() -> Result<()> {
 
     let discovery = PoolDiscovery::for_registry(
         &registry_v2_v3(),
-        FactoryConfig::default().with_uniswap_v2(v2_cfg).with_uniswap_v3(v3_cfg),
+        FactoryConfig::default()
+            .with_uniswap_v2(v2_cfg)
+            .with_uniswap_v3(v3_cfg),
     );
 
     let found = discovery.find(&mut cache, PoolQuery::pair(a, b))?;
@@ -144,7 +154,10 @@ fn find_pair_resolves_all_protocols_in_one_read() -> Result<()> {
         found.iter().map(|p| p.key.address()).collect();
     assert!(addrs.contains(&Some(v2_pair)) && addrs.contains(&Some(v3_pool)));
     assert_eq!(cache.single_reads, 0);
-    assert_eq!(cache.batch_reads, 1, "one batched read across both protocols");
+    assert_eq!(
+        cache.batch_reads, 1,
+        "one batched read across both protocols"
+    );
     Ok(())
 }
 
@@ -163,8 +176,16 @@ fn find_pair_on_protocol_filters() -> Result<()> {
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
-    cache.set(v2_factory, derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, t0, t1), word(v2_pair));
-    cache.set(v3_factory, derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500), word(v3_pool));
+    cache.set(
+        v2_factory,
+        derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, t0, t1),
+        word(v2_pair),
+    );
+    cache.set(
+        v3_factory,
+        derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500),
+        word(v3_pool),
+    );
     cache.set(
         v3_factory,
         derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
@@ -173,7 +194,9 @@ fn find_pair_on_protocol_filters() -> Result<()> {
 
     let discovery = PoolDiscovery::for_registry(
         &registry_v2_v3(),
-        FactoryConfig::default().with_uniswap_v2(v2_cfg).with_uniswap_v3(v3_cfg),
+        FactoryConfig::default()
+            .with_uniswap_v2(v2_cfg)
+            .with_uniswap_v3(v3_cfg),
     );
 
     let v2_only = discovery.find(&mut cache, PoolQuery::pair(a, b).on(ProtocolId::UniswapV2))?;
@@ -195,15 +218,21 @@ fn find_on_absent_protocol_errors_but_unfiltered_does_not() -> Result<()> {
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
     let discovery = PoolDiscovery::for_registry(
         &registry,
-        FactoryConfig::default()
-            .with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(v2_factory)),
+        FactoryConfig::default().with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(v2_factory)),
     );
     let mut cache = CountingCache::default();
 
     let err = discovery
-        .find(&mut cache, PoolQuery::pair(Address::repeat_byte(1), Address::repeat_byte(2)).on(ProtocolId::UniswapV3))
+        .find(
+            &mut cache,
+            PoolQuery::pair(Address::repeat_byte(1), Address::repeat_byte(2))
+                .on(ProtocolId::UniswapV3),
+        )
         .unwrap_err();
-    assert!(matches!(err, DiscoveryError::MissingFactory(ProtocolId::UniswapV3)));
+    assert!(matches!(
+        err,
+        DiscoveryError::MissingFactory(ProtocolId::UniswapV3)
+    ));
 
     // No filter → best-effort across registered factories, no error.
     let found = discovery.find(
@@ -230,8 +259,16 @@ fn find_basket_resolves_all_pairs_in_one_read() -> Result<()> {
     let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory); // 4 fee tiers
 
     let mut cache = CountingCache::default();
-    cache.set(v2_factory, derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b), word(v2_pair_ab));
-    cache.set(v3_factory, derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, a, c, 500), word(v3_pool_ac));
+    cache.set(
+        v2_factory,
+        derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b),
+        word(v2_pair_ab),
+    );
+    cache.set(
+        v3_factory,
+        derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, a, c, 500),
+        word(v3_pool_ac),
+    );
     cache.set(
         v3_factory,
         derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
@@ -240,7 +277,9 @@ fn find_basket_resolves_all_pairs_in_one_read() -> Result<()> {
 
     let discovery = PoolDiscovery::for_registry(
         &registry_v2_v3(),
-        FactoryConfig::default().with_uniswap_v2(v2_cfg).with_uniswap_v3(v3_cfg),
+        FactoryConfig::default()
+            .with_uniswap_v2(v2_cfg)
+            .with_uniswap_v3(v3_cfg),
     );
 
     let found = discovery.find(&mut cache, PoolQuery::basket([a, b, c]))?;
@@ -270,14 +309,24 @@ fn find_across_same_protocol_factories_one_read() -> Result<()> {
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
-    cache.set(uni, derive::v2_get_pair_slot(uni_cfg.get_pair_base_slot, t0, t1), word(uni_pair));
-    cache.set(sushi, derive::v2_get_pair_slot(sushi_cfg.get_pair_base_slot, t0, t1), word(sushi_pair));
+    cache.set(
+        uni,
+        derive::v2_get_pair_slot(uni_cfg.get_pair_base_slot, t0, t1),
+        word(uni_pair),
+    );
+    cache.set(
+        sushi,
+        derive::v2_get_pair_slot(sushi_cfg.get_pair_base_slot, t0, t1),
+        word(sushi_pair),
+    );
 
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
     let discovery = PoolDiscovery::for_registry(
         &registry,
-        FactoryConfig::default().with_uniswap_v2(uni_cfg).with_uniswap_v2(sushi_cfg),
+        FactoryConfig::default()
+            .with_uniswap_v2(uni_cfg)
+            .with_uniswap_v2(sushi_cfg),
     );
 
     let found = discovery.find(&mut cache, PoolQuery::pair(a, b).on(ProtocolId::UniswapV2))?;
@@ -302,7 +351,11 @@ fn find_v3_registration_has_full_metadata() -> Result<()> {
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
-    cache.set(v3_factory, derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500), word(pool));
+    cache.set(
+        v3_factory,
+        derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, t0, t1, 500),
+        word(pool),
+    );
     cache.set(
         v3_factory,
         derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
@@ -310,10 +363,8 @@ fn find_v3_registration_has_full_metadata() -> Result<()> {
     );
 
     let registry = registry_v2_v3();
-    let discovery = PoolDiscovery::for_registry(
-        &registry,
-        FactoryConfig::default().with_uniswap_v3(v3_cfg),
-    );
+    let discovery =
+        PoolDiscovery::for_registry(&registry, FactoryConfig::default().with_uniswap_v3(v3_cfg));
 
     let found = discovery.find(&mut cache, PoolQuery::pair(a, b).on(ProtocolId::UniswapV3))?;
     assert_eq!(found.len(), 1);
@@ -347,8 +398,12 @@ fn external_find_pools_only_factory_participates() -> Result<()> {
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
 
-    let discovery = PoolDiscovery::for_registry(&registry, FactoryConfig::default())
-        .with_factory(Box::new(StubFactory { factory: Address::repeat_byte(0xcf), pool: custom_pool }));
+    let discovery = PoolDiscovery::for_registry(&registry, FactoryConfig::default()).with_factory(
+        Box::new(StubFactory {
+            factory: Address::repeat_byte(0xcf),
+            pool: custom_pool,
+        }),
+    );
 
     let mut cache = CountingCache::default();
     let found = discovery.find(
@@ -367,11 +422,16 @@ fn find_empty_query_is_empty() -> Result<()> {
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
     let discovery = PoolDiscovery::for_registry(
         &registry,
-        FactoryConfig::default()
-            .with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(Address::repeat_byte(0xf2))),
+        FactoryConfig::default().with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(
+            Address::repeat_byte(0xf2),
+        )),
     );
     let mut cache = CountingCache::default();
-    assert!(discovery.find(&mut cache, PoolQuery::basket([]))?.is_empty());
+    assert!(
+        discovery
+            .find(&mut cache, PoolQuery::basket([]))?
+            .is_empty()
+    );
     assert!(discovery.find(&mut cache, PoolQuery::pairs([]))?.is_empty());
     assert_eq!(cache.batch_reads, 0);
     Ok(())
@@ -417,7 +477,10 @@ fn creation_log_decodes() -> Result<()> {
     assert_eq!(found.key, PoolKey::UniswapV2(pair));
     assert_eq!(
         found.source,
-        DiscoverySource::CreationEvent { block_number: Some(456), log_index: Some(9) }
+        DiscoverySource::CreationEvent {
+            block_number: Some(456),
+            log_index: Some(9)
+        }
     );
     Ok(())
 }
@@ -438,8 +501,16 @@ fn find_many_resolves_heterogeneous_queries_in_one_read() -> Result<()> {
     let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory);
 
     let mut cache = CountingCache::default();
-    cache.set(v2_factory, derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b), word(v2_pair_ab));
-    cache.set(v3_factory, derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, a, c, 500), word(v3_pool_ac));
+    cache.set(
+        v2_factory,
+        derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b),
+        word(v2_pair_ab),
+    );
+    cache.set(
+        v3_factory,
+        derive::v3_get_pool_slot(v3_cfg.get_pool_base_slot, a, c, 500),
+        word(v3_pool_ac),
+    );
     cache.set(
         v3_factory,
         derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
@@ -448,7 +519,9 @@ fn find_many_resolves_heterogeneous_queries_in_one_read() -> Result<()> {
 
     let discovery = PoolDiscovery::for_registry(
         &registry_v2_v3(),
-        FactoryConfig::default().with_uniswap_v2(v2_cfg).with_uniswap_v3(v3_cfg),
+        FactoryConfig::default()
+            .with_uniswap_v2(v2_cfg)
+            .with_uniswap_v3(v3_cfg),
     );
 
     // (a,b) only on V2; (a,c) only on V3 — one shot.
@@ -463,9 +536,16 @@ fn find_many_resolves_heterogeneous_queries_in_one_read() -> Result<()> {
     let addrs: std::collections::HashSet<Option<Address>> =
         found.iter().map(|p| p.key.address()).collect();
     assert!(addrs.contains(&Some(v2_pair_ab)) && addrs.contains(&Some(v3_pool_ac)));
-    assert_eq!(found.len(), 2, "exactly the two requested pools; got {found:?}");
+    assert_eq!(
+        found.len(),
+        2,
+        "exactly the two requested pools; got {found:?}"
+    );
     assert_eq!(cache.single_reads, 0);
-    assert_eq!(cache.batch_reads, 1, "all sub-queries resolve in one batched read");
+    assert_eq!(
+        cache.batch_reads, 1,
+        "all sub-queries resolve in one batched read"
+    );
     Ok(())
 }
 
@@ -480,7 +560,11 @@ fn find_many_dedups_and_empty_is_noop() -> Result<()> {
     let v2_cfg = UniswapV2FactoryConfig::uniswap_v2(v2_factory).with_fee_bps(30);
 
     let mut cache = CountingCache::default();
-    cache.set(v2_factory, derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b), word(v2_pair));
+    cache.set(
+        v2_factory,
+        derive::v2_get_pair_slot(v2_cfg.get_pair_base_slot, a, b),
+        word(v2_pair),
+    );
 
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
@@ -490,10 +574,16 @@ fn find_many_dedups_and_empty_is_noop() -> Result<()> {
     // The same pair reached via an unfiltered query and a V2-filtered query.
     let found = discovery.find_many(
         &mut cache,
-        [PoolQuery::pair(a, b), PoolQuery::pair(a, b).on(ProtocolId::UniswapV2)],
+        [
+            PoolQuery::pair(a, b),
+            PoolQuery::pair(a, b).on(ProtocolId::UniswapV2),
+        ],
     )?;
     assert_eq!(
-        found.iter().filter(|p| p.key == PoolKey::UniswapV2(v2_pair)).count(),
+        found
+            .iter()
+            .filter(|p| p.key == PoolKey::UniswapV2(v2_pair))
+            .count(),
         1,
         "overlapping sub-queries must not duplicate a pool"
     );

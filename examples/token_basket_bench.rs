@@ -81,7 +81,10 @@ async fn main() -> Result<()> {
 
     // --- Strategy A: naive per-pair scan (cold cache) ---
     let discovery_naive = PoolDiscovery::for_registry(&registry, config());
-    let mut cache_naive = EvmCache::builder(provider.clone()).block(block).build().await;
+    let mut cache_naive = EvmCache::builder(provider.clone())
+        .block(block)
+        .build()
+        .await;
     let naive_start = Instant::now();
     let mut naive_pools = 0usize;
     for (token0, token1) in &pairs {
@@ -106,7 +109,10 @@ async fn main() -> Result<()> {
 
     // --- Strategy B: one-shot token-basket discovery (cold cache) ---
     let discovery_basket = PoolDiscovery::for_registry(&registry, config());
-    let mut cache_basket = EvmCache::builder(provider.clone()).block(block).build().await;
+    let mut cache_basket = EvmCache::builder(provider.clone())
+        .block(block)
+        .build()
+        .await;
     let basket_start = Instant::now();
     let basket_pools = discovery_basket
         .find(&mut cache_basket, PoolQuery::basket(basket.iter().copied()))
@@ -114,7 +120,9 @@ async fn main() -> Result<()> {
     let basket_elapsed = basket_start.elapsed();
 
     println!();
-    println!("naive per-pair:   pools={naive_pools:>3}  round_trips={naive_round_trips:>3}  time={naive_elapsed:?}");
+    println!(
+        "naive per-pair:   pools={naive_pools:>3}  round_trips={naive_round_trips:>3}  time={naive_elapsed:?}"
+    );
     println!(
         "one-shot basket:  pools={:>3}  round_trips=  1  time={basket_elapsed:?}",
         basket_pools.len()

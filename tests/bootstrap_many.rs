@@ -58,17 +58,15 @@ fn account_fields_fetcher(values: HashMap<Address, (U256, B256)>) -> AccountFiel
         Ok(addresses
             .into_iter()
             .filter_map(|address| {
-                values
-                    .get(&address)
-                    .map(|(balance, code_hash)| {
-                        (
-                            address,
-                            AccountFieldsSample {
-                                balance: *balance,
-                                code_hash: *code_hash,
-                            },
-                        )
-                    })
+                values.get(&address).map(|(balance, code_hash)| {
+                    (
+                        address,
+                        AccountFieldsSample {
+                            balance: *balance,
+                            code_hash: *code_hash,
+                        },
+                    )
+                })
             })
             .collect())
     })
@@ -106,7 +104,10 @@ async fn cold_start_many_falls_back_to_ready_when_hydration_cannot_run() -> Resu
         let t1 = Address::repeat_byte(0x70 + i as u8);
         storage.insert((pool, V2_TOKEN0_SLOT), token_word(t0));
         storage.insert((pool, V2_TOKEN1_SLOT), token_word(t1));
-        storage.insert((pool, V2_RESERVES_SLOT), reserves(10 + i as u64, 20 + i as u64));
+        storage.insert(
+            (pool, V2_RESERVES_SLOT),
+            reserves(10 + i as u64, 20 + i as u64),
+        );
     }
     cache.set_storage_batch_fetcher(stub_fetcher(storage));
     let expected_hash = uniswap_v2_pair_runtime_code_hash();
@@ -120,15 +121,26 @@ async fn cold_start_many_falls_back_to_ready_when_hydration_cannot_run() -> Resu
 
     let mut pools = vec![v2_registration(pool_a), v2_registration(pool_b)];
     let outcomes = registry
-        .cold_start_many(&mut pools, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .cold_start_many(
+            &mut pools,
+            &mut cache,
+            provider.as_ref(),
+            ColdStartPolicy::Eager,
+        )
         .await?;
 
     assert_eq!(outcomes.len(), 2, "one outcome per input pool");
     assert!(
-        outcomes.iter().all(|o| matches!(o, ColdStartOutcome::Ready(_))),
+        outcomes
+            .iter()
+            .all(|o| matches!(o, ColdStartOutcome::Ready(_))),
         "every pool must finalize Ready (fast path or fallback); got {outcomes:?}"
     );
-    assert_eq!(pools[0].key, PoolKey::UniswapV2(pool_a), "input order preserved");
+    assert_eq!(
+        pools[0].key,
+        PoolKey::UniswapV2(pool_a),
+        "input order preserved"
+    );
     assert_eq!(pools[1].key, PoolKey::UniswapV2(pool_b));
     assert!(pools.iter().all(|p| p.status == PoolStatus::Ready));
     Ok(())
@@ -142,7 +154,12 @@ async fn cold_start_many_empty_is_noop() -> Result<()> {
     let registry = AdapterRegistry::new();
     let mut pools: Vec<PoolRegistration> = Vec::new();
     let outcomes = registry
-        .cold_start_many(&mut pools, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .cold_start_many(
+            &mut pools,
+            &mut cache,
+            provider.as_ref(),
+            ColdStartPolicy::Eager,
+        )
         .await?;
     assert!(outcomes.is_empty());
     Ok(())
@@ -154,7 +171,10 @@ async fn cold_start_many_empty_is_noop() -> Result<()> {
 #[test]
 fn supports_one_shot_hydration_classifies_by_protocol_and_metadata() {
     let v2 = v2_registration(Address::repeat_byte(0x01));
-    assert!(supports_one_shot_hydration(&v2), "V2 has a fixed flat read-set");
+    assert!(
+        supports_one_shot_hydration(&v2),
+        "V2 has a fixed flat read-set"
+    );
 
     let v3_ready = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x02)))
         .with_state_address(Address::repeat_byte(0x02))

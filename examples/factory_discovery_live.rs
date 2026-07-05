@@ -137,7 +137,10 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|pool| pool.registration)
         .collect();
-    let fast_eligible = ready.iter().filter(|p| supports_one_shot_hydration(p)).count();
+    let fast_eligible = ready
+        .iter()
+        .filter(|p| supports_one_shot_hydration(p))
+        .count();
 
     let cold_start_start = Instant::now();
     let outcomes = registry
@@ -165,10 +168,7 @@ async fn main() -> Result<()> {
                     changed_slots += report.changed_slots.len();
                 }
             }
-            other => bail!(
-                "{:?} did not reach Ready: {other:?}",
-                registration.key
-            ),
+            other => bail!("{:?} did not reach Ready: {other:?}", registration.key),
         }
     }
     if !ready.iter().all(|pool| pool.status == PoolStatus::Ready) {

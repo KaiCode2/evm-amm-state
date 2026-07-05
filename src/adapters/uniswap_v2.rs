@@ -42,8 +42,10 @@ impl AmmAdapter for UniswapV2Adapter {
             .uniswap_v2
             .iter()
             .map(|factory| {
-                Box::new(UniswapV2Factory::new(factory.clone(), config.verify_derivations))
-                    as Box<dyn PoolFactory>
+                Box::new(UniswapV2Factory::new(
+                    factory.clone(),
+                    config.verify_derivations,
+                )) as Box<dyn PoolFactory>
             })
             .collect()
     }
