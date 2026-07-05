@@ -1,10 +1,10 @@
 //! Benchmark: declarative token-basket pool discovery vs naive per-pair scans.
 //!
-//! Given a basket of tokens, `PoolDiscovery::find_pairs_among` expands all
+//! Given a basket of tokens, `find(PoolQuery::basket(..))` expands all
 //! `C(n,2)` pairs (× all V3 fee tiers), collects every factory mapping slot, and
 //! resolves them in ONE batched `read_storage_slots` (a single bulk `eth_call`
-//! on `EvmCache`). The naive baseline instead calls `find` / `find_uniswap_v3`
-//! per pair, one round-trip each.
+//! on `EvmCache`). The naive baseline instead calls `find(PoolQuery::pair(..)
+//! .on(protocol))` per pair per protocol, one round-trip each.
 //!
 //! Each strategy runs against its OWN cold cache pinned to the same block, so
 //! the comparison is round-trips-vs-round-trips, not warm-cache hits.
@@ -22,12 +22,11 @@ use alloy_network::AnyNetwork;
 use alloy_primitives::{Address, address};
 use alloy_provider::{Provider, RootProvider};
 use anyhow::{Context, Result};
+use evm_amm_state::adapters::factory::derive;
 use evm_amm_state::adapters::{
     AdapterRegistry, ConcentratedLiquidityAdapter, FactoryConfig, PoolDiscovery, PoolQuery,
     ProtocolId, UniswapV2Adapter, UniswapV2FactoryConfig, UniswapV3FactoryConfig,
-    UniswapV3PoolQuery,
 };
-use evm_amm_state::adapters::factory::derive;
 use evm_fork_cache::cache::EvmCache;
 
 const UNISWAP_V2_FACTORY: Address = address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f");
@@ -87,11 +86,17 @@ async fn main() -> Result<()> {
     let mut naive_pools = 0usize;
     for (token0, token1) in &pairs {
         naive_pools += discovery_naive
-            .find(&mut cache_naive, ProtocolId::UniswapV2, PoolQuery::pair(*token0, *token1))
+            .find(
+                &mut cache_naive,
+                PoolQuery::pair(*token0, *token1).on(ProtocolId::UniswapV2),
+            )
             .context("naive V2 find")?
             .len();
         naive_pools += discovery_naive
-            .find_uniswap_v3(&mut cache_naive, UniswapV3PoolQuery::pair(*token0, *token1))
+            .find(
+                &mut cache_naive,
+                PoolQuery::pair(*token0, *token1).on(ProtocolId::UniswapV3),
+            )
             .context("naive V3 find")?
             .len();
     }
@@ -104,8 +109,8 @@ async fn main() -> Result<()> {
     let mut cache_basket = EvmCache::builder(provider.clone()).block(block).build().await;
     let basket_start = Instant::now();
     let basket_pools = discovery_basket
-        .find_pairs_among(&mut cache_basket, &basket)
-        .context("basket find_pairs_among")?;
+        .find(&mut cache_basket, PoolQuery::basket(basket.iter().copied()))
+        .context("basket find")?;
     let basket_elapsed = basket_start.elapsed();
 
     println!();

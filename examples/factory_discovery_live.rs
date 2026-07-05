@@ -40,7 +40,7 @@ use evm_amm_state::adapters::{
     AdapterRegistry, AmmSyncEngine, ColdStartOutcome, ColdStartPolicy,
     ConcentratedLiquidityAdapter, DiscoverySource, FactoryConfig, PoolDiscovery, PoolKey,
     PoolQuery, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, UniswapV2Adapter,
-    UniswapV2FactoryConfig, UniswapV3FactoryConfig, UniswapV3PoolQuery, supports_one_shot_hydration,
+    UniswapV2FactoryConfig, UniswapV3FactoryConfig, supports_one_shot_hydration,
 };
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
@@ -107,14 +107,16 @@ async fn main() -> Result<()> {
         discovery
             .find(
                 &mut cache,
-                ProtocolId::UniswapV2,
-                PoolQuery::pair(USDC, WETH),
+                PoolQuery::pair(USDC, WETH).on(ProtocolId::UniswapV2),
             )
             .context("query Uniswap V2 factory")?,
     );
     discovered.extend(
         discovery
-            .find_uniswap_v3(&mut cache, UniswapV3PoolQuery::pair(USDC, WETH))
+            .find(
+                &mut cache,
+                PoolQuery::pair(USDC, WETH).on(ProtocolId::UniswapV3),
+            )
             .context("query Uniswap V3 factory")?,
     );
     let discovery_elapsed = discovery_start.elapsed();

@@ -4,14 +4,12 @@
 //! [`PoolRegistration`] values, and callers still decide when to cold-start and
 //! register them.
 
+use std::collections::HashMap;
 use std::fmt;
 
+use alloy_primitives::{Address, Log, U256};
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
-use std::collections::HashMap;
-
-use alloy_primitives::{Address, Log};
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
-use alloy_primitives::{B256, U256};
+use alloy_primitives::B256;
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 use alloy_sol_types::{SolEvent, sol};
 
@@ -44,10 +42,9 @@ pub mod derive {
     /// Every unordered token pair drawn from `tokens`, each normalized to
     /// `(token0, token1)` order and de-duplicated. For `n` distinct tokens this
     /// is the `C(n, 2)` combinations — the pair set a token-basket query
-    /// expands into (see [`PoolDiscovery::find_pairs_among`]).
+    /// expands into (see [`PoolQuery::basket`]).
     ///
-    /// [`PoolDiscovery::find_pairs_among`]: super::PoolDiscovery::find_pairs_among
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+    /// [`PoolQuery::basket`]: super::PoolQuery::basket
     pub fn pairs_among(tokens: &[Address]) -> Vec<(Address, Address)> {
         let mut pairs = Vec::new();
         for (i, &a) in tokens.iter().enumerate() {
@@ -165,86 +162,65 @@ sol! {
     event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool);
 }
 
-/// What to resolve from a protocol factory.
+/// A declarative pool-discovery query: which token pairs to resolve, optionally
+/// scoped to a single protocol.
+///
+/// Construct one with [`pair`](Self::pair), [`basket`](Self::basket), or
+/// [`pairs`](Self::pairs) — each normalizes token order (via
+/// [`derive::sort_tokens`]) and de-duplicates — then optionally narrow it with
+/// [`on`](Self::on). An unscoped query (no protocol) spans every matching
+/// factory in a single batched read; `.on(p)` restricts it to protocol `p` (and
+/// [`PoolDiscovery::find`] errors [`DiscoveryError::MissingFactory`] if no
+/// factory is registered for `p`).
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolQuery {
-    pub tokens: (Address, Address),
+    /// Normalized, de-duplicated `(token0, token1)` pairs to resolve.
+    pairs: Vec<(Address, Address)>,
+    /// The protocol to scope discovery to; `None` spans all matching factories.
+    protocol: Option<ProtocolId>,
 }
 
 impl PoolQuery {
-    /// Build a pair query, normalizing token order.
+    /// A single token pair, normalized to `(token0, token1)` order.
     pub fn pair(a: Address, b: Address) -> Self {
         Self {
-            tokens: derive::sort_tokens(a, b),
-        }
-    }
-}
-
-/// Uniswap V3-specific pool query.
-#[cfg(feature = "uniswap-v3")]
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UniswapV3PoolQuery {
-    pub tokens: (Address, Address),
-    pub variant: UniswapV3PoolVariant,
-}
-
-#[cfg(feature = "uniswap-v3")]
-impl UniswapV3PoolQuery {
-    /// Build a V3 pair query, normalizing token order and resolving all
-    /// configured fee tiers by default.
-    pub fn pair(a: Address, b: Address) -> Self {
-        Self {
-            tokens: derive::sort_tokens(a, b),
-            variant: UniswapV3PoolVariant::Any,
+            pairs: vec![derive::sort_tokens(a, b)],
+            protocol: None,
         }
     }
 
-    pub fn with_fee_tier(mut self, fee: u32) -> Self {
-        self.variant = UniswapV3PoolVariant::FeeTier(fee);
+    /// Every unordered pair drawn from a token basket — the `C(n, 2)`
+    /// combinations, each normalized and de-duplicated (see
+    /// [`derive::pairs_among`]).
+    pub fn basket(tokens: impl IntoIterator<Item = Address>) -> Self {
+        let tokens: Vec<Address> = tokens.into_iter().collect();
+        Self {
+            pairs: derive::pairs_among(&tokens),
+            protocol: None,
+        }
+    }
+
+    /// An explicit set of pairs, each normalized to `(token0, token1)` order,
+    /// then sorted and de-duplicated.
+    pub fn pairs(pairs: impl IntoIterator<Item = (Address, Address)>) -> Self {
+        let mut pairs: Vec<(Address, Address)> = pairs
+            .into_iter()
+            .map(|(a, b)| derive::sort_tokens(a, b))
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        Self {
+            pairs,
+            protocol: None,
+        }
+    }
+
+    /// Scope discovery to a single protocol. Without this, the query spans every
+    /// registered factory whose protocol has a matching pool.
+    pub fn on(mut self, protocol: ProtocolId) -> Self {
+        self.protocol = Some(protocol);
         self
-    }
-}
-
-#[cfg(feature = "uniswap-v3")]
-impl From<PoolQuery> for UniswapV3PoolQuery {
-    fn from(query: PoolQuery) -> Self {
-        Self {
-            tokens: query.tokens,
-            variant: UniswapV3PoolVariant::Any,
-        }
-    }
-}
-
-/// Uniswap V3-specific variant selector.
-#[cfg(feature = "uniswap-v3")]
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum UniswapV3PoolVariant {
-    #[default]
-    Any,
-    FeeTier(u32),
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FactoryQuery {
-    Pair(PoolQuery),
-    #[cfg(feature = "uniswap-v3")]
-    UniswapV3(UniswapV3PoolQuery),
-}
-
-impl From<PoolQuery> for FactoryQuery {
-    fn from(query: PoolQuery) -> Self {
-        Self::Pair(query)
-    }
-}
-
-#[cfg(feature = "uniswap-v3")]
-impl From<UniswapV3PoolQuery> for FactoryQuery {
-    fn from(query: UniswapV3PoolQuery) -> Self {
-        Self::UniswapV3(query)
     }
 }
 
@@ -442,7 +418,6 @@ impl DiscoveredPool {
 #[non_exhaustive]
 pub enum DiscoveryError {
     MissingFactory(ProtocolId),
-    UnsupportedQuery(&'static str),
     Factory(Box<dyn std::error::Error + Send + Sync + 'static>),
     Malformed(&'static str),
     DerivationMismatch { mapping: Address, derived: Address },
@@ -452,7 +427,6 @@ impl fmt::Display for DiscoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingFactory(protocol) => write!(f, "missing factory for {protocol:?}"),
-            Self::UnsupportedQuery(message) => write!(f, "unsupported factory query: {message}"),
             Self::Factory(err) => write!(f, "factory query failed: {err}"),
             Self::Malformed(message) => write!(f, "malformed factory response: {message}"),
             Self::DerivationMismatch { mapping, derived } => write!(
@@ -487,21 +461,38 @@ pub trait PoolFactory: Send + Sync {
     /// de-duplication, so distinct addresses of the same protocol are all kept.
     fn factory_address(&self) -> Address;
 
+    /// Resolve a single normalized `(token0, token1)` pair to its pool(s).
+    ///
+    /// The default derives from the batched
+    /// [`candidate_reads`](Self::candidate_reads) /
+    /// [`assemble_pairs`](Self::assemble_pairs) pair — so a factory that
+    /// implements those participates in single-pair discovery for free.
+    /// [`PoolDiscovery::find`] calls this only as a per-pair fallback for
+    /// factories that opt out of batching (empty `candidate_reads`); such
+    /// external factories override it directly.
     fn find_pools(
         &self,
         cache: &mut dyn AdapterCache,
-        query: &FactoryQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError>;
+        pair: (Address, Address),
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        let slots = self.candidate_reads(&[pair]);
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values = cache.read_storage_slots(&slots)?;
+        let resolved = slots.into_iter().zip(values).collect();
+        self.assemble_pairs(&[pair], &resolved)
+    }
 
     /// The storage reads (`(factory_address, slot)`) this factory needs to
     /// resolve every pair in `pairs`. Returning them instead of executing lets
-    /// [`PoolDiscovery::find_pairs_among`] gather the candidate slots of *all*
-    /// pairs across *all* factories and resolve them in a single batched
+    /// [`PoolDiscovery::find`] gather the candidate slots of *all* pairs across
+    /// *all* factories and resolve them in a single batched
     /// [`AdapterCache::read_storage_slots`] call.
     ///
     /// Defaults to none: a factory that does not implement batched multi-pair
-    /// discovery simply contributes no pools to a basket query.
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+    /// discovery simply contributes no pools to a batched query (and its
+    /// [`find_pools`](Self::find_pools) override runs per pair instead).
     fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {
         let _ = pairs;
         Vec::new()
@@ -511,7 +502,6 @@ pub trait PoolFactory: Send + Sync {
     /// (`values`, keyed by `(factory_address, slot)`) — the batched counterpart
     /// to [`find_pools`](Self::find_pools). Must read only slots this factory
     /// previously returned from [`candidate_reads`](Self::candidate_reads).
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
     fn assemble_pairs(
         &self,
         pairs: &[(Address, Address)],
@@ -587,110 +577,130 @@ impl PoolDiscovery {
         self.factories.push(factory);
     }
 
-    pub fn find(
-        &self,
-        cache: &mut dyn AdapterCache,
-        protocol: ProtocolId,
-        query: PoolQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let query = FactoryQuery::from(query);
-        let mut matched = false;
-        let mut found = Vec::new();
-        for factory in &self.factories {
-            if factory.protocol() != protocol {
-                continue;
-            }
-            matched = true;
-            found.extend(factory.find_pools(cache, &query)?);
-        }
-        if !matched {
-            return Err(DiscoveryError::MissingFactory(protocol));
-        }
-        Ok(found)
-    }
-
-    #[cfg(feature = "uniswap-v3")]
-    pub fn find_uniswap_v3(
-        &self,
-        cache: &mut dyn AdapterCache,
-        query: UniswapV3PoolQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let query = FactoryQuery::from(query);
-        let mut matched = false;
-        let mut found = Vec::new();
-        for factory in &self.factories {
-            if factory.protocol() != ProtocolId::UniswapV3 {
-                continue;
-            }
-            matched = true;
-            found.extend(factory.find_pools(cache, &query)?);
-        }
-        if !matched {
-            return Err(DiscoveryError::MissingFactory(ProtocolId::UniswapV3));
-        }
-        Ok(found)
-    }
-
-    pub fn find_all(
-        &self,
-        cache: &mut dyn AdapterCache,
-        query: PoolQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let mut found = Vec::new();
-        let query = FactoryQuery::Pair(query);
-        for factory in &self.factories {
-            found.extend(factory.find_pools(cache, &query)?);
-        }
-        Ok(found)
-    }
-
-    /// Discover **every** pool joining any pair of `tokens`, across all
-    /// registered factories, in a single batched storage read.
+    /// Shared batched resolution core behind [`find`](Self::find).
     ///
-    /// This is the declarative "give me all pools among this token basket"
-    /// query. It expands `tokens` into all `C(n, 2)` pairs (see
-    /// [`derive::pairs_among`]), collects the candidate mapping-slot reads of
-    /// every factory for every pair (for Uniswap V3, every configured fee tier
-    /// plus the shared `feeAmountTickSpacing` slots), and resolves them all with
-    /// ONE [`AdapterCache::read_storage_slots`] call — which, on an `EvmCache`,
-    /// is a single bulk `eth_call`. Request count scales with the number of
-    /// factories, not with pairs, fee tiers, or basket size.
+    /// Considers only factories matching `protocol` (all factories when
+    /// `protocol` is `None`) and partitions them into two groups by whether they
+    /// opt into batched discovery:
     ///
-    /// Only factories that implement [`PoolFactory::candidate_reads`] /
-    /// [`assemble_pairs`](PoolFactory::assemble_pairs) participate (the built-in
-    /// Uniswap V2 and V3 factories do); others contribute nothing here — use
-    /// [`find`](Self::find) for those.
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
-    pub fn find_pairs_among(
+    /// - *Batchable* factories (non-empty [`candidate_reads`]) contribute their
+    ///   candidate slots to a single shared set. The whole set is de-duplicated
+    ///   and resolved with exactly ONE [`AdapterCache::read_storage_slots`] call
+    ///   — regardless of factory or pair count — then handed back to each
+    ///   factory's [`assemble_pairs`] to build its pools. The built-in Uniswap V2
+    ///   and V3 factories are batchable.
+    /// - *Legacy* factories (default empty [`candidate_reads`], i.e. they only
+    ///   implement [`find_pools`]) fall back to a per-pair [`find_pools`] call, so
+    ///   externally-implemented factories keep working.
+    ///
+    /// [`candidate_reads`]: PoolFactory::candidate_reads
+    /// [`assemble_pairs`]: PoolFactory::assemble_pairs
+    /// [`find_pools`]: PoolFactory::find_pools
+    /// Discover pools for several [`PoolQuery`]s at once, resolving the candidate
+    /// slots of *all* of them in a single batched read and returning the
+    /// de-duplicated union.
+    ///
+    /// Each query is scoped independently, so one call can mix protocols across
+    /// pairs — some pairs only on Uniswap V2, others only on V3 — without extra
+    /// round-trips. Batchable factories (the built-in V2/V3) contribute their
+    /// candidate mapping slots to ONE [`AdapterCache::read_storage_slots`] call
+    /// (a single bulk `eth_call` on an `EvmCache`); external factories that only
+    /// implement [`find_pools`](PoolFactory::find_pools) fall back per pair. A
+    /// query scoped with [`PoolQuery::on`] to a protocol with no registered
+    /// factory yields [`DiscoveryError::MissingFactory`]; an empty query list is
+    /// `Ok(vec![])`.
+    pub fn find_many(
         &self,
         cache: &mut dyn AdapterCache,
-        tokens: &[Address],
+        queries: impl IntoIterator<Item = PoolQuery>,
     ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let pairs = derive::pairs_among(tokens);
-        if pairs.is_empty() || self.factories.is_empty() {
-            return Ok(Vec::new());
+        let queries: Vec<PoolQuery> = queries.into_iter().collect();
+
+        // An explicit `.on(protocol)` naming an unregistered protocol is an error.
+        for query in &queries {
+            if let Some(protocol) = query.protocol
+                && !self
+                    .factories
+                    .iter()
+                    .any(|factory| factory.protocol() == protocol)
+            {
+                return Err(DiscoveryError::MissingFactory(protocol));
+            }
         }
 
-        // Gather every factory's candidate slots, de-duplicate, and resolve the
-        // whole set in one batched read.
+        // Gather the candidate slots of every (query, matching batchable factory)
+        // into one set, then resolve them all in a single batched read.
         let mut slots: Vec<(Address, U256)> = Vec::new();
-        for factory in &self.factories {
-            slots.extend(factory.candidate_reads(&pairs));
+        for query in &queries {
+            for factory in self
+                .factories
+                .iter()
+                .filter(|factory| query.protocol.is_none_or(|p| factory.protocol() == p))
+            {
+                slots.extend(factory.candidate_reads(&query.pairs));
+            }
         }
         slots.sort_unstable();
         slots.dedup();
-        if slots.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        let values = cache.read_storage_slots(&slots)?;
-        let resolved: HashMap<(Address, U256), U256> = slots.into_iter().zip(values).collect();
+        let resolved: HashMap<(Address, U256), U256> = if slots.is_empty() {
+            HashMap::new()
+        } else {
+            let values = cache.read_storage_slots(&slots)?;
+            slots.into_iter().zip(values).collect()
+        };
 
+        // Assemble, de-duplicating by pool key across (possibly overlapping) queries.
         let mut found = Vec::new();
-        for factory in &self.factories {
-            found.extend(factory.assemble_pairs(&pairs, &resolved)?);
+        let mut seen = std::collections::HashSet::new();
+        for query in &queries {
+            for factory in self
+                .factories
+                .iter()
+                .filter(|factory| query.protocol.is_none_or(|p| factory.protocol() == p))
+            {
+                let pools = if factory.candidate_reads(&query.pairs).is_empty() {
+                    // Legacy factory (no `candidate_reads`): per-pair fallback.
+                    let mut out = Vec::new();
+                    for pair in &query.pairs {
+                        out.extend(factory.find_pools(cache, *pair)?);
+                    }
+                    out
+                } else {
+                    factory.assemble_pairs(&query.pairs, &resolved)?
+                };
+                for pool in pools {
+                    if seen.insert(pool.key.clone()) {
+                        found.push(pool);
+                    }
+                }
+            }
         }
+
         Ok(found)
+    }
+
+    /// Resolve a [`PoolQuery`] into discovered pools in a single batched read.
+    ///
+    /// Every pair in the query — a single pair, a token basket's `C(n, 2)`
+    /// combinations, or an explicit pair set — is resolved across all matching
+    /// factories at once: batchable factories (the built-in Uniswap V2 and V3)
+    /// contribute their candidate mapping slots to ONE
+    /// [`AdapterCache::read_storage_slots`] call (a single bulk `eth_call` on an
+    /// `EvmCache`), so request count scales with factory count, not with pairs,
+    /// fee tiers, or basket size. External factories that only implement
+    /// [`find_pools`](PoolFactory::find_pools) fall back to a per-pair call.
+    ///
+    /// An unscoped query spans every matching factory. If the query is scoped
+    /// with [`PoolQuery::on`] to a protocol that has no registered factory, this
+    /// returns [`DiscoveryError::MissingFactory`]; an unscoped query never errors
+    /// on missing factories (empty pairs simply yield `Ok(vec![])`).
+    pub fn find(
+        &self,
+        cache: &mut dyn AdapterCache,
+        query: PoolQuery,
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        self.find_many(cache, std::iter::once(query))
     }
 
     pub fn creation_sources(&self) -> Vec<EventSource> {
@@ -789,42 +799,6 @@ impl PoolFactory for UniswapV2Factory {
         self.config.factory
     }
 
-    fn find_pools(
-        &self,
-        cache: &mut dyn AdapterCache,
-        query: &FactoryQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        // With `uniswap-v3` off, `FactoryQuery` has only the `Pair` variant, so
-        // the match is single-arm; allow the lint in that build only.
-        #[cfg_attr(
-            not(feature = "uniswap-v3"),
-            allow(clippy::infallible_destructuring_match)
-        )]
-        let query = match query {
-            FactoryQuery::Pair(query) => query,
-            #[cfg(feature = "uniswap-v3")]
-            FactoryQuery::UniswapV3(_) => {
-                return Err(DiscoveryError::UnsupportedQuery(
-                    "Uniswap V2 supports only common pair queries",
-                ));
-            }
-        };
-
-        let (token0, token1) = query.tokens;
-        let slot = derive::v2_get_pair_slot(self.config.get_pair_base_slot, token0, token1);
-        let pair = address_from_word(cache.read_storage_slot(self.config.factory, slot)?)?;
-        if pair == Address::ZERO {
-            return Ok(Vec::new());
-        }
-        self.ensure_derivation_matches(pair, token0, token1)?;
-        Ok(vec![self.registration(
-            pair,
-            token0,
-            token1,
-            DiscoverySource::Query,
-        )])
-    }
-
     fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {
         pairs
             .iter()
@@ -909,13 +883,6 @@ impl UniswapV3Factory {
         }
     }
 
-    fn fees_for_query(&self, variant: &UniswapV3PoolVariant) -> Vec<u32> {
-        match variant {
-            UniswapV3PoolVariant::Any => self.config.fee_tiers.clone(),
-            UniswapV3PoolVariant::FeeTier(fee) => vec![*fee],
-        }
-    }
-
     fn registration(
         &self,
         pool: Address,
@@ -976,65 +943,6 @@ impl PoolFactory for UniswapV3Factory {
 
     fn factory_address(&self) -> Address {
         self.config.factory
-    }
-
-    fn find_pools(
-        &self,
-        cache: &mut dyn AdapterCache,
-        query: &FactoryQuery,
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let query = match query {
-            FactoryQuery::Pair(query) => UniswapV3PoolQuery::from(query.clone()),
-            FactoryQuery::UniswapV3(query) => query.clone(),
-        };
-        let (token0, token1) = query.tokens;
-        let fees = self.fees_for_query(&query.variant);
-
-        // Collect every candidate slot up front — for each fee tier both its
-        // `getPool[token0][token1][fee]` slot and its `feeAmountTickSpacing[fee]`
-        // slot — so the whole discovery resolves in ONE batched read. Slots are
-        // laid out `[pool_0, tick_0, pool_1, tick_1, ...]`, so tier `i` reads
-        // indices `2*i` (pool) and `2*i + 1` (tick spacing).
-        let mut slots = Vec::with_capacity(fees.len() * 2);
-        for &fee in &fees {
-            let pool_slot =
-                derive::v3_get_pool_slot(self.config.get_pool_base_slot, token0, token1, fee);
-            let tick_slot = derive::v3_fee_amount_tick_spacing_slot(
-                self.config.fee_amount_tick_spacing_base_slot,
-                fee,
-            );
-            slots.push((self.config.factory, pool_slot));
-            slots.push((self.config.factory, tick_slot));
-        }
-
-        let values = cache.read_storage_slots(&slots)?;
-
-        let mut found = Vec::new();
-        for (i, &fee) in fees.iter().enumerate() {
-            let pool = address_from_word(values[2 * i])?;
-            if pool == Address::ZERO {
-                continue;
-            }
-            self.ensure_derivation_matches(pool, token0, token1, fee)?;
-            // `feeAmountTickSpacing[fee]` is a factory-wide fee→spacing config
-            // independent of pool existence; only tiers with a non-zero pool
-            // produce a registration. Mirror `read_tick_spacing`'s validation.
-            let tick_spacing = i24_from_word(values[2 * i + 1]);
-            if tick_spacing <= 0 {
-                return Err(DiscoveryError::Malformed(
-                    "V3 feeAmountTickSpacing returned a non-positive spacing",
-                ));
-            }
-            found.push(self.registration(
-                pool,
-                token0,
-                token1,
-                fee,
-                tick_spacing,
-                DiscoverySource::Query,
-            ));
-        }
-        Ok(found)
     }
 
     fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {

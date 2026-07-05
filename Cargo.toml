@@ -116,7 +116,7 @@ name = "adapter_a1"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
-name = "factory_discovery"
+name = "discovery"
 required-features = ["uniswap-v2", "uniswap-v3"]
 
 [[test]]
@@ -128,16 +128,8 @@ name = "code_seed_semantics"
 required-features = ["uniswap-v2"]
 
 [[test]]
-name = "factory_batch"
-required-features = ["uniswap-v3"]
-
-[[test]]
 name = "bootstrap_many"
 required-features = ["uniswap-v2", "uniswap-v3", "curve"]
-
-[[test]]
-name = "token_basket"
-required-features = ["uniswap-v2", "uniswap-v3"]
 
 [[test]]
 name = "adapter_reactive"

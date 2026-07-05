@@ -13,20 +13,18 @@ pool address for a protocol the crate supports; they say *what* they want and
 get cold-start-ready registrations back:
 
 ```rust
-// "Give me the pool for WETH/USDC at the 0.3% fee tier."
-let pools = discovery.find(&mut cache, ProtocolId::UniswapV3,
-    PoolQuery::pair(WETH, USDC))?;
-
-// "Give me the WETH/USDC Uniswap V3 pool at the 0.3% fee tier."
-let pools = discovery.find_uniswap_v3(&mut cache,
-    UniswapV3PoolQuery::pair(WETH, USDC).with_fee_tier(3_000))?;
-
-// "Give me all Uniswap V3 pools between WBTC/WETH."
-let pools = discovery.find(&mut cache, ProtocolId::UniswapV3,
-    PoolQuery::pair(WBTC, WETH))?;
-
 // "Give me every pool between WBTC/WETH on every protocol I track."
-let pools = discovery.find_all(&mut cache, PoolQuery::pair(WBTC, WETH))?;
+let pools = discovery.find(&mut cache, PoolQuery::pair(WBTC, WETH))?;
+
+// "…but only the Uniswap V3 ones."
+let pools = discovery.find(&mut cache,
+    PoolQuery::pair(WBTC, WETH).on(ProtocolId::UniswapV3))?;
+
+// "Give me every pool joining any pair of this token basket."
+let pools = discovery.find(&mut cache, PoolQuery::basket([WETH, USDC, WBTC]))?;
+
+// "…or this explicit set of pairs."
+let pools = discovery.find(&mut cache, PoolQuery::pairs([(WETH, USDC), (WBTC, WETH)]))?;
 ```
 
 Two complementary halves, one vocabulary:
@@ -76,28 +74,22 @@ query runs at the pinned block and the event stream starts there.
 ## 3. Vocabulary (new types, all `#[non_exhaustive]`)
 
 ```rust
-/// What you want from a factory, protocol-agnostically.
+/// What you want from discovery: which token pairs to resolve, optionally
+/// scoped to one protocol. One query type covers every shape — a single pair,
+/// a token basket's `C(n, 2)` combinations, or an explicit pair set. Each
+/// constructor normalizes token order (callers never care about token0/token1
+/// sorting) and de-duplicates; `.on(protocol)` narrows an otherwise
+/// all-factories query to a single protocol.
 pub struct PoolQuery {
-    /// The (unordered) token pair. `PoolQuery::pair` normalizes order, so
-    /// callers never care about token0/token1 sorting.
-    pub tokens: (Address, Address),
+    pairs: Vec<(Address, Address)>, // normalized, de-duplicated
+    protocol: Option<ProtocolId>,   // None = every matching factory
 }
 
 impl PoolQuery {
     pub fn pair(a: Address, b: Address) -> Self;
-}
-
-/// Uniswap V3-specific query. Future protocol selectors should follow this
-/// pattern instead of adding protocol-specific knobs to `PoolQuery`.
-pub struct UniswapV3PoolQuery {
-    pub tokens: (Address, Address),
-    pub variant: UniswapV3PoolVariant,
-}
-
-pub enum UniswapV3PoolVariant {
-    /// Every configured fee tier for the pair.
-    Any,
-    FeeTier(u32),
+    pub fn basket(tokens: impl IntoIterator<Item = Address>) -> Self;
+    pub fn pairs(pairs: impl IntoIterator<Item = (Address, Address)>) -> Self;
+    pub fn on(self, protocol: ProtocolId) -> Self;
 }
 
 /// A pool located by query or creation event, ready for admission.
@@ -204,13 +196,27 @@ in 0.1.0. `Create2` is two keccaks, no I/O at all.
 pub trait PoolFactory: Send + Sync {
     fn protocol(&self) -> ProtocolId;
 
-    /// Resolve existing pools for a query against the (pinned) cache, using
-    /// the driver's configured `Resolution` strategy.
+    /// Resolve a single normalized `(token0, token1)` pair against the (pinned)
+    /// cache, using the driver's configured `Resolution` strategy. Batchable
+    /// factories get a deriving default (from `candidate_reads`/`assemble_pairs`,
+    /// below); external factories override it. Callers reach this through the
+    /// per-pair fallback in `find`.
     fn find_pools(
         &self,
         cache: &mut dyn AdapterCache,
-        query: &FactoryQuery,
+        pair: (Address, Address),
     ) -> Result<Vec<DiscoveredPool>, DiscoveryError>;
+
+    /// Batched resolution: the candidate `(factory, slot)` reads for every pair,
+    /// gathered across all factories into ONE `read_storage_slots`, then
+    /// assembled back into pools. Default empty (a factory opts out of batching
+    /// and falls back to per-pair `find_pools`).
+    fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> { Vec::new() }
+    fn assemble_pairs(
+        &self,
+        pairs: &[(Address, Address)],
+        values: &HashMap<(Address, U256), U256>,
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> { Ok(Vec::new()) }
 
     /// Factory emitters + creation topics for the live (push) half.
     fn creation_sources(&self) -> Vec<EventSource>;
@@ -263,16 +269,11 @@ impl PoolDiscovery {
     /// adapter that opts in contributes its factory.
     pub fn for_registry(registry: &AdapterRegistry, config: FactoryConfig) -> Self;
 
-    /// One protocol, one query.
-    pub fn find(&self, cache: &mut dyn AdapterCache, protocol: ProtocolId, query: PoolQuery)
-        -> Result<Vec<DiscoveredPool>, DiscoveryError>;
-
-    /// Uniswap V3-specific query with a typed fee-tier selector.
-    pub fn find_uniswap_v3(&self, cache: &mut dyn AdapterCache, query: UniswapV3PoolQuery)
-        -> Result<Vec<DiscoveredPool>, DiscoveryError>;
-
-    /// Same query fanned across every configured protocol.
-    pub fn find_all(&self, cache: &mut dyn AdapterCache, query: PoolQuery)
+    /// The whole pull surface: resolve a `PoolQuery` (pair / basket / pairs,
+    /// optionally `.on(protocol)`) across all matching factories in one batched
+    /// read. `.on(p)` errors `MissingFactory(p)` when no factory is registered
+    /// for `p`; an unscoped query spans every matching factory and never does.
+    pub fn find(&self, cache: &mut dyn AdapterCache, query: PoolQuery)
         -> Result<Vec<DiscoveredPool>, DiscoveryError>;
 
     /// Union of factory creation sources (feed to the subscription).
@@ -290,8 +291,8 @@ let config = FactoryConfig::default().with_uniswap_v3_factory(my_v3_factory);
 let discovery = PoolDiscovery::for_registry(engine.registry(), config);
 
 // Declare the pool; get it tracked.
-for found in discovery.find_uniswap_v3(&mut cache,
-    UniswapV3PoolQuery::pair(WETH, USDC).with_fee_tier(3_000))? {
+for found in discovery.find(&mut cache,
+    PoolQuery::pair(WETH, USDC).on(ProtocolId::UniswapV3))? {
     let mut registration = found.registration;
     registry_view.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     engine.register_pools([registration])?;
@@ -423,13 +424,14 @@ resolution ("WETH" → address is the consumer's lookup).
 1. `verify_derivations` default: proposed **on** (first-use cross-check per
    factory, then out of the hot path). Alternative: off by default, on in
    debug builds only.
-2. Should `find_all` fan out sequentially per protocol (simple, proposed) or
-   take a concurrency knob? Derived-slot batching already collapses the
-   dominant cost; sequential seems fine at this fan-out.
-3. `PoolQuery` today models pairs only. Add `PoolQuery::tokens([..])` (exact-set
-   match, ≥2 tokens) now or when someone needs it? Proposed: builder-ready,
-   implemented later — the type is `#[non_exhaustive]`. Protocol-specific
-   selectors should remain on protocol-specific query types.
+2. ~~Should `find_all` fan out sequentially per protocol or take a concurrency
+   knob?~~ **Resolved:** there is no `find_all` — a single `find(PoolQuery)`
+   resolves an unscoped query across every matching factory in ONE batched read,
+   so fan-out cost collapses to one round-trip regardless of protocol count.
+3. ~~`PoolQuery` models pairs only; add a multi-token constructor later?~~
+   **Resolved:** `PoolQuery` is the sole query type and covers `pair`, `basket`
+   (a token set's `C(n, 2)` pairs), and `pairs` (an explicit set), each
+   `.on(protocol)`-scopable. It stays `#[non_exhaustive]` for future shapes.
 4. Does `DiscoveryDriver` belong in this crate or the consumer's loop until
    the interests-refresh API lands? Proposed: ship it here but document the
    rebuild cost, same stance as `register_pools`.

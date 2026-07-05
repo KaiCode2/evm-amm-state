@@ -127,8 +127,9 @@ pub trait AdapterCache: StateView {
     fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256, CacheError>;
 
     /// Read many storage slots, returning one value per input slot in the SAME
-    /// order. The default loops [`read_storage_slot`]; cache backends that can
-    /// fetch in bulk should override this to collapse N reads into one round-trip.
+    /// order. The default loops [`read_storage_slot`](Self::read_storage_slot);
+    /// cache backends that can fetch in bulk should override this to collapse N
+    /// reads into one round-trip.
     fn read_storage_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<U256>, CacheError> {
         slots
             .iter()

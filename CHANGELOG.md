@@ -145,15 +145,22 @@ creation logs; `FactoryConfig` is empty by default (callers opt into explicit
 factory addresses). Multiple factories of one protocol coexist — keyed by
 `(protocol, factory_address)`, so Uniswap and a Sushi-style fork both resolve —
 and an external `PoolFactory` can be added through the `with_factory` open
-channel. V3 discovery resolves all fee-tier slots in one batched read
-(`AdapterCache::read_storage_slots`), and the declarative
-`PoolDiscovery::find_pairs_among(tokens)` expands a token basket into all
-`C(n, 2)` pairs (× all V3 fee tiers) and resolves every factory mapping slot in
-a **single bulk `eth_call`** — request count scales with factory count, not
-pairs, fee tiers, or basket size (a 5-token mainnet basket: 49 pools in 1
-round-trip vs 20, ~20× faster; `examples/token_basket_bench.rs`). Discovery is
-read-only: it produces registrations, and callers still decide when to
-cold-start them.
+channel. The whole surface is one method, `PoolDiscovery::find(cache, query)`,
+over one fluent `PoolQuery`: `PoolQuery::pair(a, b)` (a single pair),
+`PoolQuery::basket([..])` (every `C(n, 2)` pair of a token basket),
+`PoolQuery::pairs([..])` (an explicit pair set), each optionally scoped with
+`.on(protocol)`. Any query resolves in a **single batched read** (one bulk
+`eth_call` via `AdapterCache::read_storage_slots`) across all matching factories
+— all pairs, all factories, all V3 fee tiers at once — with a per-pair
+`find_pools` fallback for external factories that only implement `find_pools`
+(no `candidate_reads`). Request count scales with factory count, not pairs, fee
+tiers, or basket size (a 5-token mainnet basket: 49 pools in 1 round-trip vs 20,
+~20× faster; `examples/token_basket_bench.rs`). An unscoped query spans every
+matching factory; `.on(p)` filters and errors `MissingFactory(p)` if `p` has no
+factory. `PoolDiscovery::find_many(cache, [query, ..])` resolves several queries
+together — different protocols for different pairs — in that same single batched
+read, returning the de-duplicated union. Discovery is read-only: it produces
+registrations, and callers still decide when to cold-start them.
 
 **Bundled multi-pool bootstrap (`AdapterRegistry::cold_start_many`)** — the fast
 default for warming many pools at once: it seeds + verifies every
@@ -162,7 +169,7 @@ through a single bundled `run_storage_programs` `eth_call` (V3 full-sync / V2
 flat-slot), and finalizes `Ready` — falling back per pool to the normal
 `cold_start` for anything without a one-shot program or whose hydration fails.
 `supports_one_shot_hydration` reports eligibility. `examples/factory_discovery_live.rs`
-uses the `find → cold_start_many → register` path.
+uses the `find(PoolQuery) → cold_start_many → register` path.
 
 ### Changed
 

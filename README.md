@@ -86,19 +86,45 @@ Discovery supports Uniswap V2 and canonical Uniswap V3 style factories through
 derived mapping-slot reads (`getPair` / `getPool`) plus creation-log decoding
 (`PairCreated` / `PoolCreated`). V3-discovered registrations carry
 `V3Metadata.factory`, which gives bytecode seeding the factory immutable it
-needs to render and verify the expected pool runtime. `PoolQuery` only carries
-the common token pair; protocol-specific selectors use typed query structs such
-as `UniswapV3PoolQuery`. Multiple factories of the same protocol coexist (keyed
-by `(protocol, factory_address)`), and external `PoolFactory`s can be added via
-`PoolDiscovery::with_factory`.
+needs to render and verify the expected pool runtime. Multiple factories of the
+same protocol coexist (keyed by `(protocol, factory_address)`), and external
+`PoolFactory`s can be added via `PoolDiscovery::with_factory`.
 
-**Token-basket discovery.** `PoolDiscovery::find_pairs_among(&tokens)` is the
-declarative "give me every pool joining any pair of this basket" query: it
-expands the `C(n, 2)` pairs (× all V3 fee tiers), collects every factory mapping
-slot, and resolves them in a **single bulk `eth_call`**. Request count scales
-with the number of factories, not pairs or basket size — a 5-token mainnet
-basket resolves 49 pools in one round-trip (~20× faster than per-pair scans; see
-[`examples/token_basket_bench.rs`](examples/token_basket_bench.rs)).
+The whole surface is one method — `discovery.find(cache, query)` — over one
+fluent `PoolQuery`:
+
+```rust,ignore
+// one token pair, across every matching factory (V2, V3, forks)
+discovery.find(&mut cache, PoolQuery::pair(weth, usdc))?;
+
+// every pool joining any pair of a token basket — the C(n, 2) combinations
+discovery.find(&mut cache, PoolQuery::basket([weth, usdc, dai, wbtc]))?;
+
+// an explicit set of pairs
+discovery.find(&mut cache, PoolQuery::pairs([(weth, usdc), (weth, dai)]))?;
+
+// scope any of the above to one protocol
+discovery.find(&mut cache, PoolQuery::pair(weth, usdc).on(ProtocolId::UniswapV3))?;
+
+// mix protocols across pairs in ONE batched read — e.g. some pairs only on V2,
+// others only on V3 — with find_many
+discovery.find_many(&mut cache, [
+    PoolQuery::pairs([(weth, usdc)]).on(ProtocolId::UniswapV2),
+    PoolQuery::basket([weth, dai, wbtc]).on(ProtocolId::UniswapV3),
+])?;
+```
+
+An unscoped query spans **every** matching factory and resolves the whole thing
+— all pairs, all factories, all V3 fee tiers — in a **single batched read**
+(`AdapterCache::read_storage_slots`, one bulk `eth_call` on `EvmCache`), so
+request count scales with the number of factories, not with pairs, fee tiers, or
+basket size (a 5-token mainnet basket resolves 49 pools in one round-trip, ~20×
+faster than per-pair scans; see
+[`examples/token_basket_bench.rs`](examples/token_basket_bench.rs)). `.on(p)`
+filters to protocol `p` and errors `DiscoveryError::MissingFactory(p)` when no
+factory is registered for it (an unscoped query never does). External factories
+that only implement `find_pools` (no `candidate_reads`) keep working through a
+per-pair fallback.
 
 ### Fast multi-pool bootstrap
 
@@ -109,8 +135,8 @@ account-fields call, hydrates them through a single bundled `run_storage_program
 back per pool to the conservative per-pool `cold_start` for anything without a
 one-shot program or whose hydration fails. `supports_one_shot_hydration`
 reports which pools take the fast path. Combined with token-basket discovery,
-the happy path is `find_pairs_among → cold_start_many → register`, with request
-count driven by bootstrap phases rather than pool count.
+the happy path is `find(PoolQuery::basket(..)) → cold_start_many → register`,
+with request count driven by bootstrap phases rather than pool count.
 
 ### Extending with a new AMM
 

@@ -54,10 +54,10 @@ pub use driver::{AdapterDriver, DriverError};
 pub use factory::UniswapV2FactoryConfig;
 pub use factory::{
     CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, FactoryConfig,
-    FactoryQuery, PoolDiscovery, PoolFactory, PoolQuery,
+    PoolDiscovery, PoolFactory, PoolQuery,
 };
 #[cfg(feature = "uniswap-v3")]
-pub use factory::{UniswapV3FactoryConfig, UniswapV3PoolQuery, UniswapV3PoolVariant};
+pub use factory::UniswapV3FactoryConfig;
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
