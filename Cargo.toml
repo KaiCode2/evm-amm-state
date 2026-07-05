@@ -11,15 +11,14 @@ readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-amm-state"
 documentation = "https://docs.rs/evm-amm-state"
 
-# Build docs.rs with every feature enabled so the `uniswap-v3`-gated `v3_sync`
-# module and the `experimental-protocols` identities render.
-[package.metadata.docs.rs]
-all-features = true
-
 # Ship a lean crate: keep src + runnable examples + the user-facing guides
 # (docs/benchmarks.md, docs/curve-adapter.md), drop the internal test suite,
 # CI config, maintainer docs, and the superseded per-slice/phase design specs.
 # (gitignore-style patterns, relative to the package root.)
+#
+# NOTE: `exclude` must stay in the `[package]` table. If it is written *after*
+# a `[package.metadata.*]` header, TOML reparents it to that sub-table and
+# Cargo silently ignores it — shipping everything.
 exclude = [
     "tests/",
     ".github/",
@@ -28,6 +27,11 @@ exclude = [
     "docs/*-spec.md",
     "docs/phase-*.md",
 ]
+
+# Build docs.rs with every feature enabled so the `uniswap-v3`-gated `v3_sync`
+# module and the `experimental-protocols` identities render.
+[package.metadata.docs.rs]
+all-features = true
 
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
