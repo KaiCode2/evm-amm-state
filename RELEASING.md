@@ -1,35 +1,26 @@
 # Releasing `evm-amm-state`
 
-This crate is feature-complete but **not yet publishable to crates.io**. There
-is exactly one hard blocker — the `evm-fork-cache` git dependency — plus a short
-mechanical checklist once that clears. Work the sections in order.
+This crate is feature-complete and, as of 2026-07-05, **publishable**: the one
+hard blocker (the `evm-fork-cache` dependency) has cleared. What remains is a
+short mechanical checklist. Work the sections in order.
 
-## 0. Blocker: the `evm-fork-cache` dependency
+## 0. Dependency: the `evm-fork-cache` companion crate — ✅ CLEARED (2026-07-05)
 
-[`Cargo.toml`](Cargo.toml) pins the companion crate to a **git rev on a private
-repo**:
+Historically this crate pinned the companion crate to a **git rev on a private
+repo**, which `cargo publish` rejects (a dependency must resolve to a crates.io
+version). That is resolved:
 
-```toml
-evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "903af3d…", version = "0.1" }
-```
+- `evm-fork-cache` **0.2.0 is published on crates.io**.
+- [`Cargo.toml`](Cargo.toml) depends on it by version alone — no `git`, no
+  `path`:
+  ```toml
+  evm-fork-cache = "0.2.0"
+  ```
+- `Cargo.lock` resolves it from the crates.io registry (the path pin was dropped
+  in commit `6fc2345`).
 
-`cargo publish` **rejects git/path dependencies** — a dependency must resolve to
-a crates.io version. So before any release:
-
-1. **Publish `evm-fork-cache` to crates.io** (or confirm it is already
-   published) at a version compatible with the `version = "0.1"` requirement
-   here. As an interim step for *source* consumers, merging `evm-fork-cache#12`
-   to its `main` and re-pinning this `rev` to that merge commit is enough — but
-   crates.io publication is required for *this* crate to publish.
-2. In [`Cargo.toml`](Cargo.toml), **drop `git` and `rev`**, keeping the
-   crates.io requirement:
-   ```toml
-   evm-fork-cache = "0.1"
-   ```
-3. `cargo update -p evm-fork-cache` and commit the refreshed `Cargo.lock`.
-
-> `alloy-transport-balancer` is already a normal crates.io dependency — no
-> action needed there.
+The remaining `alloy-*` and `revm` dependencies are all ordinary crates.io
+crates — no action needed.
 
 ## 1. Pre-publish verification
 
@@ -54,6 +45,8 @@ cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' || 
 cargo +1.88 check --all-features
 ```
 
+Last run 2026-07-05 against the published `evm-fork-cache` 0.2.0: **all green.**
+
 Optional but recommended — the env-gated network tests against an archive node
 (`E2E_RPC_URL` lives in `.env`, gitignored; never commit or echo it):
 
@@ -68,27 +61,30 @@ cargo test --test reactive_ws_e2e --test reactive_curve_ws_e2e -- --ignored --no
 - Confirm `Cargo.toml` metadata is release-ready: `version`, `license`
   (`MIT OR Apache-2.0`, with `LICENSE-APACHE` + `LICENSE-MIT` present),
   `description`, `repository`, `documentation`, `readme`, `keywords`,
-  `categories`, `rust-version` (MSRV `1.88` — the CI `msrv` job guards this; it
-  builds clean on 1.88 today).
-- Inspect what would be shipped. `.env` is gitignored (and untracked), so cargo
-  already excludes it — this step is a confirmation, not a likely failure. There
-  is no `include`/`exclude` in `Cargo.toml`, so all tracked non-ignored files
-  ship (`tests/fixtures` is only tiny mock `.sol`/`.hex` files):
+  `categories`, `rust-version` (MSRV `1.88`).
+- The `[package].exclude` list drops the test suite, CI config, maintainer docs
+  (ROADMAP/RELEASING), and superseded design specs. **Keep `exclude` inside the
+  `[package]` table** — writing it after a `[package.metadata.*]` header
+  silently reparents it under that sub-table and Cargo ships everything (this
+  regressed once; fixed in `9036873`).
+- Inspect what would ship:
   ```bash
-  cargo package --list          # requires the git dep resolved (step 0)
+  cargo package --list        # ~50 files: src, examples, benches, the five
+                              # docs/ guides, README, licenses, changelog
   cargo publish --dry-run
   ```
-  `cargo publish --dry-run` failing with a git-dependency error is the signal
-  that step 0 is not yet complete.
+  Last run 2026-07-05: **50 files, 768.6 KiB (207.6 KiB compressed), verifies
+  clean.** (`cargo publish` prints `ignoring test …` for the excluded `[[test]]`
+  targets — expected and harmless.)
 
 ## 3. Version & changelog
 
-- Decide the version (initial release = `0.1.0`) and set it in `Cargo.toml`.
+- Version is `0.1.0` in `Cargo.toml`.
 - In [`CHANGELOG.md`](CHANGELOG.md), promote the `[Unreleased]` section to
-  `## [0.1.0] - YYYY-MM-DD` and add a fresh empty `[Unreleased]`. Also add the
-  matching link references at the bottom: a `[0.1.0]` target (e.g.
-  `.../releases/tag/v0.1.0`) and repoint `[Unreleased]` to a compare URL
-  (`.../compare/v0.1.0...HEAD`).
+  `## [0.1.0] - 2026-07-05` and add a fresh empty `[Unreleased]`. Drop the
+  preamble's "publishing is blocked on a local path pin" note. Add the link
+  references: a `[0.1.0]` target (`.../releases/tag/v0.1.0`) and repoint
+  `[Unreleased]` to `.../compare/v0.1.0...HEAD`.
 - Commit: `release: v0.1.0`.
 
 ## 4. Tag & publish
@@ -101,12 +97,12 @@ cargo publish
 
 ## 5. Post-publish cleanup
 
-Once `evm-fork-cache` is public on crates.io and consumed by version:
-
-- Remove all three `Authenticate git for private companion crates` steps (the
+- Remove the three `Authenticate git for private companion crates` steps (in the
   `check`, `isolation`, and `msrv` jobs) and the `CARGO_NET_GIT_FETCH_WITH_CLI`
   env from [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and delete the
-  `PRIVATE_REPO_TOKEN` repo secret — CI no longer needs private git access.
+  `PRIVATE_REPO_TOKEN` repo secret — CI no longer needs private git access now
+  that the dependency is on crates.io. (The `ci.yml` push must go over SSH: the
+  gh OAuth token lacks `workflow` scope.)
 - Verify the published docs render on docs.rs.
 
 ## Quick status
@@ -115,8 +111,9 @@ Once `evm-fork-cache` is public on crates.io and consumed by version:
 | --- | --- |
 | Feature-complete (5 protocols, full pipeline) | ✅ |
 | Tests green (unit + offline + RPC parity + WS soak) | ✅ |
-| CI green (fmt / clippy×N / tests×3 / docs / per-protocol isolation matrix) | ✅ |
-| MSRV 1.88 builds clean (CI-guarded) | ✅ |
-| License files present | ✅ |
-| `evm-fork-cache` resolvable from crates.io | ❌ **blocker** |
-| `cargo publish --dry-run` clean | ❌ (gated on the above) |
+| CI matrix green vs published 0.2.0 (fmt / clippy×N / tests×3 / docs / isolation / dep-leak / MSRV 1.88) | ✅ |
+| License files present (`LICENSE-APACHE` + `LICENSE-MIT`) | ✅ |
+| `evm-fork-cache` resolvable from crates.io | ✅ |
+| `cargo publish --dry-run` clean (50 files) | ✅ |
+| Release work merged to `main` | ⏳ pending |
+| Tagged `v0.1.0` + `cargo publish` | ⏳ pending |
