@@ -10,11 +10,11 @@ Historically this crate pinned the companion crate to a **git rev on a private
 repo**, which `cargo publish` rejects (a dependency must resolve to a crates.io
 version). That is resolved:
 
-- `evm-fork-cache` **0.2.0 is published on crates.io**.
+- `evm-fork-cache` **0.2.1 is published on crates.io**.
 - [`Cargo.toml`](Cargo.toml) depends on it by version alone — no `git`, no
   `path`:
   ```toml
-  evm-fork-cache = "0.2.0"
+  evm-fork-cache = "0.2.1"
   ```
 - `Cargo.lock` resolves it from the crates.io registry (the path pin was dropped
   in commit `6fc2345`).
@@ -45,7 +45,7 @@ cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' || 
 cargo +1.88 check --all-features
 ```
 
-Last run 2026-07-05 against the published `evm-fork-cache` 0.2.0: **all green.**
+Last run 2026-07-05 against the published `evm-fork-cache` 0.2.1: **all green.**
 
 Optional but recommended — the env-gated network tests against an archive node
 (`E2E_RPC_URL` lives in `.env`, gitignored; never commit or echo it):
@@ -111,7 +111,7 @@ cargo publish
 | --- | --- |
 | Feature-complete (5 protocols, full pipeline) | ✅ |
 | Tests green (unit + offline + RPC parity + WS soak) | ✅ |
-| CI matrix green vs published 0.2.0 (fmt / clippy×N / tests×3 / docs / isolation / dep-leak / MSRV 1.88) | ✅ |
+| CI matrix green vs published 0.2.1 (fmt / clippy×N / tests×3 / docs / isolation / dep-leak / MSRV 1.88) | ✅ |
 | License files present (`LICENSE-APACHE` + `LICENSE-MIT`) | ✅ |
 | `evm-fork-cache` resolvable from crates.io | ✅ |
 | `cargo publish --dry-run` clean (50 files) | ✅ |

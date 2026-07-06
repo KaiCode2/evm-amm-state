@@ -61,9 +61,10 @@ curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 experimental-protocols = []
 
 [dependencies]
-# Companion crate. Uses the public 0.2.0 release for bulk storage extraction,
-# custom storage programs, typed errors, and reactive resync support.
-evm-fork-cache = "0.2.0"
+# Companion crate. Uses the public 0.2.1 release for bulk storage extraction,
+# custom storage programs, typed errors, reactive resync, and trace-based
+# storage-slot discovery.
+evm-fork-cache = "0.2.1"
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"

@@ -58,11 +58,12 @@ recover to `Ready` (`AmmSyncBatchReport::{degraded_pools, recovered_pools}`).
 metadata change. Boundary and fallback policy are documented in
 [`docs/trace-backed-sync.md`](docs/trace-backed-sync.md).
 
-**Upgraded to `evm-fork-cache` 0.2.0** — batch storage fetches (cold-start
-verify/probe, repair, prefetch) now ride its bulk `eth_call` extraction by
-default (thousands of slots per 26-CU call with automatic point-read
-fallback), and the crate-owned error mirrors map its typed errors
-(`CacheError`, `StorageFetchError`) instead of `anyhow`.
+**Upgraded to `evm-fork-cache` 0.2.1** — batch storage fetches (cold-start
+verify/probe, repair, prefetch) ride its bulk `eth_call` extraction by default
+(thousands of slots per 26-CU call with automatic point-read fallback); the
+crate-owned error mirrors map its typed errors (`CacheError`,
+`StorageFetchError`) instead of `anyhow`; and 0.2.1's trace-based storage-slot
+discovery was used to verify the factory-discovery preset slots against chain.
 
 **Adapters pipeline** — a single [`AmmAdapter`] trait with five stages:
 register → cold-start → subscribe → react → simulate.
