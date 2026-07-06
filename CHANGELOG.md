@@ -158,13 +158,6 @@ storage slot, resolved in the batched read) and a **ViewCall** (an on-chain
 - **Solidly V2** (Aerodrome / Velodrome) — `SolidlyFactory` reads
   `getPool[t0][t1][bool stable]`, yielding a pair's stable **and** volatile pools
   and carrying the fork's storage layout for cold-start.
-- **Curve** (plain pools) — `CurveFactory` resolves via the MetaRegistry
-  `find_pools_for_coins` ViewCall (Curve has no Rust-derivable pool-key slot),
-  skips metapools, keeps the full multi-token coin set, and selects the
-  StableSwap vs CryptoSwap `get_dy` ABI from `get_pool_asset_type`. (Offline
-  resolution is tested; live MetaRegistry resolution is still under investigation,
-  so the mainnet preset is provisional.)
-
 The CL and Solidly preset storage constants (Pancake `getPool` slot 2 +
 `feeAmountTickSpacing` slot 1, Slipstream `getPool` slot 6, Aerodrome `getPool`
 slot 5 + the pool reserve/token layout) are **verified on-chain** by the gated
@@ -172,11 +165,13 @@ slot 5 + the pool reserve/token layout) are **verified on-chain** by the gated
 trace-based storage-slot probe rather than guessed.
 
 Creation logs decode too (`PairCreated`, the Uniswap/Pancake and Slipstream
-`PoolCreated`, the Solidly `PoolCreated`); Curve is pull-only. Two AMM shapes are
-deliberately out of scope for 0.1.0 and documented as integrator-supplied:
-**Algebra**-style CL forks (a different pool engine, added with `register_adapter`
-+ `with_factory`) and **Balancer V2** discovery (no on-chain token→pool index; an
-async log scan, planned later) — see `docs/pool-discovery.md`. `FactoryConfig` is
+`PoolCreated`, the Solidly `PoolCreated`). A few AMM shapes are deliberately out
+of scope for 0.1.0 and documented as integrator-supplied: **Algebra**-style CL
+forks (a different pool engine, added with `register_adapter` + `with_factory`),
+**Curve** (needs the Vyper MetaRegistry view call, not wired this release — its
+adapter still simulates explicitly-registered pools), and **Balancer V2**
+discovery (no on-chain token→pool index; an async log scan, planned later) — see
+`docs/pool-discovery.md`. `FactoryConfig` is
 empty by default (callers opt into explicit factory addresses). Multiple
 factories of one protocol coexist — keyed by `(protocol, factory_address)`, so
 Uniswap and a Sushi-style fork both resolve — and an external `PoolFactory` can

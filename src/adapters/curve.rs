@@ -36,7 +36,6 @@ use super::cold_start::{
     AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
     ColdStartStep, SlotFetch,
 };
-use super::factory::{CurveFactory, FactoryConfig, PoolFactory};
 use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, quote_via_call};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -233,18 +232,6 @@ fn curve_event_topics(n_coins: usize, variant: CurveVariant) -> Vec<B256> {
 impl AmmAdapter for CurveAdapter {
     fn protocol(&self) -> ProtocolId {
         ProtocolId::Curve
-    }
-
-    /// One [`CurveFactory`] per configured
-    /// [`CurveFactoryConfig`](super::factory::CurveFactoryConfig) MetaRegistry
-    /// endpoint — Curve plain-pool discovery is a ViewCall against the registry
-    /// (see [`CurveFactory`]).
-    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
-        config
-            .curve
-            .iter()
-            .map(|cfg| Box::new(CurveFactory::new(cfg.clone())) as Box<dyn PoolFactory>)
-            .collect()
     }
 
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {

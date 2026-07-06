@@ -22,7 +22,7 @@ use evm_amm_state::adapters::{FactoryConfig, PoolDiscovery, PoolQuery, ProtocolI
 // Wire the configured factories to the registered adapters.
 let discovery = PoolDiscovery::for_registry(&registry, config);
 
-// one token pair, across every matching factory (V2, V3, forks, Curve, …)
+// one token pair, across every matching factory (V2, V3, forks, …)
 discovery.find(&mut cache, PoolQuery::pair(weth, usdc))?;
 
 // every pool joining any pair of a token basket — the C(n, 2) combinations
@@ -82,7 +82,6 @@ resolved in the batched `read_storage_slots`) or a **ViewCall** (an on-chain
 | Slipstream / Aerodrome CL | DerivedSlot (tickSpacing-keyed `getPool[t0][t1][tickSpacing]`) via [`ClFactorySpec`] | discovery only — its quoter ABI differs (int24 tickSpacing), so quoting rides a Uniswap-compatible quoter |
 | Uniswap V2 | DerivedSlot (`getPair[t0][t1]`) | one pool per pair |
 | Solidly V2 (Aerodrome / Velodrome) | DerivedSlot (`getPool[t0][t1][bool stable]`) | stable **and** volatile — a pair yields up to two pools |
-| Curve (plain pools) | ViewCall (MetaRegistry `find_pools_for_coins`) | multi-token coin set carried in metadata; metapools excluded |
 
 Multiple factories of the same protocol coexist — identity is
 `(protocol, factory_address)`, so Uniswap and a Sushi-style fork both resolve,
@@ -90,8 +89,7 @@ and an exact duplicate is dropped (first wins).
 
 The V3-family entries are all one config type, [`ClFactorySpec`], driving one
 [`ConcentratedLiquidityFactory`]; the fee-keyed vs tickSpacing-keyed distinction
-is [`ClKeying`]. Solidly is [`SolidlyFactoryConfig`] / [`SolidlyFactory`]; Curve
-is [`CurveFactoryConfig`] / [`CurveFactory`].
+is [`ClKeying`]. Solidly is [`SolidlyFactoryConfig`] / [`SolidlyFactory`].
 
 ## Adding your own concentrated-liquidity fork
 
@@ -133,9 +131,9 @@ For a genuinely novel factory mechanism (not UniV3-mechanics), implement the
 
 ## What discovery covers, and what it leaves to you
 
-Discovery ships for every protocol whose pools resolve through the pinned
-cache — a derived storage slot or a MetaRegistry view call. Two things are
-deliberately left to the integrator in 0.1.0:
+Discovery ships for the protocols whose pools resolve through a derived storage
+slot on the pinned cache. A few AMM shapes are deliberately left to the
+integrator in 0.1.0:
 
 - **Algebra-style CL forks** (Camelot, QuickSwap, and similar) — single pool
   per pair, dynamically-computed fees, and a different pool engine
@@ -143,9 +141,13 @@ deliberately left to the integrator in 0.1.0:
   a different simulation engine, not just a discovery config, so they are out
   of scope for now. Implement one with `register_adapter(Arc<dyn AmmAdapter>)`
   for simulation plus `with_factory(Box<dyn PoolFactory>)` for discovery.
-- **Balancer V2 discovery** — Balancer has no on-chain token→pool index, so
-  discovery is an async log scan rather than a cache read; it is planned for a
-  later release. Balancer pools are still registered explicitly today.
+- **Curve** — Curve has no Rust-derivable pool-key slot; resolution needs the
+  Vyper MetaRegistry via a view call, which is **not wired in this release**.
+  Register Curve pools explicitly (or via a custom `with_factory`); the Curve
+  *adapter* still cold-starts and simulates them.
+- **Balancer V2** — Balancer has no on-chain token→pool index, so discovery is
+  an async log scan rather than a cache read; planned for a later release.
+  Balancer pools are still registered explicitly today.
 
 Both escape hatches (`register_adapter`, `with_factory`) are first-class and
 stable — a novel AMM never requires forking the crate.
@@ -157,8 +159,7 @@ their own pool-creation logs via [`PoolDiscovery::decode_creation`] (Uniswap V2
 `PairCreated`, the Uniswap/Pancake `PoolCreated`, the Slipstream tickSpacing
 `PoolCreated`, and the Solidly `PoolCreated`). This is the push counterpart to
 the pull queries above: feed it a factory log and it yields the same
-[`DiscoveredPool`]. Curve discovery is pull-only (MetaRegistry ViewCall) in this
-release.
+[`DiscoveredPool`].
 
 [`PoolRegistration`]: ../src/adapters/types.rs
 [`PoolQuery`]: ../src/adapters/factory.rs
@@ -177,8 +178,6 @@ release.
 [`FeeSource`]: ../src/adapters/factory.rs
 [`SolidlyFactoryConfig`]: ../src/adapters/factory.rs
 [`SolidlyFactory`]: ../src/adapters/factory.rs
-[`CurveFactoryConfig`]: ../src/adapters/factory.rs
-[`CurveFactory`]: ../src/adapters/factory.rs
 [`ConcentratedLiquidityFactory`]: ../src/adapters/factory.rs
 [`ConcentratedLiquidityAdapter`]: ../src/adapters/uniswap_v3.rs
 [`PoolFactory`]: ../src/adapters/factory.rs

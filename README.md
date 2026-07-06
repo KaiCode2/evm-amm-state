@@ -91,17 +91,18 @@ cache — a derived factory storage slot or a MetaRegistry view call:
 | Slipstream / Aerodrome CL | tickSpacing-keyed `getPool[t0][t1][tickSpacing]` (via `ClFactorySpec`) |
 | Uniswap V2 | `getPair[t0][t1]` |
 | Solidly V2 (Aerodrome / Velodrome) | `getPool[t0][t1][bool stable]` (stable + volatile) |
-| Curve (plain pools) | MetaRegistry `find_pools_for_coins` ViewCall |
 
 V3-discovered registrations carry `V3Metadata.factory`, which gives bytecode
 seeding the factory immutable it needs to render and verify the expected pool
 runtime. Multiple factories of the same protocol coexist (keyed by
 `(protocol, factory_address)`).
 
-Two AMM shapes are deliberately left to the integrator in 0.1.0 — **Algebra**-style
+A few AMM shapes are deliberately left to the integrator in 0.1.0 — **Algebra**-style
 CL forks (Camelot, QuickSwap: a different pool engine, not just a discovery
-config) and **Balancer V2** discovery (no on-chain token→pool index, so it needs
-an async log scan). Both have first-class, stable escape hatches:
+config), **Curve** (needs the Vyper MetaRegistry view call, not wired this
+release — its adapter still simulates explicitly-registered pools), and
+**Balancer V2** discovery (no on-chain token→pool index, so it needs an async log
+scan). These have first-class, stable escape hatches:
 `register_adapter(Arc<dyn AmmAdapter>)` adds a novel simulation engine and
 `PoolDiscovery::with_factory(Box<dyn PoolFactory>)` adds a novel discovery
 mechanism — a new AMM never requires forking the crate. See

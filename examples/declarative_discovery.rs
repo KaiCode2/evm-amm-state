@@ -2,14 +2,13 @@
 //!
 //! The whole point of `PoolDiscovery` is that you name *tokens and factories*,
 //! not pools. Here we:
-//!   1. Build a [`FactoryConfig`] naming the canonical mainnet Uniswap V3 factory
-//!      and Curve's mainnet MetaRegistry (via `CurveFactoryConfig::mainnet()`).
+//!   1. Build a [`FactoryConfig`] naming the canonical mainnet Uniswap V3 factory.
 //!   2. Wire those factories to the registered adapters with
 //!      [`PoolDiscovery::for_registry`].
 //!   3. Resolve every pool joining any pair of a token basket
-//!      (`PoolQuery::basket([WETH, USDC, USDT])`) — the V3 factory in one batched
-//!      `read_storage_slots`, the Curve MetaRegistry via its ViewCall — and print
-//!      each discovered pool.
+//!      (`PoolQuery::basket([WETH, USDC, USDT])`) — the V3 factory resolves all
+//!      pairs × fee tiers in one batched `read_storage_slots` — and print each
+//!      discovered pool.
 //!   4. Bootstrap the discovered registrations with
 //!      [`AdapterRegistry::cold_start_many`], register them on an
 //!      [`AmmSyncEngine`], and quote one swap fully offline.
@@ -35,14 +34,13 @@ use alloy_provider::{Provider, RootProvider};
 use anyhow::{Context, Result};
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmSyncEngine, ColdStartOutcome, ColdStartPolicy,
-    ConcentratedLiquidityAdapter, CurveAdapter, CurveFactoryConfig, DiscoveredPool, FactoryConfig,
-    PoolDiscovery, PoolKey, PoolQuery, PoolRegistration, ProtocolMetadata, SimConfig,
+    ConcentratedLiquidityAdapter, DiscoveredPool, FactoryConfig, PoolDiscovery, PoolKey, PoolQuery,
+    PoolRegistration, ProtocolMetadata, SimConfig,
 };
 use evm_fork_cache::cache::EvmCache;
 
-// Canonical Ethereum-mainnet Uniswap V3 factory and QuoterV2. Curve's mainnet
-// MetaRegistry is pinned by `CurveFactoryConfig::mainnet()`, so it needs no
-// literal here. These are the only chain constants — no pool addresses.
+// Canonical Ethereum-mainnet Uniswap V3 factory and QuoterV2. These are the only
+// chain constants — no pool addresses.
 const UNISWAP_V3_FACTORY: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
 const V3_QUOTER_V2: Address = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
 
@@ -76,15 +74,13 @@ async fn main() -> Result<()> {
     let registry = registry_with_adapters()?;
     let discovery = PoolDiscovery::for_registry(
         &registry,
-        FactoryConfig::default()
-            .with_uniswap_v3_factory(UNISWAP_V3_FACTORY)
-            .with_curve(CurveFactoryConfig::mainnet()),
+        FactoryConfig::default().with_uniswap_v3_factory(UNISWAP_V3_FACTORY),
     );
 
     // --- 2. resolve every pool joining any pair of the basket ---
     // One declarative query. The Uniswap V3 factory resolves all C(3,2) pairs ×
-    // fee tiers in a single batched `read_storage_slots`; the Curve MetaRegistry
-    // resolves the same pairs through its ViewCall. No pool address was typed.
+    // fee tiers in a single batched `read_storage_slots`. No pool address was
+    // typed.
     let basket = [WETH, USDC, USDT];
     let discovered = discovery
         .find(&mut cache, PoolQuery::basket(basket))
@@ -156,7 +152,6 @@ async fn main() -> Result<()> {
 fn registry_with_adapters() -> Result<AdapterRegistry> {
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
-    registry.register_adapter(Arc::new(CurveAdapter::default()))?;
     Ok(registry)
 }
 
@@ -189,10 +184,6 @@ fn print_discovered_pool(pool: &DiscoveredPool) {
             metadata.token1,
             metadata.fee,
             metadata.tick_spacing
-        ),
-        ProtocolMetadata::Curve(metadata) => println!(
-            "  {:?} from {:?}: coins={:?}, variant={:?}",
-            pool.key, pool.source, metadata.coins, metadata.variant
         ),
         metadata => println!(
             "  {:?} from {:?}: metadata={metadata:?}",

@@ -61,8 +61,6 @@ pub use factory::{
     CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, FactoryConfig,
     PoolDiscovery, PoolFactory, PoolQuery,
 };
-#[cfg(feature = "curve")]
-pub use factory::{CurveFactory, CurveFactoryConfig};
 #[cfg(feature = "solidly-v2")]
 pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
 pub use reactive::AmmReactiveHandler;

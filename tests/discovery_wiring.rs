@@ -1,35 +1,24 @@
 //! Combined discovery-wiring test: proves `PoolDiscovery::for_registry` fans a
 //! `FactoryConfig` out to EVERY protocol's factory driver through each adapter's
 //! `pool_factories` hook. The per-protocol driver mechanics are already covered
-//! by `tests/discovery_cl.rs` / `discovery_solidly.rs` / `discovery_curve.rs`;
-//! this test only asserts the *wiring* — that a scoped `find(PoolQuery::pair(..)
-//! .on(P))` reaches a registered factory for `P` and therefore does NOT return
+//! by `tests/discovery_cl.rs` / `discovery_solidly.rs`; this test only asserts
+//! the *wiring* — that a scoped `find(PoolQuery::pair(..).on(P))` reaches a
+//! registered factory for `P` and therefore does NOT return
 //! `DiscoveryError::MissingFactory(P)`.
 //!
 //! Over an empty cache every DerivedSlot factory (V2 `getPair`, V3/Pancake/
 //! Slipstream `getPool`, Solidly `getPool[t0][t1][stable]`) reads zero words and
-//! resolves to `Ok(vec![])`; the Curve ViewCall factory calls the MetaRegistry,
-//! whose `find_pools_for_coins` returns an ABI-encoded empty `address[]`, so it
-//! too yields `Ok(vec![])`. An empty result is success — it means the factory was
-//! wired and consulted. A `MissingFactory(P)` would mean the adapter's
+//! resolves to `Ok(vec![])`. An empty result is success — it means the factory
+//! was wired and consulted. A `MissingFactory(P)` would mean the adapter's
 //! `pool_factories` never emitted a driver for `P`.
 
 use alloy_primitives::{Address, Bytes, U256, address};
-use alloy_sol_types::{SolCall, sol};
 use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::{
     AdapterCache, AdapterRegistry, CacheError, CallOutcome, ConcentratedLiquidityAdapter,
-    CurveAdapter, DiscoveryError, FactoryConfig, PoolDiscovery, PoolQuery, ProtocolId, SlotChange,
+    DiscoveryError, FactoryConfig, PoolDiscovery, PoolQuery, ProtocolId, SlotChange,
     SolidlyV2Adapter, StateDiff, StateUpdate, StateView, UniswapV2Adapter,
 };
-
-// The single MetaRegistry view the Curve factory calls first per pair. Returning
-// an empty `address[]` short-circuits Curve discovery to an empty result (no
-// further `is_meta`/`get_coins`/`get_pool_asset_type` calls), which is exactly
-// the "factory wired, nothing found" signal this test wants.
-sol! {
-    function find_pools_for_coins(address from, address to) external view returns (address[] pools);
-}
 
 // Synthetic addresses — this test never touches a real chain or real constants.
 const UNISWAP_V2_FACTORY: Address = address!("00000000000000000000000000000000000000f2");
@@ -37,14 +26,12 @@ const UNISWAP_V3_FACTORY: Address = address!("0000000000000000000000000000000000
 const PANCAKE_V3_FACTORY: Address = address!("00000000000000000000000000000000000000f4");
 const SLIPSTREAM_FACTORY: Address = address!("00000000000000000000000000000000000000f5");
 const SOLIDLY_FACTORY: Address = address!("00000000000000000000000000000000000000f7");
-const CURVE_META_REGISTRY: Address = address!("00000000000000000000000000000000000000e0");
 
 const TOKEN_A: Address = address!("000000000000000000000000000000000000000a");
 const TOKEN_B: Address = address!("000000000000000000000000000000000000000b");
 
-/// A combined cache that satisfies both discovery mechanisms with "nothing
-/// found": storage reads are all zero, and the only executed view call
-/// (`find_pools_for_coins`) returns an empty `address[]`.
+/// A combined cache that satisfies every DerivedSlot factory with "nothing
+/// found": storage reads are all zero, so each factory resolves to `Ok(vec![])`.
 #[derive(Default)]
 struct CombinedMockCache;
 
@@ -81,21 +68,12 @@ impl AdapterCache for CombinedMockCache {
         &mut self,
         _from: Address,
         _to: Address,
-        calldata: Bytes,
+        _calldata: Bytes,
         _commit: bool,
     ) -> Result<CallOutcome, CacheError> {
-        // The Curve factory's first (and, given an empty answer, only) call is
-        // `find_pools_for_coins`. Return an ABI-encoded empty `address[]` so
-        // discovery resolves to an empty pool set rather than erroring.
-        if calldata.get(..4) == Some(find_pools_for_coinsCall::SELECTOR.as_slice()) {
-            let empty: Vec<Address> = Vec::new();
-            return Ok(CallOutcome::Success {
-                output: find_pools_for_coinsCall::abi_encode_returns(&empty).into(),
-                gas_used: 0,
-            });
-        }
-        // No other view is reached on an empty candidate set; keep the mock
-        // strict so an unexpected call surfaces loudly rather than silently.
+        // Every discovery factory under test is DerivedSlot (no ViewCall), so no
+        // call is expected. Keep the mock strict: an unexpected call reverts
+        // rather than silently succeeding.
         Ok(CallOutcome::Revert {
             output: Bytes::new(),
             gas_used: 0,
@@ -109,7 +87,6 @@ fn registry_with_all_adapters() -> Result<AdapterRegistry> {
     registry.register_adapter(std::sync::Arc::new(UniswapV2Adapter::default()))?;
     registry.register_adapter(std::sync::Arc::new(ConcentratedLiquidityAdapter::default()))?;
     registry.register_adapter(std::sync::Arc::new(SolidlyV2Adapter::default()))?;
-    registry.register_adapter(std::sync::Arc::new(CurveAdapter::default()))?;
     Ok(registry)
 }
 
@@ -122,18 +99,16 @@ fn combined_config() -> FactoryConfig {
         .with_pancake_v3_factory(PANCAKE_V3_FACTORY)
         .with_slipstream_factory(SLIPSTREAM_FACTORY)
         .with_solidly_factory(SOLIDLY_FACTORY)
-        .with_curve_meta_registry(CURVE_META_REGISTRY)
 }
 
 /// The full protocol set this slice's discovery serves. `for_registry` must emit
 /// at least one factory for each, so a `.on(P)` query never hits `MissingFactory`.
-const WIRED_PROTOCOLS: [ProtocolId; 6] = [
+const WIRED_PROTOCOLS: [ProtocolId; 5] = [
     ProtocolId::UniswapV2,
     ProtocolId::UniswapV3,
     ProtocolId::PancakeV3,
     ProtocolId::Slipstream,
     ProtocolId::SolidlyV2,
-    ProtocolId::Curve,
 ];
 
 /// `PoolDiscovery::for_registry` wires a factory for EVERY protocol in the

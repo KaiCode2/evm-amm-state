@@ -25,34 +25,30 @@
 //! - **Solidly V2 / Aerodrome** ([`SolidlyFactoryConfig::aerodrome`]): `getPool`
 //!   base slot **5** + the pool storage layout (reserves @ 20/21, tokens @ 13/14),
 //!   verified on-chain.
-//! - **Curve** ([`CurveFactoryConfig::mainnet`]): plain-pool discovery via the
-//!   canonical MetaRegistry (ViewCall). Offline resolution is exercised by
-//!   `discovery_curve`; **live MetaRegistry resolution is still under
-//!   investigation** (the view call reverts against a forked node — parked).
+//!
+//! ## Out of scope: integrator-supplied discovery
+//!
+//! Two AMM shapes ship no built-in discovery factory; supply their pools via
+//! explicit registration or a custom [`PoolFactory`] added through
+//! [`PoolDiscovery::with_factory`]:
+//! - **Balancer V2** — no on-chain token→pool index, so discovery is an async
+//!   log scan rather than a cache read.
+//! - **Curve** — its MetaRegistry `find_pools_for_coins` view reverts against a
+//!   live node, so ViewCall discovery is not built in. The Curve *adapter* still
+//!   simulates explicitly-registered Curve pools.
 
 use std::collections::HashMap;
 use std::fmt;
 
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use alloy_primitives::B256;
-#[cfg(feature = "curve")]
-use alloy_primitives::Bytes;
 use alloy_primitives::{Address, Log, U256};
-#[cfg(feature = "curve")]
-use alloy_sol_types::SolCall;
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use alloy_sol_types::SolEvent;
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "curve"))]
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 use alloy_sol_types::sol;
 
-#[cfg(feature = "curve")]
-use super::CallOutcome;
-#[cfg(any(
-    feature = "uniswap-v2",
-    feature = "uniswap-v3",
-    feature = "solidly-v2",
-    feature = "curve"
-))]
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use super::ProtocolMetadata;
 #[cfg(feature = "solidly-v2")]
 use super::SolidlyV2Metadata;
@@ -61,8 +57,6 @@ use super::UniswapV2Metadata;
 #[cfg(feature = "uniswap-v3")]
 use super::V3Metadata;
 use super::{AdapterCache, AdapterRegistry, EventSource, PoolKey, PoolRegistration, ProtocolId};
-#[cfg(feature = "curve")]
-use super::{CurveMetadata, CurveVariant};
 #[cfg(feature = "solidly-v2")]
 use crate::adapters::storage::SolidlyStorageLayout;
 #[cfg(feature = "uniswap-v3")]
@@ -471,11 +465,6 @@ pub struct FactoryConfig {
     /// per config.
     #[cfg(feature = "solidly-v2")]
     pub solidly: Vec<SolidlyFactoryConfig>,
-    /// Curve MetaRegistry endpoints for plain-pool discovery. Every entry is one
-    /// [`CurveFactoryConfig`]; the Curve adapter emits a [`CurveFactory`] per
-    /// config (ViewCall discovery, not storage-slot derivation).
-    #[cfg(feature = "curve")]
-    pub curve: Vec<CurveFactoryConfig>,
     pub verify_derivations: bool,
 }
 
@@ -488,8 +477,6 @@ impl Default for FactoryConfig {
             concentrated_liquidity: Vec::new(),
             #[cfg(feature = "solidly-v2")]
             solidly: Vec::new(),
-            #[cfg(feature = "curve")]
-            curve: Vec::new(),
             verify_derivations: true,
         }
     }
@@ -555,19 +542,6 @@ impl FactoryConfig {
     #[cfg(feature = "solidly-v2")]
     pub fn with_solidly_factory(self, factory: Address) -> Self {
         self.with_solidly(SolidlyFactoryConfig::aerodrome(factory))
-    }
-
-    /// Add a Curve MetaRegistry endpoint by its [`CurveFactoryConfig`].
-    #[cfg(feature = "curve")]
-    pub fn with_curve(mut self, config: CurveFactoryConfig) -> Self {
-        self.curve.push(config);
-        self
-    }
-
-    /// Add a Curve MetaRegistry at `meta_registry` for plain-pool discovery.
-    #[cfg(feature = "curve")]
-    pub fn with_curve_meta_registry(self, meta_registry: Address) -> Self {
-        self.with_curve(CurveFactoryConfig::new(meta_registry))
     }
 
     pub fn with_verify_derivations(mut self, verify_derivations: bool) -> Self {
@@ -1061,79 +1035,6 @@ impl SolidlyFactoryConfig {
     /// Set the push-discovery creation-event `topic0`.
     pub fn with_creation_topic0(mut self, topic0: B256) -> Self {
         self.creation_topic0 = Some(topic0);
-        self
-    }
-}
-
-/// Curve's canonical Ethereum-mainnet [`MetaRegistry`] address — a well-known
-/// public constant (deployed by Curve as the unified registry aggregator), safe
-/// to pin. The gated `discovery_curve_rpc` parity test verifies discovery
-/// against it on a live chain.
-///
-/// [`MetaRegistry`]: https://etherscan.io/address/0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC
-#[cfg(feature = "curve")]
-const CURVE_MAINNET_META_REGISTRY: Address =
-    alloy_primitives::address!("F98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC");
-
-/// The `get_pool_asset_type` value Curve's MetaRegistry reports for a crypto
-/// (v2 / Tricrypto) pool: `4`. Any other value is a StableSwap-family asset
-/// type (`0` = USD, `1` = ETH, `2` = BTC, `3` = other stable), which shares the
-/// `int128` `get_dy` quote ABI. Only `4` selects the `uint256` quote path.
-#[cfg(feature = "curve")]
-const CURVE_CRYPTO_ASSET_TYPE: u64 = 4;
-
-#[cfg(feature = "curve")]
-sol! {
-    // Curve MetaRegistry read surface used for plain-pool discovery. Only these
-    // four views are called (all `view`, executed via `AdapterCache::call_raw`
-    // with `commit = false`). Named returns; the generated `*Call::SELECTOR`
-    // drives routing and `*Call::abi_decode_returns` decodes the output. This
-    // block MUST match `tests/discovery_curve.rs` exactly.
-    function find_pools_for_coins(address from, address to) external view returns (address[] pools);
-    function get_coins(address pool) external view returns (address[8] coins);
-    function is_meta(address pool) external view returns (bool meta);
-    function get_pool_asset_type(address pool) external view returns (uint256 asset_type);
-}
-
-/// Declarative configuration for Curve plain-pool discovery via a [`MetaRegistry`].
-///
-/// Unlike the Uniswap/Solidly factories (which resolve a pool from a Rust-derived
-/// `getPool` storage slot), Curve has no clean Rust-derivable pool-key scheme, so
-/// [`CurveFactory`] discovers pools by executing the MetaRegistry's on-chain views
-/// in revm (a ViewCall through [`AdapterCache::call_raw`]) — see
-/// [`CurveFactory`]. Only the registry address is configured; the read ABI is
-/// fixed (`find_pools_for_coins` / `get_coins` / `is_meta` /
-/// `get_pool_asset_type`).
-///
-/// Construct with [`new`](Self::new) or the [`mainnet`](Self::mainnet) preset
-/// (which pins Curve's canonical mainnet MetaRegistry).
-///
-/// [`MetaRegistry`]: https://etherscan.io/address/0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC
-#[cfg(feature = "curve")]
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CurveFactoryConfig {
-    /// The Curve MetaRegistry contract address discovery calls against.
-    pub meta_registry: Address,
-}
-
-#[cfg(feature = "curve")]
-impl CurveFactoryConfig {
-    /// A Curve factory config targeting the MetaRegistry at `meta_registry`.
-    pub fn new(meta_registry: Address) -> Self {
-        Self { meta_registry }
-    }
-
-    /// Ethereum-mainnet preset: pins Curve's canonical MetaRegistry
-    /// (`0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC`), a well-known public
-    /// constant. The gated `discovery_curve_rpc` parity test exercises it.
-    pub fn mainnet() -> Self {
-        Self::new(CURVE_MAINNET_META_REGISTRY)
-    }
-
-    /// Set (replace) the MetaRegistry address.
-    pub fn with_meta_registry(mut self, meta_registry: Address) -> Self {
-        self.meta_registry = meta_registry;
         self
     }
 }
@@ -2192,225 +2093,6 @@ impl PoolFactory for SolidlyFactory {
         )))
     }
 }
-
-/// Curve plain-pool factory driver, resolving pools via the MetaRegistry
-/// (ViewCall through [`AdapterCache::call_raw`]).
-///
-/// Curve has no Rust-derivable pool-key slot, so this factory OVERRIDES
-/// [`find_pools`](PoolFactory::find_pools) and leaves
-/// [`candidate_reads`](PoolFactory::candidate_reads) empty — it is a per-pair,
-/// call-based factory (the discovery front-end falls back to `find_pools` for
-/// empty-`candidate_reads` factories). Per pair `(a, b)`:
-///
-/// 1. `find_pools_for_coins(a, b)` → candidate `address[]` (empty ⇒ no pools).
-/// 2. For each candidate (de-duplicated):
-///    - `is_meta(pool)` — metapools/lending pools are SKIPPED (plain pools only;
-///      their `get_dy` makes external base-pool calls the cold-start capture
-///      would miss).
-///    - `get_coins(pool)` → `address[8]`, trailing-zero-trimmed to the coin set;
-///      the pool is kept only if that set ⊇ `{a, b}` (the MetaRegistry can
-///      over-return pools that do not actually hold both query coins).
-///    - `get_pool_asset_type(pool)` → `4` ⇒ [`CurveVariant::CryptoSwap`]
-///      (`uint256` `get_dy`), else [`CurveVariant::StableSwap`] (`int128`
-///      `get_dy`) — selecting the correct quote ABI.
-///
-/// A discovered pool carries the FULL multi-token coin set and its
-/// [`CurveVariant`] in [`CurveMetadata`], keyed [`PoolKey::Curve`], with the
-/// [`CurveAdapter`](crate::adapters::CurveAdapter) event sources attached.
-///
-/// A MetaRegistry call that reverts/halts or returns undecodable output is a
-/// hard [`DiscoveryError`] (never silently swallowed); a zero-length
-/// `find_pools_for_coins` answer is simply an empty result.
-///
-/// ## Deferred
-///
-/// - **`CryptoSwapNG` refinement.** `get_pool_asset_type == 4` maps to
-///   `CryptoSwap`. NG-vs-base CryptoSwap is an event-only nuance (it does not
-///   change the `uint256` quote ABI), refined by the reactive event path; the NG
-///   variant is not resolved at discovery time here.
-/// - **Metapools** are explicitly out of scope (filtered), matching the Curve
-///   adapter's plain-pool scope.
-#[cfg(feature = "curve")]
-#[derive(Debug)]
-pub struct CurveFactory {
-    config: CurveFactoryConfig,
-}
-
-#[cfg(feature = "curve")]
-impl CurveFactory {
-    /// Build a driver from a fully-specified [`CurveFactoryConfig`].
-    pub fn new(config: CurveFactoryConfig) -> Self {
-        Self { config }
-    }
-
-    /// Run one MetaRegistry view `calldata` and return its success output,
-    /// mapping a revert/halt to [`DiscoveryError::Factory`] (never swallowed).
-    fn view_call(
-        &self,
-        cache: &mut dyn AdapterCache,
-        calldata: Bytes,
-    ) -> Result<Bytes, DiscoveryError> {
-        // ViewCall: `from = ZERO`, `commit = false` — reads the warmed snapshot
-        // (lazily fetching cold slots from the backend), never mutates the cache.
-        match cache.call_raw(Address::ZERO, self.config.meta_registry, calldata, false)? {
-            CallOutcome::Success { output, .. } => Ok(output),
-            CallOutcome::Revert { .. } => Err(DiscoveryError::Factory(Box::new(
-                CurveDiscoveryError::MetaRegistryReverted,
-            ))),
-            CallOutcome::Halt { reason } => Err(DiscoveryError::Factory(Box::new(
-                CurveDiscoveryError::MetaRegistryHalted(reason),
-            ))),
-        }
-    }
-
-    fn registration(
-        &self,
-        pool: Address,
-        coins: Vec<Address>,
-        variant: CurveVariant,
-    ) -> DiscoveredPool {
-        let metadata = CurveMetadata::default()
-            .with_coins(coins)
-            .with_variant(variant);
-        let registration = PoolRegistration::new(PoolKey::Curve(pool))
-            .with_state_address(pool)
-            .with_metadata(ProtocolMetadata::Curve(metadata));
-        let adapter = crate::adapters::CurveAdapter::default();
-        let sources = super::AmmAdapter::event_sources(&adapter, &registration);
-        let registration = registration.with_event_sources(sources);
-        DiscoveredPool {
-            key: registration.key.clone(),
-            registration,
-            source: DiscoverySource::Query,
-        }
-    }
-}
-
-#[cfg(feature = "curve")]
-impl PoolFactory for CurveFactory {
-    fn protocol(&self) -> ProtocolId {
-        ProtocolId::Curve
-    }
-
-    fn factory_address(&self) -> Address {
-        self.config.meta_registry
-    }
-
-    // `candidate_reads` / `assemble_pairs` intentionally left at their empty
-    // defaults: Curve is call-based (ViewCall), not storage-slot-derivable, so
-    // the discovery front-end routes it through `find_pools` per pair.
-
-    fn find_pools(
-        &self,
-        cache: &mut dyn AdapterCache,
-        pair: (Address, Address),
-    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let (a, b) = pair;
-
-        // 1. Candidate pools for the coin pair. An empty answer is not an error.
-        let output = self.view_call(
-            cache,
-            Bytes::from(find_pools_for_coinsCall { from: a, to: b }.abi_encode()),
-        )?;
-        let candidates = find_pools_for_coinsCall::abi_decode_returns(&output)
-            .map_err(|_| DiscoveryError::Malformed("MetaRegistry find_pools_for_coins output"))?;
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut found = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for pool in candidates {
-            // De-duplicate candidate addresses (the registry may repeat a pool).
-            if pool == Address::ZERO || !seen.insert(pool) {
-                continue;
-            }
-
-            // 2a. Skip metapools/lending pools — plain pools only.
-            let is_meta_out =
-                self.view_call(cache, Bytes::from(is_metaCall { pool }.abi_encode()))?;
-            let is_meta = is_metaCall::abi_decode_returns(&is_meta_out)
-                .map_err(|_| DiscoveryError::Malformed("MetaRegistry is_meta output"))?;
-            if is_meta {
-                continue;
-            }
-
-            // 2b. Coin set (address[8], trailing zeros trimmed). Keep the pool
-            // only if it actually contains BOTH query coins (the registry can
-            // over-return). The full multi-token set is carried in metadata.
-            let coins_out =
-                self.view_call(cache, Bytes::from(get_coinsCall { pool }.abi_encode()))?;
-            let coins_raw = get_coinsCall::abi_decode_returns(&coins_out)
-                .map_err(|_| DiscoveryError::Malformed("MetaRegistry get_coins output"))?;
-            let coins: Vec<Address> = coins_raw
-                .into_iter()
-                .take_while(|coin| *coin != Address::ZERO)
-                .collect();
-            if !(coins.contains(&a) && coins.contains(&b)) {
-                continue;
-            }
-
-            // 2c. Asset type selects the quote ABI: 4 => CryptoSwap (uint256
-            // get_dy), everything else => StableSwap (int128 get_dy). NG-vs-base
-            // is an event-only nuance (deferred; see the type docs).
-            let asset_type_out = self.view_call(
-                cache,
-                Bytes::from(get_pool_asset_typeCall { pool }.abi_encode()),
-            )?;
-            let asset_type =
-                get_pool_asset_typeCall::abi_decode_returns(&asset_type_out).map_err(|_| {
-                    DiscoveryError::Malformed("MetaRegistry get_pool_asset_type output")
-                })?;
-            let variant = if asset_type == U256::from(CURVE_CRYPTO_ASSET_TYPE) {
-                CurveVariant::CryptoSwap
-            } else {
-                CurveVariant::StableSwap
-            };
-
-            found.push(self.registration(pool, coins, variant));
-        }
-        Ok(found)
-    }
-
-    fn creation_sources(&self) -> Vec<EventSource> {
-        // Pull-only: Curve plain-pool discovery is via the MetaRegistry ViewCall,
-        // with no creation-event push in this slice.
-        Vec::new()
-    }
-
-    fn decode_creation(
-        &self,
-        _log: &Log,
-        _context: CreationLogContext,
-    ) -> Result<Option<DiscoveredPool>, DiscoveryError> {
-        // Pull-only (no creation-event push for Curve in this slice).
-        Ok(None)
-    }
-}
-
-/// Curve-discovery-specific failure carried inside [`DiscoveryError::Factory`]
-/// when a MetaRegistry ViewCall reverts or halts.
-#[cfg(feature = "curve")]
-#[derive(Debug)]
-enum CurveDiscoveryError {
-    MetaRegistryReverted,
-    MetaRegistryHalted(String),
-}
-
-#[cfg(feature = "curve")]
-impl fmt::Display for CurveDiscoveryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MetaRegistryReverted => write!(f, "Curve MetaRegistry view call reverted"),
-            Self::MetaRegistryHalted(reason) => {
-                write!(f, "Curve MetaRegistry view call halted: {reason}")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "curve")]
-impl std::error::Error for CurveDiscoveryError {}
 
 #[cfg(feature = "uniswap-v3")]
 fn u32_from_word(word: U256) -> u32 {
