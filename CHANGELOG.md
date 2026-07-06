@@ -7,13 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The first public release (`0.1.0`) is **pending**. Publishing to crates.io is
-blocked on the [`evm-fork-cache`] companion crate's `0.2.0` being published —
-it is currently consumed as a local path pin ([`Cargo.toml`]), which
-`cargo publish` accepts only once that version exists upstream. See
-[`RELEASING.md`](RELEASING.md) for the unblock steps.
+## [0.1.0] - 2026-07-07
 
-Everything below ships in `main` and is the intended content of `0.1.0`.
+First public release.
 
 ### Added
 
@@ -265,4 +261,5 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`Cargo.toml`]: Cargo.toml
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/commits/main
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0
