@@ -35,9 +35,9 @@ use evm_amm_state::adapters::driver::AdapterDriver;
 use evm_amm_state::adapters::storage::{SolidlyStorageLayout, V3StorageLayout};
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy,
-    CurveAdapter, CurveMetadata, CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata,
-    SimConfig, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
-    UniswapV3Adapter, V3Metadata,
+    ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata, CurveVariant, PoolKey,
+    PoolRegistration, ProtocolMetadata, SimConfig, SolidlyV2Adapter, SolidlyV2Metadata,
+    UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -144,17 +144,18 @@ fn quote_config() -> SimConfig {
 }
 
 fn bench_v3(c: &mut Criterion, rt: &Rt, url: &str) {
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::UniswapV3(V3_USDC_WETH_005))
         .with_state_address(V3_USDC_WETH_005)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            storage_layout: Some(V3StorageLayout::uniswap(10)),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(V3StorageLayout::uniswap(10)),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = quote_config();
@@ -174,11 +175,12 @@ fn bench_v2(c: &mut Criterion, rt: &Rt, url: &str) {
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::UniswapV2(V2_USDC_WETH_PAIR))
         .with_state_address(V2_USDC_WETH_PAIR)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee_bps(30),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = quote_config();
@@ -198,10 +200,9 @@ fn bench_balancer(c: &mut Criterion, rt: &Rt, url: &str) {
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::BalancerV2(BALANCER_BAL_WETH_POOL_ID))
         .with_state_address(BALANCER_VAULT)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(BALANCER_VAULT),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(BALANCER_VAULT),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = SimConfig::default();
@@ -221,11 +222,12 @@ fn bench_curve_stable(c: &mut Criterion, rt: &Rt, url: &str) {
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::Curve(CURVE_3POOL))
         .with_state_address(CURVE_3POOL)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![DAI, USDC, USDT],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![DAI, USDC, USDT])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = SimConfig::default();
@@ -245,11 +247,12 @@ fn bench_curve_crypto(c: &mut Criterion, rt: &Rt, url: &str) {
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::Curve(TRICRYPTO2))
         .with_state_address(TRICRYPTO2)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![USDT, WBTC, WETH],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::CryptoSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![USDT, WBTC, WETH])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = SimConfig::default();
@@ -275,12 +278,11 @@ fn bench_solidly(c: &mut Criterion, rt: &Rt, base_url: &str) {
     );
     let mut reg = PoolRegistration::new(PoolKey::SolidlyV2(AERODROME_WETH_USDC))
         .with_state_address(AERODROME_WETH_USDC)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            token0: None,
-            token1: None,
-            stable: Some(false),
-            storage_layout: Some(layout),
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
     cold_start(&mut reg, &mut cache);
 
     let cfg = SimConfig::default();
@@ -301,11 +303,12 @@ fn bench_reactive_v2_sync(c: &mut Criterion, rt: &Rt, url: &str) {
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::UniswapV2(V2_USDC_WETH_PAIR))
         .with_state_address(V2_USDC_WETH_PAIR)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee_bps(30),
+        ));
     cold_start(&mut reg, &mut cache);
     reg.event_sources = adapter.event_sources(&reg);
 
@@ -343,17 +346,18 @@ fn bench_reactive_v2_sync(c: &mut Criterion, rt: &Rt, url: &str) {
 /// so report it coarsely rather than as a criterion micro-bench. Treated as a
 /// one-time cost — it is amortized over every subsequent offline quote.
 fn report_cold_start_latency(rt: &Rt, url: &str) {
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let mut cache = rt.block_on(fork_cache(url, FORK_BLOCK));
     let mut reg = PoolRegistration::new(PoolKey::UniswapV3(V3_USDC_WETH_005))
         .with_state_address(V3_USDC_WETH_005)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            storage_layout: Some(V3StorageLayout::uniswap(10)),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(USDC)
+                .with_token1(WETH)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(V3StorageLayout::uniswap(10)),
+        ));
     let _ = &adapter;
 
     let start = Instant::now();
@@ -379,7 +383,7 @@ fn cold_start(reg: &mut PoolRegistration, cache: &mut EvmCache) {
 fn adapter_for(key: &PoolKey) -> Arc<dyn AmmAdapter> {
     match key {
         PoolKey::UniswapV2(_) => Arc::new(UniswapV2Adapter::default()),
-        PoolKey::UniswapV3(_) => Arc::new(UniswapV3Adapter::default()),
+        PoolKey::UniswapV3(_) => Arc::new(ConcentratedLiquidityAdapter::default()),
         PoolKey::BalancerV2(_) => Arc::new(BalancerV2Adapter::default()),
         PoolKey::SolidlyV2(_) => Arc::new(SolidlyV2Adapter::default()),
         PoolKey::Curve(_) => Arc::new(CurveAdapter::default()),

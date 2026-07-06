@@ -8,13 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::storage::{
@@ -23,11 +24,14 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
-    CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolMetadata, RepairAction, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter,
-    UniswapV2Metadata, UniswapV3Adapter, UnsupportedReason, V3Metadata,
+    ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey,
+    PoolRegistration, PoolStatus, ProtocolMetadata, RepairAction, SolidlyV2Adapter,
+    SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UnsupportedReason,
+    V3ImmutablePatchValues, V3Metadata, uniswap_v2_pair_runtime_code_hash, uniswap_v3_code_seed,
+    uniswap_v3_max_liquidity_per_tick,
 };
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::AccountFieldsSample;
+use evm_fork_cache::cache::{AccountFieldsFetchFn, CodeSeedState, EvmCache, StorageBatchFetchFn};
 use revm::state::{AccountInfo, Bytecode};
 
 // --- helpers (kept local so this manager file owns its fixtures) ---
@@ -46,24 +50,49 @@ fn fetcher_with_failures(
     fail: Vec<(Address, U256)>,
 ) -> StorageBatchFetchFn {
     let fail: HashSet<(Address, U256)> = fail.into_iter().collect();
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(address, slot)| {
-                    if fail.contains(&(address, slot)) {
-                        (address, slot, Err(anyhow!("archive miss")))
-                    } else {
-                        (
-                            address,
-                            slot,
-                            Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
-                        )
-                    }
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(address, slot)| {
+                if fail.contains(&(address, slot)) {
+                    (
+                        address,
+                        slot,
+                        Err(evm_fork_cache::StorageFetchError::custom("archive miss")),
+                    )
+                } else {
+                    (
+                        address,
+                        slot,
+                        Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
+                    )
+                }
+            })
+            .collect()
+    })
+}
+
+fn account_fields_fetcher(
+    values: HashMap<Address, (U256, B256)>,
+    calls: Arc<AtomicUsize>,
+) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(addresses
+            .into_iter()
+            .filter_map(|address| {
+                values.get(&address).map(|(balance, code_hash)| {
+                    (
+                        address,
+                        AccountFieldsSample {
+                            balance: *balance,
+                            code_hash: *code_hash,
+                        },
+                    )
                 })
-                .collect()
-        },
-    )
+            })
+            .collect())
+    })
 }
 
 fn token_slot_word(addr: Address) -> U256 {
@@ -90,7 +119,7 @@ fn v2_registry() -> AdapterRegistry {
 fn v3_registry() -> AdapterRegistry {
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     registry
 }
@@ -121,15 +150,19 @@ async fn v2_cold_start_value_reserves_is_ready() -> Result<()> {
         ]),
         Vec::new(),
     ));
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::ZERO, expected_hash))]),
+        Arc::new(AtomicUsize::new(0)),
+    ));
 
     let registry = v2_registry();
     // Config-supplied fee must survive the cold-start (V2 has no on-chain fee).
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            fee_bps: Some(30),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default().with_fee_bps(30),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -303,6 +336,59 @@ async fn v2_run_deferred_warms_lazy_deferred_slots() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_cold_start_seeds_and_verifies_runtime_bytecode_once() -> Result<()> {
+    let pool = Address::repeat_byte(0x15);
+    let token0 = Address::repeat_byte(0xb2);
+    let token1 = Address::repeat_byte(0xb3);
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            ((pool, V2_TOKEN0_SLOT), token_slot_word(token0)),
+            ((pool, V2_TOKEN1_SLOT), token_slot_word(token1)),
+            (
+                (pool, V2_RESERVES_SLOT),
+                reserves_slot(U256::from(3_u64), U256::from(4_u64), U256::ZERO),
+            ),
+        ]),
+        Vec::new(),
+    ));
+    let account_field_calls = Arc::new(AtomicUsize::new(0));
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::from(99_u64), expected_hash))]),
+        account_field_calls.clone(),
+    ));
+
+    let registry = v2_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default().with_fee_bps(30),
+        ));
+
+    let first = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(first, ColdStartOutcome::Ready(_)), "got {first:?}");
+    assert_eq!(account_field_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        cache.code_seed_state(&pool),
+        Some(CodeSeedState::Verified { code_hash, .. }) if *code_hash == expected_hash
+    ));
+
+    let second = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(second, ColdStartOutcome::Ready(_)),
+        "got {second:?}"
+    );
+    assert_eq!(
+        account_field_calls.load(Ordering::SeqCst),
+        1,
+        "verified code seeds must not be reverified on later cold-starts"
+    );
+    Ok(())
+}
+
 // --- Uniswap V3 ---
 
 #[tokio::test]
@@ -324,11 +410,11 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
     let registry = v3_registry();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -347,6 +433,43 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
             .cached_storage_value(pool, layout.liquidity_slot)
             .is_some()
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v3_bytecode_template_patches_immutables_with_explicit_factory() -> Result<()> {
+    let pool = Address::repeat_byte(0x2c);
+    let factory = Address::repeat_byte(0xf0);
+    let token0 = Address::repeat_byte(0xc2);
+    let token1 = Address::repeat_byte(0xc3);
+    let fee = 500u32;
+    let tick_spacing = 60;
+    let seed = uniswap_v3_code_seed(
+        pool,
+        &V3ImmutablePatchValues {
+            pool_address: Some(pool),
+            factory: Some(factory),
+            token0: Some(token0),
+            token1: Some(token1),
+            fee: Some(fee),
+            tick_spacing: Some(tick_spacing),
+            max_liquidity_per_tick: uniswap_v3_max_liquidity_per_tick(tick_spacing),
+        },
+    )?;
+    let expected_hash = seed.code_hash;
+
+    let mut cache = setup_cache().await?;
+    cache.set_account_fields_fetcher(account_fields_fetcher(
+        HashMap::from([(pool, (U256::from(1_u64), expected_hash))]),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    cache.seed_account_code(seed.address, seed.runtime_bytecode)?;
+    let report = cache.verify_code_seeds()?;
+    assert_eq!(report.verified, vec![pool]);
+    assert!(matches!(
+        cache.code_seed_state(&pool),
+        Some(CodeSeedState::Verified { code_hash, .. }) if *code_hash == expected_hash
+    ));
     Ok(())
 }
 
@@ -408,11 +531,11 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
     let registry = v3_registry();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -443,6 +566,152 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
     Ok(())
 }
 
+// --- Per-pool tick-warm radius (V3Metadata.warm_word_radius) ---
+//
+// The cold-start tick-warm window is ±`V3_TICK_WORD_RADIUS` (default 2) bitmap
+// words around the current word. `V3Metadata.warm_word_radius: Option<i16>` lets
+// a consumer widen (or narrow) that window per pool; `None` keeps the default.
+// These two tests pin both directions.
+
+// A configured `warm_word_radius: Some(4)` must warm a bitmap word 4 words out
+// (and its initialized ticks) — a word the default ±2 window would NOT reach.
+#[tokio::test]
+async fn v3_cold_start_respects_wider_configured_radius() -> Result<()> {
+    let pool = Address::repeat_byte(0x2A);
+    let layout = V3StorageLayout::uniswap(60);
+    let spacing = 60i32;
+
+    // Current tick 0 -> word 0. Target word +4 is outside the default ±2 window.
+    let w0 = v3_word_position(0, spacing);
+    let tick_w0 = 60; // word 0, bit 1 (current-word initialized tick)
+    let tick_wp4 = 4 * 256 * 60; // word +4, bit 0
+    assert_eq!(v3_word_position(tick_w0, spacing), w0);
+    assert_eq!(v3_word_position(tick_wp4, spacing), w0 + 4);
+
+    let key_wp4 = v3_tick_bitmap_storage_key_with_base(w0 + 4, layout.tick_bitmap_base_slot);
+    let info_w0 = v3_tick_info_storage_keys_with_base(tick_w0, layout.ticks_base_slot);
+    let info_wp4 = v3_tick_info_storage_keys_with_base(tick_wp4, layout.ticks_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            (
+                (
+                    pool,
+                    v3_tick_bitmap_storage_key_with_base(w0, layout.tick_bitmap_base_slot),
+                ),
+                v3_bit(tick_w0, spacing),
+            ),
+            ((pool, key_wp4), v3_bit(tick_wp4, spacing)),
+            ((pool, info_w0[0]), U256::from(1_u64)),
+            ((pool, info_w0[3]), U256::from(1_u64)),
+            ((pool, info_wp4[0]), U256::from(1_u64)),
+            ((pool, info_wp4[3]), U256::from(1_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60)
+                .with_warm_word_radius(4),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_wp4).is_some(),
+        "word +4 bitmap must be warmed under warm_word_radius = Some(4)"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wp4[0]).is_some(),
+        "word +4 tick info must be warmed under warm_word_radius = Some(4)"
+    );
+    Ok(())
+}
+
+// `warm_word_radius: None` must preserve the default ±2 window exactly: a word at
+// +2 is warmed, a word at +3 is not. Guards the default against drift.
+#[tokio::test]
+async fn v3_cold_start_default_radius_preserves_two_word_window() -> Result<()> {
+    let pool = Address::repeat_byte(0x2B);
+    let layout = V3StorageLayout::uniswap(60);
+    let spacing = 60i32;
+
+    let w0 = v3_word_position(0, spacing);
+    let tick_wp2 = 2 * 256 * 60; // word +2, bit 0 (inside the default window)
+    let tick_wp3 = 3 * 256 * 60; // word +3, bit 0 (outside the default window)
+    assert_eq!(v3_word_position(tick_wp2, spacing), w0 + 2);
+    assert_eq!(v3_word_position(tick_wp3, spacing), w0 + 3);
+
+    let key_wp2 = v3_tick_bitmap_storage_key_with_base(w0 + 2, layout.tick_bitmap_base_slot);
+    let key_wp3 = v3_tick_bitmap_storage_key_with_base(w0 + 3, layout.tick_bitmap_base_slot);
+    let info_wp2 = v3_tick_info_storage_keys_with_base(tick_wp2, layout.ticks_base_slot);
+    let info_wp3 = v3_tick_info_storage_keys_with_base(tick_wp3, layout.ticks_base_slot);
+
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, U256::ZERO),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+            ((pool, key_wp2), v3_bit(tick_wp2, spacing)),
+            ((pool, key_wp3), v3_bit(tick_wp3, spacing)),
+            ((pool, info_wp2[0]), U256::from(1_u64)),
+            ((pool, info_wp2[3]), U256::from(1_u64)),
+            ((pool, info_wp3[0]), U256::from(1_u64)),
+            ((pool, info_wp3[3]), U256::from(1_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_wp2).is_some(),
+        "word +2 bitmap must be warmed by the default ±2 window"
+    );
+    assert!(
+        cache.cached_storage_value(pool, key_wp3).is_none(),
+        "word +3 bitmap must NOT be warmed: the default radius is 2, not 3"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wp2[0]).is_some(),
+        "word +2 tick info must be warmed by the default window"
+    );
+    assert!(
+        cache.cached_storage_value(pool, info_wp3[0]).is_none(),
+        "word +3 tick info must NOT be warmed under the default window"
+    );
+    Ok(())
+}
+
 // Policy boundary: HotSlotsOnly warms only slot0 + liquidity — NO tick bitmap
 // words (current or neighbouring). Guards the multi-word scan from leaking into
 // the hot-only policy.
@@ -469,11 +738,11 @@ async fn v3_cold_start_hot_slots_only_skips_tick_words() -> Result<()> {
     let registry = v3_registry();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome =
         registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
@@ -519,6 +788,29 @@ async fn v3_cold_start_missing_layout_is_unsupported() -> Result<()> {
 }
 
 #[tokio::test]
+async fn v3_cold_start_zero_tick_spacing_is_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0x2a);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(HashMap::new(), Vec::new()));
+
+    let registry = v3_registry();
+    // tick_spacing 0 must be rejected as an unresolvable layout, not divide by
+    // zero inside the planner's bitmap-word math.
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_tick_spacing(0),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Unsupported(_)),
+        "zero tick spacing should be Unsupported, got {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn v3_cold_start_failed_slot0_needs_repair() -> Result<()> {
     let pool = Address::repeat_byte(0x23);
     let layout = V3StorageLayout::uniswap(60);
@@ -532,11 +824,11 @@ async fn v3_cold_start_failed_slot0_needs_repair() -> Result<()> {
     let registry = v3_registry();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -652,10 +944,9 @@ async fn balancer_cold_start_discover_verify_ready() -> Result<()> {
     let registry = balancer_registry();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -741,10 +1032,9 @@ async fn balancer_cold_start_empty_capture_repairs_via_coldstart() -> Result<()>
     let registry = balancer_registry();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -777,10 +1067,9 @@ async fn balancer_cold_start_reverting_call_needs_repair() -> Result<()> {
     let registry = balancer_registry();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -837,10 +1126,9 @@ async fn balancer_cold_start_failed_balance_slot_needs_repair() -> Result<()> {
     let registry = balancer_registry();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -906,10 +1194,9 @@ async fn balancer_cold_start_three_tokens_ready() -> Result<()> {
     let registry = balancer_registry();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -975,11 +1262,11 @@ async fn solidly_cold_start_ready_warms_reserves_and_tokens() -> Result<()> {
     let registry = solidly_registry();
     let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(layout),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -1007,11 +1294,11 @@ async fn solidly_cold_start_zero_vs_failed_reserves_are_distinct_repairs() -> Re
         U256::from(13_u64),
     );
     let metadata = || {
-        ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(layout),
-            ..Default::default()
-        })
+        ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        )
     };
 
     // Case A: reserves read a genuine on-chain ZERO (degenerate pool).
@@ -1062,16 +1349,16 @@ async fn solidly_cold_start_colliding_layout_is_unsupported() -> Result<()> {
     // reserve0_slot == token0_slot (both 10) -> colliding.
     let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(SolidlyStorageLayout::new(
-                U256::from(10_u64),
-                U256::from(11_u64),
-                U256::from(10_u64),
-                U256::from(13_u64),
-            )),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(SolidlyStorageLayout::new(
+                    U256::from(10_u64),
+                    U256::from(11_u64),
+                    U256::from(10_u64),
+                    U256::from(13_u64),
+                )),
+        ));
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
         matches!(outcome, ColdStartOutcome::Unsupported(_)),
@@ -1109,11 +1396,11 @@ async fn solidly_cold_start_lazy_defers_token_slots() -> Result<()> {
     let registry = solidly_registry();
     let mut reg = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(layout),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
     let outcome = registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Lazy)?;
     let deferred = match outcome {
         ColdStartOutcome::ReadyWithDeferred(_, d) => d,
@@ -1144,11 +1431,11 @@ async fn solidly_cold_start_lazy_defers_token_slots() -> Result<()> {
     cache_h.set_storage_batch_fetcher(fetcher_with_failures(seed(), Vec::new()));
     let mut reg_h = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(layout),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
     let outcome_h = registry.cold_start(&mut reg_h, &mut cache_h, ColdStartPolicy::HotSlotsOnly)?;
     assert!(
         matches!(outcome_h, ColdStartOutcome::Ready(_)),
@@ -1210,11 +1497,12 @@ async fn curve_cold_start_discover_verify_ready() -> Result<()> {
     let registry = curve_registry();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc, usdt],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc, usdt])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -1273,11 +1561,12 @@ async fn curve_cold_start_reverting_discover_needs_repair() -> Result<()> {
     let registry = curve_registry();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -1319,11 +1608,12 @@ async fn curve_cold_start_failed_slot_needs_verify_repair() -> Result<()> {
     let registry = curve_registry();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -1369,11 +1659,12 @@ async fn curve_cryptoswap_cold_start_discover_verify_ready_persists_variant() ->
     let registry = curve_registry();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![usdt, wbtc, weth],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::CryptoSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![usdt, wbtc, weth])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 

@@ -5,20 +5,45 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, Log};
 
 use super::{
-    AdapterCache, AmmAdapter, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
-    PoolRegistration, ProtocolId, RepairAction,
+    AdapterCache, AmmAdapter, CacheError, DeferredOutcome, DeferredWork, EventRoute, EventSource,
+    PoolKey, PoolRegistration, ProtocolId, RepairAction,
 };
 
 /// Registry of tracked AMM pools and protocol adapters.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AdapterRegistry {
     adapters: HashMap<ProtocolId, Arc<dyn AmmAdapter>>,
     pools: HashMap<PoolKey, PoolRegistration>,
+    /// Whether [`cold_start`](Self::cold_start) seeds and verifies adapter
+    /// runtime bytecode (an optimization over the lazy real-code fetch).
+    /// Defaults to `true`; opt out via [`with_code_seeding`](Self::with_code_seeding).
+    pub(crate) code_seeding: bool,
+}
+
+impl Default for AdapterRegistry {
+    fn default() -> Self {
+        Self {
+            adapters: HashMap::new(),
+            pools: HashMap::new(),
+            code_seeding: true,
+        }
+    }
 }
 
 impl AdapterRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable or disable verified-code-seeding during
+    /// [`cold_start`](Self::cold_start).
+    ///
+    /// When `false`, cold-start performs no seeding and no verification call;
+    /// the pool's runtime code is fetched lazily at first simulate as usual.
+    /// Defaults to `true`.
+    pub fn with_code_seeding(mut self, enabled: bool) -> Self {
+        self.code_seeding = enabled;
+        self
     }
 
     pub fn register_pool(&mut self, registration: PoolRegistration) -> Result<(), RegistryError> {
@@ -28,6 +53,16 @@ impl AdapterRegistry {
 
         self.pools.insert(registration.key.clone(), registration);
         Ok(())
+    }
+
+    /// Remove a pool registration, returning it if it was present.
+    ///
+    /// The inverse of [`register_pool`](Self::register_pool). Removal only
+    /// stops routing/dispatch from this registry — cache state warmed for the
+    /// pool is untouched (`AmmSyncEngine::unregister_pools_evicting` also
+    /// releases that).
+    pub fn unregister_pool(&mut self, key: &PoolKey) -> Option<PoolRegistration> {
+        self.pools.remove(key)
     }
 
     pub fn register_adapter(&mut self, adapter: Arc<dyn AmmAdapter>) -> Result<(), RegistryError> {
@@ -47,6 +82,37 @@ impl AdapterRegistry {
         Ok(())
     }
 
+    /// Remove an adapter — under **every** protocol id it serves — returning
+    /// it. The inverse of [`register_adapter`](Self::register_adapter).
+    ///
+    /// Fails with [`RegistryError::AdapterInUse`] while any registered pool
+    /// still dispatches to one of those ids (unregister the pools first), so
+    /// a registry can never route a pool to a missing adapter. Returns
+    /// `Ok(None)` when nothing is registered under `protocol`.
+    pub fn unregister_adapter(
+        &mut self,
+        protocol: ProtocolId,
+    ) -> Result<Option<Arc<dyn AmmAdapter>>, RegistryError> {
+        let Some(adapter) = self.adapters.get(&protocol).cloned() else {
+            return Ok(None);
+        };
+        let served = adapter.protocols();
+        if let Some(pool) = self
+            .pools
+            .values()
+            .find(|pool| served.contains(&pool.key.protocol()))
+        {
+            return Err(RegistryError::AdapterInUse {
+                protocol: pool.key.protocol(),
+                pool: pool.key.clone(),
+            });
+        }
+        for id in served {
+            self.adapters.remove(&id);
+        }
+        Ok(Some(adapter))
+    }
+
     pub fn adapter(&self, protocol: ProtocolId) -> Option<&Arc<dyn AmmAdapter>> {
         self.adapters.get(&protocol)
     }
@@ -57,6 +123,10 @@ impl AdapterRegistry {
 
     pub fn pool(&self, key: &PoolKey) -> Option<&PoolRegistration> {
         self.pools.get(key)
+    }
+
+    pub fn pool_mut(&mut self, key: &PoolKey) -> Option<&mut PoolRegistration> {
+        self.pools.get_mut(key)
     }
 
     pub fn pools(&self) -> impl Iterator<Item = &PoolRegistration> {
@@ -154,7 +224,7 @@ impl AdapterRegistry {
         &self,
         deferred: &[DeferredWork],
         cache: &mut dyn AdapterCache,
-    ) -> anyhow::Result<DeferredOutcome> {
+    ) -> Result<DeferredOutcome, CacheError> {
         let mut outcome = DeferredOutcome::default();
 
         for work in deferred {
@@ -184,9 +254,17 @@ impl fmt::Debug for AdapterRegistry {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionSpec {
     pub sources: Vec<EventSource>,
+}
+
+impl SubscriptionSpec {
+    /// Construct a subscription spec from a set of event sources.
+    pub fn new(sources: Vec<EventSource>) -> Self {
+        Self { sources }
+    }
 }
 
 /// Shared per-source routing predicate: does `log` belong to the pool `key` via
@@ -226,10 +304,19 @@ fn topic_address(topic: &B256) -> Address {
 }
 
 /// Errors raised while mutating an [`AdapterRegistry`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     DuplicatePool(PoolKey),
     DuplicateAdapter(ProtocolId),
+    /// The adapter still serves at least one registered pool and cannot be
+    /// unregistered until those pools are removed.
+    AdapterInUse {
+        /// A protocol id (of the adapter's served set) with a live pool.
+        protocol: ProtocolId,
+        /// One of the pools still dispatching to the adapter.
+        pool: PoolKey,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -238,6 +325,9 @@ impl fmt::Display for RegistryError {
             Self::DuplicatePool(key) => write!(f, "pool is already registered: {key:?}"),
             Self::DuplicateAdapter(protocol) => {
                 write!(f, "adapter is already registered: {protocol:?}")
+            }
+            Self::AdapterInUse { protocol, pool } => {
+                write!(f, "adapter for {protocol:?} still serves pool {pool:?}")
             }
         }
     }

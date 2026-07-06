@@ -15,12 +15,18 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, CurveVariant, DeferredWork,
-    PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, PurgeScope, SolidlyV2Adapter,
-    SolidlyV2Metadata, StateUpdate, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter,
-    V3Metadata,
+    ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
+    CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
+    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
+    uniswap_v2_pair_runtime_code_hash,
 };
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+// The reactive-runtime seam these tests exercise (raw `EvmCache::apply_updates`
+// and the upstream `ResyncedReport`/`InvalidationRequest`) speaks the upstream
+// state vocabulary, so these are the `evm_fork_cache` types, not the crate mirrors.
+use evm_fork_cache::AccountFieldsSample;
+use evm_fork_cache::PurgeScope;
+use evm_fork_cache::StateUpdate;
+use evm_fork_cache::cache::{AccountFieldsFetchFn, EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, HandlerId, InputSource, ReactiveConfig, ReactiveInput,
     ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, ReactiveReport, ReactiveRuntime,
@@ -115,17 +121,27 @@ async fn setup_cache() -> Result<EvmCache> {
 }
 
 fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(address, slot)| {
-                    let value = values.get(&(address, slot)).copied().unwrap_or_default();
-                    (address, slot, Ok(value))
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(address, slot)| {
+                let value = values.get(&(address, slot)).copied().unwrap_or_default();
+                (address, slot, Ok(value))
+            })
+            .collect()
+    })
+}
+
+fn account_fields_fetcher(samples: HashMap<Address, (U256, B256)>) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        Ok(addresses
+            .into_iter()
+            .map(|address| {
+                let (balance, code_hash) = samples.get(&address).copied().unwrap_or_default();
+                (address, AccountFieldsSample { balance, code_hash })
+            })
+            .collect())
+    })
 }
 
 fn v2_registry(pool: Address, store_sources: bool) -> AdapterRegistry {
@@ -143,13 +159,12 @@ fn v2_registry(pool: Address, store_sources: bool) -> AdapterRegistry {
 }
 
 fn v3_registry(pool: Address) -> AdapterRegistry {
-    let adapter = Arc::new(UniswapV3Adapter::default());
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(V3StorageLayout::uniswap(60)),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(60)),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
@@ -167,10 +182,9 @@ fn balancer_registry(vault: Address, pool_ids: impl IntoIterator<Item = B256>) -
     for pool_id in pool_ids {
         let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
             .with_state_address(vault)
-            .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-                vault: Some(vault),
-                ..Default::default()
-            }));
+            .with_metadata(ProtocolMetadata::BalancerV2(
+                BalancerV2Metadata::default().with_vault(vault),
+            ));
         let sources = adapter.event_sources(&registration);
         registration = registration.with_event_sources(sources);
         registry.register_pool(registration).unwrap();
@@ -272,7 +286,7 @@ fn v3_burn_log(pool: Address, tick_lower: i32, tick_upper: i32, block_number: u6
 }
 
 fn v3_registry_no_layout(pool: Address) -> AdapterRegistry {
-    let adapter = Arc::new(UniswapV3Adapter::default());
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
         .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata::default()));
@@ -901,6 +915,11 @@ async fn v2_cold_start_brings_pool_ready() -> Result<()> {
             reserves_slot(reserve0, reserve1, timestamp),
         ),
     ])));
+    let expected_hash = uniswap_v2_pair_runtime_code_hash();
+    cache.set_account_fields_fetcher(account_fields_fetcher(HashMap::from([(
+        pool,
+        (U256::ZERO, expected_hash),
+    )])));
 
     let mut registry = AdapterRegistry::new();
     registry
@@ -908,10 +927,9 @@ async fn v2_cold_start_brings_pool_ready() -> Result<()> {
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            fee_bps: Some(30),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default().with_fee_bps(30),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -1147,22 +1165,23 @@ async fn v3_cold_start_brings_pool_ready_with_tick_word() -> Result<()> {
         seed.insert((pool, keys[3]), U256::from(1_u64) << 248);
     }
 
+    let metadata = V3Metadata::default()
+        .with_token0(token0)
+        .with_token1(token1)
+        .with_fee(500)
+        .with_tick_spacing(60)
+        .with_storage_layout(layout);
+
     let mut cache = setup_cache().await?;
     cache.set_storage_batch_fetcher(stub_fetcher(seed));
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(token0),
-            token1: Some(token1),
-            fee: Some(500),
-            tick_spacing: Some(60),
-            storage_layout: Some(layout),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(metadata));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
@@ -1231,26 +1250,26 @@ async fn v3_cold_start_then_swap_applies_exact_no_resync() -> Result<()> {
         ),
     ])));
 
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
     let mut cold_registry = AdapterRegistry::new();
     cold_registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     cold_registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     registry.register_pool(registration).unwrap();
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
@@ -1304,7 +1323,7 @@ async fn v3_cold_start_missing_layout_unsupported() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     // No resolvable layout: default metadata has neither storage_layout nor
     // tick_spacing.
@@ -1332,15 +1351,15 @@ async fn v3_cold_start_missing_slot0_needs_repair() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(matches!(outcome, ColdStartOutcome::NeedsRepair(_, _)));
@@ -1357,14 +1376,14 @@ async fn pancake_v3_routes_and_applies_through_family_adapter() -> Result<()> {
     let sqrt_price = U256::from(123_u64);
     let liquidity = U256::from(456_u64);
 
-    let adapter = Arc::new(UniswapV3Adapter::default());
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registration = PoolRegistration::new(PoolKey::PancakeV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::PancakeV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::PancakeV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
@@ -1459,15 +1478,15 @@ async fn v3_cold_start_lazy_defers_tick_word() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Lazy)?;
     let bitmap_key = v3_tick_bitmap_storage_key_with_base(0_i16, layout.tick_bitmap_base_slot);
@@ -1507,15 +1526,15 @@ async fn v3_cold_start_hot_slots_only_skips_tick_word() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome =
         registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::HotSlotsOnly)?;
@@ -1545,7 +1564,7 @@ async fn v3_cold_start_hot_slots_only_skips_tick_word() -> Result<()> {
 /// key + metadata (so Pancake/Slipstream shifted layouts can be exercised).
 fn v3_family_registry(key: PoolKey, metadata: ProtocolMetadata) -> AdapterRegistry {
     let address = key.address().expect("v3-family pools are address-keyed");
-    let adapter = Arc::new(UniswapV3Adapter::default());
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registration = PoolRegistration::new(key)
         .with_state_address(address)
         .with_metadata(metadata);
@@ -1568,11 +1587,11 @@ async fn pancake_v3_mint_repair_targets_pancake_layout_slots() -> Result<()> {
 
     let registry = v3_family_registry(
         PoolKey::PancakeV3(pool),
-        ProtocolMetadata::PancakeV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }),
+        ProtocolMetadata::PancakeV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ),
     );
 
     let mut cache = setup_cache().await?;
@@ -1622,11 +1641,11 @@ async fn slipstream_mint_repair_targets_slipstream_layout_slots() -> Result<()> 
 
     let registry = v3_family_registry(
         PoolKey::Slipstream(pool),
-        ProtocolMetadata::Slipstream(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }),
+        ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ),
     );
 
     let mut cache = setup_cache().await?;
@@ -1722,15 +1741,15 @@ async fn v3_cold_start_strict_warms_hot_slots_like_eager() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Strict)?;
     assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
@@ -1767,15 +1786,15 @@ async fn v3_cold_start_missing_liquidity_is_still_ready() -> Result<()> {
 
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(layout),
-            tick_spacing: Some(60),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
 
     let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
@@ -1802,11 +1821,11 @@ fn solidly_registry(pool: Address, layout: SolidlyStorageLayout) -> AdapterRegis
     let adapter = Arc::new(SolidlyV2Adapter::default());
     let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: Some(layout),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
@@ -1870,11 +1889,9 @@ async fn solidly_sync_without_layout_does_not_mutate_cache() -> Result<()> {
     let adapter = Arc::new(SolidlyV2Adapter::default());
     let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            stable: Some(false),
-            storage_layout: None,
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default().with_stable(false),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
     let mut registry = AdapterRegistry::new();
@@ -1976,11 +1993,12 @@ async fn curve_token_exchange_resyncs_discovered_slot() -> Result<()> {
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc, usdt],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc, usdt])
+                .with_discovered_slots(Vec::new())
+                .with_variant(CurveVariant::StableSwap),
+        ));
     let outcome =
         cold_registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(matches!(outcome, ColdStartOutcome::Ready(_)));
@@ -2060,11 +2078,11 @@ async fn curve_token_exchange_empty_slots_no_error_no_mutation() -> Result<()> {
     let adapter = CurveAdapter::default();
     let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc],
-            discovered_slots: Vec::new(),
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc])
+                .with_variant(CurveVariant::StableSwap),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
@@ -2135,11 +2153,11 @@ async fn curve_reactive_runtime(
         .unwrap();
     let mut reg = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins,
-            discovered_slots: Vec::new(),
-            variant,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(coins)
+                .with_variant(variant),
+        ));
     let outcome = cold.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
         matches!(outcome, ColdStartOutcome::Ready(_)),

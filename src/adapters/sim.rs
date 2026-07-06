@@ -17,39 +17,17 @@
 //! The quote contract's bytecode must be reachable: lazily fetched against a
 //! live backend, or installed as a fixture for offline tests.
 
-#[cfg(any(
-    feature = "uniswap-v2",
-    feature = "uniswap-v3",
-    feature = "balancer-v2",
-    feature = "solidly-v2",
-    feature = "curve"
-))]
-use alloy_primitives::Bytes;
-use alloy_primitives::{Address, U256, address};
+use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_sol_types::sol;
-#[cfg(any(
-    feature = "uniswap-v2",
-    feature = "uniswap-v3",
-    feature = "balancer-v2",
-    feature = "solidly-v2",
-    feature = "curve"
-))]
-use revm::context::result::ExecutionResult;
 
-#[cfg(any(
-    feature = "uniswap-v2",
-    feature = "uniswap-v3",
-    feature = "balancer-v2",
-    feature = "solidly-v2",
-    feature = "curve"
-))]
-use super::AdapterCache;
+use super::{AdapterCache, CallOutcome};
 
 /// A swap-simulation quote: the output amount the protocol's canonical quote
 /// entrypoint returns for the requested input.
 ///
 /// Intentionally a struct (not a bare `U256`) so future quote outputs (gas,
 /// effective price, sqrt-price-after) can extend it without breaking callers.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwapQuote {
     /// The token-out amount the quote returned for `amount_in`.
@@ -65,6 +43,7 @@ impl SwapQuote {
 
 /// Why a [`simulate_swap`](super::AmmAdapter::simulate_swap) could not produce a
 /// quote.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimError {
     /// The adapter does not implement swap simulation for its protocol.
@@ -104,6 +83,7 @@ impl std::error::Error for SimError {}
 /// Per-pool/chain overrides are applied with the `with_*` builders. The Balancer
 /// vault is *not* configured here — it is the pool's own vault
 /// (`BalancerV2Metadata.vault`), resolved per-pool at quote time.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimConfig {
     /// Uniswap V3 `QuoterV2` (and family) quote target.
@@ -151,27 +131,20 @@ impl SimConfig {
 /// `simulate_swap` so the execution + revert classification lives in one place;
 /// the protocol-specific code only builds calldata and decodes the output.
 ///
-/// Gated on the protocols that call it: with no protocol adapter compiled there
-/// is no `simulate_swap` impl, so this helper would be dead code.
-#[cfg(any(
-    feature = "uniswap-v2",
-    feature = "uniswap-v3",
-    feature = "balancer-v2",
-    feature = "solidly-v2",
-    feature = "curve"
-))]
-pub(crate) fn run_quote(
+/// This is the public helper that custom-adapter authors use to run a quote
+/// entrypoint: build the target's quote calldata, call this, then decode the
+/// returned [`Bytes`] into the protocol's output.
+pub fn quote_via_call(
     cache: &mut dyn AdapterCache,
     target: Address,
     calldata: Bytes,
 ) -> Result<Bytes, SimError> {
-    let result = cache
+    match cache
         .call_raw(Address::ZERO, target, calldata, false)
-        .map_err(|err| SimError::Execution(err.to_string()))?;
-
-    match result {
-        ExecutionResult::Success { output, .. } => Ok(output.into_data()),
-        ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => Err(SimError::Reverted),
+        .map_err(|e| SimError::Execution(e.to_string()))?
+    {
+        CallOutcome::Success { output, .. } => Ok(output),
+        CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Err(SimError::Reverted),
     }
 }
 
@@ -217,9 +190,11 @@ sol! {
     ///
     /// `i`/`j` are the pool's coin indices (the `coins[]` ordering). Applies the
     /// StableSwap invariant in-EVM against the warmed balances + amplification +
-    /// fee and returns the `j`-coin output for `dx` of coin `i`. `int128` indices
-    /// match classic StableSwap (CryptoSwap / StableSwap-NG use `uint256` — out
-    /// of scope here).
+    /// fee and returns the `j`-coin output for `dx` of coin `i`. This `int128`
+    /// binding serves the StableSwap / StableSwap-NG (int128-index) variants; the
+    /// `uint256` `CurveCryptoSwap::get_dy` below serves CryptoSwap / CryptoSwapNG.
+    /// The Curve adapter selects the correct binding per the pool's
+    /// [`CurveVariant`](super::CurveVariant).
     function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
 
     /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.

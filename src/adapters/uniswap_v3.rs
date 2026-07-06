@@ -1,13 +1,12 @@
-use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
-use alloy_sol_types::{SolCall, SolEvent, sol};
-use evm_fork_cache::cold_start::{
-    ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
+use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError, v3_code_seed_from_metadata};
+use super::cold_start::{
+    AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
+    SlotFetch,
 };
-
-use super::cold_start::AdapterColdStartPlanner;
+use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quoteExactInputSingleCall,
-    run_quote,
+    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call,
+    quoteExactInputSingleCall,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -19,6 +18,8 @@ use crate::adapters::storage::{
     V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
     v3_tick_info_storage_keys_with_base, v3_word_position,
 };
+use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 
 sol! {
     event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
@@ -53,11 +54,11 @@ pub(crate) const V3_TICK_WORD_RADIUS: i16 = 2;
 /// per-pool from the registration metadata. The struct is registered once and
 /// claims all three ids via [`AmmAdapter::protocols`].
 #[derive(Clone, Debug, Default)]
-pub struct V3FamilyAdapter {
+pub struct ConcentratedLiquidityAdapter {
     _private: (),
 }
 
-impl AmmAdapter for V3FamilyAdapter {
+impl AmmAdapter for ConcentratedLiquidityAdapter {
     fn protocol(&self) -> ProtocolId {
         ProtocolId::UniswapV3
     }
@@ -87,6 +88,21 @@ impl AmmAdapter for V3FamilyAdapter {
             .collect()
     }
 
+    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        config
+            .concentrated_liquidity
+            .iter()
+            .map(|spec| {
+                // The config-level `verify_derivations` is a global off-switch: a
+                // spec's CREATE2 cross-check runs only when both it and the global
+                // flag opt in.
+                let mut spec = spec.clone();
+                spec.verify_derivations &= config.verify_derivations;
+                Box::new(ConcentratedLiquidityFactory::new(spec)) as Box<dyn PoolFactory>
+            })
+            .collect()
+    }
+
     fn cold_start_planner(
         &self,
         pool: &PoolRegistration,
@@ -105,9 +121,26 @@ impl AmmAdapter for V3FamilyAdapter {
             return Err(UnsupportedReason::MissingMetadata("V3 storage layout"));
         };
 
+        // Per-pool tick-warm radius from V3 metadata, defaulting to the crate
+        // constant when the field (or the metadata) is absent.
+        let radius = v3_warm_word_radius(pool).unwrap_or(V3_TICK_WORD_RADIUS);
+
         Ok(Box::new(UniswapV3ColdStartPlanner::new(
-            address, layout, policy,
+            address, layout, policy, radius,
         )))
+    }
+
+    fn code_seeds(
+        &self,
+        pool: &PoolRegistration,
+    ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        let Some(address) = pool.key.address() else {
+            return Ok(Vec::new());
+        };
+        let Some(metadata) = v3_metadata(pool) else {
+            return Ok(Vec::new());
+        };
+        v3_code_seed_from_metadata(address, metadata).map(|opt| opt.into_iter().collect())
     }
 
     fn decode_event(
@@ -164,6 +197,13 @@ impl AmmAdapter for V3FamilyAdapter {
     /// pool `fee` is taken from the V3-family metadata; tick-crossing swaps stay
     /// correct because the cache lazily fetches any cold tick/bitmap slot from
     /// the backend.
+    ///
+    /// The quote target is the pool's own [`V3Metadata::quoter`] when set (a
+    /// fork's QuoterV2, e.g. PancakeSwap's, filled in by factory discovery),
+    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The quote
+    /// ABI is unchanged (the `fee`-param struct variant) — forks whose quoter
+    /// takes a different struct (e.g. Slipstream's `tickSpacing`-keyed quoter)
+    /// leave `quoter` unset and ride the caller's Uniswap-compatible quoter.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -174,6 +214,9 @@ impl AmmAdapter for V3FamilyAdapter {
         config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
         let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
+        let quoter = v3_metadata(pool)
+            .and_then(|m| m.quoter)
+            .unwrap_or(config.v3_quoter);
 
         let params = QuoteExactInputSingleParams {
             tokenIn: token_in,
@@ -184,7 +227,7 @@ impl AmmAdapter for V3FamilyAdapter {
         };
         let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
-        let output = run_quote(cache, config.v3_quoter, calldata)?;
+        let output = quote_via_call(cache, quoter, calldata)?;
         let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
 
@@ -195,16 +238,30 @@ impl AmmAdapter for V3FamilyAdapter {
 /// Read the pool `fee` (in hundredths of a bip, e.g. `500` for 0.05%) from the
 /// V3-family metadata, regardless of which family variant the pool registered.
 fn v3_fee(pool: &PoolRegistration) -> Option<u32> {
-    let metadata: &V3Metadata = match &pool.metadata {
-        ProtocolMetadata::UniswapV3(m)
-        | ProtocolMetadata::PancakeV3(m)
-        | ProtocolMetadata::Slipstream(m) => m,
-        _ => return None,
-    };
-    metadata.fee
+    v3_metadata(pool).and_then(|m| m.fee)
 }
 
-impl V3FamilyAdapter {
+/// Read the per-pool cold-start tick-warm radius (in tick-bitmap words) from the
+/// V3-family metadata, regardless of which family variant the pool registered.
+///
+/// Returns `None` when the metadata is absent or `warm_word_radius` is unset, in
+/// which case callers fall back to [`V3_TICK_WORD_RADIUS`].
+fn v3_warm_word_radius(pool: &PoolRegistration) -> Option<i16> {
+    v3_metadata(pool).and_then(|m| m.warm_word_radius)
+}
+
+/// Borrow the [`V3Metadata`] for a pool if it registered as any V3-family
+/// variant (Uniswap V3 / Pancake V3 / Slipstream), else `None`.
+fn v3_metadata(pool: &PoolRegistration) -> Option<&V3Metadata> {
+    match &pool.metadata {
+        ProtocolMetadata::UniswapV3(m)
+        | ProtocolMetadata::PancakeV3(m)
+        | ProtocolMetadata::Slipstream(m) => Some(m),
+        _ => None,
+    }
+}
+
+impl ConcentratedLiquidityAdapter {
     fn decode_swap(&self, pool: &PoolRegistration, log: &Log) -> AdapterEventResult {
         if Swap::decode_log_data_validate(&log.data).is_err() {
             return AdapterEventResult::error(AdapterEventError::MalformedLog(
@@ -321,8 +378,10 @@ impl V3FamilyAdapter {
 /// - Round 1 verifies `slot0` + global `liquidity`. `slot0` is mandatory; its
 ///   [`SlotFetch`] verdict decides ready vs. repair. From the warmed `slot0` the
 ///   current tick — and so the current `tickBitmap` word `W0` — is decoded, then
-///   the window `[W0 - R, W0 + R]` (`R = `[`V3_TICK_WORD_RADIUS`]) is computed,
-///   clamped to the valid V3 word range, and each word's bitmap key resolved.
+///   the window `[W0 - R, W0 + R]` (`R = ` the pool's
+///   [`V3Metadata::warm_word_radius`], defaulting to [`V3_TICK_WORD_RADIUS`]) is
+///   computed, clamped to the valid V3 word range, and each word's bitmap key
+///   resolved.
 /// - Round 2 (`Strict`/`Eager` only) verifies **all** window bitmap words in one
 ///   round.
 /// - Round 3 (`Strict`/`Eager` only) verifies the `{0, 3}` info slots of every
@@ -335,6 +394,10 @@ struct UniswapV3ColdStartPlanner {
     address: Address,
     layout: V3StorageLayout,
     policy: ColdStartPolicy,
+    /// ± radius, in tick-bitmap words, of the cold-start tick-warm window (from
+    /// the pool's [`V3Metadata::warm_word_radius`], or [`V3_TICK_WORD_RADIUS`]
+    /// when unset). Clamped to `>= 0` in [`Self::resolve_window`].
+    radius: i16,
     phase: V3Phase,
     /// The cold-start window: each `(word, bitmap_key)` pair in
     /// `[W0 - R, W0 + R]` clamped to the valid V3 word range, resolved from the
@@ -360,11 +423,17 @@ enum V3Phase {
 }
 
 impl UniswapV3ColdStartPlanner {
-    fn new(address: Address, layout: V3StorageLayout, policy: ColdStartPolicy) -> Self {
+    fn new(
+        address: Address,
+        layout: V3StorageLayout,
+        policy: ColdStartPolicy,
+        radius: i16,
+    ) -> Self {
         Self {
             address,
             layout,
             policy,
+            radius,
             phase: V3Phase::Slot0Liquidity,
             window: Vec::new(),
             verified_slots: Vec::new(),
@@ -378,11 +447,16 @@ impl UniswapV3ColdStartPlanner {
     /// current-tick word, clamped to the valid V3 word range, returning each
     /// `(word, bitmap_key)` pair.
     ///
-    /// The clamp derives from `MIN_TICK`/`MAX_TICK = ±887272`: words outside the
-    /// pool's reachable word range are skipped. All arithmetic is done in `i32`
-    /// before the final `i16` cast so the radius offset can never overflow.
+    /// `R` is `self.radius` (the pool's [`V3Metadata::warm_word_radius`], or
+    /// [`V3_TICK_WORD_RADIUS`] when unset), clamped to `>= 0` so a negative
+    /// radius is treated as `0` (current word only) rather than underflowing the
+    /// window math.
+    ///
+    /// The word clamp derives from `MIN_TICK`/`MAX_TICK = ±887272`: words outside
+    /// the pool's reachable word range are skipped. All arithmetic is done in
+    /// `i32` before the final `i16` cast so the radius offset can never overflow.
     fn resolve_window(&self, current_word: i16) -> Vec<(i16, U256)> {
-        let radius = V3_TICK_WORD_RADIUS as i32;
+        let radius = self.radius.max(0) as i32;
         let min_word = v3_word_position(V3_MIN_TICK, self.layout.tick_spacing) as i32;
         let max_word = v3_word_position(V3_MAX_TICK, self.layout.tick_spacing) as i32;
 

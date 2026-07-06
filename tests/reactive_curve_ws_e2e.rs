@@ -168,11 +168,12 @@ fn curve_registration(
 ) -> PoolRegistration {
     PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins,
-            discovered_slots: Vec::new(),
-            variant,
-        }))
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(coins)
+                .with_discovered_slots(Vec::new())
+                .with_variant(variant),
+        ))
 }
 
 /// On-chain `get_dy(0, 1, dx)` at `block` for the pool's variant (ground truth).
@@ -200,6 +201,7 @@ async fn get_dy_at(
             }
             .abi_encode(),
         ),
+        other => panic!("unexpected CurveVariant: {other:?}"),
     };
     let tx = TransactionRequest::default()
         .with_to(pool)
@@ -214,6 +216,7 @@ async fn get_dy_at(
         CurveVariant::CryptoSwap | CurveVariant::CryptoSwapNG => {
             CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&out)?
         }
+        other => panic!("unexpected CurveVariant: {other:?}"),
     })
 }
 

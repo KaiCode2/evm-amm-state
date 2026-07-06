@@ -15,6 +15,10 @@ documentation = "https://docs.rs/evm-amm-state"
 # (docs/benchmarks.md, docs/curve-adapter.md), drop the internal test suite,
 # CI config, maintainer docs, and the superseded per-slice/phase design specs.
 # (gitignore-style patterns, relative to the package root.)
+#
+# NOTE: `exclude` must stay in the `[package]` table. If it is written *after*
+# a `[package.metadata.*]` header, TOML reparents it to that sub-table and
+# Cargo silently ignores it — shipping everything.
 exclude = [
     "tests/",
     ".github/",
@@ -23,6 +27,11 @@ exclude = [
     "docs/*-spec.md",
     "docs/phase-*.md",
 ]
+
+# Build docs.rs with every feature enabled so the `uniswap-v3`-gated `v3_sync`
+# module and the `experimental-protocols` identities render.
+[package.metadata.docs.rs]
+all-features = true
 
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
@@ -47,18 +56,16 @@ balancer-v2 = ["adapters"]
 solidly-v2 = ["adapters"] # Aerodrome / Velodrome V2 reserves pools
 curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 
+# Reserved protocol identities (BalancerV3 / Erc4626 / UniswapV4) with no adapter
+# yet; off by default so the default surface only advertises implemented protocols.
+experimental-protocols = []
+
 [dependencies]
-# Companion crate. Consumed as a git dependency while the sibling repo is
-# private and unpublished. At publish time drop `git`/`rev` and keep the
-# crates.io `version`.
-# INTERIM: pinned to the `cold-start-sync` branch tip (903af3d = base 27ae8762 +
-# the additive cold-start module) while evm-fork-cache#12 is in review. Re-pin to
-# the `main` merge commit before this consumer work merges to evm-amm-state main.
-evm-fork-cache = { git = "ssh://git@github.com/KaiCode2/evm-fork-cache.git", rev = "903af3df887bf5718693d4bacf770552681e5273", version = "0.1" }
+# Companion crate. Uses the public 0.2.1 release for bulk storage extraction,
+# custom storage programs, typed errors, reactive resync, and trace-based
+# storage-slot discovery.
+evm-fork-cache = "0.2.1"
 
-alloy-transport-balancer = { version = "0.1.2", default-features = false, features = ["balancer"] }
-
-alloy-contract = "1.0.38"
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
 alloy-primitives = { version = "1.4", features = ["map"] }
@@ -66,17 +73,22 @@ alloy-provider = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
 
-anyhow = "1.0.98"
-foundry-fork-db = "0.22"
-futures = "0.3"
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
-serde = { version = "1.0.228", features = ["derive"] }
-tracing = "0.1.41"
-tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 alloy-rpc-client = "1.0.38"
 alloy-transport = "1.0.38"
+alloy-transport-http = "1.0.38"
+# Tests/examples use anyhow::Result as their top-level error; the library's
+# public surface is typed (CacheError / DriverError / SimError / ...) and has
+# no anyhow anywhere in its normal dependency graph.
+anyhow = "1.0.98"
+# Examples/tests drive async subscriptions and stream combinators.
+futures = "0.3"
+# Gzip-capable HTTP client for the v3_full_sync example: sync-program
+# responses are hundreds of KB of nonzero storage words and compress ~3x
+# (see evm-fork-cache/docs/bulk-storage-extraction.md).
+reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
 # Examples/tests subscribe to a live node over WebSockets; enable the pubsub transport.
 alloy-provider = { version = "1.0.38", features = ["ws"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
@@ -91,6 +103,15 @@ criterion = { version = "0.5", default-features = false }
 name = "adapter_pipeline"
 required-features = ["uniswap-v2"]
 
+# From-scratch third-party-adapter demo: define a novel AMM (Custom protocol id /
+# pool key / metadata) entirely outside the crate, register it, and quote. Fully
+# self-contained — local math, no RPC, no env vars. Only needs the `adapters`
+# marker (all types used are always-compiled core), so it builds under `default`
+# and is correctly skipped when `adapters` is off.
+[[example]]
+name = "custom_adapter"
+required-features = ["adapters"]
+
 # Adapter integration tests build against the per-protocol adapters; gate them
 # so the adapter-only build runs them only when those adapters are enabled.
 [[test]]
@@ -98,8 +119,53 @@ name = "adapter_a1"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 
 [[test]]
+name = "discovery"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Combined wiring test: `PoolDiscovery::for_registry` fans a FactoryConfig out to
+# every protocol's factory driver (no MissingFactory for V2/V3/Pancake/
+# Slipstream/Solidly). Needs all discovery-capable adapter features.
+[[test]]
+name = "discovery_wiring"
+required-features = ["uniswap-v2", "uniswap-v3", "solidly-v2"]
+
+[[test]]
+name = "discovery_cl"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "discovery_cl_rpc"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "discovery_solidly"
+required-features = ["solidly-v2"]
+
+# Live parity for the Solidly V2 (Aerodrome) preset (env-gated, #[ignore]): pins
+# the getPool base slot, storage layout, and discovery wiring against Base.
+[[test]]
+name = "discovery_solidly_rpc"
+required-features = ["solidly-v2"]
+
+[[test]]
+name = "bytecode_golden"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+[[test]]
+name = "code_seed_semantics"
+required-features = ["uniswap-v2"]
+
+[[test]]
+name = "bootstrap_many"
+required-features = ["uniswap-v2", "uniswap-v3", "curve"]
+
+[[test]]
 name = "adapter_reactive"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
+
+[[test]]
+name = "adapter_sync_manager"
+required-features = ["curve", "balancer-v2"]
 
 [[test]]
 name = "cold_start_adoption"
@@ -117,6 +183,17 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 name = "adapter_swap_sim_rpc"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
+# Offline revm execution of the generated V3 one-shot sync programs.
+[[test]]
+name = "v3_sync"
+required-features = ["uniswap-v3"]
+
+# Live parity for the one-shot V3 sync (env-gated, #[ignore]): state, quote,
+# and partial-window equivalence against on-chain ground truth.
+[[test]]
+name = "v3_full_sync_rpc"
+required-features = ["uniswap-v3"]
+
 [[test]]
 name = "reactive_ws_e2e"
 required-features = ["uniswap-v2"]
@@ -131,6 +208,52 @@ required-features = ["curve"]
 name = "swap_sim"
 harness = false
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
+
+# One-shot V3 full-pool sync via a generated eth_call storage program:
+# the whole tick range + observation ring in a single call, quote-parity
+# checked against the classic windowed cold start (env-gated).
+[[example]]
+name = "v3_full_sync"
+required-features = ["uniswap-v3"]
+
+# Manual live proof that embedded AMM bytecodes can be seeded into EvmCache and
+# verified once against on-chain code hashes.
+[[example]]
+name = "verified_bytecode_seed"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Benchmark: declarative token-basket pool discovery (one bulk eth_call for all
+# pairs across both factories) vs naive per-pair scans. Env-gated on E2E_RPC_URL.
+[[example]]
+name = "token_basket_bench"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Live factory discovery -> cold-start -> reactive subscription demo for
+# Ethereum Uniswap V2 + V3 USDC/WETH pools. Env-gated; no-ops without
+# E2E_RPC_URL.
+[[example]]
+name = "factory_discovery_live"
+required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Declarative discovery demo: name factories + a token basket (no pasted pool
+# addresses), resolve pools across Uniswap V3, then cold_start_many ->
+# register -> quote. Env-gated; no-ops without E2E_RPC_URL.
+[[example]]
+name = "declarative_discovery"
+required-features = ["uniswap-v3"]
+
+# Live sync-latency comparison for prior cold-start versus one-shot storage
+# programs across V3, V2, Balancer, and Curve. Env-gated; defaults to a public
+# Ethereum endpoint when E2E_RPC_URL is unset.
+[[example]]
+name = "sync_latency"
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
+
+# Live event-time resync comparison for a real Curve event: trace-only resync
+# versus forced storage-fetch fallback. Env-gated by endpoint availability.
+[[example]]
+name = "trace_resync_latency"
+required-features = ["curve"]
 
 # End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
 [[example]]

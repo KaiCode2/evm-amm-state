@@ -2,19 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
-use anyhow::Result;
 use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3StorageLayout,
 };
 use evm_amm_state::adapters::{
     AdapterCache, AdapterDriver, AdapterEvent, AdapterEventError, AdapterEventKind,
     AdapterEventResult, AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartPolicy, CustomPoolKey, EventSource, PoolKey, PoolRegistration, ProtocolId,
-    ProtocolMetadata, RegistryError, RepairAction, SkippedDelta, SkippedMask, SlotChange,
-    SlotDelta, StateDiff, StateUpdate, StateView, SubscriptionSpec, UniswapV2Adapter,
-    UniswapV3Adapter, UnsupportedReason, UpdateQuality, V3Metadata,
+    CacheError, CallOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CustomPoolKey,
+    EventSource, PoolKey, PoolRegistration, ProtocolId, ProtocolMetadata, RegistryError,
+    RepairAction, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff, StateUpdate,
+    StateView, UniswapV2Adapter, UnsupportedReason, UpdateQuality, V3Metadata,
 };
-use revm::context::result::ExecutionResult;
 
 const CUSTOM_PROTOCOL: &str = "custom-adapter-defined";
 
@@ -122,9 +120,6 @@ impl AdapterCache for MockCache {
                 StateUpdate::Purge { address, .. } => {
                     self.storage.retain(|(stored, _), _| stored != address);
                 }
-                StateUpdate::BalanceDelta { .. }
-                | StateUpdate::Account { .. }
-                | StateUpdate::AccountUpsert { .. } => {}
                 _ => panic!("unexpected StateUpdate variant in adapter A1 mock cache"),
             }
         }
@@ -132,7 +127,7 @@ impl AdapterCache for MockCache {
         diff
     }
 
-    fn verify_slots(&mut self, _slots: &[(Address, U256)]) -> Result<Vec<SlotChange>> {
+    fn verify_slots(&mut self, _slots: &[(Address, U256)]) -> Result<Vec<SlotChange>, CacheError> {
         Ok(Vec::new())
     }
 
@@ -148,9 +143,9 @@ impl AdapterCache for MockCache {
         StateDiff::default()
     }
 
-    fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256> {
+    fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256, CacheError> {
         self.value(address, slot)
-            .ok_or_else(|| anyhow::anyhow!("slot is cold"))
+            .ok_or_else(|| CacheError::Backend("slot is cold".into()))
     }
 
     fn call_raw(
@@ -159,8 +154,10 @@ impl AdapterCache for MockCache {
         _to: Address,
         _calldata: Bytes,
         _commit: bool,
-    ) -> Result<ExecutionResult> {
-        anyhow::bail!("mock cache does not execute calls")
+    ) -> Result<CallOutcome, CacheError> {
+        Err(CacheError::Backend(
+            "mock cache does not execute calls".into(),
+        ))
     }
 }
 
@@ -205,18 +202,19 @@ impl AmmAdapter for SequencingAdapter {
         let address = pool.key.address().expect("test pool is address-keyed");
         let current = view.storage(address, self.slot).unwrap_or_default();
         let next = current + U256::from(1);
-        AdapterEventResult::event(AdapterEvent {
-            pool: pool.key.clone(),
-            emitter: log.address,
-            topic0: self.topic,
-            kind: AdapterEventKind::Swap,
-            updates: vec![
+        AdapterEventResult::event(
+            AdapterEvent::new(
+                pool.key.clone(),
+                log.address,
+                self.topic,
+                AdapterEventKind::Swap,
+                UpdateQuality::ExactIfApplied,
+            )
+            .with_updates(vec![
                 StateUpdate::slot(address, self.slot, next),
                 StateUpdate::slot_masked(address, self.cold_slot, U256::MAX, U256::from(9)),
-            ],
-            quality: UpdateQuality::ExactIfApplied,
-            repair: RepairAction::None,
-        })
+            ]),
+        )
     }
 
     fn after_apply(
@@ -341,7 +339,7 @@ fn subscription_spec_preserves_emitters_topics_and_routes() {
         )
         .unwrap();
 
-    let SubscriptionSpec { sources } = registry.subscription_spec();
+    let sources = registry.subscription_spec().sources;
     assert_eq!(sources.len(), 2);
     assert!(sources.contains(&EventSource::direct(direct_pool, vec![direct_topic])));
     assert!(sources.contains(&EventSource::indexed_bytes32(vault, vec![vault_topic], 1)));
@@ -445,13 +443,12 @@ fn uniswap_v3_swap_emits_masked_slot0_and_liquidity_update() {
     let tick = U256::from(42_u64);
     let preserved_high_bits = U256::from(0xabcdef_u64) << 184;
 
-    let adapter = Arc::new(UniswapV3Adapter::default());
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(V3StorageLayout::uniswap(60)),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(60)),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
 
@@ -497,10 +494,9 @@ fn balancer_v2_adapter_routes_vault_swap_by_pool_id() {
     let adapter = Arc::new(BalancerV2Adapter::default());
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
     let sources = adapter.event_sources(&registration);
     registration = registration.with_event_sources(sources);
     let swap_topic = registration.event_sources[0].topics[0];
@@ -521,7 +517,7 @@ fn v3_family_adapter_claims_pancake_and_slipstream() {
     // family (Uniswap V3, Pancake V3, Slipstream) so those pools can route to it.
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(Arc::new(UniswapV3Adapter::default()))
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
         .unwrap();
 
     assert!(registry.adapter(ProtocolId::UniswapV3).is_some());
@@ -566,10 +562,9 @@ fn topic_i24(value: i32) -> B256 {
 fn v3_pool_registration(pool: Address) -> PoolRegistration {
     PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(V3StorageLayout::uniswap(60)),
-            ..Default::default()
-        }))
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(60)),
+        ))
 }
 
 /// A non-address-keyed pool key, used to exercise the "pool key is not
@@ -648,7 +643,7 @@ fn v2_sync_non_address_keyed_pool_is_rejected() {
 #[test]
 fn v3_swap_malformed_data_is_rejected() {
     let pool = Address::repeat_byte(0x24);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -675,7 +670,7 @@ fn v3_swap_malformed_data_is_rejected() {
 #[test]
 fn v3_swap_missing_layout_is_unsupported() {
     let pool = Address::repeat_byte(0x25);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     // No storage_layout and no tick_spacing -> `layout_for` cannot resolve.
     let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
@@ -711,13 +706,11 @@ fn v3_swap_missing_layout_is_unsupported() {
 
 #[test]
 fn v3_swap_non_address_keyed_pool_is_rejected() {
-    let adapter = UniswapV3Adapter::default();
-    let registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
-        ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(V3StorageLayout::uniswap(60)),
-            ..Default::default()
-        }),
-    );
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let registration =
+        PoolRegistration::new(custom_bytes32_key()).with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(60)),
+        ));
     let view = MockCache::default();
 
     let result = adapter.decode_event(
@@ -750,7 +743,7 @@ fn v3_swap_non_address_keyed_pool_is_rejected() {
 #[test]
 fn v3_mint_malformed_data_is_rejected() {
     let pool = Address::repeat_byte(0x27);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -780,7 +773,7 @@ fn v3_mint_malformed_data_is_rejected() {
 #[test]
 fn v3_burn_malformed_data_is_rejected() {
     let pool = Address::repeat_byte(0x28);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -809,7 +802,7 @@ fn v3_burn_malformed_data_is_rejected() {
 #[test]
 fn v3_mint_missing_tick_topics_is_rejected() {
     let pool = Address::repeat_byte(0x29);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -909,7 +902,7 @@ fn v2_cold_start_non_address_keyed_is_unsupported() {
 #[test]
 fn v3_no_topics_is_ignored() {
     let pool = Address::repeat_byte(0x2e);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -920,7 +913,7 @@ fn v3_no_topics_is_ignored() {
 #[test]
 fn v3_unknown_topic_is_ignored() {
     let pool = Address::repeat_byte(0x2f);
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = v3_pool_registration(pool);
     let view = MockCache::default();
 
@@ -935,13 +928,11 @@ fn v3_unknown_topic_is_ignored() {
 
 #[test]
 fn v3_cold_start_non_address_keyed_is_unsupported() {
-    let adapter = UniswapV3Adapter::default();
-    let registration = PoolRegistration::new(custom_bytes32_key()).with_metadata(
-        ProtocolMetadata::UniswapV3(V3Metadata {
-            storage_layout: Some(V3StorageLayout::uniswap(60)),
-            ..Default::default()
-        }),
-    );
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let registration =
+        PoolRegistration::new(custom_bytes32_key()).with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_storage_layout(V3StorageLayout::uniswap(60)),
+        ));
 
     // The non-address-keyed check runs ahead of layout resolution, so even with a
     // resolvable layout the factory rejects the key with a `Custom` reason that
@@ -951,4 +942,71 @@ fn v3_cold_start_non_address_keyed_is_unsupported() {
         .err()
         .expect("a non-address-keyed V3 pool must be unsupported");
     assert!(matches!(reason, UnsupportedReason::Custom(_)));
+}
+
+#[test]
+fn registry_unregister_pool_and_adapter_lifecycle() {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV2Adapter::default()))
+        .expect("adapter registers");
+    let key = PoolKey::UniswapV2(Address::repeat_byte(0x51));
+    registry
+        .register_pool(PoolRegistration::new(key.clone()))
+        .expect("pool registers");
+
+    // An adapter with a live pool cannot be unregistered.
+    assert!(matches!(
+        registry.unregister_adapter(ProtocolId::UniswapV2),
+        Err(RegistryError::AdapterInUse { .. })
+    ));
+
+    // Unregistering the pool returns its registration and stops tracking it.
+    let removed = registry
+        .unregister_pool(&key)
+        .expect("registration returned");
+    assert_eq!(removed.key, key);
+    assert!(registry.pool(&key).is_none());
+    assert!(registry.unregister_pool(&key).is_none());
+
+    // With no pools left the adapter can go; a second call is a clean no-op.
+    let adapter = registry
+        .unregister_adapter(ProtocolId::UniswapV2)
+        .expect("no pools reference it")
+        .expect("adapter was registered");
+    assert_eq!(adapter.protocol(), ProtocolId::UniswapV2);
+    assert!(registry.adapter(ProtocolId::UniswapV2).is_none());
+    assert!(
+        registry
+            .unregister_adapter(ProtocolId::UniswapV2)
+            .expect("no-op")
+            .is_none()
+    );
+}
+
+#[test]
+fn registry_unregister_family_adapter_removes_every_served_id() {
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
+        .expect("family adapter registers");
+
+    // A pool on ANY served id blocks unregistration through any other id.
+    let key = PoolKey::PancakeV3(Address::repeat_byte(0x52));
+    registry
+        .register_pool(PoolRegistration::new(key.clone()))
+        .expect("pool registers");
+    assert!(matches!(
+        registry.unregister_adapter(ProtocolId::UniswapV3),
+        Err(RegistryError::AdapterInUse { .. })
+    ));
+
+    registry.unregister_pool(&key).expect("pool removed");
+    registry
+        .unregister_adapter(ProtocolId::UniswapV3)
+        .expect("removable once pools are gone")
+        .expect("adapter was registered");
+    assert!(registry.adapter(ProtocolId::UniswapV3).is_none());
+    assert!(registry.adapter(ProtocolId::PancakeV3).is_none());
+    assert!(registry.adapter(ProtocolId::Slipstream).is_none());
 }

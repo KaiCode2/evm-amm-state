@@ -20,14 +20,14 @@ use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, CurveAdapter, CurveMetadata, CurveVariant, PoolKey,
-    PoolRegistration, PoolStatus, ProtocolMetadata, SimConfig, SimError, SolidlyV2Adapter,
-    SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, UniswapV3Adapter, V3Metadata,
+    ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
+    CurveVariant, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, SimConfig, SimError,
+    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::reactive::{
@@ -75,24 +75,26 @@ fn fetcher(
     fail: Vec<(Address, U256)>,
 ) -> StorageBatchFetchFn {
     let fail: std::collections::HashSet<(Address, U256)> = fail.into_iter().collect();
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(address, slot)| {
-                    if fail.contains(&(address, slot)) {
-                        (address, slot, Err(anyhow!("archive miss")))
-                    } else {
-                        (
-                            address,
-                            slot,
-                            Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
-                        )
-                    }
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(address, slot)| {
+                if fail.contains(&(address, slot)) {
+                    (
+                        address,
+                        slot,
+                        Err(evm_fork_cache::StorageFetchError::custom("archive miss")),
+                    )
+                } else {
+                    (
+                        address,
+                        slot,
+                        Ok(values.get(&(address, slot)).copied().unwrap_or_default()),
+                    )
+                }
+            })
+            .collect()
+    })
 }
 
 fn token_slot_word(addr: Address) -> U256 {
@@ -124,11 +126,12 @@ async fn v2_simulate_swap_returns_router_quote_offline() -> Result<()> {
 
     let adapter = UniswapV2Adapter::default();
     let registration = PoolRegistration::new(PoolKey::UniswapV2(Address::repeat_byte(0x11)))
-        .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata {
-            token0: Some(token_in),
-            token1: Some(token_out),
-            fee_bps: Some(30),
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(token_in)
+                .with_token1(token_out)
+                .with_fee_bps(30),
+        ));
     let config = SimConfig::default().with_v2_router(router);
 
     let quote = adapter
@@ -199,15 +202,15 @@ async fn v3_simulate_swap_returns_quoter_amount_offline() -> Result<()> {
         .db_mut()
         .insert_account_storage(quoter, U256::ZERO, expected_out)?;
 
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x21)))
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            token0: Some(token_in),
-            token1: Some(token_out),
-            fee: Some(500),
-            tick_spacing: Some(10),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(token_in)
+                .with_token1(token_out)
+                .with_fee(500)
+                .with_tick_spacing(10),
+        ));
     let config = SimConfig::default().with_v3_quoter(quoter);
 
     let quote = adapter
@@ -236,12 +239,11 @@ async fn v3_simulate_swap_reverting_target_is_reverted() -> Result<()> {
     install_default_account(&mut cache, Address::ZERO);
     install_runtime(&mut cache, quoter, REVERT_RUNTIME);
 
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     let registration = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x21)))
-        .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata {
-            fee: Some(500),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default().with_fee(500),
+        ));
     let config = SimConfig::default().with_v3_quoter(quoter);
 
     let err = adapter
@@ -270,7 +272,7 @@ async fn v3_simulate_swap_missing_fee_is_missing_metadata() -> Result<()> {
         include_str!("fixtures/mock_v3_quoter_runtime.hex"),
     );
 
-    let adapter = UniswapV3Adapter::default();
+    let adapter = ConcentratedLiquidityAdapter::default();
     // No `fee` in metadata -> the quote cannot be built.
     let registration = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x21)))
         .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata::default()));
@@ -341,10 +343,9 @@ async fn balancer_simulate_swap_returns_vault_quote_offline() -> Result<()> {
     let adapter = BalancerV2Adapter::default();
     let registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
     let config = SimConfig::default();
 
     let quote = adapter
@@ -375,10 +376,9 @@ async fn balancer_simulate_swap_reverting_vault_is_reverted() -> Result<()> {
     let adapter = BalancerV2Adapter::default();
     let registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
     let config = SimConfig::default();
 
     let err = adapter
@@ -491,10 +491,9 @@ async fn balancer_reactive_swap_refreshes_balances_for_resim() -> Result<()> {
         .unwrap();
     let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
         .with_state_address(vault)
-        .with_metadata(ProtocolMetadata::BalancerV2(BalancerV2Metadata {
-            vault: Some(vault),
-            ..Default::default()
-        }));
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default().with_vault(vault),
+        ));
     let outcome =
         cold_registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
     assert!(
@@ -619,17 +618,18 @@ async fn solidly_simulate_swap_returns_pool_quote_offline() -> Result<()> {
     let adapter = SolidlyV2Adapter::default();
     let registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
-            token0: Some(token_in),
-            token1: Some(token_out),
-            stable: Some(false),
-            storage_layout: Some(SolidlyStorageLayout::new(
-                U256::from(10_u64),
-                U256::from(11_u64),
-                U256::from(12_u64),
-                U256::from(13_u64),
-            )),
-        }));
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_token0(token_in)
+                .with_token1(token_out)
+                .with_stable(false)
+                .with_storage_layout(SolidlyStorageLayout::new(
+                    U256::from(10_u64),
+                    U256::from(11_u64),
+                    U256::from(12_u64),
+                    U256::from(13_u64),
+                )),
+        ));
 
     let quote = adapter
         .simulate_swap(
@@ -705,11 +705,12 @@ async fn curve_simulate_swap_returns_pool_quote_offline() -> Result<()> {
     let adapter = CurveAdapter::default();
     let registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc, usdt],
-            discovered_slots: vec![U256::ZERO],
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc, usdt])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     // Swap DAI (index 0) -> USDC (index 1).
     let quote = adapter
@@ -751,11 +752,12 @@ async fn curve_simulate_swap_token_not_in_pool_is_error() -> Result<()> {
     let adapter = CurveAdapter::default();
     let registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc],
-            discovered_slots: vec![U256::ZERO],
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let err = adapter
         .simulate_swap(
@@ -824,11 +826,12 @@ async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
     let adapter = CurveAdapter::default();
     let registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc],
-            discovered_slots: vec![U256::ZERO],
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let err = adapter
         .simulate_swap(
@@ -872,11 +875,12 @@ async fn curve_cryptoswap_simulate_swap_returns_pool_quote_offline() -> Result<(
     let adapter = CurveAdapter::default();
     let registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![usdt, wbtc, weth],
-            discovered_slots: vec![U256::ZERO],
-            variant: CurveVariant::CryptoSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![usdt, wbtc, weth])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
 
     // Swap USDT (index 0) -> WBTC (index 1).
     let quote = adapter
@@ -913,11 +917,12 @@ async fn curve_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
     let adapter = CurveAdapter::default();
     let registration = PoolRegistration::new(PoolKey::Curve(pool))
         .with_state_address(pool)
-        .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-            coins: vec![dai, usdc],
-            discovered_slots: vec![U256::ZERO],
-            variant: CurveVariant::StableSwap,
-        }));
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::StableSwap),
+        ));
 
     let err = adapter
         .simulate_swap(

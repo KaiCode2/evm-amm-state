@@ -1,11 +1,9 @@
-use alloy_primitives::{Address, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
-use evm_fork_cache::cold_start::{
-    ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
+use super::cold_start::{
+    AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
+    SlotFetch,
 };
-
-use super::cold_start::AdapterColdStartPlanner;
-use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, run_quote};
+use super::factory::{FactoryConfig, PoolFactory, SolidlyFactory};
+use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, quote_via_call};
 use super::storage::{SolidlyStorageLayout, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -13,6 +11,8 @@ use super::{
     PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
     SolidlyV2Metadata, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
 };
+use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 
 sol! {
     // Velodrome V2 / Aerodrome pools emit reserves as two separate uint256 values
@@ -54,6 +54,21 @@ impl AmmAdapter for SolidlyV2Adapter {
             .address()
             .map(|address| EventSource::direct(address, vec![Sync::SIGNATURE_HASH]))
             .into_iter()
+            .collect()
+    }
+
+    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        config
+            .solidly
+            .iter()
+            .map(|solidly| {
+                // The config-level `verify_derivations` is a global off-switch: a
+                // config's CREATE2 cross-check runs only when both it and the
+                // global flag opt in.
+                let mut solidly = solidly.clone();
+                solidly.verify_derivations &= config.verify_derivations;
+                Box::new(SolidlyFactory::new(solidly)) as Box<dyn PoolFactory>
+            })
             .collect()
     }
 
@@ -187,7 +202,7 @@ impl AmmAdapter for SolidlyV2Adapter {
             .abi_encode(),
         );
 
-        let output = run_quote(cache, pool_address, calldata)?;
+        let output = quote_via_call(cache, pool_address, calldata)?;
         let amount_out = getAmountOutCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("getAmountOut return"))?;
         Ok(SwapQuote::new(amount_out))

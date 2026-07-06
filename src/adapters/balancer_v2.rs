@@ -1,12 +1,10 @@
-use alloy_primitives::{Address, B256, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
-use evm_fork_cache::cold_start::{
-    ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep, SlotFetch,
+use super::cold_start::{
+    AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
+    ColdStartStep, SlotFetch,
 };
-
-use super::cold_start::AdapterColdStartPlanner;
 use super::sim::{
-    BatchSwapStep, FundManagement, SimConfig, SimError, SwapQuote, queryBatchSwapCall, run_quote,
+    BatchSwapStep, FundManagement, SimConfig, SimError, SwapQuote, queryBatchSwapCall,
+    quote_via_call,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -14,6 +12,8 @@ use super::{
     EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
     SlotChange, StateView, UnsupportedReason, UpdateQuality,
 };
+use alloy_primitives::{Address, B256, Bytes, Log, U256};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 
 sol! {
     event Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
@@ -182,7 +182,7 @@ impl AmmAdapter for BalancerV2Adapter {
             .abi_encode(),
         );
 
-        let output = run_quote(cache, vault, calldata)?;
+        let output = quote_via_call(cache, vault, calldata)?;
         let asset_deltas = queryBatchSwapCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("queryBatchSwap return"))?;
 

@@ -16,14 +16,12 @@
 //!   events to subscribe to, how to apply those events reactively, and how to
 //!   `simulate_swap` against the cached state. The
 //!   [`adapters::AdapterRegistry`] dispatches by pool key, and
-//!   [`adapters::AmmReactiveHandler`] bridges the adapters into the
-//!   `evm_fork_cache` reactive runtime.
-//! - [`tuning`] — always-on tuning knobs shared across the adapters path.
+//!   [`adapters::AmmSyncEngine`] drives the resync-capable live path on top of
+//!   [`adapters::AmmReactiveHandler`] and the `evm_fork_cache` reactive runtime.
 //!
 //! See the crate's `examples/adapter_pipeline.rs` for an end-to-end demo that
 //! cold-starts a pool, subscribes to its events over a WebSocket endpoint,
 //! applies them reactively, and simulates a swap against the live-synced state.
 
-// Always compiled — the adapter layer and lightweight utilities have no heavy deps.
+// Always compiled — the adapter layer has no heavy deps.
 pub mod adapters;
-pub mod tuning;

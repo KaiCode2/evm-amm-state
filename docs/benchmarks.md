@@ -64,6 +64,85 @@ The reactive exact-write path is effectively free relative to a quote. Cold-star
 is a one-time setup cost gated by RPC latency, not a steady-state cost — the
 crate's design pays it once and then quotes offline forever.
 
+### One-shot sync latency — network-bound state loading
+
+The storage-program loaders added for full/known-read-set syncing are measured
+with [`examples/sync_latency.rs`](../examples/sync_latency.rs). This benchmark is
+provider-bound: it times live `eth_call` state overrides plus cache injection,
+not local revm quote execution.
+
+Reproduce:
+
+```bash
+E2E_RPC_URL=<https-mainnet-rpc> SYNC_BENCH_ITERS=7 cargo run --release --example sync_latency
+```
+
+If `E2E_RPC_URL` is unset, the example falls back to
+`https://ethereum.publicnode.com`; use a paid/archive endpoint for lower jitter.
+
+Measured on July 2, 2026, using a paid Alchemy mainnet endpoint with the
+benchmark's gzip-enabled `reqwest` client at block `25_446_111`, seven
+iterations per path:
+
+| Pool | Prior median | New median | Relative | Scope |
+| --- | ---: | ---: | ---: | --- |
+| Uniswap V3 USDC/WETH 0.05% | 150.4 ms | **124.8 ms** | **1.21× faster** | prior warms the active tick window; new loads full pool: 7,670 slots, 1,562 ticks, 723 observations |
+| Uniswap V2 USDC/WETH | 74.6 ms | **73.0 ms** | **1.02× faster** | both paths load the same 3 slots |
+| Balancer V2 80BAL/20WETH | 333.3 ms | **76.4 ms** | **4.36× faster** | prior discover→verify; new refreshes 5 known vault slots |
+| Curve 3pool StableSwap | 361.3 ms | **74.7 ms** | **4.84× faster** | prior discover→verify; new refreshes 6 known pool slots |
+
+Interpretation:
+
+- **V3:** the comparison is conservative for the new path. The prior path is not
+  a full-pool sync; it warms only the active tick window. The new path is faster
+  while loading roughly 3.5× more slots and leaves the full tick range +
+  observation ring resident.
+- **V2:** no material improvement is expected because the old path already knows
+  exactly three slots. The new loader mainly unifies the transport shape.
+- **Balancer/Curve:** the new numbers assume the read-set metadata already
+  exists. Today that metadata can come from discover→verify cold-start; the next
+  `debug_traceBlockByNumber` integration should populate it from traces, avoiding
+  the view-call discover round and keeping the one-shot refresh path.
+
+### Event-time trace resync
+
+[`examples/trace_resync_latency.rs`](../examples/trace_resync_latency.rs)
+measures the live reactive repair path for a real Curve 3pool event:
+
+```bash
+E2E_RPC_URL=<https-mainnet-rpc> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
+```
+
+The example finds a recent `TokenExchange`, cold-starts the pool at the previous
+block to establish `discovered_slots`, then ingests that historical log through
+`AmmSyncEngine` in two modes:
+
+- **trace-only:** storage fallback returns errors, so success proves the block
+  trace supplied all changed requested slots;
+- **storage-fallback:** trace is disabled, so the configured storage batch
+  fetcher refreshes the known read-set at the event block.
+
+Provider support for `debug_traceBlockByHash` varies. If the trace-only row
+reports failures, that endpoint did not supply enough trace data for the chosen
+event and the production path would rely on the storage fallback instead.
+
+Measured on July 2, 2026, using the same paid Alchemy mainnet endpoint with gzip
+enabled, seven iterations against a Curve 3pool `TokenExchange` at block
+`25_446_103`:
+
+| Path | Median | Min..max | Slots | Resync updates | Failures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Trace-only | 155.7 ms | 146.2..189.1 ms | 6 | 2 | 0 |
+| Storage fallback | 26.7 ms | 22.6..28.7 ms | 6 | 6 | 0 |
+
+For a single Curve pool, six direct storage reads are faster than tracing the
+whole block. The trace path is still important for live multi-AMM syncing because
+`evm-fork-cache` dedupes all stale-slot requests pinned to the same block into
+one block trace, so the trace cost amortizes across many pools and slots.
+Trace-only may apply fewer updates than the requested slot count because block
+traces contain changed slots; unchanged requested slots can remain valid from the
+pre-event cache state.
+
 ## How this compares to other tools
 
 Three broad approaches exist for "what does this pool quote?" They trade

@@ -1,7 +1,46 @@
 use alloy_primitives::Log;
-use anyhow::{Result, anyhow};
 
-use super::{AdapterCache, AdapterEventReport, AdapterRegistry, PoolRegistration};
+use super::{
+    AdapterCache, AdapterEventError, AdapterEventReport, AdapterRegistry, PoolRegistration,
+    ProtocolId,
+};
+
+/// Error from applying an adapter event via [`AdapterDriver`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum DriverError {
+    /// No adapter is registered for the routed pool's protocol.
+    NoAdapter(ProtocolId),
+    /// The adapter's `decode_event` returned a structured error.
+    Decode {
+        /// The protocol whose adapter reported the error.
+        protocol: ProtocolId,
+        /// The structured decode error the adapter produced.
+        error: AdapterEventError,
+    },
+}
+
+impl std::fmt::Display for DriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAdapter(protocol) => {
+                write!(f, "no adapter registered for protocol {protocol:?}")
+            }
+            Self::Decode { protocol, error } => {
+                write!(f, "adapter decode error for {protocol:?}: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DriverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Applies AMM adapter events to an [`AdapterCache`] in caller-provided order.
 #[derive(Clone, Debug)]
@@ -22,7 +61,11 @@ impl AdapterDriver {
         self.registry
     }
 
-    pub fn apply_log<C>(&self, cache: &mut C, log: &Log) -> Result<Option<AdapterEventReport>>
+    pub fn apply_log<C>(
+        &self,
+        cache: &mut C,
+        log: &Log,
+    ) -> Result<Option<AdapterEventReport>, DriverError>
     where
         C: AdapterCache,
     {
@@ -32,7 +75,11 @@ impl AdapterDriver {
         self.apply_routed_log(cache, pool, log)
     }
 
-    pub fn apply_logs<C>(&self, cache: &mut C, logs: &[Log]) -> Result<Vec<AdapterEventReport>>
+    pub fn apply_logs<C>(
+        &self,
+        cache: &mut C,
+        logs: &[Log],
+    ) -> Result<Vec<AdapterEventReport>, DriverError>
     where
         C: AdapterCache,
     {
@@ -50,7 +97,7 @@ impl AdapterDriver {
         cache: &mut C,
         pool: &PoolRegistration,
         log: &Log,
-    ) -> Result<Option<AdapterEventReport>>
+    ) -> Result<Option<AdapterEventReport>, DriverError>
     where
         C: AdapterCache,
     {
@@ -58,11 +105,11 @@ impl AdapterDriver {
         let adapter = self
             .registry
             .adapter(protocol)
-            .ok_or_else(|| anyhow!("no adapter registered for protocol {protocol:?}"))?;
+            .ok_or(DriverError::NoAdapter(protocol))?;
 
         let result = adapter.decode_event(pool, log, cache);
         if let Some(error) = result.error {
-            return Err(anyhow!("adapter decode error for {protocol:?}: {error:?}"));
+            return Err(DriverError::Decode { protocol, error });
         }
 
         let Some(event) = result.event else {

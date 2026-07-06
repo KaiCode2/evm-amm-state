@@ -18,6 +18,46 @@ The roadmap is split into two deliverables:
 No phase below should be treated as final API design. Each phase has a review
 checkpoint before implementation.
 
+## Release Plan
+
+### 0.1.0 (current)
+
+The adapters-and-cache-orchestration deliverable, feature-complete for five
+protocol families (Uniswap V2, the concentrated-liquidity family — Uniswap V3 /
+PancakeSwap V3 / Slipstream — Balancer V2, Solidly V2, and Curve) plus the
+offline `simulate_swap` surface. Pools are supplied by the consumer
+(`register_pool`); the crate does not yet discover them.
+
+### 0.2.0: Factory discovery (planned — full design in [docs/factory-discovery-spec.md](docs/factory-discovery-spec.md))
+
+**Goal:** make pool discovery **declarative** — consumers say *what* they want
+("the WETH/USDC 0.3% V3 pool", "every pool between WBTC/WETH") instead of
+hand-registering addresses. Two halves over one vocabulary:
+
+- **Pull (primary UX):** resolve existing pools **derive-first** for the hot
+  protocols — compute the factory's `getPair`/`getPool` mapping slot in Rust
+  and point-read it (batchable; bulk watchlists ride the `storage_sync`
+  loader), with CREATE2 derivation as the zero-I/O path + cross-check —
+  falling back to executing the factory's own view function in revm for the
+  protocols that are hard to recreate (Curve MetaRegistry
+  `find_pools_for_coins`, unknown forks). Balancer (no on-chain pair index)
+  backfills via a Vault log scan helper. Returns cold-start-ready
+  `PoolRegistration`s. Fully unblocked today; needs nothing from the
+  upstream interests work.
+- **Push:** subscribe to factory creation events (`PairCreated` /
+  `PoolCreated` / Vault `PoolRegistered`) and admit new pools between batches
+  via `AmmSyncEngine::register_pools` (rebuild-based now; incremental once the
+  `evm-fork-cache` interests-refresh API lands).
+
+Shape: a `PoolFactory` trait (queries + creation decode) built per protocol by
+a **defaulted** `AmmAdapter::pool_factory(&FactoryConfig)` hook, fronted by
+`PoolDiscovery::{find, find_all, creation_sources, decode_creation}`.
+`FactoryConfig` mirrors `SimConfig` (mainnet defaults + `with_*` overrides).
+Everything additive/`#[non_exhaustive]`; third-party adapters compile
+unchanged. Bonus: Curve variant detection becomes registry *provenance*
+instead of a heuristic. Slicing, per-protocol mechanics, and open questions
+live in the spec.
+
 ## Scope
 
 ### This crate should own
