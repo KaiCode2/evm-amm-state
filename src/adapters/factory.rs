@@ -3,30 +3,75 @@
 //! Discovery is intentionally read-only: factory drivers produce
 //! [`PoolRegistration`] values, and callers still decide when to cold-start and
 //! register them.
+//!
+//! ## Concentrated-liquidity presets: on-chain-verified constants
+//!
+//! Every preset's storage constants are verified against a forked archive node
+//! by the gated (`#[ignore]`) `discovery_cl_rpc` / `discovery_solidly_rpc` parity
+//! tests — discovered via evm-fork-cache's trace-based slot probe, not guessed:
+//!
+//! - **Uniswap V3** ([`ClFactorySpec::uniswap_v3`]): `getPool` / `feeAmountTickSpacing`
+//!   base slots 5 / 4, canonical fee tiers.
+//! - **PancakeSwap V3** ([`ClFactorySpec::pancake_v3`]): `getPool` base slot **2**
+//!   and `feeAmountTickSpacing` base slot **1** (verified — they differ from
+//!   Uniswap's 5 / 4), plus the `PoolDeployer`, pool init-code hash, and
+//!   `QuoterV2`. `verify_derivations` is ON (the mapping answer is cross-checked
+//!   against the CREATE2 derivation on first use).
+//! - **Slipstream / Aerodrome CL** ([`ClFactorySpec::slipstream`]): `getPool`
+//!   base slot **6** (verified). Discovery-only: `quoter` is `None` because the
+//!   Slipstream quoter takes a `tickSpacing`-keyed struct, not the Uniswap
+//!   `(…, fee, …)` struct this crate encodes — so its sim rides the caller's
+//!   Uniswap-compatible quoter (see the [`ClFactorySpec::slipstream`] docs).
+//! - **Solidly V2 / Aerodrome** ([`SolidlyFactoryConfig::aerodrome`]): `getPool`
+//!   base slot **5** + the pool storage layout (reserves @ 20/21, tokens @ 13/14),
+//!   verified on-chain.
+//! - **Curve** ([`CurveFactoryConfig::mainnet`]): plain-pool discovery via the
+//!   canonical MetaRegistry (ViewCall). Offline resolution is exercised by
+//!   `discovery_curve`; **live MetaRegistry resolution is still under
+//!   investigation** (the view call reverts against a forked node — parked).
 
 use std::collections::HashMap;
 use std::fmt;
 
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use alloy_primitives::B256;
+#[cfg(feature = "curve")]
+use alloy_primitives::Bytes;
 use alloy_primitives::{Address, Log, U256};
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
-use alloy_sol_types::{SolEvent, sol};
+#[cfg(feature = "curve")]
+use alloy_sol_types::SolCall;
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
+use alloy_sol_types::SolEvent;
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "curve"))]
+use alloy_sol_types::sol;
 
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+#[cfg(feature = "curve")]
+use super::CallOutcome;
+#[cfg(any(
+    feature = "uniswap-v2",
+    feature = "uniswap-v3",
+    feature = "solidly-v2",
+    feature = "curve"
+))]
 use super::ProtocolMetadata;
+#[cfg(feature = "solidly-v2")]
+use super::SolidlyV2Metadata;
 #[cfg(feature = "uniswap-v2")]
 use super::UniswapV2Metadata;
 #[cfg(feature = "uniswap-v3")]
 use super::V3Metadata;
 use super::{AdapterCache, AdapterRegistry, EventSource, PoolKey, PoolRegistration, ProtocolId};
+#[cfg(feature = "curve")]
+use super::{CurveMetadata, CurveVariant};
+#[cfg(feature = "solidly-v2")]
+use crate::adapters::storage::SolidlyStorageLayout;
 #[cfg(feature = "uniswap-v3")]
 use crate::adapters::storage::V3StorageLayout;
 
 /// Factory-level derivation helpers.
 pub mod derive {
     use alloy_primitives::Address;
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
     use alloy_primitives::{B256, U256, keccak256};
 
     /// Sort two token addresses into the canonical `(token0, token1)` order used
@@ -73,10 +118,37 @@ pub mod derive {
         mapping_slot_u256(second, U256::from(fee))
     }
 
+    /// Compute the storage key for a tickSpacing-keyed
+    /// `getPool[token0][token1][tickSpacing]` mapping (Slipstream / Aerodrome CL),
+    /// where the innermost key is an `int24` tickSpacing.
+    ///
+    /// The tickSpacing is sign-extended to a full 256-bit word before hashing —
+    /// the same two's-complement encoding Solidity uses for a signed mapping key —
+    /// so a (non-negative in practice) spacing produces the exact storage slot the
+    /// contract wrote. Mirrors [`v3_get_pool_slot`] but with a signed innermost
+    /// key instead of a `uint24` fee.
+    #[cfg(feature = "uniswap-v3")]
+    pub fn v3_get_pool_slot_by_spacing(
+        base_slot: U256,
+        token0: Address,
+        token1: Address,
+        spacing: i32,
+    ) -> U256 {
+        let first = mapping_slot_address(base_slot, token0);
+        let second = mapping_slot_address(first, token1);
+        mapping_slot_u256(second, i24_to_word(spacing))
+    }
+
     /// Compute the storage key for `UniswapV3Factory.feeAmountTickSpacing[fee]`.
     #[cfg(feature = "uniswap-v3")]
     pub fn v3_fee_amount_tick_spacing_slot(base_slot: U256, fee: u32) -> U256 {
         mapping_slot_u256(base_slot, U256::from(fee))
+    }
+
+    /// Compute a tick-spacing-keyed fee mapping slot.
+    #[cfg(feature = "uniswap-v3")]
+    pub fn v3_tick_spacing_fee_slot(base_slot: U256, spacing: i32) -> U256 {
+        mapping_slot_u256(base_slot, i24_to_word(spacing))
     }
 
     /// Compute a Uniswap V2 pair address using the factory CREATE2 formula.
@@ -109,13 +181,77 @@ pub mod derive {
         create2_address(deployer, keccak256(salt_preimage), init_code_hash)
     }
 
+    /// Compute a tickSpacing-keyed CL pool address via the standard V3 `abi.encode
+    /// (token0, token1, int24 spacing)` salt (Slipstream/Aerodrome shape).
+    ///
+    /// Note: some tickSpacing-keyed forks deploy pools as minimal-proxy clones
+    /// with a different salt/creation-code scheme; treat this as the standard-V3
+    /// derivation and verify a specific fork's formula before enabling its
+    /// CREATE2 cross-check.
+    #[cfg(feature = "uniswap-v3")]
+    pub fn v3_pool_address_by_spacing(
+        deployer: Address,
+        init_code_hash: B256,
+        token0: Address,
+        token1: Address,
+        spacing: i32,
+    ) -> Address {
+        let mut salt_preimage = [0u8; 96];
+        salt_preimage[12..32].copy_from_slice(token0.as_slice());
+        salt_preimage[44..64].copy_from_slice(token1.as_slice());
+        // int24 spacing, sign-extended into the trailing 32-byte word.
+        salt_preimage[64..96].copy_from_slice(&i24_to_word(spacing).to_be_bytes::<32>());
+        create2_address(deployer, keccak256(salt_preimage), init_code_hash)
+    }
+
+    /// Compute the storage key for a Solidly V2 (Aerodrome / Velodrome V2)
+    /// `PoolFactory.getPool[token0][token1][stable]` entry.
+    ///
+    /// The factory keys pools by a nested
+    /// `mapping(address => mapping(address => mapping(bool => address)))`: the two
+    /// address levels descend exactly like Uniswap V3's `getPool[t0][t1]`, and the
+    /// innermost `bool` key is encoded as a 32-byte word (`1` for stable, `0` for
+    /// volatile) — the same encoding Solidity uses for a `bool` mapping key.
+    #[cfg(feature = "solidly-v2")]
+    pub fn solidly_get_pool_slot(
+        base_slot: U256,
+        token0: Address,
+        token1: Address,
+        stable: bool,
+    ) -> U256 {
+        let first = mapping_slot_address(base_slot, token0);
+        let second = mapping_slot_address(first, token1);
+        mapping_slot_u256(second, U256::from(stable as u8))
+    }
+
+    /// Compute a Solidly V2 pool address via the factory CREATE2 formula.
+    ///
+    /// The salt is `keccak256(abi.encodePacked(token0, token1, stable))` — a
+    /// tightly packed 41-byte preimage (20 + 20 + 1), matching Aerodrome's
+    /// `PoolFactory.createPool`. Used as an optional discovery cross-check against
+    /// the `getPool` mapping answer.
+    #[cfg(feature = "solidly-v2")]
+    pub fn solidly_pool_address(
+        deployer: Address,
+        init_code_hash: B256,
+        token0: Address,
+        token1: Address,
+        stable: bool,
+    ) -> Address {
+        let mut salt_preimage = [0u8; 41];
+        salt_preimage[..20].copy_from_slice(token0.as_slice());
+        salt_preimage[20..40].copy_from_slice(token1.as_slice());
+        salt_preimage[40] = stable as u8;
+        create2_address(deployer, keccak256(salt_preimage), init_code_hash)
+    }
+
     #[cfg(feature = "uniswap-v2")]
     fn nested_address_mapping_slot(base_slot: U256, outer: Address, inner: Address) -> U256 {
         let outer_slot = mapping_slot_address(base_slot, outer);
         mapping_slot_address(outer_slot, inner)
     }
 
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
     fn mapping_slot_address(base_slot: U256, key: Address) -> U256 {
         let mut preimage = [0u8; 64];
         preimage[12..32].copy_from_slice(key.as_slice());
@@ -123,7 +259,7 @@ pub mod derive {
         keccak256(preimage).into()
     }
 
-    #[cfg(feature = "uniswap-v3")]
+    #[cfg(any(feature = "uniswap-v3", feature = "solidly-v2"))]
     fn mapping_slot_u256(base_slot: U256, key: U256) -> U256 {
         let mut preimage = [0u8; 64];
         preimage[..32].copy_from_slice(&key.to_be_bytes::<32>());
@@ -131,7 +267,25 @@ pub mod derive {
         keccak256(preimage).into()
     }
 
-    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+    /// Sign-extend an `int24` value into a 256-bit word, matching how Solidity
+    /// encodes a signed mapping key (a negative value fills the high bytes with
+    /// `0xff`). Used to key tickSpacing-mapped `getPool` slots.
+    #[cfg(feature = "uniswap-v3")]
+    fn i24_to_word(value: i32) -> U256 {
+        // A 24-bit signed value fits in an i64 losslessly; `as u64` then produces
+        // the two's-complement 64-bit pattern, and `U256::from(u64)` zero-extends
+        // — so re-apply the sign across the full 256 bits for negatives.
+        if value < 0 {
+            // (-1 as U256) is all-ones; mask in the low 64-bit two's-complement.
+            let low = U256::from(value as i64 as u64);
+            let high_ones = (U256::MAX >> 64) << 64;
+            low | high_ones
+        } else {
+            U256::from(value as u64)
+        }
+    }
+
+    #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
     fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> Address {
         let mut preimage = [0u8; 85];
         preimage[0] = 0xff;
@@ -149,8 +303,58 @@ const UNISWAP_V2_GET_PAIR_BASE_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
 const UNISWAP_V3_FEE_AMOUNT_TICK_SPACING_BASE_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
 #[cfg(feature = "uniswap-v3")]
 const UNISWAP_V3_GET_POOL_BASE_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
+/// PancakeSwap V3 `getPool` + `feeAmountTickSpacing` mapping base slots —
+/// VERIFIED on-chain (mainnet block 20_000_000) via evm-fork-cache trace-based
+/// slot discovery. Pancake's factory storage layout differs from Uniswap's 5 / 4.
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_GET_POOL_BASE_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_FEE_AMOUNT_TICK_SPACING_BASE_SLOT: U256 = U256::from_limbs([1, 0, 0, 0]);
+/// Slipstream (Aerodrome CL) factory `getPool` mapping base slot — VERIFIED
+/// on-chain (Base block 47_700_000) via trace-based slot discovery.
+#[cfg(feature = "uniswap-v3")]
+const SLIPSTREAM_GET_POOL_BASE_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
 #[cfg(feature = "uniswap-v3")]
 const UNISWAP_V3_CANONICAL_FEE_TIERS: [u32; 4] = [100, 500, 3_000, 10_000];
+/// PancakeSwap V3 fee tiers (hundredths of a bip): 0.01% / 0.05% / 0.25% / 1%.
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_FEE_TIERS: [u32; 4] = [100, 500, 2_500, 10_000];
+/// Aerodrome/Velodrome Slipstream tickSpacing tiers (int24). VERIFY against a
+/// live CLFactory before relying on production discovery — see the gated parity
+/// test. These are the commonly-deployed spacings but are not exhaustive.
+#[cfg(feature = "uniswap-v3")]
+const SLIPSTREAM_TICK_SPACINGS: [i32; 5] = [1, 50, 100, 200, 2_000];
+
+// --- Real on-chain constants for the CL presets (Ethereum mainnet / Base). ---
+// Verified against block-explorer / SDK sources; the storage-slot bases for
+// forks whose factory layout was not confirmed on-chain are gated behind the
+// `#[ignore]` RPC parity test rather than trusted blindly. See the module report.
+
+/// PancakeSwap V3 `PancakeV3PoolDeployer` (the CREATE2 deployer; the factory is a
+/// separate address). Same deterministic address across mainnet/BSC/Arbitrum.
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_POOL_DEPLOYER: Address =
+    alloy_primitives::address!("41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9");
+/// PancakeSwap V3 pool init-code hash (CREATE2 salt cross-check). "Most chains"
+/// value per the Pancake v3-sdk (mainnet included; zkSync differs).
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_INIT_CODE_HASH: B256 =
+    alloy_primitives::b256!("6ce8eb472fa82df5469c6ab6d485f17c3ad13c8cd7af59b3d4a8026c5ce0f7e2");
+/// PancakeSwap V3 `QuoterV2` (Ethereum mainnet; deterministic across several EVM
+/// chains). Uses the Uniswap-compatible `(…, fee, …)` quote struct.
+#[cfg(feature = "uniswap-v3")]
+const PANCAKE_V3_QUOTER_V2: Address =
+    alloy_primitives::address!("B048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997");
+
+// --- Solidly V2 (Aerodrome / Velodrome V2) preset constants. ---
+//
+// VERIFIED on-chain (Aerodrome PoolFactory, Base block 47_700_000) via
+// evm-fork-cache trace-based slot discovery: the `_getPool[token0][token1][stable]`
+// mapping lives at base slot 5. No CREATE2 init-code hash is pinned (Solidly's
+// salt is a packed `keccak(t0‖t1‖stable)`), so `verify_derivations` stays OFF;
+// the gated `discovery_solidly_rpc` parity test re-checks the slot on Base.
+#[cfg(feature = "solidly-v2")]
+const SOLIDLY_GET_POOL_BASE_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
 
 #[cfg(feature = "uniswap-v2")]
 sol! {
@@ -159,8 +363,31 @@ sol! {
 
 #[cfg(feature = "uniswap-v3")]
 sol! {
+    /// Uniswap/Pancake-style fee-keyed pool-creation event.
     event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool);
+
+    /// Slipstream/Aerodrome CL tickSpacing-keyed pool-creation event. The
+    /// indexed key is `tickSpacing` (int24) rather than a fee; the pool address
+    /// and (unindexed) fee follow in the data.
+    event PoolCreatedTickSpacing(address indexed token0, address indexed token1, int24 indexed tickSpacing, address pool, uint24 fee);
 }
+
+/// Solidly V2 (Aerodrome / Velodrome V2) pool-creation event, wrapped in its own
+/// module so the generated struct keeps the on-chain name `PoolCreated` (whose
+/// `SIGNATURE_HASH` is the real topic0) without colliding with the Uniswap/Pancake
+/// [`PoolCreated`] already defined above. The indexed keys are `token0`, `token1`,
+/// and the `bool stable` flag; the pool address and the (unindexed) all-pools
+/// length follow in the data. Verbatim from Aerodrome's `IPoolFactory` (the
+/// trailing `uint256` is unnamed on-chain; named `allPoolsLength` here so the
+/// generated decoder has a field).
+#[cfg(feature = "solidly-v2")]
+mod solidly_events {
+    alloy_sol_types::sol! {
+        event PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint256 allPoolsLength);
+    }
+}
+#[cfg(feature = "solidly-v2")]
+use solidly_events::PoolCreated as SolidlyPoolCreated;
 
 /// A declarative pool-discovery query: which token pairs to resolve, optionally
 /// scoped to a single protocol.
@@ -233,8 +460,22 @@ impl PoolQuery {
 pub struct FactoryConfig {
     #[cfg(feature = "uniswap-v2")]
     pub uniswap_v2: Vec<UniswapV2FactoryConfig>,
+    /// Concentrated-liquidity forks (Uniswap V3, SushiSwap V3, PancakeSwap V3,
+    /// Slipstream). Every UniV3-mechanics fork is one [`ClFactorySpec`]; the
+    /// V3-family adapter emits a [`ConcentratedLiquidityFactory`] per spec whose
+    /// protocol it serves.
     #[cfg(feature = "uniswap-v3")]
-    pub uniswap_v3: Vec<UniswapV3FactoryConfig>,
+    pub concentrated_liquidity: Vec<ClFactorySpec>,
+    /// Solidly V2 forks (Aerodrome / Velodrome V2). Every fork is one
+    /// [`SolidlyFactoryConfig`]; the Solidly adapter emits a [`SolidlyFactory`]
+    /// per config.
+    #[cfg(feature = "solidly-v2")]
+    pub solidly: Vec<SolidlyFactoryConfig>,
+    /// Curve MetaRegistry endpoints for plain-pool discovery. Every entry is one
+    /// [`CurveFactoryConfig`]; the Curve adapter emits a [`CurveFactory`] per
+    /// config (ViewCall discovery, not storage-slot derivation).
+    #[cfg(feature = "curve")]
+    pub curve: Vec<CurveFactoryConfig>,
     pub verify_derivations: bool,
 }
 
@@ -244,7 +485,11 @@ impl Default for FactoryConfig {
             #[cfg(feature = "uniswap-v2")]
             uniswap_v2: Vec::new(),
             #[cfg(feature = "uniswap-v3")]
-            uniswap_v3: Vec::new(),
+            concentrated_liquidity: Vec::new(),
+            #[cfg(feature = "solidly-v2")]
+            solidly: Vec::new(),
+            #[cfg(feature = "curve")]
+            curve: Vec::new(),
             verify_derivations: true,
         }
     }
@@ -262,15 +507,67 @@ impl FactoryConfig {
         self.with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(factory))
     }
 
+    /// Add a concentrated-liquidity fork by its [`ClFactorySpec`] — the general
+    /// entry point behind the per-fork conveniences below.
     #[cfg(feature = "uniswap-v3")]
-    pub fn with_uniswap_v3(mut self, config: UniswapV3FactoryConfig) -> Self {
-        self.uniswap_v3.push(config);
+    pub fn with_concentrated_liquidity(mut self, spec: ClFactorySpec) -> Self {
+        self.concentrated_liquidity.push(spec);
         self
     }
 
+    /// Add a concentrated-liquidity fork by its [`ClFactorySpec`].
+    ///
+    /// Alias for [`with_concentrated_liquidity`](Self::with_concentrated_liquidity),
+    /// kept so existing call sites that passed a V3 factory config keep reading
+    /// naturally now that the config is a `ClFactorySpec`.
+    #[cfg(feature = "uniswap-v3")]
+    pub fn with_uniswap_v3(self, spec: ClFactorySpec) -> Self {
+        self.with_concentrated_liquidity(spec)
+    }
+
+    /// Add a canonical Uniswap V3 factory at `factory`.
     #[cfg(feature = "uniswap-v3")]
     pub fn with_uniswap_v3_factory(self, factory: Address) -> Self {
-        self.with_uniswap_v3(UniswapV3FactoryConfig::uniswap_v3(factory))
+        self.with_concentrated_liquidity(ClFactorySpec::uniswap_v3(factory))
+    }
+
+    /// Add a PancakeSwap V3 factory at `factory` (Pancake preset).
+    #[cfg(feature = "uniswap-v3")]
+    pub fn with_pancake_v3_factory(self, factory: Address) -> Self {
+        self.with_concentrated_liquidity(ClFactorySpec::pancake_v3(factory))
+    }
+
+    /// Add a Slipstream / Aerodrome CL factory at `factory` (Slipstream preset).
+    #[cfg(feature = "uniswap-v3")]
+    pub fn with_slipstream_factory(self, factory: Address) -> Self {
+        self.with_concentrated_liquidity(ClFactorySpec::slipstream(factory))
+    }
+
+    /// Add a Solidly V2 fork (Aerodrome / Velodrome V2) by its
+    /// [`SolidlyFactoryConfig`].
+    #[cfg(feature = "solidly-v2")]
+    pub fn with_solidly(mut self, config: SolidlyFactoryConfig) -> Self {
+        self.solidly.push(config);
+        self
+    }
+
+    /// Add a Solidly V2 factory at `factory` using the Aerodrome preset.
+    #[cfg(feature = "solidly-v2")]
+    pub fn with_solidly_factory(self, factory: Address) -> Self {
+        self.with_solidly(SolidlyFactoryConfig::aerodrome(factory))
+    }
+
+    /// Add a Curve MetaRegistry endpoint by its [`CurveFactoryConfig`].
+    #[cfg(feature = "curve")]
+    pub fn with_curve(mut self, config: CurveFactoryConfig) -> Self {
+        self.curve.push(config);
+        self
+    }
+
+    /// Add a Curve MetaRegistry at `meta_registry` for plain-pool discovery.
+    #[cfg(feature = "curve")]
+    pub fn with_curve_meta_registry(self, meta_registry: Address) -> Self {
+        self.with_curve(CurveFactoryConfig::new(meta_registry))
     }
 
     pub fn with_verify_derivations(mut self, verify_derivations: bool) -> Self {
@@ -316,46 +613,527 @@ impl UniswapV2FactoryConfig {
     }
 }
 
+/// How a concentrated-liquidity factory keys its `getPool` mapping and where the
+/// per-pool tick spacing comes from.
+///
+/// Two shapes cover every UniV3-mechanics fork this crate serves:
+/// - [`Fee`](Self::Fee): the innermost `getPool` key is the fee tier
+///   (`getPool[t0][t1][fee]`), and the spacing is read from
+///   `feeAmountTickSpacing[fee]` — Uniswap V3, SushiSwap V3, PancakeSwap V3.
+/// - [`TickSpacing`](Self::TickSpacing): the innermost key *is* the tick spacing
+///   (`getPool[t0][t1][tickSpacing]`); there is no `feeAmountTickSpacing` read —
+///   Slipstream / Aerodrome CL.
 #[cfg(feature = "uniswap-v3")]
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UniswapV3FactoryConfig {
+pub enum ClKeying {
+    /// `getPool[t0][t1][fee]`; tick spacing comes from `feeAmountTickSpacing[fee]`.
+    Fee {
+        /// The fee tiers (hundredths of a bip) to probe per pair.
+        tiers: Vec<u32>,
+        /// Base slot of the `feeAmountTickSpacing` mapping.
+        fee_amount_tick_spacing_base_slot: U256,
+    },
+    /// `getPool[t0][t1][tickSpacing]`; NO `feeAmountTickSpacing` read.
+    TickSpacing {
+        /// The int24 tick spacings to probe per pair.
+        spacings: Vec<i32>,
+    },
+}
+
+/// Where a discovered pool's swap `fee` (hundredths of a bip) is resolved from.
+/// STATIC — resolved once at discovery time, never recomputed per-swap.
+#[cfg(feature = "uniswap-v3")]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeSource {
+    /// The fee is the pool-key tier itself (only valid with [`ClKeying::Fee`]).
+    Key,
+    /// Read the fee from a factory mapping keyed by the pool key
+    /// (`feeAmountTickSpacing`-style for fee keying, `tickSpacingToFee[spacing]`
+    /// for tickSpacing keying) at `base_slot`.
+    FactoryMapping {
+        /// Base slot of the fee mapping.
+        base_slot: U256,
+    },
+    /// A constant fee for every pool of this factory.
+    Fixed(u32),
+}
+
+/// Optional CREATE2 cross-check for a concentrated-liquidity fork: when present
+/// (and [`ClFactorySpec::verify_derivations`] is on), the factory re-derives the
+/// pool address from the salt and compares it to the mapping answer, hard-failing
+/// [`DiscoveryError::DerivationMismatch`] on disagreement — a guardrail against a
+/// wrong init-code hash or base slot.
+#[cfg(feature = "uniswap-v3")]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClCreate2 {
+    /// The CREATE2 deployer. `None` means "the factory itself" (Uniswap V3);
+    /// forks that deploy from a separate contract (PancakeSwap) set it explicitly.
+    pub deployer: Option<Address>,
+    /// The pool init-code hash.
+    pub init_code_hash: B256,
+}
+
+/// Data-driven specification of a concentrated-liquidity (UniV3-mechanics) fork,
+/// driving [`ConcentratedLiquidityFactory`]. Construct with the
+/// [`fee_keyed`](Self::fee_keyed) / [`tick_spacing_keyed`](Self::tick_spacing_keyed)
+/// constructors or a fork preset ([`uniswap_v3`](Self::uniswap_v3),
+/// [`sushi_v3`](Self::sushi_v3), [`pancake_v3`](Self::pancake_v3),
+/// [`slipstream`](Self::slipstream)), then refine with the `with_*` builders.
+#[cfg(feature = "uniswap-v3")]
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClFactorySpec {
+    /// The protocol identity discovered pools register under (drives the
+    /// [`PoolKey`]/[`ProtocolMetadata`] variant and storage-layout preset).
+    pub protocol: ProtocolId,
+    /// The factory contract address.
     pub factory: Address,
+    /// Base slot of the `getPool` nested mapping.
     pub get_pool_base_slot: U256,
-    pub fee_amount_tick_spacing_base_slot: U256,
-    pub init_code_hash: Option<B256>,
-    pub fee_tiers: Vec<u32>,
+    /// How the `getPool` mapping is keyed and where tick spacing comes from.
+    pub keying: ClKeying,
+    /// Where a discovered pool's fee is resolved from.
+    pub fee_source: FeeSource,
+    /// Optional CREATE2 cross-check of the mapping answer.
+    pub create2: Option<ClCreate2>,
+    /// Per-fork swap-quote target. `None` => the caller's
+    /// [`SimConfig::v3_quoter`](super::SimConfig::v3_quoter).
+    pub quoter: Option<Address>,
+    /// Push-discovery creation-event `topic0`. `None` => pull-only (no creation
+    /// sources, `decode_creation` returns `Ok(None)`).
+    pub creation_topic0: Option<B256>,
+    /// Whether to run the CREATE2 cross-check (requires [`create2`](Self::create2)).
+    pub verify_derivations: bool,
 }
 
 #[cfg(feature = "uniswap-v3")]
-impl UniswapV3FactoryConfig {
-    pub fn uniswap_v3(factory: Address) -> Self {
+impl ClFactorySpec {
+    /// A fee-keyed CL fork (Uniswap/Sushi/Pancake shape): `getPool[t0][t1][fee]`
+    /// with tick spacing from `feeAmountTickSpacing[fee]`, `fee_source: Key`.
+    pub fn fee_keyed(
+        protocol: ProtocolId,
+        factory: Address,
+        get_pool_base_slot: U256,
+        fee_amount_tick_spacing_base_slot: U256,
+        tiers: impl IntoIterator<Item = u32>,
+    ) -> Self {
         Self {
+            protocol,
             factory,
-            get_pool_base_slot: UNISWAP_V3_GET_POOL_BASE_SLOT,
-            fee_amount_tick_spacing_base_slot: UNISWAP_V3_FEE_AMOUNT_TICK_SPACING_BASE_SLOT,
-            init_code_hash: None,
-            fee_tiers: UNISWAP_V3_CANONICAL_FEE_TIERS.to_vec(),
+            get_pool_base_slot,
+            keying: ClKeying::Fee {
+                tiers: tiers.into_iter().collect(),
+                fee_amount_tick_spacing_base_slot,
+            },
+            fee_source: FeeSource::Key,
+            create2: None,
+            quoter: None,
+            creation_topic0: None,
+            verify_derivations: false,
         }
     }
 
-    pub fn with_get_pool_base_slot(mut self, slot: U256) -> Self {
-        self.get_pool_base_slot = slot;
+    /// A tickSpacing-keyed CL fork (Slipstream shape): `getPool[t0][t1][spacing]`
+    /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`; set a
+    /// real [`fee_source`](Self::with_fee_source) if the fork exposes one.
+    pub fn tick_spacing_keyed(
+        protocol: ProtocolId,
+        factory: Address,
+        get_pool_base_slot: U256,
+        spacings: impl IntoIterator<Item = i32>,
+    ) -> Self {
+        Self {
+            protocol,
+            factory,
+            get_pool_base_slot,
+            keying: ClKeying::TickSpacing {
+                spacings: spacings.into_iter().collect(),
+            },
+            fee_source: FeeSource::Fixed(0),
+            create2: None,
+            quoter: None,
+            creation_topic0: None,
+            verify_derivations: false,
+        }
+    }
+
+    /// Set the per-fork swap-quote target (a fork's own QuoterV2).
+    pub fn with_quoter(mut self, quoter: Address) -> Self {
+        self.quoter = Some(quoter);
         self
     }
 
-    pub fn with_fee_amount_tick_spacing_base_slot(mut self, slot: U256) -> Self {
-        self.fee_amount_tick_spacing_base_slot = slot;
+    /// Set the CREATE2 cross-check (`deployer: None` => the factory itself).
+    pub fn with_create2(mut self, deployer: Option<Address>, init_code_hash: B256) -> Self {
+        self.create2 = Some(ClCreate2 {
+            deployer,
+            init_code_hash,
+        });
         self
     }
 
-    pub fn with_init_code_hash(mut self, hash: B256) -> Self {
-        self.init_code_hash = Some(hash);
+    /// Toggle the CREATE2 derivation cross-check (needs [`with_create2`](Self::with_create2)).
+    pub fn with_verify_derivations(mut self, verify: bool) -> Self {
+        self.verify_derivations = verify;
         self
     }
 
+    /// Set the push-discovery creation-event `topic0`.
+    pub fn with_creation_topic0(mut self, topic0: B256) -> Self {
+        self.creation_topic0 = Some(topic0);
+        self
+    }
+
+    /// Set where a discovered pool's fee is resolved from.
+    pub fn with_fee_source(mut self, fee_source: FeeSource) -> Self {
+        self.fee_source = fee_source;
+        self
+    }
+
+    /// Replace the probed fee tiers (fee keying) — no-op under tickSpacing keying.
     pub fn with_fee_tiers(mut self, fee_tiers: impl IntoIterator<Item = u32>) -> Self {
-        self.fee_tiers = fee_tiers.into_iter().collect();
+        if let ClKeying::Fee { tiers, .. } = &mut self.keying {
+            *tiers = fee_tiers.into_iter().collect();
+        }
+        self
+    }
+
+    /// Replace the probed tick spacings (tickSpacing keying) — no-op under fee keying.
+    pub fn with_tick_spacings(mut self, spacings: impl IntoIterator<Item = i32>) -> Self {
+        if let ClKeying::TickSpacing { spacings: s } = &mut self.keying {
+            *s = spacings.into_iter().collect();
+        }
+        self
+    }
+
+    /// The `feeAmountTickSpacing` mapping base slot for a fee-keyed spec; `None`
+    /// for a tickSpacing-keyed spec (which has no such mapping).
+    pub fn fee_amount_tick_spacing_base_slot(&self) -> Option<U256> {
+        match &self.keying {
+            ClKeying::Fee {
+                fee_amount_tick_spacing_base_slot,
+                ..
+            } => Some(*fee_amount_tick_spacing_base_slot),
+            ClKeying::TickSpacing { .. } => None,
+        }
+    }
+
+    /// The fee tiers probed per pair under fee keying; empty under tickSpacing
+    /// keying (which probes spacings, not fees — see [`tick_spacings`](Self::tick_spacings)).
+    pub fn fee_tiers(&self) -> &[u32] {
+        match &self.keying {
+            ClKeying::Fee { tiers, .. } => tiers,
+            ClKeying::TickSpacing { .. } => &[],
+        }
+    }
+
+    /// The tick spacings probed per pair under tickSpacing keying; empty under
+    /// fee keying.
+    pub fn tick_spacings(&self) -> &[i32] {
+        match &self.keying {
+            ClKeying::TickSpacing { spacings } => spacings,
+            ClKeying::Fee { .. } => &[],
+        }
+    }
+
+    // --- Fork presets ---
+
+    /// Canonical Uniswap V3 factory: base slot 5, fee tiers `[100, 500, 3000,
+    /// 10000]` with `feeAmountTickSpacing` at slot 4, canonical `PoolCreated`
+    /// push topic. No CREATE2 hash by default (add one with
+    /// [`with_create2`](Self::with_create2) to enable the cross-check); quoter
+    /// left to the caller.
+    pub fn uniswap_v3(factory: Address) -> Self {
+        Self::fee_keyed(
+            ProtocolId::UniswapV3,
+            factory,
+            UNISWAP_V3_GET_POOL_BASE_SLOT,
+            UNISWAP_V3_FEE_AMOUNT_TICK_SPACING_BASE_SLOT,
+            UNISWAP_V3_CANONICAL_FEE_TIERS,
+        )
+        .with_creation_topic0(PoolCreated::SIGNATURE_HASH)
+    }
+
+    /// SushiSwap V3 — byte-identical Uniswap V3 fork. Registers as
+    /// [`ProtocolId::UniswapV3`] (same PoolKey/adapter); differs only by factory
+    /// address and (optionally) quoter. Its init-code hash is left unset (pin it
+    /// with [`with_create2`](Self::with_create2); the gated parity test verifies).
+    pub fn sushi_v3(factory: Address) -> Self {
+        // Same shape as Uniswap V3 (Sushi V3 pools register as UniswapV3).
+        Self::uniswap_v3(factory)
+    }
+
+    /// PancakeSwap V3 factory. Protocol [`ProtocolId::PancakeV3`], fee tiers
+    /// `[100, 500, 2500, 10000]`, CREATE2 via the Pancake `PoolDeployer` +
+    /// init-code hash, and the Pancake `QuoterV2` (Uniswap-compatible quote ABI).
+    ///
+    /// The `getPool` (slot 2) and `feeAmountTickSpacing` (slot 1) base slots are
+    /// VERIFIED on-chain — they differ from Uniswap's 5 / 4 — and the CREATE2
+    /// deployer + init-code hash reproduce the getter's pool, so
+    /// `verify_derivations` is ON (the mapping answer is cross-checked against the
+    /// CREATE2 derivation on first use).
+    pub fn pancake_v3(factory: Address) -> Self {
+        Self::fee_keyed(
+            ProtocolId::PancakeV3,
+            factory,
+            PANCAKE_V3_GET_POOL_BASE_SLOT,
+            PANCAKE_V3_FEE_AMOUNT_TICK_SPACING_BASE_SLOT,
+            PANCAKE_V3_FEE_TIERS,
+        )
+        .with_create2(Some(PANCAKE_V3_POOL_DEPLOYER), PANCAKE_V3_INIT_CODE_HASH)
+        .with_quoter(PANCAKE_V3_QUOTER_V2)
+        .with_creation_topic0(PoolCreated::SIGNATURE_HASH)
+        .with_verify_derivations(true)
+    }
+
+    /// Slipstream / Aerodrome CL factory. Protocol [`ProtocolId::Slipstream`],
+    /// tickSpacing-keyed, spacings `[1, 50, 100, 200, 2000]`.
+    ///
+    /// The `getPool` base slot is VERIFIED on-chain (Base CLFactory). `create2`
+    /// and `quoter` are left `None` on purpose:
+    /// - the pool init-code hash + full spacing table are not pinned here (the
+    ///   gated parity test covers the base slot);
+    /// - the Slipstream quoter takes a `tickSpacing`-keyed struct, NOT the
+    ///   Uniswap `(…, fee, …)` struct this crate encodes, so wiring it as the V3
+    ///   quote target would send malformed calldata. Discovery-only for now;
+    ///   its sim rides the caller's Uniswap-compatible quoter. See the module
+    ///   `TODO(slice-A): Slipstream quoter ABI`.
+    pub fn slipstream(factory: Address) -> Self {
+        Self::tick_spacing_keyed(
+            ProtocolId::Slipstream,
+            factory,
+            SLIPSTREAM_GET_POOL_BASE_SLOT,
+            SLIPSTREAM_TICK_SPACINGS,
+        )
+        .with_creation_topic0(PoolCreatedTickSpacing::SIGNATURE_HASH)
+    }
+}
+
+/// Backwards-compatible name for the canonical V3-family factory spec.
+///
+/// Existing call sites can keep using `UniswapV3FactoryConfig::uniswap_v3(...)`
+/// while the implementation handles broader concentrated-liquidity forks via
+/// [`ClFactorySpec`].
+#[cfg(feature = "uniswap-v3")]
+pub type UniswapV3FactoryConfig = ClFactorySpec;
+
+/// Aerodrome / Velodrome V2 pool storage layout used by the `aerodrome`/
+/// `velodrome` presets — VERIFIED on-chain (Aerodrome WETH/USDC pool, Base block
+/// 47_700_000): reserve0 @ 20, reserve1 @ 21, token0 @ 13, token1 @ 14. Velodrome
+/// V2 shares Aerodrome's contract, so the same layout applies. `new(..)` callers
+/// supply their own layout for other forks.
+#[cfg(feature = "solidly-v2")]
+const SOLIDLY_AERODROME_LAYOUT: SolidlyStorageLayout = SolidlyStorageLayout::new(
+    U256::from_limbs([20, 0, 0, 0]),
+    U256::from_limbs([21, 0, 0, 0]),
+    U256::from_limbs([13, 0, 0, 0]),
+    U256::from_limbs([14, 0, 0, 0]),
+);
+
+/// Declarative configuration for a Solidly V2 (Aerodrome / Velodrome V2) factory.
+///
+/// Solidly pools are discovered by a [`DerivedSlot`] read of the factory's
+/// `getPool[token0][token1][bool stable]` nested mapping (see
+/// [`derive::solidly_get_pool_slot`]) — each pair yields up to TWO pools, a
+/// stable and a volatile one. Discovery does NOT resolve the swap fee (Solidly
+/// pools self-quote via `getAmountOut`, and the fee is a factory `getFee` read at
+/// sim time), so there is no quoter to wire.
+///
+/// Construct with [`new`](Self::new) or a fork preset ([`aerodrome`](Self::aerodrome),
+/// [`velodrome`](Self::velodrome)), then refine with the `with_*` builders.
+///
+/// [`DerivedSlot`]: crate::adapters::factory
+#[cfg(feature = "solidly-v2")]
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolidlyFactoryConfig {
+    /// The `PoolFactory` contract address.
+    pub factory: Address,
+    /// Base slot of the `getPool[t0][t1][stable]` nested mapping.
+    pub get_pool_base_slot: U256,
+    /// The fork's reserve/token storage layout, attached to every discovered
+    /// pool so cold-start can warm the right slots.
+    pub storage_layout: SolidlyStorageLayout,
+    /// Optional CREATE2 cross-check of the mapping answer. Reuses [`ClCreate2`]
+    /// (`deployer` + `init_code_hash`); the salt scheme is Solidly-specific (see
+    /// [`derive::solidly_pool_address`]).
+    #[cfg(feature = "uniswap-v3")]
+    pub create2: Option<ClCreate2>,
+    /// Optional CREATE2 cross-check of the mapping answer (deployer +
+    /// init-code hash); the salt scheme is Solidly-specific (see
+    /// [`derive::solidly_pool_address`]).
+    ///
+    /// Mirrors the `uniswap-v3`-gated [`ClCreate2`] shape so the Solidly cfg
+    /// compiles in isolation (without `uniswap-v3`).
+    #[cfg(not(feature = "uniswap-v3"))]
+    pub create2: Option<SolidlyCreate2>,
+    /// Push-discovery creation-event `topic0`. `None` => pull-only (no creation
+    /// sources, `decode_creation` returns `Ok(None)`).
+    pub creation_topic0: Option<B256>,
+    /// Whether to run the CREATE2 cross-check (requires [`create2`](Self::create2)).
+    pub verify_derivations: bool,
+}
+
+/// Optional CREATE2 cross-check parameters for a Solidly V2 factory when the
+/// `uniswap-v3` feature (which owns [`ClCreate2`]) is not enabled.
+///
+/// Field-identical to [`ClCreate2`]; exists only so the Solidly discovery path
+/// compiles in isolation. When `uniswap-v3` is on, [`SolidlyFactoryConfig`]
+/// reuses [`ClCreate2`] directly as the spec requires.
+#[cfg(all(feature = "solidly-v2", not(feature = "uniswap-v3")))]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolidlyCreate2 {
+    /// The CREATE2 deployer. `None` means "the factory itself".
+    pub deployer: Option<Address>,
+    /// The pool init-code hash.
+    pub init_code_hash: B256,
+}
+
+/// The CREATE2 cross-check type [`SolidlyFactoryConfig`] carries: [`ClCreate2`]
+/// when `uniswap-v3` is enabled (as the spec requires), else the standalone
+/// [`SolidlyCreate2`] mirror so the Solidly cfg builds in isolation.
+#[cfg(all(feature = "solidly-v2", feature = "uniswap-v3"))]
+type SolidlyCreate2Params = ClCreate2;
+#[cfg(all(feature = "solidly-v2", not(feature = "uniswap-v3")))]
+type SolidlyCreate2Params = SolidlyCreate2;
+
+#[cfg(feature = "solidly-v2")]
+impl SolidlyFactoryConfig {
+    /// A Solidly V2 factory with an explicit `getPool` base slot and storage
+    /// layout. `create2` is `None` and `verify_derivations` is off; add a
+    /// cross-check with [`with_create2`](Self::with_create2).
+    pub fn new(
+        factory: Address,
+        get_pool_base_slot: U256,
+        storage_layout: SolidlyStorageLayout,
+    ) -> Self {
+        Self {
+            factory,
+            get_pool_base_slot,
+            storage_layout,
+            create2: None,
+            creation_topic0: None,
+            verify_derivations: false,
+        }
+    }
+
+    /// Aerodrome (Base) preset.
+    ///
+    /// The `getPool` base slot (5) and pool storage layout are VERIFIED on-chain
+    /// (Base) via trace-based slot discovery; the gated `discovery_solidly_rpc`
+    /// parity test re-checks them against the live factory. No CREATE2 init-code
+    /// hash is pinned (Solidly's salt is packed), so `verify_derivations` stays OFF.
+    pub fn aerodrome(factory: Address) -> Self {
+        Self::new(
+            factory,
+            SOLIDLY_GET_POOL_BASE_SLOT,
+            SOLIDLY_AERODROME_LAYOUT,
+        )
+        .with_creation_topic0(SolidlyPoolCreated::SIGNATURE_HASH)
+    }
+
+    /// Velodrome (Optimism) preset. Byte-identical Solidly-V2 shape to Aerodrome;
+    /// same placeholder base slot + layout and the same `PoolCreated` push topic.
+    /// See [`aerodrome`](Self::aerodrome) for the UNVERIFIED-constants caveat.
+    pub fn velodrome(factory: Address) -> Self {
+        Self::aerodrome(factory)
+    }
+
+    /// Set the CREATE2 cross-check (`deployer: None` => the factory itself).
+    pub fn with_create2(mut self, deployer: Option<Address>, init_code_hash: B256) -> Self {
+        self.create2 = Some(SolidlyCreate2Params {
+            deployer,
+            init_code_hash,
+        });
+        self
+    }
+
+    /// Toggle the CREATE2 derivation cross-check (needs [`with_create2`](Self::with_create2)).
+    pub fn with_verify_derivations(mut self, verify: bool) -> Self {
+        self.verify_derivations = verify;
+        self
+    }
+
+    /// Set the push-discovery creation-event `topic0`.
+    pub fn with_creation_topic0(mut self, topic0: B256) -> Self {
+        self.creation_topic0 = Some(topic0);
+        self
+    }
+}
+
+/// Curve's canonical Ethereum-mainnet [`MetaRegistry`] address — a well-known
+/// public constant (deployed by Curve as the unified registry aggregator), safe
+/// to pin. The gated `discovery_curve_rpc` parity test verifies discovery
+/// against it on a live chain.
+///
+/// [`MetaRegistry`]: https://etherscan.io/address/0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC
+#[cfg(feature = "curve")]
+const CURVE_MAINNET_META_REGISTRY: Address =
+    alloy_primitives::address!("F98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC");
+
+/// The `get_pool_asset_type` value Curve's MetaRegistry reports for a crypto
+/// (v2 / Tricrypto) pool: `4`. Any other value is a StableSwap-family asset
+/// type (`0` = USD, `1` = ETH, `2` = BTC, `3` = other stable), which shares the
+/// `int128` `get_dy` quote ABI. Only `4` selects the `uint256` quote path.
+#[cfg(feature = "curve")]
+const CURVE_CRYPTO_ASSET_TYPE: u64 = 4;
+
+#[cfg(feature = "curve")]
+sol! {
+    // Curve MetaRegistry read surface used for plain-pool discovery. Only these
+    // four views are called (all `view`, executed via `AdapterCache::call_raw`
+    // with `commit = false`). Named returns; the generated `*Call::SELECTOR`
+    // drives routing and `*Call::abi_decode_returns` decodes the output. This
+    // block MUST match `tests/discovery_curve.rs` exactly.
+    function find_pools_for_coins(address from, address to) external view returns (address[] pools);
+    function get_coins(address pool) external view returns (address[8] coins);
+    function is_meta(address pool) external view returns (bool meta);
+    function get_pool_asset_type(address pool) external view returns (uint256 asset_type);
+}
+
+/// Declarative configuration for Curve plain-pool discovery via a [`MetaRegistry`].
+///
+/// Unlike the Uniswap/Solidly factories (which resolve a pool from a Rust-derived
+/// `getPool` storage slot), Curve has no clean Rust-derivable pool-key scheme, so
+/// [`CurveFactory`] discovers pools by executing the MetaRegistry's on-chain views
+/// in revm (a ViewCall through [`AdapterCache::call_raw`]) — see
+/// [`CurveFactory`]. Only the registry address is configured; the read ABI is
+/// fixed (`find_pools_for_coins` / `get_coins` / `is_meta` /
+/// `get_pool_asset_type`).
+///
+/// Construct with [`new`](Self::new) or the [`mainnet`](Self::mainnet) preset
+/// (which pins Curve's canonical mainnet MetaRegistry).
+///
+/// [`MetaRegistry`]: https://etherscan.io/address/0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC
+#[cfg(feature = "curve")]
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurveFactoryConfig {
+    /// The Curve MetaRegistry contract address discovery calls against.
+    pub meta_registry: Address,
+}
+
+#[cfg(feature = "curve")]
+impl CurveFactoryConfig {
+    /// A Curve factory config targeting the MetaRegistry at `meta_registry`.
+    pub fn new(meta_registry: Address) -> Self {
+        Self { meta_registry }
+    }
+
+    /// Ethereum-mainnet preset: pins Curve's canonical MetaRegistry
+    /// (`0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC`), a well-known public
+    /// constant. The gated `discovery_curve_rpc` parity test exercises it.
+    pub fn mainnet() -> Self {
+        Self::new(CURVE_MAINNET_META_REGISTRY)
+    }
+
+    /// Set (replace) the MetaRegistry address.
+    pub fn with_meta_registry(mut self, meta_registry: Address) -> Self {
+        self.meta_registry = meta_registry;
         self
     }
 }
@@ -865,20 +1643,33 @@ impl PoolFactory for UniswapV2Factory {
     }
 }
 
+/// Data-driven concentrated-liquidity (UniV3-mechanics) factory driver.
+///
+/// One [`ClFactorySpec`] configures the whole family: fee-keyed forks (Uniswap
+/// V3 / SushiSwap V3 / PancakeSwap V3) and tickSpacing-keyed forks (Slipstream /
+/// Aerodrome). Replaces the former Uniswap-V3-only factory.
 #[cfg(feature = "uniswap-v3")]
 #[derive(Debug)]
-pub(crate) struct UniswapV3Factory {
-    config: UniswapV3FactoryConfig,
-    verify_derivations: bool,
+pub struct ConcentratedLiquidityFactory {
+    spec: ClFactorySpec,
     derivation_verified: std::sync::OnceLock<()>,
 }
 
+/// The innermost `getPool` key for one probe: a fee tier (fee keying) or an int24
+/// tick spacing (tickSpacing keying).
 #[cfg(feature = "uniswap-v3")]
-impl UniswapV3Factory {
-    pub(crate) fn new(config: UniswapV3FactoryConfig, verify_derivations: bool) -> Self {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClLookupKey {
+    Fee(u32),
+    TickSpacing(i32),
+}
+
+#[cfg(feature = "uniswap-v3")]
+impl ConcentratedLiquidityFactory {
+    /// Build a driver from a fully-specified [`ClFactorySpec`].
+    pub fn new(spec: ClFactorySpec) -> Self {
         Self {
-            config,
-            verify_derivations,
+            spec,
             derivation_verified: std::sync::OnceLock::new(),
         }
     }
@@ -892,16 +1683,37 @@ impl UniswapV3Factory {
         tick_spacing: i32,
         source: DiscoverySource,
     ) -> DiscoveredPool {
+        let storage_layout = match self.spec.protocol {
+            ProtocolId::UniswapV3 => V3StorageLayout::uniswap(tick_spacing),
+            ProtocolId::PancakeV3 => V3StorageLayout::pancake(tick_spacing),
+            ProtocolId::Slipstream => V3StorageLayout::slipstream(tick_spacing),
+            _ => V3StorageLayout::uniswap(tick_spacing),
+        };
         let metadata = V3Metadata::default()
             .with_token0(token0)
             .with_token1(token1)
             .with_fee(fee)
             .with_tick_spacing(tick_spacing)
-            .with_storage_layout(V3StorageLayout::uniswap(tick_spacing))
-            .with_factory(self.config.factory);
-        let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+            .with_storage_layout(storage_layout)
+            .with_factory(self.spec.factory);
+        let metadata = if let Some(quoter) = self.spec.quoter {
+            metadata.with_quoter(quoter)
+        } else {
+            metadata
+        };
+        let key = match self.spec.protocol {
+            ProtocolId::PancakeV3 => PoolKey::PancakeV3(pool),
+            ProtocolId::Slipstream => PoolKey::Slipstream(pool),
+            _ => PoolKey::UniswapV3(pool),
+        };
+        let protocol_metadata = match self.spec.protocol {
+            ProtocolId::PancakeV3 => ProtocolMetadata::PancakeV3(metadata),
+            ProtocolId::Slipstream => ProtocolMetadata::Slipstream(metadata),
+            _ => ProtocolMetadata::UniswapV3(metadata),
+        };
+        let registration = PoolRegistration::new(key)
             .with_state_address(pool)
-            .with_metadata(ProtocolMetadata::UniswapV3(metadata));
+            .with_metadata(protocol_metadata);
         let adapter = crate::adapters::ConcentratedLiquidityAdapter::default();
         let sources = super::AmmAdapter::event_sources(&adapter, &registration);
         let registration = registration.with_event_sources(sources);
@@ -917,16 +1729,361 @@ impl UniswapV3Factory {
         mapping: Address,
         token0: Address,
         token1: Address,
-        fee: u32,
+        key: ClLookupKey,
     ) -> Result<(), DiscoveryError> {
-        if !self.verify_derivations || self.derivation_verified.get().is_some() {
+        if !self.spec.verify_derivations || self.derivation_verified.get().is_some() {
             return Ok(());
         }
-        let Some(init_code_hash) = self.config.init_code_hash else {
+        let Some(create2) = self.spec.create2 else {
             return Ok(());
         };
+        let deployer = create2.deployer.unwrap_or(self.spec.factory);
+        let derived = match key {
+            ClLookupKey::Fee(fee) => {
+                derive::v3_pool_address(deployer, create2.init_code_hash, token0, token1, fee)
+            }
+            ClLookupKey::TickSpacing(spacing) => derive::v3_pool_address_by_spacing(
+                deployer,
+                create2.init_code_hash,
+                token0,
+                token1,
+                spacing,
+            ),
+        };
+        if derived != mapping {
+            return Err(DiscoveryError::DerivationMismatch { mapping, derived });
+        }
+        let _ = self.derivation_verified.set(());
+        Ok(())
+    }
+
+    fn fee_for_key(
+        &self,
+        key: ClLookupKey,
+        values: &HashMap<(Address, U256), U256>,
+    ) -> Result<u32, DiscoveryError> {
+        match self.spec.fee_source {
+            FeeSource::Key => match key {
+                ClLookupKey::Fee(fee) => Ok(fee),
+                ClLookupKey::TickSpacing(_) => Err(DiscoveryError::Malformed(
+                    "fee source Key is not valid for tickSpacing-keyed factories",
+                )),
+            },
+            FeeSource::Fixed(fee) => Ok(fee),
+            FeeSource::FactoryMapping { base_slot } => {
+                let slot = match key {
+                    ClLookupKey::Fee(fee) => {
+                        derive::v3_fee_amount_tick_spacing_slot(base_slot, fee)
+                    }
+                    ClLookupKey::TickSpacing(spacing) => {
+                        derive::v3_tick_spacing_fee_slot(base_slot, spacing)
+                    }
+                };
+                let word = values
+                    .get(&(self.spec.factory, slot))
+                    .copied()
+                    .unwrap_or_default();
+                Ok(u32_from_word(word))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "uniswap-v3")]
+impl PoolFactory for ConcentratedLiquidityFactory {
+    fn protocol(&self) -> ProtocolId {
+        self.spec.protocol
+    }
+
+    fn factory_address(&self) -> Address {
+        self.spec.factory
+    }
+
+    fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {
+        let mut slots = Vec::new();
+        match &self.spec.keying {
+            ClKeying::Fee {
+                tiers,
+                fee_amount_tick_spacing_base_slot,
+            } => {
+                // `feeAmountTickSpacing[fee]` is per-fee, not per-pair — read each once.
+                for &fee in tiers {
+                    slots.push((
+                        self.spec.factory,
+                        derive::v3_fee_amount_tick_spacing_slot(
+                            *fee_amount_tick_spacing_base_slot,
+                            fee,
+                        ),
+                    ));
+                }
+                for (token0, token1) in pairs {
+                    for &fee in tiers {
+                        slots.push((
+                            self.spec.factory,
+                            derive::v3_get_pool_slot(
+                                self.spec.get_pool_base_slot,
+                                *token0,
+                                *token1,
+                                fee,
+                            ),
+                        ));
+                    }
+                }
+            }
+            ClKeying::TickSpacing { spacings } => {
+                for (token0, token1) in pairs {
+                    for &spacing in spacings {
+                        slots.push((
+                            self.spec.factory,
+                            derive::v3_get_pool_slot_by_spacing(
+                                self.spec.get_pool_base_slot,
+                                *token0,
+                                *token1,
+                                spacing,
+                            ),
+                        ));
+                        if let FeeSource::FactoryMapping { base_slot } = self.spec.fee_source {
+                            slots.push((
+                                self.spec.factory,
+                                derive::v3_tick_spacing_fee_slot(base_slot, spacing),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        slots
+    }
+
+    fn assemble_pairs(
+        &self,
+        pairs: &[(Address, Address)],
+        values: &HashMap<(Address, U256), U256>,
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        let mut found = Vec::new();
+        for (token0, token1) in pairs {
+            match &self.spec.keying {
+                ClKeying::Fee {
+                    tiers,
+                    fee_amount_tick_spacing_base_slot,
+                } => {
+                    for &fee in tiers {
+                        let key = ClLookupKey::Fee(fee);
+                        let pool_slot = derive::v3_get_pool_slot(
+                            self.spec.get_pool_base_slot,
+                            *token0,
+                            *token1,
+                            fee,
+                        );
+                        let Some(&word) = values.get(&(self.spec.factory, pool_slot)) else {
+                            continue;
+                        };
+                        let pool = address_from_word(word)?;
+                        if pool == Address::ZERO {
+                            continue;
+                        }
+                        self.ensure_derivation_matches(pool, *token0, *token1, key)?;
+                        let tick_slot = derive::v3_fee_amount_tick_spacing_slot(
+                            *fee_amount_tick_spacing_base_slot,
+                            fee,
+                        );
+                        let tick_spacing = i24_from_word(
+                            values
+                                .get(&(self.spec.factory, tick_slot))
+                                .copied()
+                                .unwrap_or_default(),
+                        );
+                        if tick_spacing <= 0 {
+                            return Err(DiscoveryError::Malformed(
+                                "V3 feeAmountTickSpacing returned a non-positive spacing",
+                            ));
+                        }
+                        found.push(self.registration(
+                            pool,
+                            *token0,
+                            *token1,
+                            self.fee_for_key(key, values)?,
+                            tick_spacing,
+                            DiscoverySource::Query,
+                        ));
+                    }
+                }
+                ClKeying::TickSpacing { spacings } => {
+                    for &spacing in spacings {
+                        let key = ClLookupKey::TickSpacing(spacing);
+                        let pool_slot = derive::v3_get_pool_slot_by_spacing(
+                            self.spec.get_pool_base_slot,
+                            *token0,
+                            *token1,
+                            spacing,
+                        );
+                        let Some(&word) = values.get(&(self.spec.factory, pool_slot)) else {
+                            continue;
+                        };
+                        let pool = address_from_word(word)?;
+                        if pool == Address::ZERO {
+                            continue;
+                        }
+                        self.ensure_derivation_matches(pool, *token0, *token1, key)?;
+                        found.push(self.registration(
+                            pool,
+                            *token0,
+                            *token1,
+                            self.fee_for_key(key, values)?,
+                            spacing,
+                            DiscoverySource::Query,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn creation_sources(&self) -> Vec<EventSource> {
+        self.spec
+            .creation_topic0
+            .map(|topic| EventSource::adapter_defined(self.spec.factory, vec![topic]))
+            .into_iter()
+            .collect()
+    }
+
+    fn decode_creation(
+        &self,
+        log: &Log,
+        context: CreationLogContext,
+    ) -> Result<Option<DiscoveredPool>, DiscoveryError> {
+        let Some(topic0) = self.spec.creation_topic0 else {
+            return Ok(None);
+        };
+        if log.address != self.spec.factory || log.topics().first() != Some(&topic0) {
+            return Ok(None);
+        }
+        if topic0 == PoolCreated::SIGNATURE_HASH {
+            let event = PoolCreated::decode_log(log)
+                .map_err(|_| DiscoveryError::Malformed("PoolCreated failed to decode"))?
+                .data;
+            let fee: u32 = event.fee.to();
+            let tick_spacing: i32 = event.tickSpacing.as_i32();
+            self.ensure_derivation_matches(
+                event.pool,
+                event.token0,
+                event.token1,
+                ClLookupKey::Fee(fee),
+            )?;
+            return Ok(Some(self.registration(
+                event.pool,
+                event.token0,
+                event.token1,
+                fee,
+                tick_spacing,
+                DiscoverySource::CreationEvent {
+                    block_number: context.block_number,
+                    log_index: context.log_index,
+                },
+            )));
+        }
+        if topic0 == PoolCreatedTickSpacing::SIGNATURE_HASH {
+            let event = PoolCreatedTickSpacing::decode_log(log)
+                .map_err(|_| DiscoveryError::Malformed("PoolCreatedTickSpacing failed to decode"))?
+                .data;
+            let fee: u32 = event.fee.to();
+            let tick_spacing: i32 = event.tickSpacing.as_i32();
+            self.ensure_derivation_matches(
+                event.pool,
+                event.token0,
+                event.token1,
+                ClLookupKey::TickSpacing(tick_spacing),
+            )?;
+            return Ok(Some(self.registration(
+                event.pool,
+                event.token0,
+                event.token1,
+                fee,
+                tick_spacing,
+                DiscoverySource::CreationEvent {
+                    block_number: context.block_number,
+                    log_index: context.log_index,
+                },
+            )));
+        }
+        Ok(None)
+    }
+}
+
+/// Solidly V2 (Aerodrome / Velodrome V2) factory driver.
+///
+/// Resolves pools by a batched [`DerivedSlot`] read of the factory's
+/// `getPool[token0][token1][bool stable]` nested mapping: each pair contributes
+/// two candidate slots (volatile + stable), and a non-zero mapping answer yields
+/// a [`PoolKey::SolidlyV2`] pool carrying the fork's [`SolidlyStorageLayout`]. No
+/// quoter is wired — Solidly pools self-quote (`getAmountOut`) and their fee is a
+/// factory read at sim time — so discovery resolves only the pool set, not fees.
+///
+/// [`DerivedSlot`]: crate::adapters::factory
+#[cfg(feature = "solidly-v2")]
+#[derive(Debug)]
+pub struct SolidlyFactory {
+    config: SolidlyFactoryConfig,
+    derivation_verified: std::sync::OnceLock<()>,
+}
+
+/// The two Solidly pool variants a pair can resolve to.
+#[cfg(feature = "solidly-v2")]
+const SOLIDLY_VARIANTS: [bool; 2] = [false, true];
+
+#[cfg(feature = "solidly-v2")]
+impl SolidlyFactory {
+    /// Build a driver from a fully-specified [`SolidlyFactoryConfig`].
+    pub fn new(config: SolidlyFactoryConfig) -> Self {
+        Self {
+            config,
+            derivation_verified: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn registration(
+        &self,
+        pool: Address,
+        token0: Address,
+        token1: Address,
+        stable: bool,
+        source: DiscoverySource,
+    ) -> DiscoveredPool {
+        let metadata = SolidlyV2Metadata::default()
+            .with_token0(token0)
+            .with_token1(token1)
+            .with_stable(stable)
+            .with_storage_layout(self.config.storage_layout);
+        let registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+            .with_state_address(pool)
+            .with_metadata(ProtocolMetadata::SolidlyV2(metadata));
+        let adapter = crate::adapters::SolidlyV2Adapter::default();
+        let sources = super::AmmAdapter::event_sources(&adapter, &registration);
+        let registration = registration.with_event_sources(sources);
+        DiscoveredPool {
+            key: registration.key.clone(),
+            registration,
+            source,
+        }
+    }
+
+    fn ensure_derivation_matches(
+        &self,
+        mapping: Address,
+        token0: Address,
+        token1: Address,
+        stable: bool,
+    ) -> Result<(), DiscoveryError> {
+        if !self.config.verify_derivations || self.derivation_verified.get().is_some() {
+            return Ok(());
+        }
+        let Some(create2) = self.config.create2 else {
+            return Ok(());
+        };
+        let deployer = create2.deployer.unwrap_or(self.config.factory);
         let derived =
-            derive::v3_pool_address(self.config.factory, init_code_hash, token0, token1, fee);
+            derive::solidly_pool_address(deployer, create2.init_code_hash, token0, token1, stable);
         if derived != mapping {
             return Err(DiscoveryError::DerivationMismatch { mapping, derived });
         }
@@ -935,10 +2092,10 @@ impl UniswapV3Factory {
     }
 }
 
-#[cfg(feature = "uniswap-v3")]
-impl PoolFactory for UniswapV3Factory {
+#[cfg(feature = "solidly-v2")]
+impl PoolFactory for SolidlyFactory {
     fn protocol(&self) -> ProtocolId {
-        ProtocolId::UniswapV3
+        ProtocolId::SolidlyV2
     }
 
     fn factory_address(&self) -> Address {
@@ -946,22 +2103,17 @@ impl PoolFactory for UniswapV3Factory {
     }
 
     fn candidate_reads(&self, pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {
-        let mut slots = Vec::with_capacity(self.config.fee_tiers.len() * (pairs.len() + 1));
-        // `feeAmountTickSpacing[fee]` is per-fee, not per-pair — read each once.
-        for &fee in &self.config.fee_tiers {
-            slots.push((
-                self.config.factory,
-                derive::v3_fee_amount_tick_spacing_slot(
-                    self.config.fee_amount_tick_spacing_base_slot,
-                    fee,
-                ),
-            ));
-        }
+        let mut slots = Vec::with_capacity(pairs.len() * SOLIDLY_VARIANTS.len());
         for (token0, token1) in pairs {
-            for &fee in &self.config.fee_tiers {
+            for stable in SOLIDLY_VARIANTS {
                 slots.push((
                     self.config.factory,
-                    derive::v3_get_pool_slot(self.config.get_pool_base_slot, *token0, *token1, fee),
+                    derive::solidly_get_pool_slot(
+                        self.config.get_pool_base_slot,
+                        *token0,
+                        *token1,
+                        stable,
+                    ),
                 ));
             }
         }
@@ -975,38 +2127,26 @@ impl PoolFactory for UniswapV3Factory {
     ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
         let mut found = Vec::new();
         for (token0, token1) in pairs {
-            for &fee in &self.config.fee_tiers {
-                let pool_slot =
-                    derive::v3_get_pool_slot(self.config.get_pool_base_slot, *token0, *token1, fee);
-                let Some(&word) = values.get(&(self.config.factory, pool_slot)) else {
+            for stable in SOLIDLY_VARIANTS {
+                let slot = derive::solidly_get_pool_slot(
+                    self.config.get_pool_base_slot,
+                    *token0,
+                    *token1,
+                    stable,
+                );
+                let Some(&word) = values.get(&(self.config.factory, slot)) else {
                     continue;
                 };
                 let pool = address_from_word(word)?;
                 if pool == Address::ZERO {
                     continue;
                 }
-                self.ensure_derivation_matches(pool, *token0, *token1, fee)?;
-                let tick_slot = derive::v3_fee_amount_tick_spacing_slot(
-                    self.config.fee_amount_tick_spacing_base_slot,
-                    fee,
-                );
-                let tick_spacing = i24_from_word(
-                    values
-                        .get(&(self.config.factory, tick_slot))
-                        .copied()
-                        .unwrap_or_default(),
-                );
-                if tick_spacing <= 0 {
-                    return Err(DiscoveryError::Malformed(
-                        "V3 feeAmountTickSpacing returned a non-positive spacing",
-                    ));
-                }
+                self.ensure_derivation_matches(pool, *token0, *token1, stable)?;
                 found.push(self.registration(
                     pool,
                     *token0,
                     *token1,
-                    fee,
-                    tick_spacing,
+                    stable,
                     DiscoverySource::Query,
                 ));
             }
@@ -1015,10 +2155,11 @@ impl PoolFactory for UniswapV3Factory {
     }
 
     fn creation_sources(&self) -> Vec<EventSource> {
-        vec![EventSource::adapter_defined(
-            self.config.factory,
-            vec![PoolCreated::SIGNATURE_HASH],
-        )]
+        self.config
+            .creation_topic0
+            .map(|topic| EventSource::adapter_defined(self.config.factory, vec![topic]))
+            .into_iter()
+            .collect()
     }
 
     fn decode_creation(
@@ -1026,23 +2167,24 @@ impl PoolFactory for UniswapV3Factory {
         log: &Log,
         context: CreationLogContext,
     ) -> Result<Option<DiscoveredPool>, DiscoveryError> {
-        if log.address != self.config.factory
-            || log.topics().first() != Some(&PoolCreated::SIGNATURE_HASH)
-        {
+        let Some(topic0) = self.config.creation_topic0 else {
+            return Ok(None);
+        };
+        if log.address != self.config.factory || log.topics().first() != Some(&topic0) {
             return Ok(None);
         }
-        let event = PoolCreated::decode_log(log)
-            .map_err(|_| DiscoveryError::Malformed("PoolCreated failed to decode"))?
+        if topic0 != SolidlyPoolCreated::SIGNATURE_HASH {
+            return Ok(None);
+        }
+        let event = SolidlyPoolCreated::decode_log(log)
+            .map_err(|_| DiscoveryError::Malformed("SolidlyPoolCreated failed to decode"))?
             .data;
-        let fee: u32 = event.fee.to();
-        let tick_spacing: i32 = event.tickSpacing.as_i32();
-        self.ensure_derivation_matches(event.pool, event.token0, event.token1, fee)?;
+        self.ensure_derivation_matches(event.pool, event.token0, event.token1, event.stable)?;
         Ok(Some(self.registration(
             event.pool,
             event.token0,
             event.token1,
-            fee,
-            tick_spacing,
+            event.stable,
             DiscoverySource::CreationEvent {
                 block_number: context.block_number,
                 log_index: context.log_index,
@@ -1051,7 +2193,232 @@ impl PoolFactory for UniswapV3Factory {
     }
 }
 
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
+/// Curve plain-pool factory driver, resolving pools via the MetaRegistry
+/// (ViewCall through [`AdapterCache::call_raw`]).
+///
+/// Curve has no Rust-derivable pool-key slot, so this factory OVERRIDES
+/// [`find_pools`](PoolFactory::find_pools) and leaves
+/// [`candidate_reads`](PoolFactory::candidate_reads) empty — it is a per-pair,
+/// call-based factory (the discovery front-end falls back to `find_pools` for
+/// empty-`candidate_reads` factories). Per pair `(a, b)`:
+///
+/// 1. `find_pools_for_coins(a, b)` → candidate `address[]` (empty ⇒ no pools).
+/// 2. For each candidate (de-duplicated):
+///    - `is_meta(pool)` — metapools/lending pools are SKIPPED (plain pools only;
+///      their `get_dy` makes external base-pool calls the cold-start capture
+///      would miss).
+///    - `get_coins(pool)` → `address[8]`, trailing-zero-trimmed to the coin set;
+///      the pool is kept only if that set ⊇ `{a, b}` (the MetaRegistry can
+///      over-return pools that do not actually hold both query coins).
+///    - `get_pool_asset_type(pool)` → `4` ⇒ [`CurveVariant::CryptoSwap`]
+///      (`uint256` `get_dy`), else [`CurveVariant::StableSwap`] (`int128`
+///      `get_dy`) — selecting the correct quote ABI.
+///
+/// A discovered pool carries the FULL multi-token coin set and its
+/// [`CurveVariant`] in [`CurveMetadata`], keyed [`PoolKey::Curve`], with the
+/// [`CurveAdapter`](crate::adapters::CurveAdapter) event sources attached.
+///
+/// A MetaRegistry call that reverts/halts or returns undecodable output is a
+/// hard [`DiscoveryError`] (never silently swallowed); a zero-length
+/// `find_pools_for_coins` answer is simply an empty result.
+///
+/// ## Deferred
+///
+/// - **`CryptoSwapNG` refinement.** `get_pool_asset_type == 4` maps to
+///   `CryptoSwap`. NG-vs-base CryptoSwap is an event-only nuance (it does not
+///   change the `uint256` quote ABI), refined by the reactive event path; the NG
+///   variant is not resolved at discovery time here.
+/// - **Metapools** are explicitly out of scope (filtered), matching the Curve
+///   adapter's plain-pool scope.
+#[cfg(feature = "curve")]
+#[derive(Debug)]
+pub struct CurveFactory {
+    config: CurveFactoryConfig,
+}
+
+#[cfg(feature = "curve")]
+impl CurveFactory {
+    /// Build a driver from a fully-specified [`CurveFactoryConfig`].
+    pub fn new(config: CurveFactoryConfig) -> Self {
+        Self { config }
+    }
+
+    /// Run one MetaRegistry view `calldata` and return its success output,
+    /// mapping a revert/halt to [`DiscoveryError::Factory`] (never swallowed).
+    fn view_call(
+        &self,
+        cache: &mut dyn AdapterCache,
+        calldata: Bytes,
+    ) -> Result<Bytes, DiscoveryError> {
+        // ViewCall: `from = ZERO`, `commit = false` — reads the warmed snapshot
+        // (lazily fetching cold slots from the backend), never mutates the cache.
+        match cache.call_raw(Address::ZERO, self.config.meta_registry, calldata, false)? {
+            CallOutcome::Success { output, .. } => Ok(output),
+            CallOutcome::Revert { .. } => Err(DiscoveryError::Factory(Box::new(
+                CurveDiscoveryError::MetaRegistryReverted,
+            ))),
+            CallOutcome::Halt { reason } => Err(DiscoveryError::Factory(Box::new(
+                CurveDiscoveryError::MetaRegistryHalted(reason),
+            ))),
+        }
+    }
+
+    fn registration(
+        &self,
+        pool: Address,
+        coins: Vec<Address>,
+        variant: CurveVariant,
+    ) -> DiscoveredPool {
+        let metadata = CurveMetadata::default()
+            .with_coins(coins)
+            .with_variant(variant);
+        let registration = PoolRegistration::new(PoolKey::Curve(pool))
+            .with_state_address(pool)
+            .with_metadata(ProtocolMetadata::Curve(metadata));
+        let adapter = crate::adapters::CurveAdapter::default();
+        let sources = super::AmmAdapter::event_sources(&adapter, &registration);
+        let registration = registration.with_event_sources(sources);
+        DiscoveredPool {
+            key: registration.key.clone(),
+            registration,
+            source: DiscoverySource::Query,
+        }
+    }
+}
+
+#[cfg(feature = "curve")]
+impl PoolFactory for CurveFactory {
+    fn protocol(&self) -> ProtocolId {
+        ProtocolId::Curve
+    }
+
+    fn factory_address(&self) -> Address {
+        self.config.meta_registry
+    }
+
+    // `candidate_reads` / `assemble_pairs` intentionally left at their empty
+    // defaults: Curve is call-based (ViewCall), not storage-slot-derivable, so
+    // the discovery front-end routes it through `find_pools` per pair.
+
+    fn find_pools(
+        &self,
+        cache: &mut dyn AdapterCache,
+        pair: (Address, Address),
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        let (a, b) = pair;
+
+        // 1. Candidate pools for the coin pair. An empty answer is not an error.
+        let output = self.view_call(
+            cache,
+            Bytes::from(find_pools_for_coinsCall { from: a, to: b }.abi_encode()),
+        )?;
+        let candidates = find_pools_for_coinsCall::abi_decode_returns(&output)
+            .map_err(|_| DiscoveryError::Malformed("MetaRegistry find_pools_for_coins output"))?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for pool in candidates {
+            // De-duplicate candidate addresses (the registry may repeat a pool).
+            if pool == Address::ZERO || !seen.insert(pool) {
+                continue;
+            }
+
+            // 2a. Skip metapools/lending pools — plain pools only.
+            let is_meta_out =
+                self.view_call(cache, Bytes::from(is_metaCall { pool }.abi_encode()))?;
+            let is_meta = is_metaCall::abi_decode_returns(&is_meta_out)
+                .map_err(|_| DiscoveryError::Malformed("MetaRegistry is_meta output"))?;
+            if is_meta {
+                continue;
+            }
+
+            // 2b. Coin set (address[8], trailing zeros trimmed). Keep the pool
+            // only if it actually contains BOTH query coins (the registry can
+            // over-return). The full multi-token set is carried in metadata.
+            let coins_out =
+                self.view_call(cache, Bytes::from(get_coinsCall { pool }.abi_encode()))?;
+            let coins_raw = get_coinsCall::abi_decode_returns(&coins_out)
+                .map_err(|_| DiscoveryError::Malformed("MetaRegistry get_coins output"))?;
+            let coins: Vec<Address> = coins_raw
+                .into_iter()
+                .take_while(|coin| *coin != Address::ZERO)
+                .collect();
+            if !(coins.contains(&a) && coins.contains(&b)) {
+                continue;
+            }
+
+            // 2c. Asset type selects the quote ABI: 4 => CryptoSwap (uint256
+            // get_dy), everything else => StableSwap (int128 get_dy). NG-vs-base
+            // is an event-only nuance (deferred; see the type docs).
+            let asset_type_out = self.view_call(
+                cache,
+                Bytes::from(get_pool_asset_typeCall { pool }.abi_encode()),
+            )?;
+            let asset_type =
+                get_pool_asset_typeCall::abi_decode_returns(&asset_type_out).map_err(|_| {
+                    DiscoveryError::Malformed("MetaRegistry get_pool_asset_type output")
+                })?;
+            let variant = if asset_type == U256::from(CURVE_CRYPTO_ASSET_TYPE) {
+                CurveVariant::CryptoSwap
+            } else {
+                CurveVariant::StableSwap
+            };
+
+            found.push(self.registration(pool, coins, variant));
+        }
+        Ok(found)
+    }
+
+    fn creation_sources(&self) -> Vec<EventSource> {
+        // Pull-only: Curve plain-pool discovery is via the MetaRegistry ViewCall,
+        // with no creation-event push in this slice.
+        Vec::new()
+    }
+
+    fn decode_creation(
+        &self,
+        _log: &Log,
+        _context: CreationLogContext,
+    ) -> Result<Option<DiscoveredPool>, DiscoveryError> {
+        // Pull-only (no creation-event push for Curve in this slice).
+        Ok(None)
+    }
+}
+
+/// Curve-discovery-specific failure carried inside [`DiscoveryError::Factory`]
+/// when a MetaRegistry ViewCall reverts or halts.
+#[cfg(feature = "curve")]
+#[derive(Debug)]
+enum CurveDiscoveryError {
+    MetaRegistryReverted,
+    MetaRegistryHalted(String),
+}
+
+#[cfg(feature = "curve")]
+impl fmt::Display for CurveDiscoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MetaRegistryReverted => write!(f, "Curve MetaRegistry view call reverted"),
+            Self::MetaRegistryHalted(reason) => {
+                write!(f, "Curve MetaRegistry view call halted: {reason}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "curve")]
+impl std::error::Error for CurveDiscoveryError {}
+
+#[cfg(feature = "uniswap-v3")]
+fn u32_from_word(word: U256) -> u32 {
+    let bytes = word.to_be_bytes::<32>();
+    u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]])
+}
+
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 fn address_from_word(word: U256) -> Result<Address, DiscoveryError> {
     let bytes = word.to_be_bytes::<32>();
     if bytes[..12].iter().any(|b| *b != 0) {
@@ -1070,5 +2437,41 @@ fn i24_from_word(word: U256) -> i32 {
         (raw | 0xff00_0000) as i32
     } else {
         raw as i32
+    }
+}
+
+#[cfg(all(test, feature = "solidly-v2"))]
+mod solidly_tests {
+    use super::*;
+    use alloy_primitives::keccak256;
+
+    /// The Solidly `PoolCreated` push topic0 must be the REAL on-chain event
+    /// signature `keccak256("PoolCreated(address,address,bool,address,uint256)")`
+    /// — NOT the Rust alias name. This guards the module-wrapping that keeps the
+    /// generated struct named `PoolCreated` (renaming it silently produces the
+    /// wrong topic0, so real creation logs would never match).
+    #[test]
+    fn solidly_pool_created_topic0_matches_onchain_signature() {
+        let expected = keccak256(b"PoolCreated(address,address,bool,address,uint256)");
+        assert_eq!(SolidlyPoolCreated::SIGNATURE_HASH, expected);
+        assert_eq!(
+            SolidlyPoolCreated::SIGNATURE,
+            "PoolCreated(address,address,bool,address,uint256)"
+        );
+    }
+
+    /// `solidly_get_pool_slot` descends the two address levels exactly like the
+    /// V3 `getPool[t0][t1]` mapping, then keys the innermost `bool` as 0/1 — so
+    /// the stable and volatile variants land on distinct, non-zero slots.
+    #[test]
+    fn solidly_get_pool_slot_distinguishes_stable_flag() {
+        let base = U256::from(3);
+        let t0 = Address::repeat_byte(0x0a);
+        let t1 = Address::repeat_byte(0x0b);
+        let volatile = derive::solidly_get_pool_slot(base, t0, t1, false);
+        let stable = derive::solidly_get_pool_slot(base, t0, t1, true);
+        assert_ne!(volatile, stable);
+        assert_ne!(volatile, U256::ZERO);
+        assert_ne!(stable, U256::ZERO);
     }
 }

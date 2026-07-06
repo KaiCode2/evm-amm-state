@@ -82,13 +82,31 @@ is empty by default: callers opt in with explicit factory addresses, e.g.
 `FactoryConfig::default().with_uniswap_v3_factory(factory)`, so chain- and
 fork-specific deployments never inherit an assumed factory.
 
-Discovery supports Uniswap V2 and canonical Uniswap V3 style factories through
-derived mapping-slot reads (`getPair` / `getPool`) plus creation-log decoding
-(`PairCreated` / `PoolCreated`). V3-discovered registrations carry
-`V3Metadata.factory`, which gives bytecode seeding the factory immutable it
-needs to render and verify the expected pool runtime. Multiple factories of the
-same protocol coexist (keyed by `(protocol, factory_address)`), and external
-`PoolFactory`s can be added via `PoolDiscovery::with_factory`.
+Discovery ships for every protocol whose pools resolve through the pinned
+cache — a derived factory storage slot or a MetaRegistry view call:
+
+| Protocol | Mechanism |
+| --- | --- |
+| Uniswap V3 / Sushi V3 / Pancake V3 | fee-keyed `getPool[t0][t1][fee]` (via `ClFactorySpec`) |
+| Slipstream / Aerodrome CL | tickSpacing-keyed `getPool[t0][t1][tickSpacing]` (via `ClFactorySpec`) |
+| Uniswap V2 | `getPair[t0][t1]` |
+| Solidly V2 (Aerodrome / Velodrome) | `getPool[t0][t1][bool stable]` (stable + volatile) |
+| Curve (plain pools) | MetaRegistry `find_pools_for_coins` ViewCall |
+
+V3-discovered registrations carry `V3Metadata.factory`, which gives bytecode
+seeding the factory immutable it needs to render and verify the expected pool
+runtime. Multiple factories of the same protocol coexist (keyed by
+`(protocol, factory_address)`).
+
+Two AMM shapes are deliberately left to the integrator in 0.1.0 — **Algebra**-style
+CL forks (Camelot, QuickSwap: a different pool engine, not just a discovery
+config) and **Balancer V2** discovery (no on-chain token→pool index, so it needs
+an async log scan). Both have first-class, stable escape hatches:
+`register_adapter(Arc<dyn AmmAdapter>)` adds a novel simulation engine and
+`PoolDiscovery::with_factory(Box<dyn PoolFactory>)` adds a novel discovery
+mechanism — a new AMM never requires forking the crate. See
+[`docs/pool-discovery.md`](docs/pool-discovery.md) for the full coverage table,
+adding your own CL fork, and this boundary in depth.
 
 The whole surface is one method — `discovery.find(cache, query)` — over one
 fluent `PoolQuery`:

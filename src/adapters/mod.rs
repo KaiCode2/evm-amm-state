@@ -53,14 +53,23 @@ pub use driver::{AdapterDriver, DriverError};
 #[cfg(feature = "uniswap-v2")]
 pub use factory::UniswapV2FactoryConfig;
 #[cfg(feature = "uniswap-v3")]
-pub use factory::UniswapV3FactoryConfig;
+pub use factory::{
+    ClCreate2, ClFactorySpec, ClKeying, ConcentratedLiquidityFactory, FeeSource,
+    UniswapV3FactoryConfig,
+};
 pub use factory::{
     CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, FactoryConfig,
     PoolDiscovery, PoolFactory, PoolQuery,
 };
+#[cfg(feature = "curve")]
+pub use factory::{CurveFactory, CurveFactoryConfig};
+#[cfg(feature = "solidly-v2")]
+pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
+#[cfg(feature = "solidly-v2")]
+pub use storage::SolidlyStorageLayout;
 pub use storage_sync::{
     CALLDATA_SLOT_LOADER_CODE, StorageSyncEncoding, StorageSyncError, StorageSyncSnapshot,
     StorageSyncSpec, build_calldata_slot_loader_program, build_slot_loader_program,

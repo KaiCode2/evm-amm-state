@@ -332,6 +332,13 @@ pub struct V3Metadata {
     /// pool bytecode. Factory discovery fills this; manual registrations can set
     /// it explicitly when they want bytecode seeding.
     pub factory: Option<Address>,
+    /// Per-pool swap-quote target (a fork's own QuoterV2). When set, swap
+    /// simulation quotes against this address instead of the caller's
+    /// [`SimConfig::v3_quoter`](super::SimConfig::v3_quoter) — so a discovered
+    /// PancakeSwap pool quotes against Pancake's quoter. `None` falls back to the
+    /// caller's configured quoter. Factory discovery fills this from the
+    /// fork's [`ClFactorySpec`](super::factory::ClFactorySpec) quoter.
+    pub quoter: Option<Address>,
     pub storage_layout: Option<V3StorageLayout>,
     /// The ± radius, in tick-bitmap words, of the cold-start tick-warm window
     /// around the current word (`Strict`/`Eager` policies).
@@ -371,6 +378,12 @@ impl V3Metadata {
     /// Set the pool factory/deployer address.
     pub fn with_factory(mut self, factory: Address) -> Self {
         self.factory = Some(factory);
+        self
+    }
+
+    /// Set the per-pool swap-quote target (see [`quoter`](Self::quoter)).
+    pub fn with_quoter(mut self, quoter: Address) -> Self {
+        self.quoter = Some(quoter);
         self
     }
 

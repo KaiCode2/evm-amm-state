@@ -14,11 +14,11 @@ use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::factory::derive;
 use evm_amm_state::adapters::{
-    AdapterCache, AdapterRegistry, CacheError, CallOutcome, ConcentratedLiquidityAdapter,
-    CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, EventSource,
-    FactoryConfig, PoolDiscovery, PoolFactory, PoolKey, PoolQuery, PoolRegistration, ProtocolId,
-    ProtocolMetadata, SlotChange, StateDiff, StateUpdate, StateView, UniswapV2Adapter,
-    UniswapV2FactoryConfig, UniswapV2Metadata, UniswapV3FactoryConfig,
+    AdapterCache, AdapterRegistry, CacheError, CallOutcome, ClFactorySpec,
+    ConcentratedLiquidityAdapter, CreationLogContext, DiscoveredPool, DiscoveryError,
+    DiscoverySource, EventSource, FactoryConfig, PoolDiscovery, PoolFactory, PoolKey, PoolQuery,
+    PoolRegistration, ProtocolId, ProtocolMetadata, SlotChange, StateDiff, StateUpdate, StateView,
+    UniswapV2Adapter, UniswapV2FactoryConfig, UniswapV2Metadata,
 };
 
 // --- counting cache ---
@@ -121,7 +121,7 @@ fn find_pair_resolves_all_protocols_in_one_read() -> Result<()> {
     let v3_pool = Address::repeat_byte(0x35);
 
     let v2_cfg = UniswapV2FactoryConfig::uniswap_v2(v2_factory).with_fee_bps(30);
-    let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory);
+    let v3_cfg = ClFactorySpec::uniswap_v3(v3_factory);
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
@@ -137,7 +137,10 @@ fn find_pair_resolves_all_protocols_in_one_read() -> Result<()> {
     );
     cache.set(
         v3_factory,
-        derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
+        derive::v3_fee_amount_tick_spacing_slot(
+            v3_cfg.fee_amount_tick_spacing_base_slot().unwrap(),
+            500,
+        ),
         U256::from(10),
     );
 
@@ -172,7 +175,7 @@ fn find_pair_on_protocol_filters() -> Result<()> {
     let v3_pool = Address::repeat_byte(0x35);
 
     let v2_cfg = UniswapV2FactoryConfig::uniswap_v2(v2_factory).with_fee_bps(30);
-    let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory);
+    let v3_cfg = ClFactorySpec::uniswap_v3(v3_factory);
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
@@ -188,7 +191,10 @@ fn find_pair_on_protocol_filters() -> Result<()> {
     );
     cache.set(
         v3_factory,
-        derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
+        derive::v3_fee_amount_tick_spacing_slot(
+            v3_cfg.fee_amount_tick_spacing_base_slot().unwrap(),
+            500,
+        ),
         U256::from(10),
     );
 
@@ -256,7 +262,7 @@ fn find_basket_resolves_all_pairs_in_one_read() -> Result<()> {
     let v3_pool_ac = Address::repeat_byte(0x35);
 
     let v2_cfg = UniswapV2FactoryConfig::uniswap_v2(v2_factory).with_fee_bps(30);
-    let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory); // 4 fee tiers
+    let v3_cfg = ClFactorySpec::uniswap_v3(v3_factory); // 4 fee tiers
 
     let mut cache = CountingCache::default();
     cache.set(
@@ -271,7 +277,10 @@ fn find_basket_resolves_all_pairs_in_one_read() -> Result<()> {
     );
     cache.set(
         v3_factory,
-        derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
+        derive::v3_fee_amount_tick_spacing_slot(
+            v3_cfg.fee_amount_tick_spacing_base_slot().unwrap(),
+            500,
+        ),
         U256::from(10),
     );
 
@@ -347,7 +356,7 @@ fn find_v3_registration_has_full_metadata() -> Result<()> {
     let a = Address::repeat_byte(0xcc);
     let b = Address::repeat_byte(0xaa);
     let pool = Address::repeat_byte(0x33);
-    let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory).with_fee_tiers([500]);
+    let v3_cfg = ClFactorySpec::uniswap_v3(v3_factory).with_fee_tiers([500]);
     let (t0, t1) = derive::sort_tokens(a, b);
 
     let mut cache = CountingCache::default();
@@ -358,7 +367,10 @@ fn find_v3_registration_has_full_metadata() -> Result<()> {
     );
     cache.set(
         v3_factory,
-        derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
+        derive::v3_fee_amount_tick_spacing_slot(
+            v3_cfg.fee_amount_tick_spacing_base_slot().unwrap(),
+            500,
+        ),
         U256::from(10),
     );
 
@@ -498,7 +510,7 @@ fn find_many_resolves_heterogeneous_queries_in_one_read() -> Result<()> {
     let v3_pool_ac = Address::repeat_byte(0x35);
 
     let v2_cfg = UniswapV2FactoryConfig::uniswap_v2(v2_factory).with_fee_bps(30);
-    let v3_cfg = UniswapV3FactoryConfig::uniswap_v3(v3_factory);
+    let v3_cfg = ClFactorySpec::uniswap_v3(v3_factory);
 
     let mut cache = CountingCache::default();
     cache.set(
@@ -513,7 +525,10 @@ fn find_many_resolves_heterogeneous_queries_in_one_read() -> Result<()> {
     );
     cache.set(
         v3_factory,
-        derive::v3_fee_amount_tick_spacing_slot(v3_cfg.fee_amount_tick_spacing_base_slot, 500),
+        derive::v3_fee_amount_tick_spacing_slot(
+            v3_cfg.fee_amount_tick_spacing_base_slot().unwrap(),
+            500,
+        ),
         U256::from(10),
     );
 

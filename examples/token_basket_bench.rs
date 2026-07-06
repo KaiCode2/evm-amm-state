@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
 
     let v2_config = UniswapV2FactoryConfig::uniswap_v2(UNISWAP_V2_FACTORY).with_fee_bps(30);
     let v3_config = UniswapV3FactoryConfig::uniswap_v3(UNISWAP_V3_FACTORY);
-    let fee_tiers = v3_config.fee_tiers.len();
+    let fee_tiers = v3_config.fee_tiers().len();
     let config = || {
         FactoryConfig::default()
             .with_uniswap_v2(v2_config.clone())

@@ -121,6 +121,43 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
 name = "discovery"
 required-features = ["uniswap-v2", "uniswap-v3"]
 
+# Combined wiring test: `PoolDiscovery::for_registry` fans a FactoryConfig out to
+# every protocol's factory driver (no MissingFactory for V2/V3/Pancake/
+# Slipstream/Solidly/Curve). Needs all discovery-capable adapter features.
+[[test]]
+name = "discovery_wiring"
+required-features = ["uniswap-v2", "uniswap-v3", "solidly-v2", "curve"]
+
+[[test]]
+name = "discovery_cl"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "discovery_cl_rpc"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "discovery_solidly"
+required-features = ["solidly-v2"]
+
+[[test]]
+name = "discovery_curve"
+required-features = ["curve"]
+
+# Live parity for Curve plain-pool discovery via the MetaRegistry (env-gated,
+# #[ignore]): pins the canonical mainnet MetaRegistry, resolves 3pool for
+# DAI/USDC with the right coins + StableSwap variant, and confirms metapool
+# exclusion against the live `is_meta` view.
+[[test]]
+name = "discovery_curve_rpc"
+required-features = ["curve"]
+
+# Live parity for the Solidly V2 (Aerodrome) preset (env-gated, #[ignore]): pins
+# the getPool base slot, storage layout, and discovery wiring against Base.
+[[test]]
+name = "discovery_solidly_rpc"
+required-features = ["solidly-v2"]
+
 [[test]]
 name = "bytecode_golden"
 required-features = ["uniswap-v2", "uniswap-v3"]
@@ -208,6 +245,13 @@ required-features = ["uniswap-v2", "uniswap-v3"]
 [[example]]
 name = "factory_discovery_live"
 required-features = ["uniswap-v2", "uniswap-v3"]
+
+# Declarative discovery demo: name factories + a token basket (no pasted pool
+# addresses), resolve pools across Uniswap V3 + Curve, then cold_start_many ->
+# register -> quote. Env-gated; no-ops without E2E_RPC_URL.
+[[example]]
+name = "declarative_discovery"
+required-features = ["uniswap-v3", "curve"]
 
 # Live sync-latency comparison for prior cold-start versus one-shot storage
 # programs across V3, V2, Balancer, and Curve. Env-gated; defaults to a public

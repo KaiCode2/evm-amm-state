@@ -139,13 +139,49 @@ offsets are pinned to chain-truth code hashes across tickSpacings 1/10/60
 
 **Factory-backed pool discovery (`adapters::factory`)** — build
 cold-start-ready `PoolRegistration`s from configured factories instead of pasted
-addresses. `PoolDiscovery` resolves Uniswap V2 (`getPair`) and V3 (`getPool` +
-`feeAmountTickSpacing`) mapping slots and decodes `PairCreated`/`PoolCreated`
-creation logs; `FactoryConfig` is empty by default (callers opt into explicit
-factory addresses). Multiple factories of one protocol coexist — keyed by
-`(protocol, factory_address)`, so Uniswap and a Sushi-style fork both resolve —
-and an external `PoolFactory` can be added through the `with_factory` open
-channel. The whole surface is one method, `PoolDiscovery::find(cache, query)`,
+addresses, across every protocol whose pools resolve through the pinned cache.
+Two discovery mechanisms: a **DerivedSlot** read (a Rust-computed factory
+storage slot, resolved in the batched read) and a **ViewCall** (an on-chain
+`view` executed in revm via `AdapterCache::call_raw`). Coverage:
+
+- **Concentrated liquidity** — one generalized `ClFactorySpec` drives the whole
+  UniV3-mechanics family through a single `ConcentratedLiquidityFactory`: fee-keyed
+  forks (Uniswap V3, SushiSwap V3, PancakeSwap V3 — `getPool[t0][t1][fee]` with
+  tick spacing from `feeAmountTickSpacing[fee]`) and tickSpacing-keyed forks
+  (Slipstream / Aerodrome CL — `getPool[t0][t1][tickSpacing]`, no fee mapping).
+  `ClKeying` selects the shape, `FeeSource` where the fee comes from, and a
+  per-pool `quoter` flows into metadata; fork presets (`uniswap_v3`, `sushi_v3`,
+  `pancake_v3`, `slipstream`) are pre-filled specs. An optional CREATE2
+  cross-check hard-fails `DerivationMismatch` on a wrong init-code hash / base
+  slot.
+- **Uniswap V2** — `getPair[t0][t1]`.
+- **Solidly V2** (Aerodrome / Velodrome) — `SolidlyFactory` reads
+  `getPool[t0][t1][bool stable]`, yielding a pair's stable **and** volatile pools
+  and carrying the fork's storage layout for cold-start.
+- **Curve** (plain pools) — `CurveFactory` resolves via the MetaRegistry
+  `find_pools_for_coins` ViewCall (Curve has no Rust-derivable pool-key slot),
+  skips metapools, keeps the full multi-token coin set, and selects the
+  StableSwap vs CryptoSwap `get_dy` ABI from `get_pool_asset_type`. (Offline
+  resolution is tested; live MetaRegistry resolution is still under investigation,
+  so the mainnet preset is provisional.)
+
+The CL and Solidly preset storage constants (Pancake `getPool` slot 2 +
+`feeAmountTickSpacing` slot 1, Slipstream `getPool` slot 6, Aerodrome `getPool`
+slot 5 + the pool reserve/token layout) are **verified on-chain** by the gated
+`discovery_cl_rpc` / `discovery_solidly_rpc` parity tests — discovered with a
+trace-based storage-slot probe rather than guessed.
+
+Creation logs decode too (`PairCreated`, the Uniswap/Pancake and Slipstream
+`PoolCreated`, the Solidly `PoolCreated`); Curve is pull-only. Two AMM shapes are
+deliberately out of scope for 0.1.0 and documented as integrator-supplied:
+**Algebra**-style CL forks (a different pool engine, added with `register_adapter`
++ `with_factory`) and **Balancer V2** discovery (no on-chain token→pool index; an
+async log scan, planned later) — see `docs/pool-discovery.md`. `FactoryConfig` is
+empty by default (callers opt into explicit factory addresses). Multiple
+factories of one protocol coexist — keyed by `(protocol, factory_address)`, so
+Uniswap and a Sushi-style fork both resolve — and an external `PoolFactory` can
+be added through the `with_factory` open channel. The whole surface is one
+method, `PoolDiscovery::find(cache, query)`,
 over one fluent `PoolQuery`: `PoolQuery::pair(a, b)` (a single pair),
 `PoolQuery::basket([..])` (every `C(n, 2)` pair of a token basket),
 `PoolQuery::pairs([..])` (an explicit pair set), each optionally scoped with

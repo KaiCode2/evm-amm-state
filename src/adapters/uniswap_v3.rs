@@ -3,7 +3,7 @@ use super::cold_start::{
     AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     SlotFetch,
 };
-use super::factory::{FactoryConfig, PoolFactory, UniswapV3Factory};
+use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
     QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call,
     quoteExactInputSingleCall,
@@ -90,13 +90,15 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
 
     fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
         config
-            .uniswap_v3
+            .concentrated_liquidity
             .iter()
-            .map(|factory| {
-                Box::new(UniswapV3Factory::new(
-                    factory.clone(),
-                    config.verify_derivations,
-                )) as Box<dyn PoolFactory>
+            .map(|spec| {
+                // The config-level `verify_derivations` is a global off-switch: a
+                // spec's CREATE2 cross-check runs only when both it and the global
+                // flag opt in.
+                let mut spec = spec.clone();
+                spec.verify_derivations &= config.verify_derivations;
+                Box::new(ConcentratedLiquidityFactory::new(spec)) as Box<dyn PoolFactory>
             })
             .collect()
     }
@@ -195,6 +197,13 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     /// pool `fee` is taken from the V3-family metadata; tick-crossing swaps stay
     /// correct because the cache lazily fetches any cold tick/bitmap slot from
     /// the backend.
+    ///
+    /// The quote target is the pool's own [`V3Metadata::quoter`] when set (a
+    /// fork's QuoterV2, e.g. PancakeSwap's, filled in by factory discovery),
+    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The quote
+    /// ABI is unchanged (the `fee`-param struct variant) — forks whose quoter
+    /// takes a different struct (e.g. Slipstream's `tickSpacing`-keyed quoter)
+    /// leave `quoter` unset and ride the caller's Uniswap-compatible quoter.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -205,6 +214,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
         let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
+        let quoter = v3_metadata(pool)
+            .and_then(|m| m.quoter)
+            .unwrap_or(config.v3_quoter);
 
         let params = QuoteExactInputSingleParams {
             tokenIn: token_in,
@@ -215,7 +227,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         };
         let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
-        let output = quote_via_call(cache, config.v3_quoter, calldata)?;
+        let output = quote_via_call(cache, quoter, calldata)?;
         let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
 

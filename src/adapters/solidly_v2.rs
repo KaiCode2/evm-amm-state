@@ -2,6 +2,7 @@ use super::cold_start::{
     AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     SlotFetch,
 };
+use super::factory::{FactoryConfig, PoolFactory, SolidlyFactory};
 use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, quote_via_call};
 use super::storage::{SolidlyStorageLayout, decode_address_slot};
 use super::{
@@ -53,6 +54,21 @@ impl AmmAdapter for SolidlyV2Adapter {
             .address()
             .map(|address| EventSource::direct(address, vec![Sync::SIGNATURE_HASH]))
             .into_iter()
+            .collect()
+    }
+
+    fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
+        config
+            .solidly
+            .iter()
+            .map(|solidly| {
+                // The config-level `verify_derivations` is a global off-switch: a
+                // config's CREATE2 cross-check runs only when both it and the
+                // global flag opt in.
+                let mut solidly = solidly.clone();
+                solidly.verify_derivations &= config.verify_derivations;
+                Box::new(SolidlyFactory::new(solidly)) as Box<dyn PoolFactory>
+            })
             .collect()
     }
 
