@@ -51,7 +51,10 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
-All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
+All protocol features are on by default. See
+[`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
+per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
+discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
 
 > **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
@@ -384,6 +387,11 @@ the crate builds from source with no generated bindings crate.
 cargo test                       # unit + offline integration tests
 cargo test --no-default-features # protocol-neutral core
 ```
+
+These run from a clone of the repository. The published crate **excludes the
+integration test suite** (`tests/`) to stay lean, so `cargo test` on a crates.io
+download exercises only the inline unit tests — clone the repo for the full
+suite.
 
 Network-dependent tests are env-gated and `#[ignore]`d. With an archive RPC they
 pin a block, cold-start a real pool, and assert `simulate_swap` **equals the

@@ -65,7 +65,7 @@ pub use factory::{
 pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
-pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
+pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 #[cfg(feature = "solidly-v2")]
 pub use storage::SolidlyStorageLayout;
 pub use storage_sync::{

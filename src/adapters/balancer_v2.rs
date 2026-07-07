@@ -4,7 +4,7 @@ use super::cold_start::{
 };
 use super::sim::{
     BatchSwapStep, FundManagement, SimConfig, SimError, SwapQuote, queryBatchSwapCall,
-    quote_via_call,
+    quote_via_call_from,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -143,7 +143,7 @@ impl AmmAdapter for BalancerV2Adapter {
         token_in: Address,
         token_out: Address,
         amount_in: U256,
-        _config: &SimConfig,
+        config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
         let (vault, pool_id) = match (&pool.metadata, pool.key.bytes32()) {
             (ProtocolMetadata::BalancerV2(metadata), Some(pool_id)) => {
@@ -182,7 +182,7 @@ impl AmmAdapter for BalancerV2Adapter {
             .abi_encode(),
         );
 
-        let output = quote_via_call(cache, vault, calldata)?;
+        let output = quote_via_call_from(cache, config.from, vault, calldata)?;
         let asset_deltas = queryBatchSwapCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("queryBatchSwap return"))?;
 

@@ -29,6 +29,13 @@ qualitatively, to the other ways people price AMM swaps.
 
 ## Results
 
+> Point-in-time medians from a single host and run (mid-2026, the Methodology
+> host above) — treat them as order-of-magnitude, and re-run the reproduce
+> command for numbers on your own machine. `cargo bench` prints full Criterion
+> statistics (mean / median / std-dev / outliers) to stdout and writes HTML
+> reports under `target/criterion/`; the medians below are the headline figures
+> from that output.
+
 ### `simulate_swap` — one offline quote (the repeated hot path)
 
 | Protocol | Quote entrypoint | Median / quote | ≈ Quotes/sec |

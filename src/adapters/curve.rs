@@ -36,7 +36,7 @@ use super::cold_start::{
     AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
     ColdStartStep, SlotFetch,
 };
-use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, quote_via_call};
+use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, quote_via_call_from};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant,
@@ -408,7 +408,7 @@ impl AmmAdapter for CurveAdapter {
         token_in: Address,
         token_out: Address,
         amount_in: U256,
-        _config: &SimConfig,
+        config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
         let pool_address = pool
             .key
@@ -457,7 +457,7 @@ impl AmmAdapter for CurveAdapter {
                     }
                     .abi_encode(),
                 );
-                let output = quote_via_call(cache, pool_address, calldata)?;
+                let output = quote_via_call_from(cache, config.from, pool_address, calldata)?;
                 get_dyCall::abi_decode_returns_validate(&output)
                     .map_err(|_| SimError::MalformedOutput("get_dy return"))?
             }
@@ -470,7 +470,7 @@ impl AmmAdapter for CurveAdapter {
                     }
                     .abi_encode(),
                 );
-                let output = quote_via_call(cache, pool_address, calldata)?;
+                let output = quote_via_call_from(cache, config.from, pool_address, calldata)?;
                 super::sim::CurveCryptoSwap::get_dyCall::abi_decode_returns_validate(&output)
                     .map_err(|_| SimError::MalformedOutput("CryptoSwap get_dy return"))?
             }

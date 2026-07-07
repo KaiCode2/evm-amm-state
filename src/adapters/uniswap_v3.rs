@@ -5,7 +5,7 @@ use super::cold_start::{
 };
 use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call,
+    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call_from,
     quoteExactInputSingleCall,
 };
 use super::{
@@ -245,7 +245,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         };
         let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
-        let output = quote_via_call(cache, quoter, calldata)?;
+        let output = quote_via_call_from(cache, config.from, quoter, calldata)?;
         let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
 
