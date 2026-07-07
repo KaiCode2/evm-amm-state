@@ -87,9 +87,24 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
 
         let result = adapter.decode_event(pool, log, state);
         if let Some(error) = result.error {
-            return Err(HandlerError::new(format!(
-                "adapter decode error for {protocol:?}: {error:?}"
-            )));
+            // A malformed / undecodable log for a watched topic must NOT abort
+            // the batch: other pools' events in the same `ingest_batch` still
+            // need to apply. Skip this log with a `NoStateEffect` outcome and
+            // surface the failure as an observability hook instead of a hard
+            // `HandlerError`.
+            let labels = vec![
+                ReportTag::new("protocol", format!("{protocol:?}")),
+                ReportTag::new("emitter", format!("{:?}", log.address)),
+                ReportTag::new("error", format!("{error:?}")),
+            ];
+            return Ok(HandlerOutcome {
+                effects: vec![ReactiveEffect::Hook(hook_signal(
+                    "amm.decode_error",
+                    labels.clone(),
+                ))],
+                quality: StateEffectQuality::NoStateEffect,
+                tags: labels,
+            });
         }
 
         let Some(event) = result.event else {

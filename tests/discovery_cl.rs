@@ -216,6 +216,12 @@ fn tick_spacing_keyed_resolves_without_fee_mapping() -> Result<()> {
         Some(spacing),
         "tickSpacing is the key"
     );
+    assert_eq!(
+        cl_metadata(&found[0]).fee,
+        None,
+        "no on-chain fee mapping → fee is left unset (not a bogus 0), so \
+         simulate_swap surfaces MissingMetadata rather than quoting at fee 0"
+    );
     assert_eq!(cache.batch_reads, 1);
     Ok(())
 }

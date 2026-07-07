@@ -47,6 +47,12 @@ pub const SLIPSTREAM_TICKS_BASE_SLOT: U256 = U256::from_limbs([19, 0, 0, 0]);
 pub const SLIPSTREAM_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([18, 0, 0, 0]);
 
 /// Storage layout for a V3-style concentrated-liquidity pool.
+///
+/// `#[non_exhaustive]`: construct via [`V3StorageLayout::new`] (or the
+/// `uniswap`/`pancake`/`slipstream` presets) so future layout fields (e.g. a new
+/// fork's fee-growth or observation base slots) can be added without a breaking
+/// change.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct V3StorageLayout {
     pub slot0_slot: U256,
@@ -114,6 +120,10 @@ impl V3StorageLayout {
 /// indices are fork-specific and config-supplied — there is no derivable default,
 /// so validate a fork's layout with the gated RPC-parity test before relying on
 /// it in production.
+///
+/// `#[non_exhaustive]`: construct via [`SolidlyStorageLayout::new`] so future
+/// layout fields can be added without a breaking change.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SolidlyStorageLayout {
     pub reserve0_slot: U256,

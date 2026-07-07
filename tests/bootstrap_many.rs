@@ -80,11 +80,17 @@ fn reserves(reserve0: u64, reserve1: u64) -> U256 {
     U256::from(reserve0) | (U256::from(reserve1) << 112)
 }
 
+/// A metadata-complete Uniswap V2 registration (token0/token1 + fee): eligible
+/// for the fast one-shot path (see `fast_metadata_complete`), so it exercises the
+/// fast→fallback transition rather than being diverted to fallback by the gate.
 fn v2_registration(pool: Address) -> PoolRegistration {
     PoolRegistration::new(PoolKey::UniswapV2(pool))
         .with_state_address(pool)
         .with_metadata(ProtocolMetadata::UniswapV2(
-            UniswapV2Metadata::default().with_fee_bps(30),
+            UniswapV2Metadata::default()
+                .with_token0(Address::repeat_byte(0xa0))
+                .with_token1(Address::repeat_byte(0xa1))
+                .with_fee_bps(30),
         ))
 }
 
@@ -143,6 +149,60 @@ async fn cold_start_many_falls_back_to_ready_when_hydration_cannot_run() -> Resu
     );
     assert_eq!(pools[1].key, PoolKey::UniswapV2(pool_b));
     assert!(pools.iter().all(|p| p.status == PoolStatus::Ready));
+    Ok(())
+}
+
+/// The metadata-completeness gate: a registration still missing its identity
+/// metadata (a Uniswap V2 pool with no `token0`/`token1`) must NOT be finalized
+/// by the fast path — it falls back to the normal `cold_start`, whose planner
+/// decodes and merges the tokens from storage. Without the gate the fast path
+/// would mark it `Ready` with `token0`/`token1` still `None` (finish() skipped).
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_start_many_incomplete_metadata_falls_back_and_merges_tokens() -> Result<()> {
+    let pool = Address::repeat_byte(0x55);
+    let t0 = Address::repeat_byte(0x66);
+    let t1 = Address::repeat_byte(0x77);
+    let provider = empty_mock_provider();
+    let mut cache = EvmCache::new(provider.clone()).await;
+
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((pool, V2_TOKEN0_SLOT), token_word(t0)),
+        ((pool, V2_TOKEN1_SLOT), token_word(t1)),
+        ((pool, V2_RESERVES_SLOT), reserves(10, 20)),
+    ])));
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
+
+    // No token0/token1 in metadata → not fast-eligible → must fall back.
+    let mut pools = vec![
+        PoolRegistration::new(PoolKey::UniswapV2(pool))
+            .with_state_address(pool)
+            .with_metadata(ProtocolMetadata::UniswapV2(
+                UniswapV2Metadata::default().with_fee_bps(30),
+            )),
+    ];
+    let outcomes = registry
+        .cold_start_many(
+            &mut pools,
+            &mut cache,
+            provider.as_ref(),
+            ColdStartPolicy::Eager,
+        )
+        .await?;
+
+    assert!(matches!(outcomes[0], ColdStartOutcome::Ready(_)));
+    assert_eq!(pools[0].status, PoolStatus::Ready);
+    // The fallback cold_start decoded + merged the tokens from storage; the fast
+    // path (which skips finish()) would have left them None.
+    match &pools[0].metadata {
+        ProtocolMetadata::UniswapV2(m) => {
+            assert_eq!(m.token0, Some(t0), "fallback must merge decoded token0");
+            assert_eq!(m.token1, Some(t1), "fallback must merge decoded token1");
+            assert_eq!(m.fee_bps, Some(30), "config fee_bps must survive the merge");
+        }
+        other => panic!("expected UniswapV2 metadata, got {other:?}"),
+    }
     Ok(())
 }
 

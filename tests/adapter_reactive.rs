@@ -201,6 +201,12 @@ fn v3_swap_topic() -> B256 {
     keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 }
 
+/// PancakeSwap V3 `Swap` — appends `protocolFeesToken0`/`protocolFeesToken1`
+/// (`uint128`), giving it a distinct `topic0` from the Uniswap V3 `Swap`.
+fn pancake_v3_swap_topic() -> B256 {
+    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)")
+}
+
 fn v3_mint_topic() -> B256 {
     keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
 }
@@ -417,6 +423,54 @@ async fn v2_sync_applies_masked_update_through_reactive_runtime() -> Result<()> 
             .any(|signal| signal.namespace.as_ref() == "evm-amm-state"
                 && signal.kind.as_ref() == "amm.event")
     );
+    Ok(())
+}
+
+/// Batch robustness: a malformed log for a watched topic must NOT abort the
+/// reactive batch — a later valid log in the same `ingest_batch` still applies.
+/// The handler isolates the decode failure to a `NoStateEffect` outcome instead
+/// of a `HandlerError` that would fail the whole batch.
+#[tokio::test]
+async fn malformed_log_does_not_abort_reactive_batch() -> Result<()> {
+    let pool = Address::repeat_byte(0x3f);
+    let reserve0 = U256::from(777_u64);
+    let reserve1 = U256::from(888_u64);
+
+    // First: the correct Sync topic + emitter, but a truncated one-word body the
+    // V2 adapter rejects as malformed. Second: a well-formed Sync for the same
+    // pool. If the malformed log aborted the batch, the valid one would not land.
+    let malformed = rpc_log(pool, vec![v2_sync_topic()], abi_words([reserve0]), 12, 0, 0);
+    let valid = rpc_log(
+        pool,
+        vec![v2_sync_topic()],
+        abi_words([reserve0, reserve1]),
+        12,
+        0,
+        1,
+    );
+
+    let mut cache = setup_cache().await?;
+    // Warm the reserves slot so the valid Sync's masked write lands exactly
+    // (a cold slot would be skipped into a resync rather than applied).
+    cache.apply_updates(&[StateUpdate::slot(pool, V2_RESERVES_SLOT, U256::ZERO)]);
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v2_registry(pool, true))))?;
+
+    // The whole batch must succeed (no HandlerError propagated by the malformed log).
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![
+            (ReactiveInput::Log(malformed), included_context(12, 0)),
+            (ReactiveInput::Log(valid), included_context(12, 1)),
+        ]),
+    )?;
+
+    // The valid Sync's reserves landed despite the earlier malformed log.
+    let raw = cache
+        .cached_storage_value(pool, V2_RESERVES_SLOT)
+        .expect("valid Sync must have written the reserves slot");
+    assert_eq!(raw & low_mask(112), reserve0);
+    assert_eq!((raw >> 112) & low_mask(112), reserve1);
     Ok(())
 }
 
@@ -1395,14 +1449,26 @@ async fn pancake_v3_routes_and_applies_through_family_adapter() -> Result<()> {
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
     runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
 
+    // A PancakeSwap V3 `Swap`: the distinct Pancake topic0 and the extended
+    // 7-word non-indexed body (…, tick, protocolFeesToken0, protocolFeesToken1).
+    // Routing must accept the Pancake topic (which the Uniswap adapter would not
+    // have subscribed), and the shared body decode still reads words 2/3/4.
     let log = rpc_log(
         pool,
         vec![
-            v3_swap_topic(),
+            pancake_v3_swap_topic(),
             topic_address(Address::repeat_byte(0x01)),
             topic_address(Address::repeat_byte(0x02)),
         ],
-        abi_words([U256::ZERO, U256::ZERO, sqrt_price, liquidity, U256::ZERO]),
+        abi_words([
+            U256::ZERO,
+            U256::ZERO,
+            sqrt_price,
+            liquidity,
+            U256::ZERO,
+            U256::from(7_u64),
+            U256::from(9_u64),
+        ]),
         50,
         0,
         0,
@@ -1931,7 +1997,10 @@ async fn solidly_sync_without_layout_does_not_mutate_cache() -> Result<()> {
 // `discovered_slots` rather than applying the event payload. These tests cover:
 // (1) a cold-started pool emits a `VerifySlots` resync over its discovered slot,
 // and (2) the batch-robustness guard: an empty-`discovered_slots` pool must not
-// error or mutate (a decode error would fail the whole `ingest_batch`).
+// error or mutate — the adapter returns `ignored()` for the known-unsupported
+// case (and, since the handler now isolates decode failures per-log, even a
+// genuine decode error no longer fails the whole `ingest_batch`; see
+// `malformed_log_does_not_abort_reactive_batch`).
 
 fn curve_token_exchange_topic() -> B256 {
     keccak256("TokenExchange(address,int128,uint256,int128,uint256)")

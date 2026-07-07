@@ -27,6 +27,22 @@ sol! {
     event Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
 }
 
+/// PancakeSwap V3 `Swap` appends `protocolFeesToken0`/`protocolFeesToken1`
+/// (`uint128`) to the Uniswap V3 event, so its `topic0` differs (`0x19b47279…`
+/// vs Uniswap's `0xc42079f9…`). The extra fields append after `tick`, so
+/// `sqrtPriceX96`/`liquidity`/`tick` stay at data words 2/3/4 and the body decode
+/// is shared with the Uniswap [`Swap`]. `Mint`/`Burn` are unchanged from Uniswap
+/// V3, so their hashes are shared. Wrapped in a module so the 9-field event's
+/// `sol!`-generated constructor can be exempted from `clippy::too_many_arguments`
+/// without relaxing the lint for the rest of the file.
+mod pancake_v3 {
+    #![allow(clippy::too_many_arguments)]
+    alloy_sol_types::sol! {
+        event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint128 protocolFeesToken0, uint128 protocolFeesToken1);
+    }
+}
+use pancake_v3::Swap as PancakeV3Swap;
+
 const SLOT0_PRICE_TICK_BITS: usize = 184;
 const SLOT0_TICK_SHIFT: usize = 160;
 
@@ -78,7 +94,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
                 EventSource::direct(
                     address,
                     vec![
-                        Swap::SIGNATURE_HASH,
+                        swap_topic_for(pool.protocol()),
                         Mint::SIGNATURE_HASH,
                         Burn::SIGNATURE_HASH,
                     ],
@@ -154,7 +170,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         };
 
         if topic0 == Swap::SIGNATURE_HASH {
-            self.decode_swap(pool, log)
+            self.decode_swap(pool, log, topic0, SwapAbi::Uniswap)
+        } else if topic0 == PancakeV3Swap::SIGNATURE_HASH {
+            self.decode_swap(pool, log, topic0, SwapAbi::Pancake)
         } else if topic0 == Mint::SIGNATURE_HASH {
             self.decode_tick_range_repair(pool, log, true)
         } else if topic0 == Burn::SIGNATURE_HASH {
@@ -250,6 +268,26 @@ fn v3_warm_word_radius(pool: &PoolRegistration) -> Option<i16> {
     v3_metadata(pool).and_then(|m| m.warm_word_radius)
 }
 
+/// Which `Swap` ABI a routed log matched — the Uniswap V3 shape or the
+/// PancakeSwap V3 shape (two extra `uint128` fields, so a distinct `topic0`).
+#[derive(Clone, Copy)]
+enum SwapAbi {
+    Uniswap,
+    Pancake,
+}
+
+/// The `Swap` event `topic0` to subscribe/route for `protocol`.
+///
+/// PancakeSwap V3 emits an extended `Swap` (extra `protocolFeesToken0/1`), so its
+/// `topic0` differs from Uniswap's; every other V3-family fork (Uniswap V3,
+/// Slipstream) uses the canonical Uniswap `Swap` hash.
+fn swap_topic_for(protocol: ProtocolId) -> B256 {
+    match protocol {
+        ProtocolId::PancakeV3 => PancakeV3Swap::SIGNATURE_HASH,
+        _ => Swap::SIGNATURE_HASH,
+    }
+}
+
 /// Borrow the [`V3Metadata`] for a pool if it registered as any V3-family
 /// variant (Uniswap V3 / Pancake V3 / Slipstream), else `None`.
 fn v3_metadata(pool: &PoolRegistration) -> Option<&V3Metadata> {
@@ -262,8 +300,27 @@ fn v3_metadata(pool: &PoolRegistration) -> Option<&V3Metadata> {
 }
 
 impl ConcentratedLiquidityAdapter {
-    fn decode_swap(&self, pool: &PoolRegistration, log: &Log) -> AdapterEventResult {
-        if Swap::decode_log_data_validate(&log.data).is_err() {
+    fn decode_swap(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        topic0: B256,
+        abi: SwapAbi,
+    ) -> AdapterEventResult {
+        // Validate against the ABI whose topic0 matched. Cross-protocol safety
+        // comes from topic0 routing — a pool only subscribes its own Swap hash
+        // (`swap_topic_for`), so `decode_event` always pairs the matched topic0
+        // with its `SwapAbi` — NOT from payload length: alloy's log decoder reads
+        // only the leading static words, so the Uniswap validator tolerates the
+        // Pancake body's two trailing `uint128`s (the Pancake validator, which
+        // needs more words, does reject the shorter Uniswap body). Either way
+        // `sqrtPriceX96`/`liquidity`/`tick` share data words 2/3/4, so the body
+        // decode below is ABI-agnostic once the matched validator passes.
+        let valid = match abi {
+            SwapAbi::Uniswap => Swap::decode_log_data_validate(&log.data).is_ok(),
+            SwapAbi::Pancake => PancakeV3Swap::decode_log_data_validate(&log.data).is_ok(),
+        };
+        if !valid {
             return AdapterEventResult::error(AdapterEventError::MalformedLog(
                 "malformed V3 Swap log",
             ));
@@ -302,7 +359,7 @@ impl ConcentratedLiquidityAdapter {
         AdapterEventResult::event(AdapterEvent {
             pool: pool.key.clone(),
             emitter: log.address,
-            topic0: Swap::SIGNATURE_HASH,
+            topic0,
             kind: AdapterEventKind::Swap,
             updates: vec![
                 StateUpdate::slot_masked(address, layout.slot0_slot, mask, value),

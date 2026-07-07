@@ -75,6 +75,17 @@ impl AdapterDriver {
         self.apply_routed_log(cache, pool, log)
     }
 
+    /// Apply a batch of logs in order, returning a report per routed-and-decoded
+    /// log.
+    ///
+    /// Batch-robust: a single malformed / undecodable log (a
+    /// [`DriverError::Decode`]) is **skipped** so the rest of the batch still
+    /// applies — the same contract the reactive runtime path
+    /// ([`AmmReactiveHandler`](super::AmmReactiveHandler)) follows. A
+    /// [`DriverError::NoAdapter`] is a registry misconfiguration rather than
+    /// per-log data, so it still propagates and aborts the batch. Use
+    /// [`apply_log`](Self::apply_log) when a caller needs the structured decode
+    /// error for an individual log.
     pub fn apply_logs<C>(
         &self,
         cache: &mut C,
@@ -85,8 +96,11 @@ impl AdapterDriver {
     {
         let mut reports = Vec::new();
         for log in logs {
-            if let Some(report) = self.apply_log(cache, log)? {
-                reports.push(report);
+            match self.apply_log(cache, log) {
+                Ok(Some(report)) => reports.push(report),
+                Ok(None) => {}
+                Err(DriverError::Decode { .. }) => {}
+                Err(err @ DriverError::NoAdapter(_)) => return Err(err),
             }
         }
         Ok(reports)

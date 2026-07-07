@@ -395,6 +395,54 @@ fn driver_processes_logs_in_order_and_reports_post_apply_repairs() {
     ));
 }
 
+/// `apply_logs` is batch-robust: a single malformed log (a `DriverError::Decode`)
+/// is skipped so the rest of the batch still applies — the same contract the
+/// reactive runtime path follows. A malformed Sync ahead of a valid one must not
+/// drop the valid event or abort the batch.
+#[test]
+fn apply_logs_isolates_a_malformed_log_from_the_batch() {
+    let pool = Address::repeat_byte(0x9a);
+    let mask112 = (U256::from(1) << 112) - U256::from(1);
+
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(Arc::new(UniswapV2Adapter::default()))
+        .unwrap();
+    registry
+        .register_pool(
+            PoolRegistration::new(PoolKey::UniswapV2(pool))
+                .with_state_address(pool)
+                .with_event_source(EventSource::direct(pool, vec![v2_sync_topic()])),
+        )
+        .unwrap();
+
+    let mut cache = MockCache::default();
+    // Warm the reserves slot so the valid masked Sync write lands exactly.
+    cache.seed(pool, V2_RESERVES_SLOT, U256::ZERO);
+
+    let driver = AdapterDriver::new(registry);
+    let reports = driver
+        .apply_logs(
+            &mut cache,
+            &[
+                // Truncated one-word Sync body → DriverError::Decode, isolated.
+                log(pool, vec![v2_sync_topic()], word(U256::from(1_u64))),
+                // Well-formed Sync → applied.
+                log(
+                    pool,
+                    vec![v2_sync_topic()],
+                    abi_words([U256::from(111_u64), U256::from(222_u64)]),
+                ),
+            ],
+        )
+        .expect("a malformed log must not abort the batch");
+
+    assert_eq!(reports.len(), 1, "only the valid Sync yields a report");
+    let raw = cache.value(pool, V2_RESERVES_SLOT).unwrap();
+    assert_eq!(raw & mask112, U256::from(111_u64));
+    assert_eq!((raw >> 112) & mask112, U256::from(222_u64));
+}
+
 #[test]
 fn uniswap_v2_sync_updates_reserves_without_clobbering_timestamp() {
     let pool = Address::repeat_byte(0xbb);

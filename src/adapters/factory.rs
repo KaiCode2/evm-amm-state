@@ -711,8 +711,12 @@ impl ClFactorySpec {
     }
 
     /// A tickSpacing-keyed CL fork (Slipstream shape): `getPool[t0][t1][spacing]`
-    /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`; set a
-    /// real [`fee_source`](Self::with_fee_source) if the fork exposes one.
+    /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`, the
+    /// "no fee mapping" sentinel: discovered registrations leave `V3Metadata.fee`
+    /// **unset** (so `simulate_swap` returns `MissingMetadata("V3 fee")` rather
+    /// than quoting at fee 0 — these forks are discovery-only for quoting unless
+    /// the caller supplies a compatible quoter). Set a real
+    /// [`fee_source`](Self::with_fee_source) if the fork exposes one on-chain.
     pub fn tick_spacing_keyed(
         protocol: ProtocolId,
         factory: Address,
@@ -1590,13 +1594,21 @@ impl ConcentratedLiquidityFactory {
             ProtocolId::Slipstream => V3StorageLayout::slipstream(tick_spacing),
             _ => V3StorageLayout::uniswap(tick_spacing),
         };
-        let metadata = V3Metadata::default()
+        let mut metadata = V3Metadata::default()
             .with_token0(token0)
             .with_token1(token1)
-            .with_fee(fee)
             .with_tick_spacing(tick_spacing)
             .with_storage_layout(storage_layout)
             .with_factory(self.spec.factory);
+        // A resolved fee of 0 is the tickSpacing-keyed "no fee mapping" sentinel
+        // (Slipstream / Aerodrome CL have no on-chain fee→pool mapping and set
+        // `FeeSource::Fixed(0)`): leave `fee` UNSET rather than record a bogus 0,
+        // so `simulate_swap` surfaces `MissingMetadata("V3 fee")` — Slipstream is
+        // discovery-only for quoting — instead of silently quoting at fee 0.
+        // Fee-keyed forks always resolve a real, non-zero tier.
+        if fee != 0 {
+            metadata = metadata.with_fee(fee);
+        }
         let metadata = if let Some(quoter) = self.spec.quoter {
             metadata.with_quoter(quoter)
         } else {

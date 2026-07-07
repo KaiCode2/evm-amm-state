@@ -557,10 +557,10 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
     let address = pool.key.address()?;
 
     #[cfg(feature = "uniswap-v3")]
-    if let Some(layout) = v3_storage_layout(pool) {
+    if let Some(spec) = v3_sync_spec(pool) {
         return Some(HydrationKind::V3 {
             pool: address,
-            spec: V3SyncSpec::uniswap(layout),
+            spec,
         });
     }
     // Without the `uniswap-v3` feature the V3 full-sync path is uncompiled, so
@@ -573,20 +573,39 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
         .map(|spec| HydrationKind::Flat { spec })
 }
 
-/// Borrow the explicit V3 `storage_layout` for a V3-family pool, if present.
+/// Build the one-shot V3 full-sync spec for a V3-family pool, if it is eligible.
 ///
-/// Unlike [`layout_for`](super::storage::layout_for), this does **not** derive a
-/// layout from `tick_spacing`: one-shot hydration is offered only when the
-/// layout is explicitly carried, matching [`hydration_kind`]'s contract.
+/// Eligibility (all required):
+/// - the pool registered as a V3-family variant carrying an **explicit**
+///   `storage_layout` (unlike [`layout_for`](super::storage::layout_for), this
+///   does not derive a layout from `tick_spacing` alone), and
+/// - that layout has a **positive** `tick_spacing` — `full_word_range` /
+///   `v3_word_position` require it, so a non-positive spacing returns `None`
+///   here and falls to the single-pool `cold_start` (which reports
+///   `Unsupported`) rather than panicking in the fast path.
+///
+/// The **canonical Uniswap** spec (which bakes in Uniswap's fee-growth,
+/// protocol-fees, and observation slot positions) is used only for genuine
+/// Uniswap V3 pools. Other V3-family forks (PancakeSwap V3, Slipstream) use the
+/// layout-only [`V3SyncSpec::core`] (slot0 + liquidity + the ticks/bitmap the
+/// layout locates) so hydration never injects auxiliary state from unverified
+/// slot positions. Extend a fork to the full spec once its layout is confirmed.
 #[cfg(feature = "uniswap-v3")]
-fn v3_storage_layout(pool: &PoolRegistration) -> Option<super::storage::V3StorageLayout> {
+fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
-    match &pool.metadata {
-        ProtocolMetadata::UniswapV3(metadata)
-        | ProtocolMetadata::PancakeV3(metadata)
-        | ProtocolMetadata::Slipstream(metadata) => metadata.storage_layout,
-        _ => None,
-    }
+    let (metadata, canonical_uniswap) = match &pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata) => (metadata, true),
+        ProtocolMetadata::PancakeV3(metadata) | ProtocolMetadata::Slipstream(metadata) => {
+            (metadata, false)
+        }
+        _ => return None,
+    };
+    let layout = metadata.storage_layout.filter(|l| l.tick_spacing > 0)?;
+    Some(if canonical_uniswap {
+        V3SyncSpec::uniswap(layout)
+    } else {
+        V3SyncSpec::core(layout)
+    })
 }
 
 /// Whether `pool` can be hydrated by a single one-shot storage program (the fast
@@ -601,6 +620,50 @@ fn v3_storage_layout(pool: &PoolRegistration) -> Option<super::storage::V3Storag
 /// `cold_start_many` will actually attempt.
 pub fn supports_one_shot_hydration(pool: &PoolRegistration) -> bool {
     hydration_kind(pool).is_some()
+}
+
+/// Whether `pool`'s registration metadata is already complete enough for the
+/// one-shot fast path to finalize it `Ready` *without* the adapter planner's
+/// [`finish`](AdapterColdStartPlanner::finish) (metadata merge + status
+/// validation).
+///
+/// The fast path only warms the cache; a registration still missing identity
+/// metadata — e.g. a Uniswap V2 pool without its `token0`/`token1`, which the
+/// normal cold-start decodes from storage and merges — must fall back to the
+/// multi-round [`cold_start`](AdapterRegistry::cold_start) so `finish` runs.
+/// Registrations produced by factory discovery are already complete and stay on
+/// the fast path.
+///
+/// For a V3-family pool `finish` *preserves* (never merges) metadata, so
+/// completeness here means the fields a later `simulate_swap` needs (`fee`) plus
+/// the layout the fast path already requires. A V3 fork with no fee tier (e.g. a
+/// discovered Slipstream pool, whose `fee` is deliberately unset) therefore
+/// forgoes the fast path and takes the normal `cold_start` — acceptable, since it
+/// is discovery-only for quoting anyway. Balancer/Curve flat hydration only
+/// applies once a discovered read-set exists, which itself is produced by a
+/// prior discover→verify `cold_start` that already ran `finish`.
+fn fast_metadata_complete(pool: &PoolRegistration) -> bool {
+    use super::ProtocolMetadata;
+    match &pool.metadata {
+        ProtocolMetadata::UniswapV2(m) => m.token0.is_some() && m.token1.is_some(),
+        ProtocolMetadata::UniswapV3(m)
+        | ProtocolMetadata::PancakeV3(m)
+        | ProtocolMetadata::Slipstream(m) => m.fee.is_some() && m.storage_layout.is_some(),
+        // Solidly `finish` decodes+merges token0/token1 like V2, so require them
+        // here too — otherwise the fast path would leave metadata tokens `None`
+        // while the fallback populates them (an inconsistency for consumers that
+        // read `PoolRegistration.metadata`).
+        ProtocolMetadata::SolidlyV2(m) => {
+            m.token0.is_some()
+                && m.token1.is_some()
+                && m.stable.is_some()
+                && m.storage_layout.is_some()
+        }
+        ProtocolMetadata::BalancerV2(m) => m.vault.is_some() && !m.balance_slots.is_empty(),
+        ProtocolMetadata::Curve(m) => !m.coins.is_empty() && !m.discovered_slots.is_empty(),
+        // No known completeness contract → let the normal cold_start finalize it.
+        ProtocolMetadata::Unknown | ProtocolMetadata::Custom(_) => false,
+    }
 }
 
 /// A failure hydrating one pool from a one-shot storage program's output.
@@ -705,8 +768,13 @@ impl AdapterRegistry {
     /// this path collapses the fast-eligible pools into a fixed number of
     /// phases:
     ///
-    /// 1. **Classify.** Each pool is `fast` when its adapter is registered and
-    ///    [`supports_one_shot_hydration`] holds; everything else is `fallback`.
+    /// 1. **Classify.** A pool is `fast` when its adapter is registered,
+    ///    [`supports_one_shot_hydration`] holds, **and** its registration is
+    ///    already metadata-complete for its protocol (the fast path warms the
+    ///    cache and marks `Ready` without running the planner's `finish`, so a
+    ///    pool whose identity metadata still needs decoding/merging — e.g. a
+    ///    bare Uniswap V2 registration without `token0`/`token1` — is left to
+    ///    `fallback`). Everything else is `fallback`.
     /// 2. **Batched seed + verify.** Every fast pool's [`code_seeds`] are seeded
     ///    together (same skip rules as the single-pool path) and, if any are
     ///    pending, verified in **one** account-fields call — unverifiable seeds
@@ -752,7 +820,14 @@ impl AdapterRegistry {
             if self.adapter(pool.protocol()).is_none() {
                 continue;
             }
-            if let Some(kind) = hydration_kind(pool) {
+            // Fast-path only registrations that are already metadata-complete for
+            // their protocol. The fast path warms the cache and finalizes `Ready`
+            // WITHOUT running the adapter planner's `finish()` (metadata merge +
+            // status validation), so a pool still missing identity metadata must
+            // take the normal multi-round `cold_start` to be finalized correctly.
+            if let Some(kind) = hydration_kind(pool)
+                && fast_metadata_complete(pool)
+            {
                 is_fallback[index] = false;
                 fast.push((index, kind));
             }
@@ -931,5 +1006,70 @@ fn verify_pending_seeds(cache: &mut EvmCache) -> CodeSeedReport {
             }
             CodeSeedReport::default()
         }
+    }
+}
+
+#[cfg(all(test, feature = "uniswap-v3"))]
+mod tests {
+    use super::*;
+    use crate::adapters::storage::V3StorageLayout;
+    use crate::adapters::types::{PoolKey, PoolRegistration, ProtocolMetadata, V3Metadata};
+    use crate::adapters::v3_sync::V3SyncSpec;
+    use alloy_primitives::Address;
+
+    /// A genuine Uniswap V3 pool takes the canonical full spec (fee-growth,
+    /// protocol-fees, and observation slots baked in).
+    #[test]
+    fn uniswap_v3_uses_the_canonical_full_spec() {
+        let layout = V3StorageLayout::uniswap(10);
+        let pool = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x11)))
+            .with_metadata(ProtocolMetadata::UniswapV3(
+                V3Metadata::default()
+                    .with_fee(500)
+                    .with_storage_layout(layout),
+            ));
+        assert_eq!(v3_sync_spec(&pool), Some(V3SyncSpec::uniswap(layout)));
+    }
+
+    /// PancakeSwap V3 and Slipstream use the layout-only `core` spec (slot0 +
+    /// liquidity + ticks) — their extra static/observation slots are not verified,
+    /// so hydration must not inject Uniswap's positions for them.
+    #[test]
+    fn pancake_and_slipstream_use_the_core_spec_until_verified() {
+        let pancake_layout = V3StorageLayout::pancake(10);
+        let pancake = PoolRegistration::new(PoolKey::PancakeV3(Address::repeat_byte(0x22)))
+            .with_metadata(ProtocolMetadata::PancakeV3(
+                V3Metadata::default()
+                    .with_fee(2500)
+                    .with_storage_layout(pancake_layout),
+            ));
+        assert_eq!(
+            v3_sync_spec(&pancake),
+            Some(V3SyncSpec::core(pancake_layout))
+        );
+
+        let slip_layout = V3StorageLayout::slipstream(100);
+        let slip = PoolRegistration::new(PoolKey::Slipstream(Address::repeat_byte(0x33)))
+            .with_metadata(ProtocolMetadata::Slipstream(
+                V3Metadata::default().with_storage_layout(slip_layout),
+            ));
+        assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+    }
+
+    /// A non-positive tick spacing would panic in `full_word_range` /
+    /// `v3_word_position`; `v3_sync_spec` must return `None` so the pool falls
+    /// back to the single-pool `cold_start` (Unsupported) instead of panicking in
+    /// the `cold_start_many` fast path.
+    #[test]
+    fn non_positive_tick_spacing_is_not_fast_eligible() {
+        let layout = V3StorageLayout::uniswap(0);
+        let pool = PoolRegistration::new(PoolKey::UniswapV3(Address::repeat_byte(0x44)))
+            .with_metadata(ProtocolMetadata::UniswapV3(
+                V3Metadata::default()
+                    .with_fee(500)
+                    .with_storage_layout(layout),
+            ));
+        assert_eq!(v3_sync_spec(&pool), None);
+        assert!(!supports_one_shot_hydration(&pool));
     }
 }
