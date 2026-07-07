@@ -43,8 +43,14 @@ impl SwapQuote {
 
 /// Why a [`simulate_swap`](super::AmmAdapter::simulate_swap) could not produce a
 /// quote.
+///
+/// Not `Clone`/`PartialEq` (the [`Execution`](Self::Execution) variant carries a
+/// boxed source error that is neither), matching the crate's other
+/// boxed-source facades ([`CacheError`](super::CacheError),
+/// [`DriverError`](super::DriverError)). Match on the variant, or walk
+/// [`source`](std::error::Error::source) for the underlying cause.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SimError {
     /// The adapter does not implement swap simulation for its protocol.
     Unsupported(super::ProtocolId),
@@ -54,8 +60,11 @@ pub enum SimError {
     Reverted,
     /// The quote call executed but its return data could not be decoded.
     MalformedOutput(&'static str),
-    /// The underlying `call_raw` failed (host/transact error).
-    Execution(String),
+    /// The underlying `call_raw` failed (host/transact error), carrying the
+    /// un-flattened cause. Downcast the payload (or walk
+    /// [`source`](std::error::Error::source)) — e.g. to
+    /// [`CacheError`](super::CacheError) — for typed handling.
+    Execution(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// A catch-all for protocol-specific failures.
     Custom(String),
 }
@@ -75,7 +84,14 @@ impl core::fmt::Display for SimError {
     }
 }
 
-impl std::error::Error for SimError {}
+impl std::error::Error for SimError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Execution(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+            _ => None,
+        }
+    }
+}
 
 /// Resolved quote-target addresses for swap simulation.
 ///
@@ -141,7 +157,7 @@ pub fn quote_via_call(
 ) -> Result<Bytes, SimError> {
     match cache
         .call_raw(Address::ZERO, target, calldata, false)
-        .map_err(|e| SimError::Execution(e.to_string()))?
+        .map_err(|e| SimError::Execution(Box::new(e)))?
     {
         CallOutcome::Success { output, .. } => Ok(output),
         CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Err(SimError::Reverted),

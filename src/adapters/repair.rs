@@ -58,9 +58,14 @@ pub(crate) fn v3_tick_range_effects(
 }
 
 /// Compute the sorted, deduped slot set a V3 liquidity event over
-/// `[tick_lower, tick_upper]` must resync: the boundary `Tick.Info` slots
-/// `{0, 3}` for each tick, the containing `tickBitmap` word(s) (deduped when the
-/// boundary ticks share a word), and the global `liquidity` slot.
+/// `[tick_lower, tick_upper]` must resync: all four `Tick.Info` slots for each
+/// boundary tick, the containing `tickBitmap` word(s) (deduped when the boundary
+/// ticks share a word), and the global `liquidity` slot.
+///
+/// All four info words are refreshed (not just `{0, 3}`): a `Mint`/`Burn` that
+/// flips a tick's initialized state sets/clears its `feeGrowthOutside{0,1}X128`
+/// (words 1/2), which a later tick-crossing quote reads — so the resync must
+/// cover them, matching what the cold-start planner warms.
 pub(crate) fn v3_tick_range_slots(
     layout: &V3StorageLayout,
     tick_lower: i32,
@@ -70,8 +75,7 @@ pub(crate) fn v3_tick_range_slots(
 
     for tick in [tick_lower, tick_upper] {
         let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
-        slots.push(keys[0]);
-        slots.push(keys[3]);
+        slots.extend_from_slice(&keys);
     }
 
     let mut words = [
@@ -102,9 +106,9 @@ mod tests {
     use super::*;
     use crate::adapters::storage::V3StorageLayout;
 
-    /// Golden slot-set check for distinct bitmap words. 2 ticks x {slot0,
-    /// slot3} + 2 bitmap words + liquidity = 7 deduped slots, matching the
-    /// independent reconstruction below.
+    /// Golden slot-set check for distinct bitmap words. 2 ticks x 4 info words +
+    /// 2 bitmap words + liquidity = 11 deduped slots, matching the independent
+    /// reconstruction below.
     #[test]
     fn slot_set_distinct_words() {
         let layout = V3StorageLayout::uniswap(60);
@@ -114,8 +118,7 @@ mod tests {
         let mut expected = Vec::new();
         for tick in [tick_lower, tick_upper] {
             let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
-            expected.push(keys[0]);
-            expected.push(keys[3]);
+            expected.extend_from_slice(&keys);
         }
         for word in [
             v3_word_position(tick_lower, layout.tick_spacing),
@@ -131,11 +134,11 @@ mod tests {
         expected.dedup();
 
         assert_eq!(got, expected);
-        assert_eq!(got.len(), 7);
+        assert_eq!(got.len(), 11);
     }
 
-    /// Boundary ticks in the same bitmap word collapse to one bitmap slot,
-    /// leaving 6 deduped slots.
+    /// Boundary ticks in the same bitmap word collapse to one bitmap slot: 2
+    /// ticks x 4 info words + 1 shared bitmap word + liquidity = 10 deduped slots.
     #[test]
     fn slot_set_shared_word_dedupes() {
         let layout = V3StorageLayout::uniswap(60);
@@ -146,6 +149,6 @@ mod tests {
         );
 
         let got = v3_tick_range_slots(&layout, tick_lower, tick_upper);
-        assert_eq!(got.len(), 6);
+        assert_eq!(got.len(), 10);
     }
 }

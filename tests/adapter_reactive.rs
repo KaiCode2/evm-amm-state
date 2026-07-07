@@ -222,7 +222,7 @@ fn word_pos(tick: i32, tick_spacing: i32) -> i16 {
 }
 
 /// Independent oracle for the slot set a V3 liquidity-event repair must resync:
-/// the boundary `Tick.Info` slots {0, 3}, the (deduped) containing bitmap words,
+/// all four boundary `Tick.Info` slots, the (deduped) containing bitmap words,
 /// and the global liquidity slot. Returned sorted and deduped.
 fn expected_tick_repair_slots(
     layout: V3StorageLayout,
@@ -232,8 +232,7 @@ fn expected_tick_repair_slots(
     let mut slots = Vec::new();
     for tick in [tick_lower, tick_upper] {
         let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
-        slots.push(keys[0]);
-        slots.push(keys[3]);
+        slots.extend_from_slice(&keys);
     }
     let mut words = vec![
         word_pos(tick_lower, layout.tick_spacing),
@@ -897,12 +896,12 @@ async fn v3_burn_same_word_dedupes_bitmap_slot() -> Result<()> {
     let mut got = slots.clone();
     got.sort_unstable();
     got.dedup();
-    // 2 ticks x {slot0, slot3} + 1 shared bitmap word + liquidity = 6 slots.
+    // 2 ticks x 4 info words + 1 shared bitmap word + liquidity = 10 slots.
     assert_eq!(
         got,
         expected_tick_repair_slots(layout, tick_lower, tick_upper)
     );
-    assert_eq!(got.len(), 6);
+    assert_eq!(got.len(), 10);
     Ok(())
 }
 

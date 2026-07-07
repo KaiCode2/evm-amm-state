@@ -441,8 +441,8 @@ impl ConcentratedLiquidityAdapter {
 ///   resolved.
 /// - Round 2 (`Strict`/`Eager` only) verifies **all** window bitmap words in one
 ///   round.
-/// - Round 3 (`Strict`/`Eager` only) verifies the `{0, 3}` info slots of every
-///   tick initialized across the whole window in one round.
+/// - Round 3 (`Strict`/`Eager` only) verifies all four `Tick.Info` words of
+///   every tick initialized across the whole window in one round.
 ///
 /// `HotSlotsOnly` stops after round 1 (slot0 + liquidity — no bitmap/tick
 /// warming). `Lazy` stops after round 1 and defers the **window** of bitmap
@@ -607,8 +607,15 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 }
             }
             V3Phase::BitmapWord => {
-                // Round 3: warm the {0, 3} info slots of every tick initialized
-                // across the whole window. Each window word's bitmap is extracted
+                // Round 3: warm ALL FOUR `Tick.Info` words of every tick
+                // initialized across the whole window. A tick-crossing swap quote
+                // reads the full struct — `liquidityGross`/`liquidityNet` (word 0),
+                // both `feeGrowthOutside{0,1}X128` (words 1/2), and the packed
+                // `tickCumulative`/`secondsPerLiquidity`/`secondsOutside`/
+                // `initialized` (word 3) — so warming only {0, 3} left a hard
+                // tick-crossing quote lazily fetching words 1/2 (correct online,
+                // but not fully offline). Warming all four matches the one-shot
+                // full-sync program. Each window word's bitmap is extracted
                 // adapter-locally: bit `i` set => tick `(word * 256 + i) *
                 // tick_spacing`, skipping any tick outside [MIN_TICK, MAX_TICK].
                 let mut tick_slots: Vec<(Address, U256)> = Vec::new();
@@ -629,8 +636,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                                 tick_i,
                                 self.layout.ticks_base_slot,
                             );
-                            tick_slots.push((self.address, keys[0]));
-                            tick_slots.push((self.address, keys[3]));
+                            tick_slots.extend(keys.iter().map(|key| (self.address, *key)));
                         }
                     }
                 }

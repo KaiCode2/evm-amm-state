@@ -108,7 +108,7 @@ fn quote_via_call_is_public_and_maps_revert_to_sim_error() {
         },
     };
     let err = quote_via_call(&mut cache, Address::ZERO, Bytes::new()).unwrap_err();
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
 }
 
 #[test]
@@ -171,4 +171,15 @@ fn errors_preserve_their_source_chain() {
     };
     let source = std::error::Error::source(&driver_err).expect("DriverError keeps its cause");
     assert_eq!(source.to_string(), "malformed log: boom");
+
+    // SimError::Execution carries the boxed cache error un-flattened (not a
+    // stringified copy): source() exposes it and it downcasts to the typed
+    // CacheError, so a consumer can distinguish an execution failure's cause.
+    let sim_err = SimError::Execution(Box::new(CacheError::Backend("call_raw failed".into())));
+    let source = std::error::Error::source(&sim_err).expect("SimError::Execution keeps its cause");
+    assert!(
+        source.downcast_ref::<CacheError>().is_some(),
+        "the execution cause downcasts to the typed CacheError"
+    );
+    assert_eq!(source.to_string(), "cache backend error: call_raw failed");
 }

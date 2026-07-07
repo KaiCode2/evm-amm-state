@@ -2,14 +2,20 @@
 
 `evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
 cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
-their on-chain state into the cache, keeps them current **purely from chain log
-events** (no RPC in the hot path), and runs fast, **fully-offline swap
-simulations** against the live-synced state.
+their on-chain state into the cache, and keeps them current **from chain log
+events**: protocols whose events carry absolute state (Uniswap V2 / Solidly
+`Sync`) are updated with **no RPC at all**, while protocols whose events carry
+only deltas (Uniswap V3 liquidity, Balancer, Curve) turn each event into a
+bounded, hash-pinned storage **resync** (block trace first, then bulk-storage /
+point-read fallback). Once a pool's quote read-set is warmed and current, swap
+**simulations run fully offline** against the live-synced state.
 
 The defining design choice: **no reimplemented AMM math.** Every quote runs the
-pool's *own* canonical on-chain quote entrypoint inside a local revm against the
-warmed cache (e.g. Uniswap `QuoterV2`, Curve `get_dy`), then decodes the result.
-There is no `LocalAMM`/`amm-math` formula layer to drift from the real contracts.
+protocol's *canonical* on-chain quote entrypoint inside a local revm against the
+warmed cache — the pool's own `get_dy` / `getAmountOut`, or the protocol's
+official router/quoter (Uniswap `QuoterV2` / `Router02`) — then decodes the
+result. There is no `LocalAMM`/`amm-math` formula layer to drift from the real
+contracts.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 
@@ -48,6 +54,14 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
 
+> **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
+> reserves its cold-start warms — the pool's `stable` flag and token `decimals`,
+> plus an external `IPoolFactory(factory).getFee()` STATICCALL (which needs the
+> factory's code and fee slots). With a live-backed cache these fetch lazily on
+> the first quote; for fully-offline Solidly quotes, keep a backend attached or
+> pre-warm that read-set. Uniswap V2/V3 and Curve cold-starts already cover their
+> quote read-set (V3 within its warmed tick window).
+
 ### Verified Pool Bytecode Seeding
 
 Known pool runtime bytecodes live in [`src/adapters/bytecodes`](src/adapters/bytecodes)
@@ -70,9 +84,11 @@ entirely with `AdapterRegistry::with_code_seeding(false)`.
 Uniswap V3 has an embedded pool template and an explicit `uniswap_v3_code_seed`
 helper for callers that already know the pool immutables. Factory-discovered
 Uniswap V3 registrations carry the factory immutable in metadata, allowing
-automatic V3 seeding without assuming a chain-global factory address. Balancer
-and Curve pool bytecode seeding are also in scope for this bytecode workstream
-before it is considered complete.
+automatic V3 seeding without assuming a chain-global factory address. Bytecode
+seeding covers Uniswap V2 and the V3 family; Balancer and Curve pools have no
+embedded seed and simply fetch their runtime code lazily on first simulate. Since
+seeding is a pure optimization over that lazy fetch, this is only a latency
+difference, never a correctness one.
 
 ### Factory-backed Discovery
 

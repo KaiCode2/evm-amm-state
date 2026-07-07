@@ -519,6 +519,8 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
             ((pool, key_wp1), v3_bit(tick_wp1, spacing)),
             ((pool, key_wm1), v3_bit(tick_wm1, spacing)),
             ((pool, info_w0[0]), U256::from(1_u64)),
+            ((pool, info_w0[1]), U256::from(1_u64)),
+            ((pool, info_w0[2]), U256::from(1_u64)),
             ((pool, info_w0[3]), U256::from(1_u64)),
             ((pool, info_wp1[0]), U256::from(1_u64)),
             ((pool, info_wp1[3]), U256::from(1_u64)),
@@ -546,6 +548,12 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
     // Current word still warmed (regression).
     assert!(cache.cached_storage_value(pool, key_w0).is_some());
     assert!(cache.cached_storage_value(pool, info_w0[0]).is_some());
+    // All FOUR Tick.Info words of an initialized tick are warmed: a tick-crossing
+    // quote also reads feeGrowthOutside{0,1}X128 (words 1/2), so warming only
+    // {0, 3} would force a lazy fetch mid-quote (not fully offline).
+    assert!(cache.cached_storage_value(pool, info_w0[1]).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[2]).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[3]).is_some());
     // Neighbouring words + their initialized ticks warmed (the new behaviour).
     assert!(
         cache.cached_storage_value(pool, key_wp1).is_some(),

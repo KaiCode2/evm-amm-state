@@ -876,9 +876,10 @@ impl ClFactorySpec {
     ///   gated parity test covers the base slot);
     /// - the Slipstream quoter takes a `tickSpacing`-keyed struct, NOT the
     ///   Uniswap `(…, fee, …)` struct this crate encodes, so wiring it as the V3
-    ///   quote target would send malformed calldata. Discovery-only for now;
-    ///   its sim rides the caller's Uniswap-compatible quoter. See the module
-    ///   `TODO(slice-A): Slipstream quoter ABI`.
+    ///   quote target would send malformed calldata. Slipstream is therefore
+    ///   discovery-only for quoting: its discovered `fee` is left unset, so
+    ///   `simulate_swap` returns `MissingMetadata("V3 fee")` unless the caller
+    ///   supplies a Slipstream-compatible quoter and fee.
     pub fn slipstream(factory: Address) -> Self {
         Self::tick_spacing_keyed(
             ProtocolId::Slipstream,
@@ -1015,8 +1016,11 @@ impl SolidlyFactoryConfig {
     }
 
     /// Velodrome (Optimism) preset. Byte-identical Solidly-V2 shape to Aerodrome;
-    /// same placeholder base slot + layout and the same `PoolCreated` push topic.
-    /// See [`aerodrome`](Self::aerodrome) for the UNVERIFIED-constants caveat.
+    /// it reuses Aerodrome's base slot + layout and `PoolCreated` push topic.
+    /// Those constants are confirmed on Base for Aerodrome but are NOT yet
+    /// verified for Velodrome on Optimism — treat them as provisional and run the
+    /// gated parity check against an Optimism endpoint before relying on this
+    /// preset in production.
     pub fn velodrome(factory: Address) -> Self {
         Self::aerodrome(factory)
     }
