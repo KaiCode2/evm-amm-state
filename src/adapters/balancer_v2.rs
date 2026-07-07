@@ -87,7 +87,11 @@ impl AmmAdapter for BalancerV2Adapter {
         };
 
         Ok(Box::new(BalancerV2ColdStartPlanner::new(
-            vault, pool_id, known_slots, tokens, policy,
+            vault,
+            pool_id,
+            known_slots,
+            tokens,
+            policy,
         )))
     }
 
