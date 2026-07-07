@@ -4,7 +4,7 @@ use super::cold_start::{
     SlotFetch,
 };
 use super::factory::{FactoryConfig, PoolFactory, UniswapV2Factory};
-use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, quote_via_call};
+use super::sim::{SimConfig, SimError, SwapQuote, getAmountsOutCall, quote_via_call_from};
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -19,6 +19,7 @@ sol! {
     event Sync(uint112 reserve0, uint112 reserve1);
 }
 
+/// Adapter for Uniswap V2 constant-product pairs.
 #[derive(Clone, Debug, Default)]
 pub struct UniswapV2Adapter {
     _private: (),
@@ -166,7 +167,7 @@ impl AmmAdapter for UniswapV2Adapter {
             .abi_encode(),
         );
 
-        let output = quote_via_call(cache, config.v2_router, calldata)?;
+        let output = quote_via_call_from(cache, config.from, config.v2_router, calldata)?;
         let amounts = getAmountsOutCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("getAmountsOut return"))?;
 

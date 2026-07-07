@@ -11,6 +11,7 @@ use super::{
 
 /// Protocol adapter contract for AMM-specific routing, cold-start, and decoding.
 pub trait AmmAdapter: Send + Sync {
+    /// The adapter's primary/canonical protocol id.
     fn protocol(&self) -> ProtocolId;
 
     /// Every protocol id this adapter serves.
@@ -24,10 +25,14 @@ pub trait AmmAdapter: Send + Sync {
         vec![self.protocol()]
     }
 
+    /// The log sources to subscribe/route for `pool`. Defaults to the pool's own
+    /// stored `event_sources`; override to derive them from adapter knowledge.
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
         pool.event_sources.clone()
     }
 
+    /// Route a log to the pool key it belongs to. Defaults to the registry's
+    /// generic emitter/topic routing; override for adapter-defined routing.
     fn route_log(&self, log: &Log, registry: &AdapterRegistry) -> Option<PoolKey> {
         registry.route_log_generic(log).map(|pool| pool.key.clone())
     }
@@ -89,6 +94,10 @@ pub trait AmmAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Decode a routed log into a semantic event with its cache updates.
+    /// Defaults to [`AdapterEventResult::ignored`]; a malformed watched log
+    /// should return [`AdapterEventResult::error`] (it is isolated per-log, not
+    /// batch-fatal), never panic.
     fn decode_event(
         &self,
         _pool: &PoolRegistration,
@@ -98,6 +107,9 @@ pub trait AmmAdapter: Send + Sync {
         AdapterEventResult::ignored()
     }
 
+    /// Follow-up repair after `event`'s updates were applied, given the resulting
+    /// `diff` (e.g. re-verify slots that were skipped because they were cold).
+    /// Defaults to [`RepairAction::None`].
     fn after_apply(
         &self,
         _pool: &PoolRegistration,

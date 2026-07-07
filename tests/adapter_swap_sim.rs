@@ -177,7 +177,7 @@ async fn v2_simulate_swap_reverting_target_is_reverted() -> Result<()> {
             &config,
         )
         .expect_err("reverting router must error");
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }
@@ -256,7 +256,7 @@ async fn v3_simulate_swap_reverting_target_is_reverted() -> Result<()> {
             &config,
         )
         .expect_err("reverting quoter must error");
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }
@@ -288,7 +288,7 @@ async fn v3_simulate_swap_missing_fee_is_missing_metadata() -> Result<()> {
             &config,
         )
         .expect_err("missing fee must error");
-    assert_eq!(err, SimError::MissingMetadata("V3 fee"));
+    assert!(matches!(err, SimError::MissingMetadata("V3 fee")));
     Ok(())
 }
 
@@ -391,7 +391,7 @@ async fn balancer_simulate_swap_reverting_vault_is_reverted() -> Result<()> {
             &config,
         )
         .expect_err("reverting vault must error");
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }
@@ -673,7 +673,7 @@ async fn solidly_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("reverting pool must error");
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }
@@ -770,7 +770,10 @@ async fn curve_simulate_swap_token_not_in_pool_is_error() -> Result<()> {
         )
         .expect_err("token outside the pool must error");
     // Specific variant: the call must never be built/run (never Reverted).
-    assert_eq!(err, SimError::MissingMetadata("Curve token not in pool"));
+    assert!(matches!(
+        err,
+        SimError::MissingMetadata("Curve token not in pool")
+    ));
     Ok(())
 }
 
@@ -803,7 +806,7 @@ async fn curve_simulate_swap_without_coins_is_error() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("missing coins must error");
-    assert_eq!(err, SimError::MissingMetadata("Curve coins"));
+    assert!(matches!(err, SimError::MissingMetadata("Curve coins")));
     Ok(())
 }
 
@@ -843,7 +846,7 @@ async fn curve_simulate_swap_self_swap_is_error() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("self-swap must error");
-    assert_eq!(err, SimError::Custom("Curve token_in == token_out".into()));
+    assert!(matches!(err, SimError::Custom(ref s) if s == "Curve token_in == token_out"));
     assert!(asserter.read_q().is_empty(), "must not touch the backend");
     Ok(())
 }
@@ -934,7 +937,7 @@ async fn curve_simulate_swap_reverting_pool_is_reverted() -> Result<()> {
             &SimConfig::default(),
         )
         .expect_err("reverting pool must error");
-    assert_eq!(err, SimError::Reverted);
+    assert!(matches!(err, SimError::Reverted));
     assert!(asserter.read_q().is_empty(), "must be fully offline");
     Ok(())
 }

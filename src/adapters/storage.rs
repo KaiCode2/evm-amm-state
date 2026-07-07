@@ -55,10 +55,15 @@ pub const SLIPSTREAM_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([18, 0, 0, 0
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct V3StorageLayout {
+    /// Storage slot of packed `slot0` (sqrtPriceX96 + current tick).
     pub slot0_slot: U256,
+    /// Storage slot of the global `liquidity`.
     pub liquidity_slot: U256,
+    /// Base slot of the `ticks` mapping (`Tick.Info` structs).
     pub ticks_base_slot: U256,
+    /// Base slot of the `tickBitmap` mapping.
     pub tick_bitmap_base_slot: U256,
+    /// The pool's tick spacing (must be positive).
     pub tick_spacing: i32,
 }
 
@@ -126,9 +131,13 @@ impl V3StorageLayout {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SolidlyStorageLayout {
+    /// Storage slot of `reserve0` (a full `uint256` word).
     pub reserve0_slot: U256,
+    /// Storage slot of `reserve1` (a full `uint256` word).
     pub reserve1_slot: U256,
+    /// Storage slot of the `token0` address.
     pub token0_slot: U256,
+    /// Storage slot of the `token1` address.
     pub token1_slot: U256,
 }
 
