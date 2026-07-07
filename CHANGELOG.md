@@ -76,8 +76,11 @@ register → cold-start → subscribe → react → simulate.
   exact masked reserve write (event-sourced, no refetch).
 - **Uniswap V3 family** (V3, PancakeSwap V3, Slipstream) — `QuoterV2`
   quotes; slot0 + liquidity + a bounded, fixed-radius **multi-word tick-window
-  warm-up** at cold-start; `Swap` → slot0/liquidity, `Mint`/`Burn` → tick-range
-  resync.
+  warm-up** at cold-start; `Swap` → slot0/liquidity. `Mint`/`Burn` are
+  **event-sourced**: the exact `liquidityGross`/`liquidityNet` (packed word 0),
+  `tickBitmap` bit, and in-range global `liquidity` are written directly from the
+  event for warm (in-window) ticks with no RPC, and only genuinely-cold ticks
+  fall back to a targeted resync.
 - **Balancer V2** — `Vault.queryBatchSwap` quotes; discover→verify cold-start
   (`getPoolTokens` read-set); `Swap` → balance-slot resync.
 - **Solidly V2** (Aerodrome / Velodrome) — pool `getAmountOut` quotes;
@@ -91,10 +94,13 @@ register → cold-start → subscribe → react → simulate.
 quote entrypoint inside a local revm against the warmed cache, then decodes the
 result. There is **no reimplemented AMM math**.
 
-**Reactive synchronization** — fully offline (no RPC in the hot path). Pools
-whose events carry absolute state are event-sourced with exact writes (Uniswap
-V2 / Solidly `Sync`); pools whose events carry deltas re-verify just the
-affected slots (Uniswap V3 tick ranges, Balancer / Curve `VerifySlots`).
+**Reactive synchronization** — fully offline (no RPC in the hot path) for the
+common case. Pools whose events carry absolute state are event-sourced with exact
+writes (Uniswap V2 / Solidly `Sync`); Uniswap V3 `Mint`/`Burn` are event-sourced
+too, applying the exact liquidity delta to the warmed tick/bitmap/liquidity slots
+and resyncing only ticks outside the warmed window; Balancer / Curve events carry
+deltas over a non-predictable layout and re-verify the discovered slots
+(`VerifySlots`).
 
 **Testing & CI**
 

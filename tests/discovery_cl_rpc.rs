@@ -19,18 +19,20 @@
 //! # (its `eth-mainnet` host is swapped to `base-mainnet`).
 //! ```
 //!
-//! ## TODO(slice-A): what these tests pin
+//! ## What these tests pin
 //!
-//! - **Pancake V3**: the preset defaults `get_pool` / `feeAmountTickSpacing` base
-//!   slots to the Uniswap values (5 / 4) with `verify_derivations` OFF, because
-//!   Pancake's factory storage layout was not confirmed offline. If
-//!   `pancake_get_pool_base_slot_matches_getter` passes, base slot 5 is correct
-//!   and the preset can flip `verify_derivations` on (the CREATE2 deployer +
-//!   init-code hash are already pinned). If it FAILS, the base slot is wrong and
-//!   must be corrected in `ClFactorySpec::pancake_v3`.
-//! - **Slipstream**: the preset is discovery-only (no `create2`, no `quoter`).
-//!   `slipstream_get_pool_base_slot_matches_getter` pins the `getPool` base slot
-//!   + the tickSpacing salt encoding against Aerodrome's live CLFactory on Base.
+//! - **Pancake V3**: the preset uses Pancake's OWN factory layout — `get_pool`
+//!   base slot 2 and `feeAmountTickSpacing` base slot 1 (not the Uniswap 5 / 4) —
+//!   with `verify_derivations` ON and the CREATE2 deployer + init-code hash
+//!   pinned. `pancake_get_pool_base_slot_matches_getter` confirms that base slot
+//!   against the live factory getter and `pancake_create2_matches_getter`
+//!   confirms the CREATE2 derivation; a regression there means the constants in
+//!   `ClFactorySpec::pancake_v3` are wrong.
+//! - **Slipstream**: the preset is discovery-only (no `create2`, no `quoter` — its
+//!   quoter takes a different, tickSpacing-keyed ABI, so quoting rides a
+//!   caller-supplied compatible quoter). `slipstream_get_pool_base_slot_matches_getter`
+//!   confirms the `getPool` base slot + the tickSpacing salt encoding against
+//!   Aerodrome's live CLFactory on Base.
 
 #![cfg(feature = "uniswap-v3")]
 
@@ -140,10 +142,11 @@ async fn storage_addr(
     Ok(Address::from_slice(&word.to_be_bytes::<32>()[12..]))
 }
 
-/// Pancake V3: the fee-keyed `getPool` base slot (preset default 5) must hold the
-/// same pool the factory's `getPool(t0,t1,fee)` getter returns. Proves the base
-/// slot on-chain; if it passes, `ClFactorySpec::pancake_v3` can enable
-/// `verify_derivations`.
+/// Pancake V3: the fee-keyed `getPool` base slot (preset slot 2 — Pancake's own
+/// layout, not the Uniswap 5) must hold the same pool the factory's
+/// `getPool(t0,t1,fee)` getter returns — confirming the shipped
+/// `ClFactorySpec::pancake_v3` constant, which already runs with
+/// `verify_derivations` on.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires E2E_RPC_URL archive node; run with --ignored"]
 async fn pancake_get_pool_base_slot_matches_getter() -> Result<()> {
@@ -182,7 +185,7 @@ async fn pancake_get_pool_base_slot_matches_getter() -> Result<()> {
         assert_eq!(
             from_storage, getter,
             "Pancake getPool base slot {} is WRONG for fee {fee}: storage={from_storage:?} getter={getter:?}. \
-             Fix ClFactorySpec::pancake_v3's get_pool_base_slot (TODO slice-A).",
+             The shipped ClFactorySpec::pancake_v3 get_pool_base_slot has regressed.",
             spec.get_pool_base_slot
         );
     }
@@ -232,7 +235,7 @@ async fn pancake_create2_matches_getter() -> Result<()> {
         assert_eq!(
             derived, getter,
             "Pancake CREATE2 (deployer {deployer:?}, init hash {:?}) does not reproduce the \
-             getter pool for fee {fee}: derived={derived:?} getter={getter:?} (TODO slice-A).",
+             getter pool for fee {fee}: derived={derived:?} getter={getter:?}.",
             create2.init_code_hash
         );
     }
@@ -267,7 +270,7 @@ async fn pancake_discovery_resolves_live_pool() -> Result<()> {
     )?;
     assert!(
         !found.is_empty(),
-        "Pancake preset found no USDC/WETH pool — likely a wrong get_pool_base_slot (TODO slice-A)"
+        "Pancake preset found no USDC/WETH pool — likely a wrong get_pool_base_slot"
     );
     for pool in &found {
         assert!(
@@ -322,7 +325,7 @@ async fn slipstream_get_pool_base_slot_matches_getter() -> Result<()> {
         from_storage, getter,
         "Slipstream getPool base slot {} (spacing {SLIPSTREAM_WETH_USDC_SPACING}) is WRONG: \
          storage={from_storage:?} getter={getter:?}. Fix ClFactorySpec::slipstream's \
-         get_pool_base_slot (TODO slice-A).",
+         get_pool_base_slot.",
         spec.get_pool_base_slot
     );
     Ok(())

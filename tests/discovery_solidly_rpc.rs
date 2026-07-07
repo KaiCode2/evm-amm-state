@@ -22,20 +22,19 @@
 //! E2E_BASE_RPC_URL=<base-archive-url> cargo test --test discovery_solidly_rpc -- --ignored
 //! ```
 //!
-//! ## TODO(slice-B): what these tests pin
+//! ## What these tests pin
 //!
-//! The `SolidlyFactoryConfig::aerodrome` preset ships with a PLACEHOLDER
-//! `get_pool_base_slot` and PLACEHOLDER storage layout, `verify_derivations` OFF,
-//! because Aerodrome's factory storage layout (the `_getPool` mapping is a
-//! private variable) and pool storage layout were not confirmed offline.
-//! - `aerodrome_get_pool_base_slot_matches_getter` pins the `_getPool` base slot
-//!   (and the `bool` salt encoding). If it FAILS, correct
-//!   `SOLIDLY_GET_POOL_BASE_SLOT` in `factory.rs`.
-//! - `aerodrome_storage_layout_matches_getters` pins the reserve/token slots. If
-//!   it FAILS, correct `SOLIDLY_PLACEHOLDER_LAYOUT` in `factory.rs`.
-//!
-//! Once both pass, the preset can be updated with the confirmed constants (and a
-//! CREATE2 init hash added) and `verify_derivations` flipped on.
+//! The `SolidlyFactoryConfig::aerodrome` preset ships the on-chain-confirmed
+//! `get_pool_base_slot` (5) and reserve/token storage layout; these gated tests
+//! confirm them against Aerodrome's live factory + a real pool on Base.
+//! `verify_derivations` stays OFF for this preset because no CREATE2 init-code
+//! hash is pinned for Aerodrome pools (unlike the CL presets), so there is no
+//! derivation to cross-check — discovery relies on the factory storage read.
+//! - `aerodrome_get_pool_base_slot_matches_getter` confirms the `_getPool` base
+//!   slot (and the `bool` salt encoding); a regression means
+//!   `SOLIDLY_GET_POOL_BASE_SLOT` in `factory.rs` is wrong.
+//! - `aerodrome_storage_layout_matches_getters` confirms the reserve/token slots;
+//!   a regression means `SOLIDLY_AERODROME_LAYOUT` in `factory.rs` is wrong.
 
 #![cfg(feature = "solidly-v2")]
 
@@ -161,7 +160,7 @@ async fn storage_word(
         .context("eth_getStorageAt")
 }
 
-/// Aerodrome: the `getPool[t0][t1][stable]` base slot (preset placeholder) must
+/// Aerodrome: the `getPool[t0][t1][stable]` base slot (preset slot 5) must
 /// hold the same pool the factory's `getPool(t0,t1,stable)` getter returns, for
 /// BOTH variants that exist. Proves the base slot + `bool` salt encoding on-chain.
 #[tokio::test(flavor = "multi_thread")]
@@ -197,7 +196,7 @@ async fn aerodrome_get_pool_base_slot_matches_getter() -> Result<()> {
             from_storage, getter,
             "Aerodrome getPool base slot {} is WRONG for stable={stable}: \
              storage={from_storage:?} getter={getter:?}. Fix SOLIDLY_GET_POOL_BASE_SLOT / the \
-             aerodrome preset (TODO slice-B).",
+             shipped aerodrome preset has regressed.",
             config.get_pool_base_slot
         );
     }
@@ -208,7 +207,7 @@ async fn aerodrome_get_pool_base_slot_matches_getter() -> Result<()> {
     Ok(())
 }
 
-/// Aerodrome: the preset's placeholder [`SolidlyStorageLayout`] must match the
+/// Aerodrome: the preset's [`SolidlyStorageLayout`] must match the
 /// pool's public getters — `reserve0`/`reserve1` == `getReserves()` and
 /// `token0`/`token1` == `tokens()` — read straight from storage. Pins the layout.
 #[tokio::test(flavor = "multi_thread")]
@@ -259,25 +258,25 @@ async fn aerodrome_storage_layout_matches_getters() -> Result<()> {
     assert_eq!(
         slot_reserve0, reserves.reserve0,
         "Aerodrome reserve0 slot {} WRONG: storage={slot_reserve0} getter={}. Fix \
-         SOLIDLY_PLACEHOLDER_LAYOUT (TODO slice-B).",
+         SOLIDLY_AERODROME_LAYOUT has regressed.",
         layout.reserve0_slot, reserves.reserve0
     );
     assert_eq!(
         slot_reserve1, reserves.reserve1,
         "Aerodrome reserve1 slot {} WRONG: storage={slot_reserve1} getter={}. Fix \
-         SOLIDLY_PLACEHOLDER_LAYOUT (TODO slice-B).",
+         SOLIDLY_AERODROME_LAYOUT has regressed.",
         layout.reserve1_slot, reserves.reserve1
     );
     assert_eq!(
         slot_token0, toks.token0,
         "Aerodrome token0 slot {} WRONG: storage={slot_token0:?} getter={:?}. Fix \
-         SOLIDLY_PLACEHOLDER_LAYOUT (TODO slice-B).",
+         SOLIDLY_AERODROME_LAYOUT has regressed.",
         layout.token0_slot, toks.token0
     );
     assert_eq!(
         slot_token1, toks.token1,
         "Aerodrome token1 slot {} WRONG: storage={slot_token1:?} getter={:?}. Fix \
-         SOLIDLY_PLACEHOLDER_LAYOUT (TODO slice-B).",
+         SOLIDLY_AERODROME_LAYOUT has regressed.",
         layout.token1_slot, toks.token1
     );
     Ok(())
@@ -310,7 +309,7 @@ async fn aerodrome_discovery_resolves_live_pool() -> Result<()> {
     )?;
     assert!(
         !found.is_empty(),
-        "Aerodrome preset found no WETH/USDC pool — likely a wrong get_pool_base_slot (TODO slice-B)"
+        "Aerodrome preset found no WETH/USDC pool — likely a wrong get_pool_base_slot"
     );
     for pool in &found {
         assert!(

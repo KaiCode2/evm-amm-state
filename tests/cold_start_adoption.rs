@@ -519,6 +519,8 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
             ((pool, key_wp1), v3_bit(tick_wp1, spacing)),
             ((pool, key_wm1), v3_bit(tick_wm1, spacing)),
             ((pool, info_w0[0]), U256::from(1_u64)),
+            ((pool, info_w0[1]), U256::from(1_u64)),
+            ((pool, info_w0[2]), U256::from(1_u64)),
             ((pool, info_w0[3]), U256::from(1_u64)),
             ((pool, info_wp1[0]), U256::from(1_u64)),
             ((pool, info_wp1[3]), U256::from(1_u64)),
@@ -546,6 +548,12 @@ async fn v3_cold_start_warms_neighbouring_tick_words() -> Result<()> {
     // Current word still warmed (regression).
     assert!(cache.cached_storage_value(pool, key_w0).is_some());
     assert!(cache.cached_storage_value(pool, info_w0[0]).is_some());
+    // All FOUR Tick.Info words of an initialized tick are warmed: a tick-crossing
+    // quote also reads feeGrowthOutside{0,1}X128 (words 1/2), so warming only
+    // {0, 3} would force a lazy fetch mid-quote (not fully offline).
+    assert!(cache.cached_storage_value(pool, info_w0[1]).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[2]).is_some());
+    assert!(cache.cached_storage_value(pool, info_w0[3]).is_some());
     // Neighbouring words + their initialized ticks warmed (the new behaviour).
     assert!(
         cache.cached_storage_value(pool, key_wp1).is_some(),
@@ -986,6 +994,87 @@ async fn balancer_cold_start_discover_verify_ready() -> Result<()> {
     assert!(
         asserter.read_q().is_empty(),
         "the cold start must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+// Verify-only fast path (Balancer): when the balance read-set is already known
+// (balance_slots pre-populated), cold-start skips the getPoolTokens discovery.
+// No vault runtime is installed, so a discover call would fail — reaching Ready
+// proves no discovery ran. The single verify round warms the known slot, and the
+// config-supplied tokens are preserved (no getPoolTokens decode to repopulate).
+#[tokio::test(flavor = "multi_thread")]
+async fn balancer_cold_start_verify_only_skips_discovery() -> Result<()> {
+    let vault = Address::repeat_byte(0x32);
+    let mut pid = [0u8; 32];
+    pid[..20].fill(0x11);
+    pid[20..].fill(0x22);
+    let pool_id = B256::from(pid);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(1000_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    // Bare, code-less vault: the known slot injects offline (account exists), and
+    // a discover getPoolTokens would fail on code-less code — so reaching Ready
+    // proves the verify-only path skipped discovery.
+    install_default_account(&mut cache, vault);
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(2), stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((vault, U256::from(2)), fresh)]),
+        Vec::new(),
+    ));
+
+    let registry = balancer_registry();
+    let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
+        .with_state_address(vault)
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default()
+                .with_vault(vault)
+                .with_tokens([token0, token1])
+                // A pre-populated read-set selects the verify-only fast path.
+                .with_balance_slots([U256::from(2)]),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "verify-only cold-start should reach Ready without discovery, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::BalancerV2(ref m) => {
+            assert_eq!(m.vault, Some(vault));
+            assert_eq!(
+                m.tokens,
+                vec![token0, token1],
+                "config tokens must be preserved (no getPoolTokens decode ran)"
+            );
+            assert!(
+                m.balance_slots.contains(&U256::from(2)),
+                "the known read-set must be persisted, got {:?}",
+                m.balance_slots
+            );
+            assert_eq!(
+                m.pool_address,
+                Some(Address::repeat_byte(0x11)),
+                "pool_address is still derived from the poolId"
+            );
+        }
+        ref other => panic!("expected BalancerV2 metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(vault, U256::from(2)),
+        Some(fresh),
+        "the single verify round must refresh the known slot to the fresh value"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the verify-only cold start must be fully offline (no RPC)"
     );
     Ok(())
 }
@@ -1541,6 +1630,118 @@ async fn curve_cold_start_discover_verify_ready() -> Result<()> {
         asserter.read_q().is_empty(),
         "the cold start must be fully offline (no RPC)"
     );
+    Ok(())
+}
+
+// Verify-only fast path: when the read-set is already known (discovered_slots
+// pre-populated), cold-start skips discovery entirely. No pool runtime is
+// installed here, so a discover `get_dy` sim would fail — reaching Ready proves
+// no discovery ran. The single verify round warms the known slot, and coins /
+// variant / the discovered set are preserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_verify_only_skips_discovery() -> Result<()> {
+    let pool = Address::repeat_byte(0xc4);
+    let dai = Address::repeat_byte(0x01);
+    let usdc = Address::repeat_byte(0x02);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(777_000_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    // Install a BARE, code-less pool account (no runtime). Two consequences:
+    // (1) the verified slot can be injected fully offline (the account exists,
+    //     so no lazy account fetch), and (2) it doubles as the discovery-skip
+    //     proof — a discover round would run `get_dy` against a code-less
+    //     account, capture no slots, and repair (NoSlotsDiscovered), so reaching
+    //     Ready proves the verify-only path skipped discovery entirely.
+    install_default_account(&mut cache, pool);
+    // Seed the known slot STALE; the single verify round must refresh it.
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((pool, U256::ZERO), fresh)]),
+        Vec::new(),
+    ));
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![dai, usdc])
+                // A pre-populated read-set selects the verify-only fast path.
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "verify-only cold-start should reach Ready without discovery, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::Curve(ref m) => {
+            assert_eq!(m.coins, vec![dai, usdc], "config coins must be preserved");
+            assert_eq!(
+                m.variant,
+                CurveVariant::CryptoSwap,
+                "config variant must be preserved"
+            );
+            assert!(
+                m.discovered_slots.contains(&U256::ZERO),
+                "the known read-set must be persisted, got {:?}",
+                m.discovered_slots
+            );
+        }
+        ref other => panic!("expected Curve metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        Some(fresh),
+        "the single verify round must refresh the known slot to the fresh value"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the verify-only cold start must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
+// Verify-only fast path, archive miss: a known slot that fails in the verify
+// round must NOT be marked Ready over an unwarmed read-set — it needs a
+// `VerifySlots` repair over the known slots, mirroring the discovery path's
+// archive-miss behavior.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_verify_only_unfetchable_slot_needs_repair() -> Result<()> {
+    let pool = Address::repeat_byte(0xc5);
+
+    let (mut cache, _asserter) = setup_cache_with_asserter().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::new(),
+        vec![(pool, U256::ZERO)],
+    ));
+
+    let registry = curve_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                .with_discovered_slots(vec![U256::ZERO])
+                .with_variant(CurveVariant::StableSwap),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(
+            outcome,
+            ColdStartOutcome::NeedsRepair(_, RepairAction::VerifySlots(_))
+        ),
+        "an unfetchable known slot must need a VerifySlots repair, got {outcome:?}"
+    );
+    assert_ne!(registration.status, PoolStatus::Ready);
     Ok(())
 }
 

@@ -43,8 +43,14 @@ impl SwapQuote {
 
 /// Why a [`simulate_swap`](super::AmmAdapter::simulate_swap) could not produce a
 /// quote.
+///
+/// Not `Clone`/`PartialEq` (the [`Execution`](Self::Execution) variant carries a
+/// boxed source error that is neither), matching the crate's other
+/// boxed-source facades ([`CacheError`](super::CacheError),
+/// [`DriverError`](super::DriverError)). Match on the variant, or walk
+/// [`source`](std::error::Error::source) for the underlying cause.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SimError {
     /// The adapter does not implement swap simulation for its protocol.
     Unsupported(super::ProtocolId),
@@ -54,8 +60,11 @@ pub enum SimError {
     Reverted,
     /// The quote call executed but its return data could not be decoded.
     MalformedOutput(&'static str),
-    /// The underlying `call_raw` failed (host/transact error).
-    Execution(String),
+    /// The underlying `call_raw` failed (host/transact error), carrying the
+    /// un-flattened cause. Downcast the payload (or walk
+    /// [`source`](std::error::Error::source)) — e.g. to
+    /// [`CacheError`](super::CacheError) — for typed handling.
+    Execution(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// A catch-all for protocol-specific failures.
     Custom(String),
 }
@@ -75,7 +84,14 @@ impl core::fmt::Display for SimError {
     }
 }
 
-impl std::error::Error for SimError {}
+impl std::error::Error for SimError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Execution(err) => Some(&**err as &(dyn std::error::Error + 'static)),
+            _ => None,
+        }
+    }
+}
 
 /// Resolved quote-target addresses for swap simulation.
 ///
@@ -90,6 +106,11 @@ pub struct SimConfig {
     pub v3_quoter: Address,
     /// Uniswap V2 `UniswapV2Router02` quote target.
     pub v2_router: Address,
+    /// The `msg.sender` (`from`) each quote call runs as. Defaults to
+    /// [`Address::ZERO`]; override for the rare quoter/router that gates its
+    /// output on the caller. Threaded into [`quote_via_call_from`] by every
+    /// adapter's `simulate_swap`.
+    pub from: Address,
 }
 
 /// Ethereum-mainnet Uniswap V3 `QuoterV2`.
@@ -103,6 +124,7 @@ impl Default for SimConfig {
         Self {
             v3_quoter: MAINNET_V3_QUOTER_V2,
             v2_router: MAINNET_V2_ROUTER_02,
+            from: Address::ZERO,
         }
     }
 }
@@ -120,6 +142,13 @@ impl SimConfig {
         self.v2_router = router;
         self
     }
+
+    /// Override the `msg.sender` (`from`) quote calls run as (default
+    /// [`Address::ZERO`]). Use for a quote target that gates on the caller.
+    pub fn with_from(mut self, from: Address) -> Self {
+        self.from = from;
+        self
+    }
 }
 
 /// Run a quote `calldata` against `target` on the cache and return the raw
@@ -134,14 +163,30 @@ impl SimConfig {
 /// This is the public helper that custom-adapter authors use to run a quote
 /// entrypoint: build the target's quote calldata, call this, then decode the
 /// returned [`Bytes`] into the protocol's output.
+///
+/// Runs the call as `from = ZERO`. Use [`quote_via_call_from`] when the quote
+/// target gates its output on `msg.sender`.
 pub fn quote_via_call(
     cache: &mut dyn AdapterCache,
     target: Address,
     calldata: Bytes,
 ) -> Result<Bytes, SimError> {
+    quote_via_call_from(cache, Address::ZERO, target, calldata)
+}
+
+/// Like [`quote_via_call`], but runs the quote as `from` (`msg.sender`) rather
+/// than [`Address::ZERO`]. Adapters thread [`SimConfig::from`] here so a caller
+/// can quote against a target that gates behavior on the sender; the default
+/// [`SimConfig::from`] keeps the `ZERO`-sender behavior.
+pub fn quote_via_call_from(
+    cache: &mut dyn AdapterCache,
+    from: Address,
+    target: Address,
+    calldata: Bytes,
+) -> Result<Bytes, SimError> {
     match cache
-        .call_raw(Address::ZERO, target, calldata, false)
-        .map_err(|e| SimError::Execution(e.to_string()))?
+        .call_raw(from, target, calldata, false)
+        .map_err(|e| SimError::Execution(Box::new(e)))?
     {
         CallOutcome::Success { output, .. } => Ok(output),
         CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Err(SimError::Reverted),

@@ -452,6 +452,7 @@ impl PoolQuery {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FactoryConfig {
+    /// Uniswap V2 factories (canonical plus same-protocol forks).
     #[cfg(feature = "uniswap-v2")]
     pub uniswap_v2: Vec<UniswapV2FactoryConfig>,
     /// Concentrated-liquidity forks (Uniswap V3, SushiSwap V3, PancakeSwap V3,
@@ -465,6 +466,8 @@ pub struct FactoryConfig {
     /// per config.
     #[cfg(feature = "solidly-v2")]
     pub solidly: Vec<SolidlyFactoryConfig>,
+    /// Global switch for the CREATE2 cross-check: a spec's derivation
+    /// verification runs only when both this and the spec opt in. Defaults `true`.
     pub verify_derivations: bool,
 }
 
@@ -483,12 +486,14 @@ impl Default for FactoryConfig {
 }
 
 impl FactoryConfig {
+    /// Add a Uniswap V2 factory by its [`UniswapV2FactoryConfig`].
     #[cfg(feature = "uniswap-v2")]
     pub fn with_uniswap_v2(mut self, config: UniswapV2FactoryConfig) -> Self {
         self.uniswap_v2.push(config);
         self
     }
 
+    /// Add a canonical Uniswap V2 factory at `factory`.
     #[cfg(feature = "uniswap-v2")]
     pub fn with_uniswap_v2_factory(self, factory: Address) -> Self {
         self.with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(factory))
@@ -544,24 +549,31 @@ impl FactoryConfig {
         self.with_solidly(SolidlyFactoryConfig::aerodrome(factory))
     }
 
+    /// Toggle the global CREATE2 derivation cross-check (default `true`).
     pub fn with_verify_derivations(mut self, verify_derivations: bool) -> Self {
         self.verify_derivations = verify_derivations;
         self
     }
 }
 
+/// Configuration for one Uniswap V2 (or V2-fork) factory.
 #[cfg(feature = "uniswap-v2")]
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UniswapV2FactoryConfig {
+    /// The factory contract address.
     pub factory: Address,
+    /// Base storage slot of the factory's `getPair[t0][t1]` mapping.
     pub get_pair_base_slot: U256,
+    /// Optional pair init-code hash for the CREATE2 cross-check.
     pub init_code_hash: Option<B256>,
+    /// Optional swap fee (basis points) carried into discovered pool metadata.
     pub fee_bps: Option<u32>,
 }
 
 #[cfg(feature = "uniswap-v2")]
 impl UniswapV2FactoryConfig {
+    /// A canonical Uniswap V2 factory preset at `factory`.
     pub fn uniswap_v2(factory: Address) -> Self {
         Self {
             factory,
@@ -571,16 +583,19 @@ impl UniswapV2FactoryConfig {
         }
     }
 
+    /// Override the `getPair` mapping base slot (for a non-canonical fork).
     pub fn with_get_pair_base_slot(mut self, slot: U256) -> Self {
         self.get_pair_base_slot = slot;
         self
     }
 
+    /// Set the pair init-code hash (enables the CREATE2 cross-check).
     pub fn with_init_code_hash(mut self, hash: B256) -> Self {
         self.init_code_hash = Some(hash);
         self
     }
 
+    /// Set the swap fee (basis points) for discovered pools.
     pub fn with_fee_bps(mut self, fee_bps: u32) -> Self {
         self.fee_bps = Some(fee_bps);
         self
@@ -711,8 +726,12 @@ impl ClFactorySpec {
     }
 
     /// A tickSpacing-keyed CL fork (Slipstream shape): `getPool[t0][t1][spacing]`
-    /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`; set a
-    /// real [`fee_source`](Self::with_fee_source) if the fork exposes one.
+    /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`, the
+    /// "no fee mapping" sentinel: discovered registrations leave `V3Metadata.fee`
+    /// **unset** (so `simulate_swap` returns `MissingMetadata("V3 fee")` rather
+    /// than quoting at fee 0 — these forks are discovery-only for quoting unless
+    /// the caller supplies a compatible quoter). Set a real
+    /// [`fee_source`](Self::with_fee_source) if the fork exposes one on-chain.
     pub fn tick_spacing_keyed(
         protocol: ProtocolId,
         factory: Address,
@@ -872,9 +891,10 @@ impl ClFactorySpec {
     ///   gated parity test covers the base slot);
     /// - the Slipstream quoter takes a `tickSpacing`-keyed struct, NOT the
     ///   Uniswap `(…, fee, …)` struct this crate encodes, so wiring it as the V3
-    ///   quote target would send malformed calldata. Discovery-only for now;
-    ///   its sim rides the caller's Uniswap-compatible quoter. See the module
-    ///   `TODO(slice-A): Slipstream quoter ABI`.
+    ///   quote target would send malformed calldata. Slipstream is therefore
+    ///   discovery-only for quoting: its discovered `fee` is left unset, so
+    ///   `simulate_swap` returns `MissingMetadata("V3 fee")` unless the caller
+    ///   supplies a Slipstream-compatible quoter and fee.
     pub fn slipstream(factory: Address) -> Self {
         Self::tick_spacing_keyed(
             ProtocolId::Slipstream,
@@ -1011,8 +1031,11 @@ impl SolidlyFactoryConfig {
     }
 
     /// Velodrome (Optimism) preset. Byte-identical Solidly-V2 shape to Aerodrome;
-    /// same placeholder base slot + layout and the same `PoolCreated` push topic.
-    /// See [`aerodrome`](Self::aerodrome) for the UNVERIFIED-constants caveat.
+    /// it reuses Aerodrome's base slot + layout and `PoolCreated` push topic.
+    /// Those constants are confirmed on Base for Aerodrome but are NOT yet
+    /// verified for Velodrome on Optimism — treat them as provisional and run the
+    /// gated parity check against an Optimism endpoint before relying on this
+    /// preset in production.
     pub fn velodrome(factory: Address) -> Self {
         Self::aerodrome(factory)
     }
@@ -1043,9 +1066,13 @@ impl SolidlyFactoryConfig {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscoverySource {
+    /// Resolved by a factory-storage / view query (a [`PoolQuery`]).
     Query,
+    /// Decoded from a factory creation log.
     CreationEvent {
+        /// The creation log's block number, if known.
         block_number: Option<u64>,
+        /// The creation log's index within the block, if known.
         log_index: Option<u64>,
     },
 }
@@ -1054,11 +1081,14 @@ pub enum DiscoverySource {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CreationLogContext {
+    /// The log's block number, if known.
     pub block_number: Option<u64>,
+    /// The log's index within the block, if known.
     pub log_index: Option<u64>,
 }
 
 impl CreationLogContext {
+    /// A context from an optional block number and log index.
     pub const fn new(block_number: Option<u64>, log_index: Option<u64>) -> Self {
         Self {
             block_number,
@@ -1076,8 +1106,11 @@ impl CreationLogContext {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct DiscoveredPool {
+    /// The discovered pool's key.
     pub key: PoolKey,
+    /// A cold-start-ready registration for the pool.
     pub registration: PoolRegistration,
+    /// How the pool was discovered.
     pub source: DiscoverySource,
 }
 
@@ -1096,10 +1129,19 @@ impl DiscoveredPool {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DiscoveryError {
+    /// A `.on(protocol)`-scoped query named a protocol with no configured factory.
     MissingFactory(ProtocolId),
+    /// The factory query (storage read / view call) failed.
     Factory(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A factory response could not be decoded.
     Malformed(&'static str),
-    DerivationMismatch { mapping: Address, derived: Address },
+    /// The factory mapping answer disagrees with the CREATE2 derivation.
+    DerivationMismatch {
+        /// The pool address the factory mapping returned.
+        mapping: Address,
+        /// The pool address derived from CREATE2 (init-code hash + salt).
+        derived: Address,
+    },
 }
 
 impl fmt::Display for DiscoveryError {
@@ -1133,6 +1175,7 @@ impl From<super::CacheError> for DiscoveryError {
 
 /// Per-protocol factory driver.
 pub trait PoolFactory: Send + Sync {
+    /// The protocol whose pools this factory resolves.
     fn protocol(&self) -> ProtocolId;
 
     /// Address of the factory contract this driver resolves against. Used
@@ -1190,8 +1233,12 @@ pub trait PoolFactory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The log sources (factory address + creation topic) to subscribe for
+    /// live pool-creation discovery.
     fn creation_sources(&self) -> Vec<EventSource>;
 
+    /// Decode a factory creation log into a discovered pool, or `None` if the
+    /// log is not a creation event this factory handles.
     fn decode_creation(
         &self,
         log: &Log,
@@ -1212,6 +1259,8 @@ pub struct PoolDiscovery {
 }
 
 impl PoolDiscovery {
+    /// A discovery front-end over an explicit set of factory drivers
+    /// (de-duplicated by `(protocol, factory_address)`, insertion order kept).
     pub fn new(factories: impl IntoIterator<Item = Box<dyn PoolFactory>>) -> Self {
         let mut discovery = Self {
             factories: Vec::new(),
@@ -1222,6 +1271,8 @@ impl PoolDiscovery {
         discovery
     }
 
+    /// Build discovery by fanning `config` out to every registered adapter's
+    /// `pool_factories`, collecting the resulting drivers.
     pub fn for_registry(registry: &AdapterRegistry, config: FactoryConfig) -> Self {
         let mut factories = Vec::new();
         let mut seen = Vec::new();
@@ -1382,6 +1433,8 @@ impl PoolDiscovery {
         self.find_many(cache, std::iter::once(query))
     }
 
+    /// The union of every registered factory's creation-log sources, for live
+    /// pool-creation discovery.
     pub fn creation_sources(&self) -> Vec<EventSource> {
         self.factories
             .iter()
@@ -1389,6 +1442,8 @@ impl PoolDiscovery {
             .collect()
     }
 
+    /// Decode a factory creation `log` into a discovered pool by trying each
+    /// registered factory; `Ok(None)` if none handled it.
     pub fn decode_creation(
         &self,
         log: &Log,
@@ -1590,13 +1645,21 @@ impl ConcentratedLiquidityFactory {
             ProtocolId::Slipstream => V3StorageLayout::slipstream(tick_spacing),
             _ => V3StorageLayout::uniswap(tick_spacing),
         };
-        let metadata = V3Metadata::default()
+        let mut metadata = V3Metadata::default()
             .with_token0(token0)
             .with_token1(token1)
-            .with_fee(fee)
             .with_tick_spacing(tick_spacing)
             .with_storage_layout(storage_layout)
             .with_factory(self.spec.factory);
+        // A resolved fee of 0 is the tickSpacing-keyed "no fee mapping" sentinel
+        // (Slipstream / Aerodrome CL have no on-chain fee→pool mapping and set
+        // `FeeSource::Fixed(0)`): leave `fee` UNSET rather than record a bogus 0,
+        // so `simulate_swap` surfaces `MissingMetadata("V3 fee")` — Slipstream is
+        // discovery-only for quoting — instead of silently quoting at fee 0.
+        // Fee-keyed forks always resolve a real, non-zero tier.
+        if fee != 0 {
+            metadata = metadata.with_fee(fee);
+        }
         let metadata = if let Some(quoter) = self.spec.quoter {
             metadata.with_quoter(quoter)
         } else {

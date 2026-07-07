@@ -27,14 +27,17 @@ pub struct AmmReactiveHandler {
 }
 
 impl AmmReactiveHandler {
+    /// Wrap an [`AdapterRegistry`] as a reactive handler.
     pub fn new(registry: AdapterRegistry) -> Self {
         Self { registry }
     }
 
+    /// This handler's stable id in the reactive runtime.
     pub fn id(&self) -> HandlerId {
         HandlerId::new(HANDLER_ID)
     }
 
+    /// The log interests (emitter/topic filters) for every tracked pool.
     pub fn interests(&self) -> Vec<ReactiveInterest<Ethereum>> {
         self.registry
             .pools()
@@ -43,6 +46,7 @@ impl AmmReactiveHandler {
             .collect()
     }
 
+    /// The wrapped registry.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
     }
@@ -87,9 +91,24 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
 
         let result = adapter.decode_event(pool, log, state);
         if let Some(error) = result.error {
-            return Err(HandlerError::new(format!(
-                "adapter decode error for {protocol:?}: {error:?}"
-            )));
+            // A malformed / undecodable log for a watched topic must NOT abort
+            // the batch: other pools' events in the same `ingest_batch` still
+            // need to apply. Skip this log with a `NoStateEffect` outcome and
+            // surface the failure as an observability hook instead of a hard
+            // `HandlerError`.
+            let labels = vec![
+                ReportTag::new("protocol", format!("{protocol:?}")),
+                ReportTag::new("emitter", format!("{:?}", log.address)),
+                ReportTag::new("error", format!("{error:?}")),
+            ];
+            return Ok(HandlerOutcome {
+                effects: vec![ReactiveEffect::Hook(hook_signal(
+                    "amm.decode_error",
+                    labels.clone(),
+                ))],
+                quality: StateEffectQuality::NoStateEffect,
+                tags: labels,
+            });
         }
 
         let Some(event) = result.event else {

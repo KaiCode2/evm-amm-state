@@ -201,6 +201,12 @@ fn v3_swap_topic() -> B256 {
     keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 }
 
+/// PancakeSwap V3 `Swap` — appends `protocolFeesToken0`/`protocolFeesToken1`
+/// (`uint128`), giving it a distinct `topic0` from the Uniswap V3 `Swap`.
+fn pancake_v3_swap_topic() -> B256 {
+    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)")
+}
+
 fn v3_mint_topic() -> B256 {
     keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
 }
@@ -215,29 +221,24 @@ fn word_pos(tick: i32, tick_spacing: i32) -> i16 {
     tick.div_euclid(tick_spacing).div_euclid(256) as i16
 }
 
-/// Independent oracle for the slot set a V3 liquidity-event repair must resync:
-/// the boundary `Tick.Info` slots {0, 3}, the (deduped) containing bitmap words,
-/// and the global liquidity slot. Returned sorted and deduped.
-fn expected_tick_repair_slots(
+/// Oracle for the slot set a liquidity event resyncs when nothing is warmed
+/// (`slot0` and both boundary ticks cold): all four `Tick.Info` slots of each
+/// tick, the (deduped) containing bitmap words, and the global `liquidity` slot
+/// (with `slot0` cold the in-range decision is unknown, so `liquidity` is
+/// conservatively resynced rather than dropped). Sorted and deduped.
+fn expected_cold_resync_slots(
     layout: V3StorageLayout,
     tick_lower: i32,
     tick_upper: i32,
 ) -> Vec<U256> {
     let mut slots = Vec::new();
     for tick in [tick_lower, tick_upper] {
-        let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
-        slots.push(keys[0]);
-        slots.push(keys[3]);
-    }
-    let mut words = vec![
-        word_pos(tick_lower, layout.tick_spacing),
-        word_pos(tick_upper, layout.tick_spacing),
-    ];
-    words.sort_unstable();
-    words.dedup();
-    for word in words {
+        slots.extend_from_slice(&v3_tick_info_storage_keys_with_base(
+            tick,
+            layout.ticks_base_slot,
+        ));
         slots.push(v3_tick_bitmap_storage_key_with_base(
-            word,
+            word_pos(tick, layout.tick_spacing),
             layout.tick_bitmap_base_slot,
         ));
     }
@@ -245,6 +246,12 @@ fn expected_tick_repair_slots(
     slots.sort_unstable();
     slots.dedup();
     slots
+}
+
+/// Pack a `Tick.Info` word 0: `liquidityGross` (low 128) + `liquidityNet` (high
+/// 128, two's complement).
+fn packed_tick_word0(gross: u128, net: i128) -> U256 {
+    U256::from(gross) | (U256::from(net as u128) << 128)
 }
 
 fn v3_mint_log(pool: Address, tick_lower: i32, tick_upper: i32, block_number: u64) -> RpcLog {
@@ -420,6 +427,54 @@ async fn v2_sync_applies_masked_update_through_reactive_runtime() -> Result<()> 
     Ok(())
 }
 
+/// Batch robustness: a malformed log for a watched topic must NOT abort the
+/// reactive batch — a later valid log in the same `ingest_batch` still applies.
+/// The handler isolates the decode failure to a `NoStateEffect` outcome instead
+/// of a `HandlerError` that would fail the whole batch.
+#[tokio::test]
+async fn malformed_log_does_not_abort_reactive_batch() -> Result<()> {
+    let pool = Address::repeat_byte(0x3f);
+    let reserve0 = U256::from(777_u64);
+    let reserve1 = U256::from(888_u64);
+
+    // First: the correct Sync topic + emitter, but a truncated one-word body the
+    // V2 adapter rejects as malformed. Second: a well-formed Sync for the same
+    // pool. If the malformed log aborted the batch, the valid one would not land.
+    let malformed = rpc_log(pool, vec![v2_sync_topic()], abi_words([reserve0]), 12, 0, 0);
+    let valid = rpc_log(
+        pool,
+        vec![v2_sync_topic()],
+        abi_words([reserve0, reserve1]),
+        12,
+        0,
+        1,
+    );
+
+    let mut cache = setup_cache().await?;
+    // Warm the reserves slot so the valid Sync's masked write lands exactly
+    // (a cold slot would be skipped into a resync rather than applied).
+    cache.apply_updates(&[StateUpdate::slot(pool, V2_RESERVES_SLOT, U256::ZERO)]);
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v2_registry(pool, true))))?;
+
+    // The whole batch must succeed (no HandlerError propagated by the malformed log).
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![
+            (ReactiveInput::Log(malformed), included_context(12, 0)),
+            (ReactiveInput::Log(valid), included_context(12, 1)),
+        ]),
+    )?;
+
+    // The valid Sync's reserves landed despite the earlier malformed log.
+    let raw = cache
+        .cached_storage_value(pool, V2_RESERVES_SLOT)
+        .expect("valid Sync must have written the reserves slot");
+    assert_eq!(raw & low_mask(112), reserve0);
+    assert_eq!((raw >> 112) & low_mask(112), reserve1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn v2_sync_cold_slot_emits_hash_pinned_resync_and_repairs_cache() -> Result<()> {
     let pool = Address::repeat_byte(0x32);
@@ -537,30 +592,15 @@ async fn v3_swap_applies_slot0_and_liquidity_updates_through_runtime() -> Result
     Ok(())
 }
 
+// A Mint whose boundary ticks are cold (nothing warmed) cannot be
+// read-modify-written, so the adapter emits a targeted resync over exactly those
+// ticks' info + bitmap slots (no direct writes, no whole-storage invalidation).
 #[tokio::test]
-async fn v3_mint_emits_tick_range_repair_hook() -> Result<()> {
+async fn v3_mint_cold_ticks_emit_resync() -> Result<()> {
     let pool = Address::repeat_byte(0x42);
+    let layout = V3StorageLayout::uniswap(60);
     let tick_lower = 60;
     let tick_upper = 120;
-    let mut data = address_word(Address::repeat_byte(0x03));
-    data.extend(abi_words([
-        U256::from(1_u64),
-        U256::from(2_u64),
-        U256::from(3_u64),
-    ]));
-    let log = rpc_log(
-        pool,
-        vec![
-            v3_mint_topic(),
-            topic_address(Address::repeat_byte(0x04)),
-            topic_i24(tick_lower),
-            topic_i24(tick_upper),
-        ],
-        data,
-        14,
-        0,
-        0,
-    );
 
     let mut cache = setup_cache().await?;
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
@@ -568,7 +608,10 @@ async fn v3_mint_emits_tick_range_repair_hook() -> Result<()> {
 
     let report = runtime.ingest_batch(
         &mut cache,
-        batch(vec![(ReactiveInput::Log(log), included_context(14, 0))]),
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, 14)),
+            included_context(14, 0),
+        )]),
     )?;
 
     assert_eq!(report.applied.len(), 1);
@@ -576,17 +619,146 @@ async fn v3_mint_emits_tick_range_repair_hook() -> Result<()> {
         report.applied[0].quality,
         StateEffectQuality::RequiresRepair
     );
+    // Nothing warm to write; the whole effect is the resync.
     assert!(report.applied[0].state_updates.is_empty());
-    let repair_signal = report.applied[0]
-        .hook_signals
-        .iter()
-        .find(|signal| {
-            signal.namespace.as_ref() == "evm-amm-state"
-                && signal.kind.as_ref() == "amm.repair.v3_tick_range"
-        })
-        .expect("V3 liquidity changes should emit a tick-range repair hook");
-    assert_eq!(tag_value(&repair_signal.labels, "tick_lower"), Some("60"));
-    assert_eq!(tag_value(&repair_signal.labels, "tick_upper"), Some("120"));
+    assert_eq!(report.applied[0].resyncs.len(), 1);
+    let [ResyncTarget::StorageSlots { address, slots }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a single storage-slots resync target");
+    };
+    assert_eq!(*address, pool);
+    let mut got = slots.clone();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got,
+        expected_cold_resync_slots(layout, tick_lower, tick_upper)
+    );
+    // The observability event hook is still emitted.
+    assert!(
+        report.applied[0]
+            .hook_signals
+            .iter()
+            .any(|signal| signal.kind.as_ref() == "amm.event")
+    );
+    Ok(())
+}
+
+// A Mint whose ticks and global liquidity are already warmed applies exact
+// direct writes with NO resync: gross/net on each boundary tick's packed word 0,
+// and the in-range global liquidity — the event-sourced (no-RPC) hot path.
+#[tokio::test]
+async fn v3_mint_warm_applies_direct_writes() -> Result<()> {
+    let pool = Address::repeat_byte(0x4a);
+    let layout = V3StorageLayout::uniswap(60);
+    let tick_lower = 60;
+    let tick_upper = 180; // current tick 120 is in [60, 180)
+    let amount = 7u128; // v3_mint_log bakes amount = 7
+
+    let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
+    let upper_key = v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot)[0];
+
+    let mut cache = setup_cache().await?;
+    // Warm slot0 (current tick 120, in range), global liquidity, and both already
+    // initialized boundary ticks.
+    cache.apply_updates(&[
+        StateUpdate::slot(
+            pool,
+            layout.slot0_slot,
+            v3_slot0_word(U256::from(1u64), 120, U256::ZERO),
+        ),
+        StateUpdate::slot(pool, layout.liquidity_slot, U256::from(1_000u64)),
+        StateUpdate::slot(pool, lower_key, packed_tick_word0(100, 40)),
+        StateUpdate::slot(pool, upper_key, packed_tick_word0(100, -40)),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v3_registry(pool))))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, 24)),
+            included_context(24, 0),
+        )]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput
+    );
+    assert!(
+        report.applied[0].resyncs.is_empty(),
+        "fully-warm liquidity event must not resync"
+    );
+
+    // Global in-range liquidity += amount.
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(U256::from(1_000u64 + amount as u64))
+    );
+    // Lower tick: gross += amount, net += amount.
+    assert_eq!(
+        cache.cached_storage_value(pool, lower_key),
+        Some(packed_tick_word0(100 + amount, 40 + amount as i128))
+    );
+    // Upper tick: gross += amount, net -= amount.
+    assert_eq!(
+        cache.cached_storage_value(pool, upper_key),
+        Some(packed_tick_word0(100 + amount, -40 - amount as i128))
+    );
+    Ok(())
+}
+
+// A Mint whose range does NOT straddle the current tick leaves global liquidity
+// untouched, while still updating the boundary ticks' gross/net.
+#[tokio::test]
+async fn v3_mint_out_of_range_leaves_global_liquidity() -> Result<()> {
+    let pool = Address::repeat_byte(0x4b);
+    let layout = V3StorageLayout::uniswap(60);
+    let tick_lower = 60;
+    let tick_upper = 180; // current tick 600 is ABOVE the range
+    let amount = 7u128;
+    let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
+
+    let mut cache = setup_cache().await?;
+    cache.apply_updates(&[
+        StateUpdate::slot(
+            pool,
+            layout.slot0_slot,
+            v3_slot0_word(U256::from(1u64), 600, U256::ZERO),
+        ),
+        StateUpdate::slot(pool, layout.liquidity_slot, U256::from(1_000u64)),
+        StateUpdate::slot(pool, lower_key, packed_tick_word0(100, 40)),
+        StateUpdate::slot(
+            pool,
+            v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot)[0],
+            packed_tick_word0(100, -40),
+        ),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v3_registry(pool))))?;
+
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, 25)),
+            included_context(25, 0),
+        )]),
+    )?;
+
+    // Out of range: global liquidity unchanged; boundary tick still updated.
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(U256::from(1_000u64))
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, lower_key),
+        Some(packed_tick_word0(100 + amount, 40 + amount as i128))
+    );
     Ok(())
 }
 
@@ -697,6 +869,194 @@ async fn removed_log_rolls_back_previously_applied_update() -> Result<()> {
     Ok(())
 }
 
+// A Burn that removes a warm tick's entire gross liquidity clears its bitmap bit
+// (Uniswap `flipTick` XOR) and zeroes its word 0 — all event-sourced, no resync.
+#[tokio::test]
+async fn v3_burn_to_zero_clears_bitmap_bit() -> Result<()> {
+    let pool = Address::repeat_byte(0x4c);
+    let layout = V3StorageLayout::uniswap(60);
+    let tick_lower = 60; // bit 1
+    let tick_upper = 180; // bit 3 (same bitmap word 0)
+    let amount = 7u128; // v3_burn_log bakes amount = 7
+
+    let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
+    let upper_key = v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot)[0];
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(
+        word_pos(tick_lower, layout.tick_spacing),
+        layout.tick_bitmap_base_slot,
+    );
+    let bits_set = (U256::from(1u8) << 1) | (U256::from(1u8) << 3);
+
+    let mut cache = setup_cache().await?;
+    cache.apply_updates(&[
+        StateUpdate::slot(
+            pool,
+            layout.slot0_slot,
+            v3_slot0_word(U256::from(1u64), 120, U256::ZERO),
+        ),
+        StateUpdate::slot(pool, layout.liquidity_slot, U256::from(1_000u64)),
+        // Each boundary tick holds exactly `amount` gross, so a full burn zeroes it.
+        StateUpdate::slot(pool, lower_key, packed_tick_word0(amount, amount as i128)),
+        StateUpdate::slot(
+            pool,
+            upper_key,
+            packed_tick_word0(amount, -(amount as i128)),
+        ),
+        StateUpdate::slot(pool, bitmap_key, bits_set),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v3_registry(pool))))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_burn_log(pool, tick_lower, tick_upper, 26)),
+            included_context(26, 0),
+        )]),
+    )?;
+
+    assert!(report.applied[0].resyncs.is_empty());
+    // Both ticks fully burned -> word 0 zeroed, both bitmap bits cleared (XOR).
+    assert_eq!(
+        cache.cached_storage_value(pool, lower_key),
+        Some(U256::ZERO)
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, upper_key),
+        Some(U256::ZERO)
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, bitmap_key),
+        Some(U256::ZERO)
+    );
+    // In-range liquidity decreased by amount.
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(U256::from(1_000u64 - amount as u64))
+    );
+    Ok(())
+}
+
+// One warm boundary tick + one cold: the warm tick gets a direct write, the cold
+// tick is resynced (its info + bitmap slots) — the mixed hybrid path.
+#[tokio::test]
+async fn v3_mint_mixed_warm_and_cold_ticks() -> Result<()> {
+    let pool = Address::repeat_byte(0x4d);
+    let layout = V3StorageLayout::uniswap(60);
+    let tick_lower = 60; // warm
+    let tick_upper = 15_360; // cold, in a different bitmap word
+    let amount = 7u128;
+    let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
+
+    let mut cache = setup_cache().await?;
+    // Warm slot0 (current tick 120, in range), liquidity, and ONLY the lower tick.
+    cache.apply_updates(&[
+        StateUpdate::slot(
+            pool,
+            layout.slot0_slot,
+            v3_slot0_word(U256::from(1u64), 120, U256::ZERO),
+        ),
+        StateUpdate::slot(pool, layout.liquidity_slot, U256::from(1_000u64)),
+        StateUpdate::slot(pool, lower_key, packed_tick_word0(100, 40)),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v3_registry(pool))))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, 27)),
+            included_context(27, 0),
+        )]),
+    )?;
+
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::RequiresRepair
+    );
+    // Warm lower tick + in-range liquidity: exact direct writes.
+    assert_eq!(
+        cache.cached_storage_value(pool, lower_key),
+        Some(packed_tick_word0(100 + amount, 40 + amount as i128))
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, layout.liquidity_slot),
+        Some(U256::from(1_000u64 + amount as u64))
+    );
+    // Cold upper tick: exactly its info + bitmap slots resynced (nothing else).
+    let [ResyncTarget::StorageSlots { slots, .. }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a storage-slots resync target");
+    };
+    let mut got = slots.clone();
+    got.sort_unstable();
+    got.dedup();
+    let mut expected =
+        v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot).to_vec();
+    expected.push(v3_tick_bitmap_storage_key_with_base(
+        word_pos(tick_upper, layout.tick_spacing),
+        layout.tick_bitmap_base_slot,
+    ));
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+// A degraded pool with cold slot0 but warm ticks: the boundary ticks still get
+// direct writes, and the global liquidity is conservatively RESYNCED (not
+// silently dropped) since the in-range decision can't be made.
+#[tokio::test]
+async fn v3_mint_cold_slot0_resyncs_global_liquidity() -> Result<()> {
+    let pool = Address::repeat_byte(0x4e);
+    let layout = V3StorageLayout::uniswap(60);
+    let tick_lower = 60;
+    let tick_upper = 180;
+    let amount = 7u128;
+    let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
+    let upper_key = v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot)[0];
+
+    let mut cache = setup_cache().await?;
+    // Warm both ticks (no flip: gross stays nonzero) but NOT slot0 or liquidity.
+    cache.apply_updates(&[
+        StateUpdate::slot(pool, lower_key, packed_tick_word0(100, 40)),
+        StateUpdate::slot(pool, upper_key, packed_tick_word0(100, -40)),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(v3_registry(pool))))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(v3_mint_log(pool, tick_lower, tick_upper, 28)),
+            included_context(28, 0),
+        )]),
+    )?;
+
+    // Warm ticks: direct writes.
+    assert_eq!(
+        cache.cached_storage_value(pool, lower_key),
+        Some(packed_tick_word0(100 + amount, 40 + amount as i128))
+    );
+    // The global liquidity delta is not dropped: it is resynced (only that slot;
+    // ticks are warm and don't flip, so they need no resync).
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::RequiresRepair
+    );
+    let [ResyncTarget::StorageSlots { slots, .. }] =
+        report.applied[0].resyncs[0].targets.as_slice()
+    else {
+        panic!("expected a storage-slots resync target");
+    };
+    assert_eq!(slots.as_slice(), &[layout.liquidity_slot]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn v3_mint_emits_targeted_tick_resync() -> Result<()> {
     let pool = Address::repeat_byte(0x43);
@@ -745,28 +1105,20 @@ async fn v3_mint_emits_targeted_tick_resync() -> Result<()> {
     got.dedup();
     assert_eq!(
         got,
-        expected_tick_repair_slots(layout, tick_lower, tick_upper)
-    );
-
-    // Observability hook is preserved alongside the executable resync.
-    assert!(
-        report.applied[0]
-            .hook_signals
-            .iter()
-            .any(|signal| signal.kind.as_ref() == "amm.repair.v3_tick_range")
+        expected_cold_resync_slots(layout, tick_lower, tick_upper)
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn v3_mint_resync_repairs_tick_and_liquidity_slots() -> Result<()> {
+async fn v3_mint_resync_repairs_cold_tick_slots() -> Result<()> {
     let pool = Address::repeat_byte(0x44);
     let layout = V3StorageLayout::uniswap(60);
     let tick_lower = 60;
     let tick_upper = 180;
     let block = 21;
 
-    let expected = expected_tick_repair_slots(layout, tick_lower, tick_upper);
+    let expected = expected_cold_resync_slots(layout, tick_lower, tick_upper);
     let mut fetched: HashMap<(Address, U256), U256> = HashMap::new();
     for (i, slot) in expected.iter().enumerate() {
         fetched.insert((pool, *slot), U256::from(1_000 + i as u64));
@@ -843,12 +1195,13 @@ async fn v3_burn_same_word_dedupes_bitmap_slot() -> Result<()> {
     let mut got = slots.clone();
     got.sort_unstable();
     got.dedup();
-    // 2 ticks x {slot0, slot3} + 1 shared bitmap word + liquidity = 6 slots.
+    // Cold everything, shared bitmap word: 2 ticks x 4 info words + 1 shared
+    // bitmap word + global liquidity (slot0 cold -> conservatively resynced) = 10.
     assert_eq!(
         got,
-        expected_tick_repair_slots(layout, tick_lower, tick_upper)
+        expected_cold_resync_slots(layout, tick_lower, tick_upper)
     );
-    assert_eq!(got.len(), 6);
+    assert_eq!(got.len(), 10);
     Ok(())
 }
 
@@ -1395,14 +1748,26 @@ async fn pancake_v3_routes_and_applies_through_family_adapter() -> Result<()> {
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
     runtime.register_handler(Arc::new(AmmReactiveHandler::new(registry)))?;
 
+    // A PancakeSwap V3 `Swap`: the distinct Pancake topic0 and the extended
+    // 7-word non-indexed body (…, tick, protocolFeesToken0, protocolFeesToken1).
+    // Routing must accept the Pancake topic (which the Uniswap adapter would not
+    // have subscribed), and the shared body decode still reads words 2/3/4.
     let log = rpc_log(
         pool,
         vec![
-            v3_swap_topic(),
+            pancake_v3_swap_topic(),
             topic_address(Address::repeat_byte(0x01)),
             topic_address(Address::repeat_byte(0x02)),
         ],
-        abi_words([U256::ZERO, U256::ZERO, sqrt_price, liquidity, U256::ZERO]),
+        abi_words([
+            U256::ZERO,
+            U256::ZERO,
+            sqrt_price,
+            liquidity,
+            U256::ZERO,
+            U256::from(7_u64),
+            U256::from(9_u64),
+        ]),
         50,
         0,
         0,
@@ -1619,14 +1984,14 @@ async fn pancake_v3_mint_repair_targets_pancake_layout_slots() -> Result<()> {
     got.dedup();
     assert_eq!(
         got,
-        expected_tick_repair_slots(layout, tick_lower, tick_upper),
+        expected_cold_resync_slots(layout, tick_lower, tick_upper),
         "repair must target the Pancake layout slots"
     );
     // The Pancake slots are genuinely distinct from the Uniswap layout's,
     // proving the family adapter lowered the repair against the Pancake layout.
     assert_ne!(
         got,
-        expected_tick_repair_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
+        expected_cold_resync_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
     );
     Ok(())
 }
@@ -1673,12 +2038,12 @@ async fn slipstream_mint_repair_targets_slipstream_layout_slots() -> Result<()> 
     got.dedup();
     assert_eq!(
         got,
-        expected_tick_repair_slots(layout, tick_lower, tick_upper),
+        expected_cold_resync_slots(layout, tick_lower, tick_upper),
         "repair must target the Slipstream layout slots"
     );
     assert_ne!(
         got,
-        expected_tick_repair_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
+        expected_cold_resync_slots(V3StorageLayout::uniswap(60), tick_lower, tick_upper)
     );
     Ok(())
 }
@@ -1931,7 +2296,10 @@ async fn solidly_sync_without_layout_does_not_mutate_cache() -> Result<()> {
 // `discovered_slots` rather than applying the event payload. These tests cover:
 // (1) a cold-started pool emits a `VerifySlots` resync over its discovered slot,
 // and (2) the batch-robustness guard: an empty-`discovered_slots` pool must not
-// error or mutate (a decode error would fail the whole `ingest_batch`).
+// error or mutate — the adapter returns `ignored()` for the known-unsupported
+// case (and, since the handler now isolates decode failures per-log, even a
+// genuine decode error no longer fails the whole `ingest_batch`; see
+// `malformed_log_does_not_abort_reactive_batch`).
 
 fn curve_token_exchange_topic() -> B256 {
     keccak256("TokenExchange(address,int128,uint256,int128,uint256)")
