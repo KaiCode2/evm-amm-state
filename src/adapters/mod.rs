@@ -88,10 +88,10 @@ pub use sync_manager::{AmmSyncBatchReport, AmmSyncEngine, AmmSyncError};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
-    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata,
-    CurveVariant, CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SolidlyV2Metadata,
-    UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3Metadata,
+    BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    CurveMetadata, CurveVariant, CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute,
+    EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
+    SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3Metadata,
 };
 
 #[cfg(feature = "balancer-v2")]
