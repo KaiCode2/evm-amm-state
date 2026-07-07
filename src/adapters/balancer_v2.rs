@@ -32,6 +32,16 @@ fn cash_mask() -> U256 {
     (U256::from(1) << CASH_BITS) - U256::from(1)
 }
 
+/// Balancer V2 pool specialization encoded in the poolId after the 20-byte pool
+/// address. `2` is the only specialization where the high 112-bit balance field
+/// is another token's `cash`; GENERAL/MINIMAL pools use it for `managed`.
+const TWO_TOKEN_SPECIALIZATION: u16 = 2;
+
+fn is_two_token_pool(pool_id: B256) -> bool {
+    let bytes = pool_id.as_slice();
+    u16::from_be_bytes([bytes[20], bytes[21]]) == TWO_TOKEN_SPECIALIZATION
+}
+
 /// Extract the 112-bit `cash` field at the low (bits 0–111) or high (bits
 /// 112–223) position of a packed vault balance word.
 fn cash_field(word: U256, high: bool) -> U256 {
@@ -69,14 +79,17 @@ fn apply_cash_delta(word: U256, high: bool, add: bool, amount: U256) -> Option<U
 /// **unique** match — a zero balance, a managed balance (`cash != balance`), or a
 /// value collision with another field — is skipped, so the reactive `Swap` path
 /// resyncs it rather than risk writing the wrong slot. Specialization-agnostic:
-/// works for the TWO_TOKEN shared slot and per-token GENERAL/MINIMAL slots alike,
-/// and naturally ignores `EnumerableMap` overhead slots (no balance matches them).
+/// works for the TWO_TOKEN shared slot and per-token GENERAL/MINIMAL slots alike.
+/// For GENERAL/MINIMAL pools, the high 112-bit field is `managed`, not `cash`, so
+/// it is only considered when the poolId specialization is TWO_TOKEN. The probe
+/// naturally ignores `EnumerableMap` overhead slots (no balance matches them).
 fn probe_token_cash(
     tokens: &[Address],
     balances: &[U256],
     verified_slots: &[(Address, U256)],
     vault: Address,
     state: &dyn StateView,
+    high_field_can_be_cash: bool,
 ) -> Vec<BalancerTokenBalance> {
     let mut located = Vec::new();
     for (token, balance) in tokens.iter().zip(balances.iter()) {
@@ -92,7 +105,7 @@ fn probe_token_cash(
                 if cash_field(word, false) == *balance {
                     found.push((slot, false));
                 }
-                if cash_field(word, true) == *balance {
+                if high_field_can_be_cash && cash_field(word, true) == *balance {
                     found.push((slot, true));
                 }
                 found
@@ -116,6 +129,14 @@ fn token_cash_location(
         .iter()
         .find(|balance| balance.token == token)
         .copied()
+}
+
+#[derive(Clone, Copy)]
+struct SwapCashDelta {
+    token_in: Address,
+    amount_in: U256,
+    token_out: Address,
+    amount_out: U256,
 }
 
 /// The resync repair + quality for the fallback path: re-verify the known
@@ -144,27 +165,32 @@ fn resync_repair(vault: Address, metadata: &BalancerV2Metadata) -> (RepairAction
 fn event_source_swap(
     view: &dyn StateView,
     vault: Address,
+    pool_id: B256,
     metadata: &BalancerV2Metadata,
-    token_in: Address,
-    amount_in: U256,
-    token_out: Address,
-    amount_out: U256,
+    swap: SwapCashDelta,
 ) -> Option<Vec<StateUpdate>> {
-    let in_loc = token_cash_location(metadata, token_in)?;
-    let out_loc = token_cash_location(metadata, token_out)?;
+    let in_loc = token_cash_location(metadata, swap.token_in)?;
+    let out_loc = token_cash_location(metadata, swap.token_out)?;
+
+    if !is_two_token_pool(pool_id) && (in_loc.high_field || out_loc.high_field) {
+        return None;
+    }
 
     if in_loc.slot == out_loc.slot {
+        if in_loc.high_field == out_loc.high_field {
+            return None;
+        }
         // TWO_TOKEN shared slot: both fields live in one word, so apply both
         // deltas to a single write (two separate writes would clobber each other).
         let word = view.storage(vault, in_loc.slot)?;
-        let word = apply_cash_delta(word, in_loc.high_field, true, amount_in)?;
-        let word = apply_cash_delta(word, out_loc.high_field, false, amount_out)?;
+        let word = apply_cash_delta(word, in_loc.high_field, true, swap.amount_in)?;
+        let word = apply_cash_delta(word, out_loc.high_field, false, swap.amount_out)?;
         Some(vec![StateUpdate::slot(vault, in_loc.slot, word)])
     } else {
         let word_in = view.storage(vault, in_loc.slot)?;
-        let word_in = apply_cash_delta(word_in, in_loc.high_field, true, amount_in)?;
+        let word_in = apply_cash_delta(word_in, in_loc.high_field, true, swap.amount_in)?;
         let word_out = view.storage(vault, out_loc.slot)?;
-        let word_out = apply_cash_delta(word_out, out_loc.high_field, false, amount_out)?;
+        let word_out = apply_cash_delta(word_out, out_loc.high_field, false, swap.amount_out)?;
         Some(vec![
             StateUpdate::slot(vault, in_loc.slot, word_in),
             StateUpdate::slot(vault, out_loc.slot, word_out),
@@ -186,15 +212,20 @@ fn decode_swap(pool: &PoolRegistration, log: &Log, view: &dyn StateView) -> Adap
 
     let (updates, repair, quality) = match &pool.metadata {
         ProtocolMetadata::BalancerV2(metadata) => match metadata.vault {
-            Some(vault) => match event_source_swap(
-                view,
-                vault,
-                metadata,
-                decoded.tokenIn,
-                decoded.amountIn,
-                decoded.tokenOut,
-                decoded.amountOut,
-            ) {
+            Some(vault) => match pool.key.bytes32().and_then(|pool_id| {
+                event_source_swap(
+                    view,
+                    vault,
+                    pool_id,
+                    metadata,
+                    SwapCashDelta {
+                        token_in: decoded.tokenIn,
+                        amount_in: decoded.amountIn,
+                        token_out: decoded.tokenOut,
+                        amount_out: decoded.amountOut,
+                    },
+                )
+            }) {
                 Some(updates) => (updates, RepairAction::None, UpdateQuality::Exact),
                 None => {
                     let (repair, quality) = resync_repair(vault, metadata);
@@ -679,6 +710,7 @@ impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
                         &self.verified_slots,
                         self.vault,
                         state,
+                        is_two_token_pool(self.pool_id),
                     );
                 }
                 ColdStartStep::Done
@@ -778,6 +810,26 @@ mod tests {
         Address::repeat_byte(byte)
     }
 
+    fn pool_id(specialization: u16) -> B256 {
+        let mut bytes = [0x11; 32];
+        bytes[20..22].copy_from_slice(&specialization.to_be_bytes());
+        B256::from(bytes)
+    }
+
+    fn swap_delta(
+        token_in: Address,
+        amount_in: u64,
+        token_out: Address,
+        amount_out: u64,
+    ) -> SwapCashDelta {
+        SwapCashDelta {
+            token_in,
+            amount_in: U256::from(amount_in),
+            token_out,
+            amount_out: U256::from(amount_out),
+        }
+    }
+
     /// A single-token `BalanceAllocation`: `[block:32][managed:112][cash:112]`.
     fn packed(block: u64, managed: u128, cash: u128) -> U256 {
         (U256::from(block) << 224) | (U256::from(managed) << 112) | U256::from(cash)
@@ -843,6 +895,7 @@ mod tests {
             &[(vault, slot)],
             vault,
             &view,
+            true,
         );
         assert_eq!(cash.len(), 2);
         assert!(cash.contains(&BalancerTokenBalance::new(t0, slot, false)));
@@ -877,9 +930,30 @@ mod tests {
             &[(vault, s0), (vault, s1), (vault, s2), (vault, s3)],
             vault,
             &view,
+            false,
         );
         // Only t1 is unambiguous: t0/t2 share value 1000 (2 matches each), t3 is zero.
         assert_eq!(cash, vec![BalancerTokenBalance::new(t1, s1, false)]);
+    }
+
+    #[test]
+    fn probe_skips_high_managed_field_for_non_two_token_pools() {
+        let vault = addr(0xba);
+        let token = addr(0x01);
+        let slot = U256::from(0x77_u64);
+        let mut m = HashMap::new();
+        m.insert((vault, slot), packed(9, 777, 111)); // high=managed, low=cash
+        let view = MapView(m);
+
+        let cash = probe_token_cash(
+            &[token],
+            &[U256::from(777_u64)],
+            &[(vault, slot)],
+            vault,
+            &view,
+            false,
+        );
+        assert!(cash.is_empty());
     }
 
     #[test]
@@ -900,11 +974,9 @@ mod tests {
         let updates = event_source_swap(
             &view,
             vault,
+            pool_id(TWO_TOKEN_SPECIALIZATION),
             &meta,
-            t_in,
-            U256::from(30_u64),
-            t_out,
-            U256::from(20_u64),
+            swap_delta(t_in, 30, t_out, 20),
         )
         .unwrap();
         assert_eq!(updates.len(), 1, "shared slot -> one combined write");
@@ -935,11 +1007,9 @@ mod tests {
         let updates = event_source_swap(
             &view,
             vault,
+            pool_id(0),
             &meta,
-            t_in,
-            U256::from(10_u64),
-            t_out,
-            U256::from(20_u64),
+            swap_delta(t_in, 10, t_out, 20),
         )
         .unwrap();
         assert_eq!(updates.len(), 2);
@@ -967,11 +1037,9 @@ mod tests {
             event_source_swap(
                 &view,
                 vault,
+                pool_id(TWO_TOKEN_SPECIALIZATION),
                 &bare,
-                t_in,
-                U256::from(1_u64),
-                t_out,
-                U256::from(1_u64)
+                swap_delta(t_in, 1, t_out, 1)
             )
             .is_none()
         );
@@ -986,11 +1054,53 @@ mod tests {
             event_source_swap(
                 &view,
                 vault,
+                pool_id(TWO_TOKEN_SPECIALIZATION),
                 &mapped,
-                t_in,
-                U256::from(1_u64),
-                t_out,
-                U256::from(1_u64)
+                swap_delta(t_in, 1, t_out, 1)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn event_source_swap_rejects_invalid_token_cash_metadata() {
+        let vault = addr(0xba);
+        let (t_in, t_out) = (addr(0x01), addr(0x02));
+        let slot = U256::from(0x77_u64);
+        let mut m = HashMap::new();
+        m.insert((vault, slot), packed_two(5, 1000, 500));
+        let view = MapView(m);
+
+        let duplicate_field = BalancerV2Metadata::default()
+            .with_vault(vault)
+            .with_token_cash([
+                BalancerTokenBalance::new(t_in, slot, false),
+                BalancerTokenBalance::new(t_out, slot, false),
+            ]);
+        assert!(
+            event_source_swap(
+                &view,
+                vault,
+                pool_id(TWO_TOKEN_SPECIALIZATION),
+                &duplicate_field,
+                swap_delta(t_in, 30, t_out, 20),
+            )
+            .is_none()
+        );
+
+        let high_field_on_general = BalancerV2Metadata::default()
+            .with_vault(vault)
+            .with_token_cash([
+                BalancerTokenBalance::new(t_in, slot, false),
+                BalancerTokenBalance::new(t_out, slot, true),
+            ]);
+        assert!(
+            event_source_swap(
+                &view,
+                vault,
+                pool_id(0),
+                &high_field_on_general,
+                swap_delta(t_in, 30, t_out, 20),
             )
             .is_none()
         );

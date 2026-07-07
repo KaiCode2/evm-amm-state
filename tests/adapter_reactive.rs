@@ -67,6 +67,12 @@ fn block_ref(block_number: u64) -> BlockRef {
     }
 }
 
+fn balancer_pool_id(specialization: u16, seed: u8) -> B256 {
+    let mut bytes = [seed; 32];
+    bytes[20..22].copy_from_slice(&specialization.to_be_bytes());
+    B256::from(bytes)
+}
+
 fn included_context(
     block_number: u64,
     log_index: u64,
@@ -837,7 +843,7 @@ fn balancer_registry_with_metadata(
 #[tokio::test]
 async fn balancer_swap_event_sources_two_token_shared_slot() -> Result<()> {
     let vault = Address::repeat_byte(0x52);
-    let pool_id = B256::repeat_byte(0xc3);
+    let pool_id = balancer_pool_id(2, 0xc3);
     let token_in = Address::repeat_byte(0x01);
     let token_out = Address::repeat_byte(0x02);
     let slot = U256::from(0x77_u64);
@@ -910,7 +916,7 @@ async fn balancer_swap_event_sources_two_token_shared_slot() -> Result<()> {
 #[tokio::test]
 async fn balancer_swap_event_sources_general_separate_slots() -> Result<()> {
     let vault = Address::repeat_byte(0x53);
-    let pool_id = B256::repeat_byte(0xd4);
+    let pool_id = balancer_pool_id(0, 0xd4);
     let token_in = Address::repeat_byte(0x03);
     let token_out = Address::repeat_byte(0x04);
     let slot_in = U256::from(0x11_u64);
