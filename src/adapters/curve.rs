@@ -32,6 +32,7 @@
 //!
 //! [`docs/curve-adapter.md`]: https://github.com/KaiCode2/evm-amm-state/blob/main/docs/curve-adapter.md
 
+use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError};
 use super::cold_start::{
     AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
     ColdStartStep, SlotFetch,
@@ -260,18 +261,55 @@ impl AmmAdapter for CurveAdapter {
             ));
         };
 
-        // Preserve the config-supplied coins + variant across cold-start so
-        // `finish` can re-emit them alongside the discovered slots. The variant
-        // also drives the discover call's `get_dy` ABI (a CryptoSwap pool
-        // reverts the int128 discover, which would be a spurious DiscoverFailed).
-        let (coins, variant) = match &pool.metadata {
-            ProtocolMetadata::Curve(metadata) => (metadata.coins.clone(), metadata.variant),
-            _ => (Vec::new(), CurveVariant::StableSwap),
+        // Preserve the config-supplied coins + variant + code_seed across
+        // cold-start so `finish` can re-emit them alongside the discovered slots.
+        // The variant also drives the discover call's `get_dy` ABI (a CryptoSwap
+        // pool reverts the int128 discover, a spurious DiscoverFailed). A
+        // non-empty `discovered_slots` means the read-set is already known (a
+        // prior discovery / trace / registry), so the planner runs a verify-only
+        // fast path instead of rediscovering — see [`CurveColdStartPlanner`].
+        let (coins, variant, known_slots, code_seed) = match &pool.metadata {
+            ProtocolMetadata::Curve(metadata) => (
+                metadata.coins.clone(),
+                metadata.variant,
+                metadata.discovered_slots.clone(),
+                metadata.code_seed.clone(),
+            ),
+            _ => (Vec::new(), CurveVariant::StableSwap, Vec::new(), None),
         };
 
         Ok(Box::new(CurveColdStartPlanner::new(
-            address, coins, variant, policy,
+            address,
+            coins,
+            variant,
+            known_slots,
+            code_seed,
+            policy,
         )))
+    }
+
+    /// Return the caller-supplied runtime bytecode seed, if any.
+    ///
+    /// Curve pools are per-pool Vyper builds with no shared or renderable
+    /// template, so unlike Uniswap V2/V3 the crate embeds no canonical seed. A
+    /// caller that already knows a pool's runtime can attach it via
+    /// [`CurveMetadata::code_seed`], and cold-start verifies it once against the
+    /// on-chain `EXTCODEHASH` (mismatch → purged → lazy real code, never a
+    /// correctness risk). Missing metadata / an address-less key / no seed all
+    /// return `Ok(vec![])` — simply not seedable, not an error.
+    fn code_seeds(
+        &self,
+        pool: &PoolRegistration,
+    ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        let ProtocolMetadata::Curve(metadata) = &pool.metadata else {
+            return Ok(Vec::new());
+        };
+        match (&metadata.code_seed, pool.key.address()) {
+            (Some(code), Some(address)) if !code.is_empty() => {
+                Ok(vec![AdapterCodeSeed::new(address, code.clone())])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn decode_event(
@@ -498,19 +536,27 @@ enum CurveRepair {
     BalancesUnfetched,
 }
 
-/// Cold-start planner for a Curve StableSwap plain pool: a discover → verify run.
+/// Cold-start planner for a Curve plain pool, in one of two modes:
 ///
-/// A real Curve pool's `get_dy` read-set (balances + amplification + fee) lives
-/// behind a non-predictable Vyper storage layout, so the planner cannot name the
-/// slots up front. Instead round 1 runs a `get_dy(0, 1, DISCOVER_DX)` call on the
-/// pool (`restrict_to = [pool]`) and captures the `(pool, slot)` pairs it SLOADs.
-/// Round 2 authoritatively verifies exactly those discovered slots so the live
-/// read-set is warmed for a subsequent `simulate_swap`.
+/// - **Discover → verify** (the read-set is unknown). A real Curve pool's
+///   `get_dy` read-set (balances + amplification + fee) lives behind a
+///   non-predictable Vyper storage layout, so the planner cannot name the slots
+///   up front. Round 1 runs a `get_dy(0, 1, DISCOVER_DX)` call on the pool
+///   (`restrict_to = [pool]`) and captures the `(pool, slot)` pairs it SLOADs;
+///   round 2 authoritatively verifies exactly those discovered slots so the live
+///   read-set is warmed for a subsequent `simulate_swap`.
+/// - **Verify-only** (the read-set is already known — `CurveMetadata`
+///   [`discovered_slots`](super::CurveMetadata::discovered_slots) was
+///   pre-populated from a prior discovery, a block trace, or a registry). The
+///   planner skips discovery entirely — no pool-account/bytecode fetch, no local
+///   `get_dy` faulting over a cold cache — and runs a single verify round over
+///   the known slots. This is what makes a known-read-set `cold_start` as cheap
+///   as the bundled [`cold_start_many`](super::AdapterRegistry::cold_start_many)
+///   storage-program path.
 ///
-/// The flow runs for every policy (the pool state is the hot set, so there is no
-/// verify-only shortcut), mirroring Balancer. The planner stays policy-aware in
-/// shape (the policy is threaded into the report) so later slices can refine
-/// `HotSlotsOnly`/`Lazy`.
+/// The flow runs for every policy (the pool state is the hot set). The planner
+/// stays policy-aware in shape (the policy is threaded into the report) so later
+/// slices can refine `HotSlotsOnly`/`Lazy`.
 struct CurveColdStartPlanner {
     pool: Address,
     /// Config-supplied coins, preserved across the run and re-emitted on `Ready`.
@@ -518,9 +564,14 @@ struct CurveColdStartPlanner {
     /// Config-supplied Curve dialect; drives the discover `get_dy` ABI and is
     /// re-emitted on `Ready` so reactive + later sims keep it.
     variant: CurveVariant,
+    /// Config-supplied optional runtime bytecode seed, preserved across the run
+    /// and re-emitted on `Ready` (seeding itself is handled by the registry
+    /// before the driver runs; the planner only carries it through `finish`).
+    code_seed: Option<Bytes>,
     policy: ColdStartPolicy,
     phase: CurvePhase,
-    /// The pool slots discovered in round 1 and verified in round 2.
+    /// The pool slots being warmed: discovered in round 1 (discover→verify) or
+    /// pre-populated from the known read-set (verify-only), then verified.
     verified_slots: Vec<(Address, U256)>,
     /// Slots injected across the run (the refreshed read-set).
     changed_slots: Vec<SlotChange>,
@@ -534,15 +585,34 @@ impl CurveColdStartPlanner {
         pool: Address,
         coins: Vec<Address>,
         variant: CurveVariant,
+        known_slots: Vec<U256>,
+        code_seed: Option<Bytes>,
         policy: ColdStartPolicy,
     ) -> Self {
+        // A pre-populated read-set selects the verify-only fast path: start in
+        // `Verify` with the known slots as the read-set, so `initial_plan` emits
+        // a single verify round (no discover call) and `finish` persists them.
+        // Sort + dedup for a stable, minimal fetch set. An empty read-set keeps
+        // the discover→verify default (byte-for-byte unchanged from before).
+        let mut slots = known_slots;
+        slots.sort_unstable();
+        slots.dedup();
+        let (phase, verified_slots) = if slots.is_empty() {
+            (CurvePhase::Discover, Vec::new())
+        } else {
+            (
+                CurvePhase::Verify,
+                slots.into_iter().map(|slot| (pool, slot)).collect(),
+            )
+        };
         Self {
             pool,
             coins,
             variant,
+            code_seed,
             policy,
-            phase: CurvePhase::Discover,
-            verified_slots: Vec::new(),
+            phase,
+            verified_slots,
             changed_slots: Vec::new(),
             repair: None,
         }
@@ -551,6 +621,19 @@ impl CurveColdStartPlanner {
 
 impl AdapterColdStartPlanner for CurveColdStartPlanner {
     fn initial_plan(&mut self, _state: &dyn StateView) -> ColdStartPlan {
+        // Verify-only fast path: the read-set is already known (pre-populated in
+        // `new`), so skip discovery — and the pool-account/bytecode fetch and
+        // cold-cache `get_dy` faulting it needs — and warm exactly those slots in
+        // a single verify round. `on_results` lands directly in its `Verify`
+        // branch, and `finish` persists the same set. A stale/incomplete read-set
+        // is safe: the first `simulate_swap` lazily faults anything missing.
+        if matches!(self.phase, CurvePhase::Verify) {
+            return ColdStartPlan {
+                verify: self.verified_slots.clone(),
+                ..Default::default()
+            };
+        }
+
         // Round 1: ensure the pool's code, then run `get_dy(0, 1, DISCOVER_DX)`
         // and capture the slots it touches (restricted to the pool so only its
         // own read-set is collected — plain pools are self-contained). The
@@ -720,6 +803,8 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
                     // Persist the config-supplied variant so the reactive path
                     // and later sims keep the correct `get_dy` / event ABI.
                     variant: self.variant,
+                    // Preserve any caller-supplied bytecode seed across the run.
+                    code_seed: self.code_seed.clone(),
                 });
                 pool.status = PoolStatus::Ready;
                 report.status = PoolStatus::Ready;
@@ -907,5 +992,55 @@ mod tests {
         assert!(!ng.contains(&TokenExchange::SIGNATURE_HASH));
         // NG uses its own AddLiquidity shape, not v2's.
         assert!(!ng.contains(&crypto_add_liquidity_topic(3)));
+    }
+
+    // `code_seeds` surfaces the caller-supplied runtime bytecode as a single
+    // verifiable seed when `CurveMetadata.code_seed` is set, and is a clean
+    // no-op (never an error) otherwise. Curve has no embedded/renderable
+    // template, so this hook is the only Curve seed source.
+    #[test]
+    fn code_seeds_returns_caller_supplied_bytecode_or_empty() {
+        use crate::adapters::PoolKey;
+
+        let pool = Address::repeat_byte(0xcc);
+        // A tiny valid runtime (PUSH1 0, PUSH1 0, RETURN) stands in for a pool's
+        // real Vyper code — `code_seeds` does not execute it, only wraps it.
+        let runtime = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]);
+        let adapter = CurveAdapter::default();
+
+        // With a code_seed: exactly one seed, addressed at the pool, hash over
+        // the seeded bytes (== AdapterCodeSeed::new).
+        let seeded = PoolRegistration::new(PoolKey::Curve(pool))
+            .with_state_address(pool)
+            .with_metadata(ProtocolMetadata::Curve(
+                CurveMetadata::default()
+                    .with_coins([Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                    .with_code_seed(runtime.clone()),
+            ));
+        let seeds = adapter
+            .code_seeds(&seeded)
+            .expect("code_seeds never errors");
+        assert_eq!(seeds, vec![AdapterCodeSeed::new(pool, runtime)]);
+
+        // No code_seed (the default): no seeds, not an error.
+        let unseeded = PoolRegistration::new(PoolKey::Curve(pool))
+            .with_state_address(pool)
+            .with_metadata(ProtocolMetadata::Curve(CurveMetadata::default()));
+        assert!(
+            adapter
+                .code_seeds(&unseeded)
+                .expect("never errors")
+                .is_empty(),
+            "no code_seed => no seeds"
+        );
+
+        // An empty code_seed is treated as absent (nothing to verify).
+        let empty = PoolRegistration::new(PoolKey::Curve(pool)).with_metadata(
+            ProtocolMetadata::Curve(CurveMetadata::default().with_code_seed(Bytes::new())),
+        );
+        assert!(
+            adapter.code_seeds(&empty).expect("never errors").is_empty(),
+            "empty code_seed => no seeds"
+        );
     }
 }

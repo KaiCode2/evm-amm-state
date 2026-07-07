@@ -26,18 +26,28 @@ reimplemented Curve math**.
 ```rust
 use evm_amm_state::adapters::{CurveMetadata, CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata};
 
+// Minimal: coins (index order) + dialect. Cold-start discovers the read-set.
 let reg = PoolRegistration::new(PoolKey::Curve(pool_address))
     .with_state_address(pool_address)
-    .with_metadata(ProtocolMetadata::Curve(CurveMetadata {
-        // Coins in index order; coins[i] is the get_dy index `i`. Config-supplied
-        // (static pool identity); drives the simulate_swap token -> index mapping.
-        coins: vec![dai, usdc, usdt],
-        // Populated by cold-start (the get_dy read-set). Leave empty.
-        discovered_slots: Vec::new(),
-        // The dialect — selects the get_dy ABI and the event set.
-        variant: CurveVariant::StableSwap,
-    }));
+    .with_metadata(ProtocolMetadata::Curve(
+        CurveMetadata::default()
+            // coins[i] is the get_dy index `i`; config-supplied static pool
+            // identity, drives the simulate_swap token -> index mapping.
+            .with_coins(vec![dai, usdc, usdt])
+            // The dialect — selects the get_dy ABI and the event set.
+            .with_variant(CurveVariant::StableSwap),
+    ));
+
+// Fast reboot: pre-fill the read-set (from a prior discovery / trace / registry)
+// to skip discovery, and optionally seed the pool runtime. See "Cold-start".
+//   CurveMetadata::default()
+//       .with_coins(vec![dai, usdc, usdt])
+//       .with_discovered_slots(known_slots) // verify-only cold_start + cold_start_many
+//       .with_code_seed(pool_runtime)       // no lazy code fetch at first quote
 ```
+
+(`CurveMetadata` is `#[non_exhaustive]`; construct it via `default()` + the
+`with_*` builders rather than a struct literal.)
 
 `CurveVariant` (defaults to `StableSwap`, so classic + NG pools need no flag):
 
@@ -52,22 +62,52 @@ quote path (differing only by the 3-arg `RemoveLiquidityOne`, which both route);
 CryptoSwap/Tricrypto-NG share the `uint256` quote path (differing only in
 events).
 
-## Cold-start — discover → verify
+## Cold-start — discover → verify, or verify-only
 
 A real Curve pool has **no predictable balance-slot layout** (a probe confirmed
 `balances[]` is not at a fixed slot — it varies by Vyper build), so the planner
-does not hand-code slots. Instead it mirrors `BalancerV2ColdStartPlanner`:
+does not hand-code slots. It runs in one of two modes.
+
+**Discover → verify** — the read-set is unknown (`discovered_slots` empty),
+mirroring `BalancerV2ColdStartPlanner`:
 
 1. **Discover** — run `get_dy(0, 1, DISCOVER_DX)` against the pool with
    `restrict_to=[pool]`, capturing the exact storage slots it SLOADs (balances +
    amplification + fee, wherever they live). The discover call uses the variant's
    `get_dy` ABI (a CryptoSwap pool reverts the `int128` form).
 2. **Verify** — authoritatively warm those captured slots.
-3. **finish** — persist `coins` + `discovered_slots` + `variant`, status `Ready`.
+3. **finish** — persist `coins` + `discovered_slots` + `variant` (+ any
+   `code_seed`), status `Ready`.
 
 Repairs mirror Balancer: a reverting/empty discover → re-run cold-start; an
 archive-miss on a discovered slot → `VerifySlots`; a per-slot `SlotFetch`
 distinguishes a genuine zero from a fetch failure.
+
+**Verify-only** — the read-set is already known (`discovered_slots` pre-populated
+from a prior discovery, a block trace, or a registry). The planner **skips
+discovery entirely** — no pool-account/bytecode fetch and no cold-cache `get_dy`
+faulting — and warms exactly the known slots in a **single verify round**. This
+is what makes a known-read-set `cold_start` as cheap as the bundled
+`cold_start_many` storage-program path (the same one-shot hydration Uniswap V2/V3
+use), and it makes the pool eligible for `cold_start_many` /
+`supports_one_shot_hydration`. A stale/incomplete set is safe: verify refreshes
+what it has and the first `simulate_swap` lazily faults anything missing. See
+[`examples/curve_cold_start_phases.rs`](../examples/curve_cold_start_phases.rs)
+for a live discovery-vs-verify-only-vs-`cold_start_many` breakdown.
+
+### Bytecode seeding (optional)
+
+Curve pools are per-pool Vyper builds with **no shared or renderable template**
+(unlike Uniswap V2's shared pair runtime or V3's rendered template), so the crate
+embeds no Curve seed. A caller that already knows a pool's runtime can attach it
+via [`CurveMetadata::with_code_seed`]: cold-start (and `cold_start_many`) verify
+it once against the on-chain `EXTCODEHASH` — a mismatch is purged and the pool
+falls back to lazily fetching the real code, so a wrong seed is a latency
+question, never a correctness one. Seeding removes the one lazy code fetch a Curve
+pool otherwise pays on its first `simulate_swap`, matching the fully-offline
+V2/V3 profile after bootstrap.
+
+[`CurveMetadata::with_code_seed`]: https://docs.rs/evm-amm-state/latest/evm_amm_state/adapters/struct.CurveMetadata.html
 
 ## Reactive — resync (not event-sourcing)
 

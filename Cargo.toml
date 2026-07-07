@@ -265,6 +265,13 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "curve"]
 name = "trace_resync_latency"
 required-features = ["curve"]
 
+# Curve cold-start phase breakdown: discovery (slow first boot) vs verify-only
+# cold_start vs cold_start_many, once the read-set is known. Env-gated; defaults
+# to a public Ethereum endpoint when E2E_RPC_URL is unset.
+[[example]]
+name = "curve_cold_start_phases"
+required-features = ["curve"]
+
 # End-to-end arbitrage examples (env-gated; need an archive RPC to warm state).
 [[example]]
 name = "arbitrage_cross_dex"

@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 
 use super::cache::{SlotChange, StateDiff, StateUpdate};
 use super::storage::{SolidlyStorageLayout, V3StorageLayout};
@@ -608,18 +608,42 @@ pub enum CurveVariant {
 /// keeping cached state fresh for a later `simulate_swap`. Slot-only; all live
 /// on the pool address. Empty until cold-start runs.
 ///
+/// **Pre-populating `discovered_slots`** (from a prior discovery, a block trace,
+/// or a MetaRegistry-backed source) turns the otherwise unavoidable
+/// discover→verify cold start into a single verify round: `cold_start` skips the
+/// local `get_dy` discovery entirely, and the pool becomes eligible for the fast
+/// bundled [`cold_start_many`](super::AdapterRegistry::cold_start_many) /
+/// [`storage_sync`](super::storage_sync) path — the same one-shot hydration
+/// Uniswap V2/V3 use. A stale/incomplete set is safe: verify refreshes what it
+/// has and the first `simulate_swap` lazily faults any missing slot.
+///
 /// `variant` selects the index ABI (`StableSwap`/NG use `int128`; `CryptoSwap`
 /// uses `uint256`). Defaults to `StableSwap` (slice-1 + NG behavior).
+///
+/// `code_seed` is an **optional** caller-supplied canonical runtime bytecode for
+/// the pool. Curve pools are per-pool Vyper builds with no shared template
+/// (unlike Uniswap V2's shared pair runtime or V3's rendered template), so the
+/// crate embeds no Curve seed — but a caller that already knows a pool's runtime
+/// can attach it here. Cold-start verifies it once against the on-chain
+/// `EXTCODEHASH` (a mismatch is purged, falling back to lazily fetching the real
+/// code — never a correctness risk), removing the one lazy code fetch a Curve
+/// pool otherwise pays on its first `simulate_swap`. Empty/`None` = lazy fetch.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CurveMetadata {
     /// The pool's static coin ordering (drives the `get_dy` token→index map).
     pub coins: Vec<Address>,
     /// The `get_dy` read-set discovered at cold-start (balances + A + fee),
-    /// re-verified by the reactive path. Empty until discovery runs.
+    /// re-verified by the reactive path. Empty until discovery runs. Pre-fill it
+    /// to skip discovery (a verify-only cold start) and enable the fast bundled
+    /// hydration path.
     pub discovered_slots: Vec<U256>,
     /// The pool dialect selecting the `get_dy` / `TokenExchange` index ABI.
     pub variant: CurveVariant,
+    /// Optional caller-supplied canonical runtime bytecode for the pool, seeded
+    /// and verified once against on-chain code at cold-start. `None` (the
+    /// default) lazily fetches the real code on first simulate.
+    pub code_seed: Option<Bytes>,
 }
 
 impl CurveMetadata {
@@ -641,6 +665,16 @@ impl CurveMetadata {
     /// Set the Curve pool dialect (index ABI) variant.
     pub fn with_variant(mut self, variant: CurveVariant) -> Self {
         self.variant = variant;
+        self
+    }
+
+    /// Attach an optional canonical runtime bytecode seed for the pool.
+    ///
+    /// Cold-start verifies it once against the on-chain `EXTCODEHASH`; a mismatch
+    /// is purged and the pool falls back to lazily fetching its real code, so a
+    /// wrong seed is a latency question, never a correctness one.
+    pub fn with_code_seed(mut self, code_seed: impl Into<Bytes>) -> Self {
+        self.code_seed = Some(code_seed.into());
         self
     }
 }
