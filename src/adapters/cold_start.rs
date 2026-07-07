@@ -21,7 +21,8 @@
 //! a mandatory slot's verdict from `Value` / `Zero` / `FetchFailed`, so a genuine
 //! on-chain zero and a transient archive miss become *distinguishable* repairs.
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use evm_fork_cache::CacheError as UpstreamCacheError;
 use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_programs};
 use evm_fork_cache::cache::{CodeSeedState, EvmCache};
@@ -29,7 +30,10 @@ use evm_fork_cache::cold_start::ColdStartConfig;
 
 use super::bytecode::AdapterCodeSeed;
 use super::state::UpstreamStateView;
-use super::storage_sync::{StorageSyncSpec, decode_storage_sync, storage_sync_spec_for_pool};
+use super::storage_sync::{
+    StorageSyncEncoding, StorageSyncSpec, decode_storage_sync, run_storage_syncs,
+    storage_sync_spec_for_pool,
+};
 use super::{
     AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
     PoolRegistration, PoolStatus, SlotChange, StateView, UnsupportedReason,
@@ -879,7 +883,19 @@ impl AdapterRegistry {
             }
         }
 
-        // Step 4: finalize every fallback pool through the normal cold-start.
+        // Step 3.5: prime any layout-free fallback pool (Curve/Balancer with no
+        // known read-set) via one `eth_createAccessList` + one bundled load, so
+        // the step-4 cold-start below runs warm instead of faulting each slot
+        // serially over RPC. Best-effort: an un-primable pool (provider lacks
+        // `eth_createAccessList`, the call reverted, or it touched no slots)
+        // keeps the correct local-discovery fallback intact.
+        if self.access_list_discovery {
+            self.prime_fallback_read_sets(pools, &is_fallback, cache, provider)
+                .await;
+        }
+
+        // Step 4: finalize every fallback pool through the normal cold-start
+        // (now warm for any pool primed in step 3.5).
         for (index, pool) in pools.iter_mut().enumerate() {
             if is_fallback[index] {
                 outcomes[index] = Some(self.cold_start(pool, cache, policy)?);
@@ -892,6 +908,226 @@ impl AdapterRegistry {
             .map(|outcome| outcome.expect("every pool is fast-hydrated or fell back"))
             .collect())
     }
+
+    /// Cold-start one pool, deriving an unknown read-set via `eth_createAccessList`
+    /// first (the two-shot first-boot fast path).
+    ///
+    /// The single-pool, provider-backed analog of [`cold_start`](Self::cold_start):
+    /// where `cold_start` runs the discover view-call in local revm over a cold
+    /// cache — faulting each SLOAD one-at-a-time over RPC — this asks the node for
+    /// the discover call's access list in one round-trip, bulk-loads those slots,
+    /// then finalizes through the normal cold-start (now warm). A layout-free pool
+    /// (Curve / Balancer) whose read-set is already known, or any named/derived-slot
+    /// protocol (Uniswap V2/V3, Solidly), simply takes the normal path. Delegates to
+    /// [`cold_start_many`](Self::cold_start_many) so all priming logic lives in one
+    /// place; the same graceful fallback and `Err` propagation apply.
+    pub async fn cold_start_primed<P>(
+        &self,
+        pool: &mut PoolRegistration,
+        cache: &mut EvmCache,
+        provider: &P,
+        policy: ColdStartPolicy,
+    ) -> Result<ColdStartOutcome, ColdStartError>
+    where
+        P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+    {
+        let mut outcomes = self
+            .cold_start_many(std::slice::from_mut(pool), cache, provider, policy)
+            .await?;
+        Ok(outcomes
+            .pop()
+            .expect("cold_start_many returns one outcome per input pool"))
+    }
+
+    /// Two-shot read-set priming for `cold_start_many`'s fallback pools.
+    ///
+    /// **Shot 1:** for each fallback pool whose adapter planner declares a discover
+    /// view-call — the signal for a layout-free read-set that must be discovered
+    /// (Curve `get_dy`, Balancer `getPoolTokens`); named/derived-slot protocols
+    /// declare none and are skipped — derive that call's storage read-set with one
+    /// `eth_createAccessList`. **Shot 2:** one bundled storage program loads every
+    /// derived read-set, injected as cold-prefetched storage.
+    ///
+    /// This only *prewarms* the cache: the authoritative read-set and all
+    /// metadata/status finalization still come from the caller's subsequent
+    /// per-pool [`cold_start`](Self::cold_start), whose discover call now executes
+    /// warm (no serial faulting) and whose `finish` persists everything as usual.
+    /// So an incomplete access list self-heals (the warm discover captures the true
+    /// set; any missed slot faults once) and there is no correctness risk.
+    async fn prime_fallback_read_sets<P>(
+        &self,
+        pools: &[PoolRegistration],
+        is_fallback: &[bool],
+        cache: &mut EvmCache,
+        provider: &P,
+    ) where
+        P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+    {
+        // Collect each fallback pool's discover call. A verify-only / named-slot
+        // planner (Uniswap V2/V3, Solidly, or a Curve/Balancer pool whose read-set
+        // is already known) declares no discover call and is skipped — so an
+        // all-fast bootstrap does no extra work here (not even the gas-price fetch
+        // below).
+        let mut discover_calls: Vec<ColdStartCall> = Vec::new();
+        for (index, pool) in pools.iter().enumerate() {
+            if !is_fallback[index] {
+                continue;
+            }
+            let Some(adapter) = self.adapter(pool.protocol()) else {
+                continue;
+            };
+            let Ok(mut planner) = adapter.cold_start_planner(pool, ColdStartPolicy::Eager) else {
+                continue;
+            };
+            let plan =
+                planner.initial_plan(&UpstreamStateView(&*cache as &dyn evm_fork_cache::StateView));
+            if let Some(call) = plan.discover.into_iter().next() {
+                discover_calls.push(call);
+            }
+        }
+        if discover_calls.is_empty() {
+            return;
+        }
+
+        // Shot 1: `eth_createAccessList` runs the call for real at the PINNED
+        // block, so its gasPrice must be >= that block's baseFee (unlike the
+        // crate's local revm, which enforces no fee floor). Use the pinned block's
+        // own baseFee — the *latest* suggested price can sit below a historical
+        // block's baseFee. Fetch it once for the batch; default to 1 gwei
+        // (pre-London / unavailable), where an under-floor price just triggers
+        // per-pool fallback.
+        let block = cache.block();
+        let gas_price = pinned_base_fee(provider, block).await.unwrap_or(1_000_000_000);
+        let mut specs: Vec<StorageSyncSpec> = Vec::new();
+        for call in &discover_calls {
+            if let Some(slots) = access_list_read_set(provider, block, gas_price, call).await {
+                specs.push(
+                    StorageSyncSpec::new(call.to, slots)
+                        .with_encoding(StorageSyncEncoding::CalldataSlots),
+                );
+            }
+        }
+
+        // Shot 2: one bundled program loads every derived read-set; inject each
+        // successful snapshot so the follow-up cold-start's discover runs warm.
+        if specs.is_empty() {
+            return;
+        }
+        for snapshot in run_storage_syncs(provider, block, &specs)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            snapshot.inject(cache);
+        }
+    }
+}
+
+/// The pinned `block`'s base fee, used as the `gasPrice` for the
+/// `eth_createAccessList` probe.
+///
+/// `eth_createAccessList` executes at `block`, so its `gasPrice` must be
+/// `>= block.baseFee`; the node's *latest* suggested price can sit below a
+/// historical block's base fee (the bug this replaces). `None` — pre-London, or
+/// the block / header could not be fetched — lets the caller fall back to a
+/// default (an under-floor price merely triggers per-pool local discovery).
+async fn pinned_base_fee<P>(provider: &P, block: alloy_eips::BlockId) -> Option<u128>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    let block = provider.get_block(block).await.ok().flatten()?;
+    block.header.base_fee_per_gas.map(u128::from)
+}
+
+/// Gas cap for the `eth_createAccessList` probe: generous headroom over any
+/// single AMM view-call (observed ~100k for a Curve `get_dy`), bounded so the
+/// node's `balance >= gas * gasPrice` funding check stays affordable from `ZERO`.
+/// The access list is independent of this limit as long as the call completes.
+const ACCESS_LIST_GAS_CAP: u64 = 30_000_000;
+
+/// Null-tolerant view of the `eth_createAccessList` response.
+///
+/// geth returns `"storageKeys": null` for accounts a call merely touched without
+/// reading storage; alloy's own `AccessListItem` (a plain `Vec<B256>`) rejects
+/// that `null`, so this local mirror uses `Option<Vec<B256>>` (null / missing →
+/// `None`). Only the target's slots are read, so those touched-but-storageless
+/// accounts are skipped anyway.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessListProbe {
+    #[serde(default)]
+    access_list: Vec<AccessListProbeItem>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessListProbeItem {
+    address: Address,
+    #[serde(default)]
+    storage_keys: Option<Vec<B256>>,
+}
+
+/// Derive a discover call's storage read-set on `call.to` via one
+/// `eth_createAccessList`, or `None` when the provider lacks the method, the call
+/// reverted (reported via [`AccessListResult::error`]), or it touched no slots on
+/// the target — in every such case the caller falls back to local discovery.
+///
+/// Issued as a raw request carrying a plain [`TransactionRequest`] (`from`
+/// mirrors the local discover call's `from`, i.e. `ZERO`), so it needs no
+/// network-specific request wrapper. `eth_createAccessList`'s access list captures
+/// every storage slot the call SLOADs — exactly the read-set — which we then
+/// bulk-load, replacing the local discover's serial per-slot faulting.
+async fn access_list_read_set<P>(
+    provider: &P,
+    block: alloy_eips::BlockId,
+    gas_price: u128,
+    call: &ColdStartCall,
+) -> Option<Vec<U256>>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    // `eth_createAccessList` executes the call for real on the node, so — unlike
+    // the crate's local revm — it enforces the post-London fee floor
+    // (`gasPrice >= baseFee`) and sender funding (`balance >= gas * gasPrice`).
+    // The caller-supplied `gas_price` is the node's suggested price (>= baseFee),
+    // and a bounded gas cap keeps `gas * gasPrice` small and affordable from
+    // `ZERO`. If those still don't hold (e.g. an unfunded `ZERO` on some chain),
+    // the node errors and we fall back to local discovery.
+    let request = TransactionRequest {
+        from: Some(call.from),
+        to: Some(TxKind::Call(call.to)),
+        input: TransactionInput::new(call.calldata.clone()),
+        gas: Some(ACCESS_LIST_GAS_CAP),
+        gas_price: Some(gas_price),
+        ..Default::default()
+    };
+
+    let result: AccessListProbe = provider
+        .client()
+        .request("eth_createAccessList", (request, block))
+        .await
+        .ok()?;
+    // A server-side revert / gas cap reports via `error`; the list is then
+    // unreliable, so fall back rather than prime from it.
+    if result.error.is_some() {
+        return None;
+    }
+    // The read-set lives on `call.to` (the pool / vault); collect exactly its
+    // slots, deduped and ordered for a stable, minimal bulk load. Accounts the
+    // call merely touched (null / empty `storageKeys`) are skipped.
+    let mut slots: Vec<U256> = result
+        .access_list
+        .iter()
+        .filter(|item| item.address == call.to)
+        .filter_map(|item| item.storage_keys.as_deref())
+        .flatten()
+        .map(|key| U256::from_be_slice(key.as_slice()))
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    (!slots.is_empty()).then_some(slots)
 }
 
 /// Attach the verified-code-seed results to the [`ColdStartReport`] carried by a

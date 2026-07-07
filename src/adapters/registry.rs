@@ -18,6 +18,13 @@ pub struct AdapterRegistry {
     /// runtime bytecode (an optimization over the lazy real-code fetch).
     /// Defaults to `true`; opt out via [`with_code_seeding`](Self::with_code_seeding).
     pub(crate) code_seeding: bool,
+    /// Whether [`cold_start_many`](Self::cold_start_many) / [`cold_start_primed`](Self::cold_start_primed)
+    /// derive an unknown read-set with one `eth_createAccessList` call before
+    /// warming (the two-shot first-boot fast path). Defaults to `true`; opt out
+    /// via [`with_access_list_discovery`](Self::with_access_list_discovery) on a
+    /// provider that lacks `eth_createAccessList` (a per-pool failure already
+    /// falls back to local discovery, so this is only a round-trip optimization).
+    pub(crate) access_list_discovery: bool,
 }
 
 impl Default for AdapterRegistry {
@@ -26,6 +33,7 @@ impl Default for AdapterRegistry {
             adapters: HashMap::new(),
             pools: HashMap::new(),
             code_seeding: true,
+            access_list_discovery: true,
         }
     }
 }
@@ -44,6 +52,21 @@ impl AdapterRegistry {
     /// Defaults to `true`.
     pub fn with_code_seeding(mut self, enabled: bool) -> Self {
         self.code_seeding = enabled;
+        self
+    }
+
+    /// Enable or disable `eth_createAccessList`-based read-set discovery during
+    /// [`cold_start_many`](Self::cold_start_many) / [`cold_start_primed`](Self::cold_start_primed).
+    ///
+    /// When `true` (the default), a layout-free pool with no known read-set
+    /// (Curve / Balancer on first boot) has its `get_dy` / `getPoolTokens`
+    /// read-set derived by a single `eth_createAccessList` call and bulk-loaded,
+    /// so the subsequent cold-start runs warm instead of faulting each slot
+    /// serially. A provider that lacks `eth_createAccessList`, or a per-pool
+    /// failure, falls back to local discovery automatically — so disabling this
+    /// only avoids the (cheap, self-recovering) attempt.
+    pub fn with_access_list_discovery(mut self, enabled: bool) -> Self {
+        self.access_list_discovery = enabled;
         self
     }
 

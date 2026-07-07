@@ -73,6 +73,11 @@ alloy-provider = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
 
+# Lenient deserialization of the `eth_createAccessList` response: geth returns
+# `"storageKeys": null` for touched accounts with no storage access, which alloy's
+# own `AccessListItem` rejects. Already in the graph via alloy/revm.
+serde = { version = "1", features = ["derive"] }
+
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
 
 [dev-dependencies]
@@ -182,6 +187,12 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 [[test]]
 name = "adapter_swap_sim_rpc"
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
+
+# Live parity for eth_createAccessList two-shot cold warming (env-gated, #[ignore]):
+# `cold_start_primed`'s access-list-derived read-set equals local discovery's.
+[[test]]
+name = "access_list_discovery_rpc"
+required-features = ["curve"]
 
 # Offline revm execution of the generated V3 one-shot sync programs.
 [[test]]

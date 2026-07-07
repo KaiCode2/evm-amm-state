@@ -14,6 +14,7 @@ use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
+use alloy_rpc_types_eth::{AccessList, AccessListItem, AccessListResult};
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
 
@@ -1742,6 +1743,151 @@ async fn curve_cold_start_verify_only_unfetchable_slot_needs_repair() -> Result<
         "an unfetchable known slot must need a VerifySlots repair, got {outcome:?}"
     );
     assert_ne!(registration.status, PoolStatus::Ready);
+    Ok(())
+}
+
+// Two-shot first-boot warming (`cold_start_primed`): a Curve pool with NO known
+// read-set has its `get_dy` read-set derived by one `eth_createAccessList` (shot
+// 1) and bulk-loaded (shot 2), so the follow-up discover runs WARM. The only two
+// provider requests queued are createAccessList + the one bundled load; the
+// discover does not fault slot 0 over RPC (it was prewarmed) — reaching Ready
+// with an empty request queue proves the serial faulting was eliminated.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_primed_access_list_avoids_serial_faults() -> Result<()> {
+    let pool = Address::repeat_byte(0xca);
+    let fresh = U256::from(999_000_u64);
+
+    let asserter = Asserter::new();
+    let provider = Arc::new(RootProvider::<AnyNetwork>::new(RpcClient::mocked(
+        asserter.clone(),
+    )));
+    let mut cache = EvmCache::new(provider.clone()).await;
+
+    // Batch gas price (eth_gasPrice), fetched once before the access-list probe.
+    asserter.push_success(&U256::from(1_000_000_000_u64));
+    // Shot 1: createAccessList reports the pool touches slot 0.
+    asserter.push_success(&AccessListResult {
+        access_list: AccessList(vec![AccessListItem {
+            address: pool,
+            storage_keys: vec![B256::ZERO],
+        }]),
+        gas_used: U256::ZERO,
+        error: None,
+    });
+    // Shot 2: the bundled storage program returns slot 0's value (32 bytes).
+    asserter.push_success(&Bytes::from(fresh.to_be_bytes::<32>().to_vec()));
+
+    // Runtime so the warm discover's `get_dy` executes + the account is present
+    // (no account fetch); ZERO is the discover call's gas-credited beneficiary;
+    // the stub fetcher serves the verify round offline.
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((pool, U256::ZERO), fresh)]),
+        Vec::new(),
+    ));
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(CurveAdapter::default()))?;
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                .with_variant(CurveVariant::StableSwap),
+        ));
+
+    let outcome = registry
+        .cold_start_primed(&mut registration, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .await?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "primed cold-start should reach Ready, got {outcome:?}"
+    );
+    match registration.metadata {
+        ProtocolMetadata::Curve(ref m) => assert!(
+            m.discovered_slots.contains(&U256::ZERO),
+            "the warm discover must persist the read-set, got {:?}",
+            m.discovered_slots
+        ),
+        ref other => panic!("expected Curve metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        Some(fresh),
+        "slot 0 warmed to the fresh value"
+    );
+    // Exactly createAccessList + one bundled load were issued: a serial slot
+    // fault would have needed a third (un-queued) request and failed the run.
+    assert!(
+        asserter.read_q().is_empty(),
+        "no serial per-slot faults: only createAccessList + one bundled load"
+    );
+    Ok(())
+}
+
+// Graceful fallback: when the provider lacks `eth_createAccessList` (here, the
+// mock has no queued response, so it errors), priming is skipped and the pool
+// finalizes through the normal local discovery — still Ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn curve_cold_start_primed_falls_back_when_access_list_unsupported() -> Result<()> {
+    let pool = Address::repeat_byte(0xcb);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(555_000_u64);
+
+    let asserter = Asserter::new();
+    let provider = Arc::new(RootProvider::<AnyNetwork>::new(RpcClient::mocked(
+        asserter.clone(),
+    )));
+    let mut cache = EvmCache::new(provider.clone()).await;
+
+    // No queued response → createAccessList errors → priming skipped. The local
+    // discovery then runs: pre-seed slot 0 so its `get_dy` SLOAD does not fault,
+    // and the stub fetcher refreshes it in the verify round. ZERO is the discover
+    // call's gas-credited beneficiary.
+    install_default_account(&mut cache, Address::ZERO);
+    install_vault_runtime(
+        &mut cache,
+        pool,
+        include_str!("fixtures/mock_curve_pool_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(pool, U256::ZERO, stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((pool, U256::ZERO), fresh)]),
+        Vec::new(),
+    ));
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(CurveAdapter::default()))?;
+    let mut registration = PoolRegistration::new(PoolKey::Curve(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins(vec![Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
+                .with_variant(CurveVariant::StableSwap),
+        ));
+
+    let outcome = registry
+        .cold_start_primed(&mut registration, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .await?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "unsupported createAccessList must fall back to local discovery and still reach Ready, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    assert_eq!(
+        cache.cached_storage_value(pool, U256::ZERO),
+        Some(fresh),
+        "local discovery + verify refreshed the slot"
+    );
     Ok(())
 }
 

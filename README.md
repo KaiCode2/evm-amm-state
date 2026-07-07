@@ -181,6 +181,17 @@ discovery, a trace, or a registry), joining V2/V3 in the same bundled call. Comb
 the happy path is `find(PoolQuery::basket(..)) → cold_start_many → register`,
 with request count driven by bootstrap phases rather than pool count.
 
+**Fast first boot (no prior read-set).** Even a layout-free pool's *very first*
+cold start is fast by default: before falling back to local discovery (which runs
+the `get_dy` / `getPoolTokens` view-call in local revm over a cold cache, faulting
+each SLOAD serially over RPC), `cold_start_many` derives the read-set with a
+single `eth_createAccessList` and bulk-loads it, so the discover call then runs
+warm. `AdapterRegistry::cold_start_primed(pool, cache, provider, policy)` is the
+single-pool async entry point. This needs no configuration and no new API on the
+happy path; a provider that lacks `eth_createAccessList` (or any per-pool failure)
+transparently falls back to local discovery. Opt out with
+`AdapterRegistry::with_access_list_discovery(false)`.
+
 ### Extending with a new AMM
 
 You can add a brand-new AMM from *outside* the crate — no fork, no `src/` edit —

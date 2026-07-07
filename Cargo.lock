@@ -1903,6 +1903,7 @@ dependencies = [
  "futures",
  "reqwest",
  "revm",
+ "serde",
  "tokio",
 ]
 

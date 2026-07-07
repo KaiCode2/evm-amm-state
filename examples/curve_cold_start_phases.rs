@@ -195,13 +195,39 @@ async fn main() -> Result<()> {
         })?
     };
 
+    // 4) access-list first boot: the read-set is UNKNOWN (empty), but
+    //    `cold_start_primed` derives it via one `eth_createAccessList` + one
+    //    bundled load, then runs the discover warm — no serial faulting. This is
+    //    the fast path for a genuine first boot (no prior discovery needed).
+    let access_list = measure(iterations, || {
+        let provider = provider.clone();
+        async move {
+            let mut cache = cache(provider.clone(), block).await;
+            let mut reg = curve_registration(Vec::new(), None);
+            let outcome = curve_registry()
+                .cold_start_primed(&mut reg, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+                .await?;
+            ensure_ready(&outcome, "cold_start_primed")?;
+            Ok(())
+        }
+    })
+    .await
+    .map(|durations| PhaseStats {
+        durations,
+        details: "eth_createAccessList + bundled load, then warm discover".to_string(),
+    })?;
+
     print_row("discovery cold_start (cold first boot)", &discovery);
+    print_row("access-list first boot (cold_start_primed)", &access_list);
     print_row("verify-only cold_start (known read-set)", &verify_only);
     print_row("cold_start_many (known read-set)", &bundled);
 
     let base = discovery.median_ms();
     println!(
-        "\nverify-only is {:.1}x faster than first-discovery; cold_start_many is {:.1}x faster.",
+        "\naccess-list first boot is {:.1}x faster than local discovery (both from an \
+         unknown read-set); verify-only is {:.1}x and cold_start_many {:.1}x (both reuse a \
+         known read-set).",
+        base / access_list.median_ms().max(f64::MIN_POSITIVE),
         base / verify_only.median_ms().max(f64::MIN_POSITIVE),
         base / bundled.median_ms().max(f64::MIN_POSITIVE),
     );

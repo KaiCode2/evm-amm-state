@@ -119,6 +119,17 @@ faulting in each slot it SLOADs. That first-discovery cost — not warmed quotin
 is what makes a cold Curve boot lag Uniswap V2/V3, whose hot state is a known slot
 set (or tick-bitmap program) hydrated in one bundled `eth_call`.
 
+**Fast first boot (no prior read-set).** The discovery cost above is dominated by
+*serial* per-slot faulting. `AdapterRegistry::cold_start_primed` (and
+`cold_start_many`) instead derive the read-set with a single `eth_createAccessList`
+and bulk-load it, so the discover call then runs warm — no serial faulting.
+Measured on a public endpoint (Tricrypto2, via `curve_cold_start_phases`,
+mid-2026): local discovery **~728 ms → access-list first boot ~431 ms (~1.7×
+faster)**, closing further toward the ~100 ms known-read-set paths on
+higher-latency providers, where serial faulting is punished more per round-trip.
+This needs no prior read-set and no configuration; a provider without
+`eth_createAccessList` transparently falls back to local discovery.
+
 Once the read-set is known, the gap closes to the one-shot figures above (the
 same Curve 3pool row: **~361 ms → ~75 ms**). Two paths reuse a persisted
 `CurveMetadata.discovered_slots` (from a prior discovery, a block trace, or a
@@ -130,8 +141,8 @@ registry):
   the identical fast path Uniswap V2/V3 take.
 
 [`examples/curve_cold_start_phases.rs`](../examples/curve_cold_start_phases.rs)
-times all three (discovery vs verify-only vs `cold_start_many`) against a live
-pool and prints the breakdown — run it for numbers on your own endpoint:
+times all four (discovery, access-list first boot, verify-only, `cold_start_many`)
+against a live pool and prints the breakdown — run it for numbers on your endpoint:
 
 ```bash
 E2E_RPC_URL=<archive-url> cargo run --release --example curve_cold_start_phases
