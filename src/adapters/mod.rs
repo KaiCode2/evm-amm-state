@@ -5,11 +5,15 @@
 
 // Protocol-neutral infrastructure — always compiled (no heavy deps).
 pub mod bytecode;
+/// The [`AdapterCache`] facade over `evm-fork-cache` (reads, writes, raw calls).
 pub mod cache;
 pub mod cold_start;
+/// [`AdapterDriver`], which applies decoded logs to a cache in caller order.
 pub mod driver;
 pub mod factory;
+/// The [`AmmReactiveHandler`] bridge onto the `evm-fork-cache` reactive runtime.
 pub mod reactive;
+/// The [`AdapterRegistry`] of tracked pools and protocol adapters.
 pub mod registry;
 pub mod repair;
 pub mod sim;
@@ -17,18 +21,24 @@ pub mod state;
 pub mod storage;
 pub mod storage_sync;
 pub mod sync_manager;
+/// The [`AmmAdapter`] protocol-adapter trait.
 pub mod traits;
+/// Core public vocabulary: pool keys, metadata, events, repairs, and outcomes.
 pub mod types;
 
 // Per-protocol adapters — gated by their protocol feature.
+/// Balancer V2 adapter (shared-vault `queryBatchSwap` quotes).
 #[cfg(feature = "balancer-v2")]
 pub mod balancer_v2;
 #[cfg(feature = "curve")]
 pub mod curve;
+/// Solidly V2 (Aerodrome / Velodrome) adapter.
 #[cfg(feature = "solidly-v2")]
 pub mod solidly_v2;
+/// Uniswap V2 adapter (constant-product pairs).
 #[cfg(feature = "uniswap-v2")]
 pub mod uniswap_v2;
+/// Uniswap V3-family adapter (Uniswap V3 / PancakeSwap V3 / Slipstream).
 #[cfg(feature = "uniswap-v3")]
 pub mod uniswap_v3;
 #[cfg(feature = "uniswap-v3")]
@@ -65,7 +75,7 @@ pub use factory::{
 pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
-pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call};
+pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 #[cfg(feature = "solidly-v2")]
 pub use storage::SolidlyStorageLayout;
 pub use storage_sync::{

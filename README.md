@@ -46,12 +46,15 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
-| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → tick-range resync |
+| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → exact tick + global-liquidity writes where warm, resync only cold ticks |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`) | `Swap` → balance-slot resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
-All protocol features are on by default. See [`docs/curve-adapter.md`](docs/curve-adapter.md)
+All protocol features are on by default. See
+[`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
+per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
+discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
 
 > **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
@@ -85,10 +88,13 @@ Uniswap V3 has an embedded pool template and an explicit `uniswap_v3_code_seed`
 helper for callers that already know the pool immutables. Factory-discovered
 Uniswap V3 registrations carry the factory immutable in metadata, allowing
 automatic V3 seeding without assuming a chain-global factory address. Bytecode
-seeding covers Uniswap V2 and the V3 family; Balancer and Curve pools have no
-embedded seed and simply fetch their runtime code lazily on first simulate. Since
-seeding is a pure optimization over that lazy fetch, this is only a latency
-difference, never a correctness one.
+seeding covers Uniswap V2 and the V3 family from embedded/rendered templates.
+Balancer and Curve pools have no shared template, so by default they fetch their
+runtime code lazily on first simulate — but **Curve accepts an optional
+caller-supplied seed** via `CurveMetadata::with_code_seed(runtime)` for callers
+that already know a pool's Vyper runtime (verified once against on-chain code,
+same purge-on-mismatch contract). Since seeding is a pure optimization over that
+lazy fetch, this is only a latency difference, never a correctness one.
 
 ### Factory-backed Discovery
 
@@ -166,10 +172,12 @@ per-pair fallback.
 `AdapterRegistry::cold_start_many(pools, cache, provider, policy)` warms many
 pools at once: it seeds + verifies all one-shot-eligible pools' code in one
 account-fields call, hydrates them through a single bundled `run_storage_programs`
-`eth_call` (V3 full-sync / V2 flat-slot), and finalizes them `Ready`, falling
-back per pool to the conservative per-pool `cold_start` for anything without a
-one-shot program or whose hydration fails. `supports_one_shot_hydration`
-reports which pools take the fast path. Combined with token-basket discovery,
+`eth_call` (V3 full-sync / V2 flat-slot / Balancer or **Curve** discovered
+read-set), and finalizes them `Ready`, falling back per pool to the conservative
+per-pool `cold_start` for anything without a one-shot program or whose hydration
+fails. `supports_one_shot_hydration` reports which pools take the fast path — a
+Curve pool qualifies once its `discovered_slots` read-set is known (from a prior
+discovery, a trace, or a registry), joining V2/V3 in the same bundled call. Combined with token-basket discovery,
 the happy path is `find(PoolQuery::basket(..)) → cold_start_many → register`,
 with request count driven by bootstrap phases rather than pool count.
 
@@ -384,6 +392,11 @@ the crate builds from source with no generated bindings crate.
 cargo test                       # unit + offline integration tests
 cargo test --no-default-features # protocol-neutral core
 ```
+
+These run from a clone of the repository. The published crate **excludes the
+integration test suite** (`tests/`) to stay lean, so `cargo test` on a crates.io
+download exercises only the inline unit tests — clone the repo for the full
+suite.
 
 Network-dependent tests are env-gated and `#[ignore]`d. With an archive RPC they
 pin a block, cold-start a real pool, and assert `simulate_swap` **equals the

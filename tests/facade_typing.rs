@@ -23,6 +23,7 @@ use evm_amm_state::adapters::{
     AdapterCache, AdapterDriver, AdapterEventError, AdapterEventResult, AdapterRegistry,
     AmmAdapter, CacheError, CallOutcome, DriverError, EventSource, PoolKey, PoolRegistration,
     ProtocolId, SimError, SlotChange, StateDiff, StateUpdate, StateView, quote_via_call,
+    quote_via_call_from,
 };
 
 /// Minimal `AdapterCache` whose `call_raw` returns a caller-chosen `CallOutcome`.
@@ -64,6 +65,52 @@ impl AdapterCache for MockCache {
         _commit: bool,
     ) -> Result<CallOutcome, CacheError> {
         Ok(self.call.clone())
+    }
+}
+
+/// Cache that records the `from` (`msg.sender`) its `call_raw` was invoked with,
+/// so the quote helpers' sender threading can be asserted.
+struct CapturingCache {
+    from: std::cell::Cell<Address>,
+}
+
+impl StateView for CapturingCache {
+    fn storage(&self, _address: Address, _slot: U256) -> Option<U256> {
+        None
+    }
+}
+
+impl AdapterCache for CapturingCache {
+    fn cached_storage(&self, _address: Address, _slot: U256) -> Option<U256> {
+        None
+    }
+    fn apply_updates(&mut self, _updates: &[StateUpdate]) -> StateDiff {
+        StateDiff::default()
+    }
+    fn verify_slots(&mut self, _slots: &[(Address, U256)]) -> Result<Vec<SlotChange>, CacheError> {
+        Ok(Vec::new())
+    }
+    fn purge_storage(&mut self, _address: Address) -> StateDiff {
+        StateDiff::default()
+    }
+    fn purge_slots(&mut self, _address: Address, _slots: &[U256]) -> StateDiff {
+        StateDiff::default()
+    }
+    fn read_storage_slot(&mut self, _address: Address, _slot: U256) -> Result<U256, CacheError> {
+        Ok(U256::ZERO)
+    }
+    fn call_raw(
+        &mut self,
+        from: Address,
+        _to: Address,
+        _calldata: Bytes,
+        _commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        self.from.set(from);
+        Ok(CallOutcome::Success {
+            output: Bytes::new(),
+            gas_used: 0,
+        })
     }
 }
 
@@ -109,6 +156,25 @@ fn quote_via_call_is_public_and_maps_revert_to_sim_error() {
     };
     let err = quote_via_call(&mut cache, Address::ZERO, Bytes::new()).unwrap_err();
     assert!(matches!(err, SimError::Reverted));
+}
+
+#[test]
+fn quote_via_call_from_threads_the_sender() {
+    // `quote_via_call` runs the quote as the ZERO sender.
+    let mut cache = CapturingCache {
+        from: std::cell::Cell::new(Address::repeat_byte(0xee)),
+    };
+    quote_via_call(&mut cache, Address::repeat_byte(0x01), Bytes::new()).unwrap();
+    assert_eq!(cache.from.get(), Address::ZERO);
+
+    // `quote_via_call_from` runs it as the given sender — this is what every
+    // adapter wires from `SimConfig::from`.
+    let sender = Address::repeat_byte(0x99);
+    let mut cache = CapturingCache {
+        from: std::cell::Cell::new(Address::ZERO),
+    };
+    quote_via_call_from(&mut cache, sender, Address::repeat_byte(0x01), Bytes::new()).unwrap();
+    assert_eq!(cache.from.get(), sender);
 }
 
 #[test]

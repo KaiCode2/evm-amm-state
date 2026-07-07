@@ -31,6 +31,7 @@ impl Default for AdapterRegistry {
 }
 
 impl AdapterRegistry {
+    /// An empty registry with code-seeding enabled.
     pub fn new() -> Self {
         Self::default()
     }
@@ -46,6 +47,8 @@ impl AdapterRegistry {
         self
     }
 
+    /// Register a pool. Errors [`RegistryError::DuplicatePool`] if its key is
+    /// already registered.
     pub fn register_pool(&mut self, registration: PoolRegistration) -> Result<(), RegistryError> {
         if self.pools.contains_key(&registration.key) {
             return Err(RegistryError::DuplicatePool(registration.key));
@@ -65,6 +68,9 @@ impl AdapterRegistry {
         self.pools.remove(key)
     }
 
+    /// Register an adapter under every id it [`serves`](AmmAdapter::protocols).
+    /// Errors [`RegistryError::DuplicateAdapter`] if any of those ids is taken
+    /// (no partial insert).
     pub fn register_adapter(&mut self, adapter: Arc<dyn AmmAdapter>) -> Result<(), RegistryError> {
         // Validate every claimed id up front so a multi-protocol adapter never
         // partially inserts when one of its ids collides.
@@ -113,26 +119,33 @@ impl AdapterRegistry {
         Ok(Some(adapter))
     }
 
+    /// The adapter registered for `protocol`, if any.
     pub fn adapter(&self, protocol: ProtocolId) -> Option<&Arc<dyn AmmAdapter>> {
         self.adapters.get(&protocol)
     }
 
+    /// Iterate the registered adapters (a family adapter appears once per id).
     pub fn adapters(&self) -> impl Iterator<Item = &Arc<dyn AmmAdapter>> {
         self.adapters.values()
     }
 
+    /// The registration for `key`, if tracked.
     pub fn pool(&self, key: &PoolKey) -> Option<&PoolRegistration> {
         self.pools.get(key)
     }
 
+    /// A mutable borrow of the registration for `key`, if tracked.
     pub fn pool_mut(&mut self, key: &PoolKey) -> Option<&mut PoolRegistration> {
         self.pools.get_mut(key)
     }
 
+    /// Iterate the tracked pool registrations.
     pub fn pools(&self) -> impl Iterator<Item = &PoolRegistration> {
         self.pools.values()
     }
 
+    /// Route `log` to the pool it belongs to (generic emitter/topic routing,
+    /// then each adapter's `route_log` fallback).
     pub fn route_log(&self, log: &Log) -> Option<&PoolRegistration> {
         if let Some(pool) = self.route_log_generic(log) {
             return Some(pool);
@@ -167,6 +180,8 @@ impl AdapterRegistry {
         })
     }
 
+    /// The sorted, de-duplicated set of `topic0`s across every tracked pool's
+    /// event sources (a log-subscription filter).
     pub fn subscription_topics(&self) -> Vec<B256> {
         let mut topics: Vec<B256> = self
             .pools
@@ -180,6 +195,7 @@ impl AdapterRegistry {
         topics
     }
 
+    /// The full [`SubscriptionSpec`] (every tracked pool's event sources).
     pub fn subscription_spec(&self) -> SubscriptionSpec {
         SubscriptionSpec {
             sources: self
@@ -190,10 +206,12 @@ impl AdapterRegistry {
         }
     }
 
+    /// The number of tracked pools.
     pub fn len(&self) -> usize {
         self.pools.len()
     }
 
+    /// Whether no pools are tracked.
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty()
     }
@@ -254,9 +272,11 @@ impl fmt::Debug for AdapterRegistry {
     }
 }
 
+/// The set of event sources to subscribe for a registry's tracked pools.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionSpec {
+    /// Every event source to subscribe across the tracked pools.
     pub sources: Vec<EventSource>,
 }
 
@@ -307,7 +327,9 @@ fn topic_address(topic: &B256) -> Address {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
+    /// A pool with this key is already registered.
     DuplicatePool(PoolKey),
+    /// An adapter for this protocol id is already registered.
     DuplicateAdapter(ProtocolId),
     /// The adapter still serves at least one registered pool and cannot be
     /// unregistered until those pools are removed.

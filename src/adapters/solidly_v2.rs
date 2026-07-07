@@ -3,7 +3,7 @@ use super::cold_start::{
     SlotFetch,
 };
 use super::factory::{FactoryConfig, PoolFactory, SolidlyFactory};
-use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, quote_via_call};
+use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, quote_via_call_from};
 use super::storage::{SolidlyStorageLayout, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -187,7 +187,7 @@ impl AmmAdapter for SolidlyV2Adapter {
         token_in: Address,
         _token_out: Address,
         amount_in: U256,
-        _config: &SimConfig,
+        config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
         let pool_address = pool
             .key
@@ -202,7 +202,7 @@ impl AmmAdapter for SolidlyV2Adapter {
             .abi_encode(),
         );
 
-        let output = quote_via_call(cache, pool_address, calldata)?;
+        let output = quote_via_call_from(cache, config.from, pool_address, calldata)?;
         let amount_out = getAmountOutCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("getAmountOut return"))?;
         Ok(SwapQuote::new(amount_out))

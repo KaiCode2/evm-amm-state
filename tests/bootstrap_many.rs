@@ -273,4 +273,20 @@ fn supports_one_shot_hydration_classifies_by_protocol_and_metadata() {
         !supports_one_shot_hydration(&curve),
         "Curve has no persisted flat read-set until discovery runs"
     );
+
+    // ...but once a Curve pool's read-set is persisted (a prior discovery, a
+    // trace, or a registry), it joins the fast bundled hydration path — the
+    // discovered slots become a flat storage-sync program, just like V2/Solidly.
+    let curve_ready = PoolRegistration::new(PoolKey::Curve(Address::repeat_byte(0x05)))
+        .with_state_address(Address::repeat_byte(0x05))
+        .with_metadata(ProtocolMetadata::Curve(
+            CurveMetadata::default()
+                .with_coins([Address::repeat_byte(0x0a), Address::repeat_byte(0x0b)])
+                .with_discovered_slots([U256::from(1), U256::from(2)])
+                .with_variant(CurveVariant::CryptoSwap),
+        ));
+    assert!(
+        supports_one_shot_hydration(&curve_ready),
+        "Curve with a persisted discovered read-set supports one-shot flat hydration"
+    );
 }

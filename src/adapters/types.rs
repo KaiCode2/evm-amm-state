@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 
 use super::cache::{SlotChange, StateDiff, StateUpdate};
 use super::storage::{SolidlyStorageLayout, V3StorageLayout};
@@ -11,19 +11,30 @@ use super::storage::{SolidlyStorageLayout, V3StorageLayout};
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProtocolId {
+    /// Uniswap V2 constant-product pairs.
     UniswapV2,
+    /// Uniswap V3 concentrated-liquidity pools.
     UniswapV3,
+    /// PancakeSwap V3 (Uniswap V3-family with its own fee tiers / slot layout).
     PancakeV3,
+    /// Slipstream / Aerodrome concentrated-liquidity (tickSpacing-keyed).
     Slipstream,
+    /// Solidly V2 (Aerodrome / Velodrome) reserves pools.
     SolidlyV2,
+    /// Balancer V2 (shared-vault) pools.
     BalancerV2,
+    /// Balancer V3 — reserved identity, no adapter yet.
     #[cfg(feature = "experimental-protocols")]
     BalancerV3,
+    /// Curve StableSwap / CryptoSwap family pools.
     Curve,
+    /// ERC-4626 tokenized vaults — reserved identity, no adapter yet.
     #[cfg(feature = "experimental-protocols")]
     Erc4626,
+    /// Uniswap V4 — reserved identity, no adapter yet.
     #[cfg(feature = "experimental-protocols")]
     UniswapV4,
+    /// A third-party protocol, identified by a `'static` name.
     Custom(&'static str),
 }
 
@@ -31,19 +42,30 @@ pub enum ProtocolId {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PoolKey {
+    /// Uniswap V2 pair, keyed by pool address.
     UniswapV2(Address),
+    /// Uniswap V3 pool, keyed by pool address.
     UniswapV3(Address),
+    /// PancakeSwap V3 pool, keyed by pool address.
     PancakeV3(Address),
+    /// Slipstream / Aerodrome CL pool, keyed by pool address.
     Slipstream(Address),
+    /// Solidly V2 pool, keyed by pool address.
     SolidlyV2(Address),
+    /// Balancer V2 pool, keyed by its 32-byte `poolId`.
     BalancerV2(B256),
+    /// Balancer V3 pool, keyed by pool address (reserved; no adapter yet).
     #[cfg(feature = "experimental-protocols")]
     BalancerV3(Address),
+    /// Curve pool, keyed by pool address.
     Curve(Address),
+    /// ERC-4626 vault, keyed by address (reserved; no adapter yet).
     #[cfg(feature = "experimental-protocols")]
     Erc4626(Address),
+    /// Uniswap V4 pool, keyed by its 32-byte pool id (reserved; no adapter yet).
     #[cfg(feature = "experimental-protocols")]
     UniswapV4(B256),
+    /// A third-party pool identity (see [`CustomPoolKey`]).
     Custom(CustomPoolKey),
 }
 
@@ -109,22 +131,33 @@ impl PoolKey {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomPoolKey {
+    /// An address-keyed custom pool.
     Address {
+        /// The custom protocol's `'static` name.
         protocol: &'static str,
+        /// The pool's contract address.
         address: Address,
     },
+    /// A bytes32-keyed custom pool (e.g. a vault-style pool id).
     Bytes32 {
+        /// The custom protocol's `'static` name.
         protocol: &'static str,
+        /// The pool's 32-byte identifier.
         id: B256,
     },
+    /// A custom pool identified by both an address and a bytes32 id.
     Composite {
+        /// The custom protocol's `'static` name.
         protocol: &'static str,
+        /// The pool's contract address.
         address: Address,
+        /// The pool's 32-byte identifier.
         id: B256,
     },
 }
 
 impl CustomPoolKey {
+    /// The [`ProtocolId::Custom`] this key belongs to.
     pub fn protocol(&self) -> ProtocolId {
         match self {
             Self::Address { protocol, .. }
@@ -133,6 +166,7 @@ impl CustomPoolKey {
         }
     }
 
+    /// The pool's contract address, for address- or composite-keyed variants.
     pub fn address(&self) -> Option<Address> {
         match self {
             Self::Address { address, .. } | Self::Composite { address, .. } => Some(*address),
@@ -140,6 +174,7 @@ impl CustomPoolKey {
         }
     }
 
+    /// The pool's 32-byte id, for bytes32- or composite-keyed variants.
     pub fn bytes32(&self) -> Option<B256> {
         match self {
             Self::Bytes32 { id, .. } | Self::Composite { id, .. } => Some(*id),
@@ -152,12 +187,16 @@ impl CustomPoolKey {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventSource {
+    /// The contract address that emits the log.
     pub emitter: Address,
+    /// The `topic0` signature hashes this source matches (empty = any topic).
     pub topics: Vec<B256>,
+    /// How a matched log is routed to a pool key.
     pub route: EventRoute,
 }
 
 impl EventSource {
+    /// A source whose logs route directly by emitter address.
     pub fn direct(emitter: Address, topics: Vec<B256>) -> Self {
         Self {
             emitter,
@@ -166,6 +205,7 @@ impl EventSource {
         }
     }
 
+    /// A source whose logs route by an indexed **address** topic at `topic_index`.
     pub fn indexed_address(emitter: Address, topics: Vec<B256>, topic_index: usize) -> Self {
         Self {
             emitter,
@@ -174,6 +214,7 @@ impl EventSource {
         }
     }
 
+    /// A source whose logs route by an indexed **bytes32** topic at `topic_index`.
     pub fn indexed_bytes32(emitter: Address, topics: Vec<B256>, topic_index: usize) -> Self {
         Self {
             emitter,
@@ -182,6 +223,7 @@ impl EventSource {
         }
     }
 
+    /// A source whose routing is decided by the adapter's own `route_log`.
     pub fn adapter_defined(emitter: Address, topics: Vec<B256>) -> Self {
         Self {
             emitter,
@@ -198,9 +240,19 @@ impl EventSource {
 /// dispatch semantics and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventRoute {
+    /// The log belongs to the pool whose key address is the emitter.
     Direct,
-    IndexedAddress { topic_index: usize },
-    IndexedBytes32 { topic_index: usize },
+    /// Route by an indexed address topic at `topic_index` (the low 20 bytes).
+    IndexedAddress {
+        /// Index of the topic carrying the pool address.
+        topic_index: usize,
+    },
+    /// Route by an indexed bytes32 topic at `topic_index` (e.g. a Balancer poolId).
+    IndexedBytes32 {
+        /// Index of the topic carrying the pool's bytes32 id.
+        topic_index: usize,
+    },
+    /// Routing is delegated to the adapter's own `route_log`.
     AdapterDefined,
 }
 
@@ -208,14 +260,21 @@ pub enum EventRoute {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct PoolRegistration {
+    /// The pool's protocol-specific identity.
     pub key: PoolKey,
+    /// Contract addresses whose storage backs this pool (pool and/or vault).
     pub state_addresses: Vec<Address>,
+    /// Log sources to subscribe and route for this pool.
     pub event_sources: Vec<EventSource>,
+    /// Protocol metadata (tokens, fee, layout, discovered slots, …).
     pub metadata: ProtocolMetadata,
+    /// Lifecycle status of the registration.
     pub status: PoolStatus,
 }
 
 impl PoolRegistration {
+    /// A new registration for `key` with empty sources/metadata and
+    /// [`PoolStatus::Pending`].
     pub fn new(key: PoolKey) -> Self {
         Self {
             key,
@@ -226,35 +285,42 @@ impl PoolRegistration {
         }
     }
 
+    /// The pool's protocol family (from its [`key`](Self::key)).
     pub fn protocol(&self) -> ProtocolId {
         self.key.protocol()
     }
 
+    /// Add one backing state address.
     pub fn with_state_address(mut self, address: Address) -> Self {
         self.state_addresses.push(address);
         self
     }
 
+    /// Add several backing state addresses.
     pub fn with_state_addresses(mut self, addresses: impl IntoIterator<Item = Address>) -> Self {
         self.state_addresses.extend(addresses);
         self
     }
 
+    /// Add one event source.
     pub fn with_event_source(mut self, source: EventSource) -> Self {
         self.event_sources.push(source);
         self
     }
 
+    /// Add several event sources.
     pub fn with_event_sources(mut self, sources: impl IntoIterator<Item = EventSource>) -> Self {
         self.event_sources.extend(sources);
         self
     }
 
+    /// Set the protocol metadata.
     pub fn with_metadata(mut self, metadata: ProtocolMetadata) -> Self {
         self.metadata = metadata;
         self
     }
 
+    /// Set the lifecycle status.
     pub fn with_status(mut self, status: PoolStatus) -> Self {
         self.status = status;
         self
@@ -265,15 +331,24 @@ impl PoolRegistration {
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub enum ProtocolMetadata {
+    /// No metadata known yet (the default before cold-start/registration fills it).
     #[default]
     Unknown,
+    /// Uniswap V2 pair metadata.
     UniswapV2(UniswapV2Metadata),
+    /// Uniswap V3 pool metadata.
     UniswapV3(V3Metadata),
+    /// PancakeSwap V3 pool metadata (shares [`V3Metadata`]).
     PancakeV3(V3Metadata),
+    /// Slipstream / Aerodrome CL pool metadata (shares [`V3Metadata`]).
     Slipstream(V3Metadata),
+    /// Balancer V2 pool metadata.
     BalancerV2(BalancerV2Metadata),
+    /// Solidly V2 pool metadata.
     SolidlyV2(SolidlyV2Metadata),
+    /// Curve pool metadata.
     Curve(CurveMetadata),
+    /// Opaque third-party metadata, downcast by the custom adapter.
     Custom(Arc<dyn Any + Send + Sync>),
 }
 
@@ -293,11 +368,15 @@ impl fmt::Debug for ProtocolMetadata {
     }
 }
 
+/// Metadata for a Uniswap V2 pair.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UniswapV2Metadata {
+    /// The pair's `token0` (decoded from storage at cold-start when unset).
     pub token0: Option<Address>,
+    /// The pair's `token1` (decoded from storage at cold-start when unset).
     pub token1: Option<Address>,
+    /// Config-supplied swap fee in basis points (V2 has no on-chain fee slot).
     pub fee_bps: Option<u32>,
 }
 
@@ -321,12 +400,19 @@ impl UniswapV2Metadata {
     }
 }
 
+/// Metadata for a Uniswap V3-family pool (Uniswap V3 / PancakeSwap V3 / Slipstream).
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct V3Metadata {
+    /// The pool's `token0`.
     pub token0: Option<Address>,
+    /// The pool's `token1`.
     pub token1: Option<Address>,
+    /// The pool fee in hundredths of a bip (e.g. `500` = 0.05%). Required for
+    /// `simulate_swap` (the QuoterV2 fee argument).
     pub fee: Option<u32>,
+    /// The pool's tick spacing (drives the derived storage layout when no
+    /// explicit `storage_layout` is set).
     pub tick_spacing: Option<i32>,
     /// Factory/deployer address embedded as an immutable in canonical Uniswap V3
     /// pool bytecode. Factory discovery fills this; manual registrations can set
@@ -339,6 +425,8 @@ pub struct V3Metadata {
     /// caller's configured quoter. Factory discovery fills this from the
     /// fork's [`ClFactorySpec`](super::factory::ClFactorySpec) quoter.
     pub quoter: Option<Address>,
+    /// Explicit V3 storage layout (slot bases + tick spacing). When unset it is
+    /// derived from `tick_spacing` per the pool's family.
     pub storage_layout: Option<V3StorageLayout>,
     /// The ± radius, in tick-bitmap words, of the cold-start tick-warm window
     /// around the current word (`Strict`/`Eager` policies).
@@ -400,14 +488,18 @@ impl V3Metadata {
     }
 }
 
+/// Metadata for a Solidly V2 (Aerodrome / Velodrome) reserves pool.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SolidlyV2Metadata {
+    /// The pool's `token0` (decoded from the config layout at cold-start).
     pub token0: Option<Address>,
+    /// The pool's `token1` (decoded from the config layout at cold-start).
     pub token1: Option<Address>,
     /// `true` for stable (x³y+y³x) pools, `false` for volatile (xy=k). Config-
     /// supplied; preserved across cold-start.
     pub stable: Option<bool>,
+    /// Fork-specific reserve/token storage layout (config-supplied; no default).
     pub storage_layout: Option<SolidlyStorageLayout>,
 }
 
@@ -430,18 +522,22 @@ impl SolidlyV2Metadata {
         self
     }
 
-    /// Set the pool's Solidly storage layout descriptor.
+    /// Set the pool's Solidly storage layout descriptor (fork-specific slots).
     pub fn with_storage_layout(mut self, storage_layout: SolidlyStorageLayout) -> Self {
         self.storage_layout = Some(storage_layout);
         self
     }
 }
 
+/// Metadata for a Balancer V2 pool.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BalancerV2Metadata {
+    /// The Balancer `Vault` address (the swap/quote target).
     pub vault: Option<Address>,
+    /// The pool's own contract address (distinct from the shared vault).
     pub pool_address: Option<Address>,
+    /// The pool's registered token list (from `getPoolTokens`).
     pub tokens: Vec<Address>,
     /// Vault balance storage slots discovered during cold-start (the `(vault,
     /// slot)` pairs the `getPoolTokens` view-call SLOADed; recorded slot-only
@@ -512,14 +608,42 @@ pub enum CurveVariant {
 /// keeping cached state fresh for a later `simulate_swap`. Slot-only; all live
 /// on the pool address. Empty until cold-start runs.
 ///
+/// **Pre-populating `discovered_slots`** (from a prior discovery, a block trace,
+/// or a MetaRegistry-backed source) turns the otherwise unavoidable
+/// discover→verify cold start into a single verify round: `cold_start` skips the
+/// local `get_dy` discovery entirely, and the pool becomes eligible for the fast
+/// bundled [`cold_start_many`](super::AdapterRegistry::cold_start_many) /
+/// [`storage_sync`](super::storage_sync) path — the same one-shot hydration
+/// Uniswap V2/V3 use. A stale/incomplete set is safe: verify refreshes what it
+/// has and the first `simulate_swap` lazily faults any missing slot.
+///
 /// `variant` selects the index ABI (`StableSwap`/NG use `int128`; `CryptoSwap`
 /// uses `uint256`). Defaults to `StableSwap` (slice-1 + NG behavior).
+///
+/// `code_seed` is an **optional** caller-supplied canonical runtime bytecode for
+/// the pool. Curve pools are per-pool Vyper builds with no shared template
+/// (unlike Uniswap V2's shared pair runtime or V3's rendered template), so the
+/// crate embeds no Curve seed — but a caller that already knows a pool's runtime
+/// can attach it here. Cold-start verifies it once against the on-chain
+/// `EXTCODEHASH` (a mismatch is purged, falling back to lazily fetching the real
+/// code — never a correctness risk), removing the one lazy code fetch a Curve
+/// pool otherwise pays on its first `simulate_swap`. Empty/`None` = lazy fetch.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CurveMetadata {
+    /// The pool's static coin ordering (drives the `get_dy` token→index map).
     pub coins: Vec<Address>,
+    /// The `get_dy` read-set discovered at cold-start (balances + A + fee),
+    /// re-verified by the reactive path. Empty until discovery runs. Pre-fill it
+    /// to skip discovery (a verify-only cold start) and enable the fast bundled
+    /// hydration path.
     pub discovered_slots: Vec<U256>,
+    /// The pool dialect selecting the `get_dy` / `TokenExchange` index ABI.
     pub variant: CurveVariant,
+    /// Optional caller-supplied canonical runtime bytecode for the pool, seeded
+    /// and verified once against on-chain code at cold-start. `None` (the
+    /// default) lazily fetches the real code on first simulate.
+    pub code_seed: Option<Bytes>,
 }
 
 impl CurveMetadata {
@@ -543,18 +667,34 @@ impl CurveMetadata {
         self.variant = variant;
         self
     }
+
+    /// Attach an optional canonical runtime bytecode seed for the pool.
+    ///
+    /// Cold-start verifies it once against the on-chain `EXTCODEHASH`; a mismatch
+    /// is purged and the pool falls back to lazily fetching its real code, so a
+    /// wrong seed is a latency question, never a correctness one.
+    pub fn with_code_seed(mut self, code_seed: impl Into<Bytes>) -> Self {
+        self.code_seed = Some(code_seed.into());
+        self
+    }
 }
 
 /// Lifecycle status for a tracked pool registration.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PoolStatus {
+    /// Registered but not yet cold-started.
     #[default]
     Pending,
+    /// Cold-start in progress / partially warmed.
     Cold,
+    /// Warmed and ready to simulate.
     Ready,
+    /// Warmed but a repair target failed; state may be stale until a resync.
     Degraded,
+    /// Explicitly disabled by the caller.
     Disabled,
+    /// The protocol/layout is not supported for this pool.
     Unsupported,
 }
 
@@ -562,12 +702,19 @@ pub enum PoolStatus {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterEvent {
+    /// The pool this event belongs to.
     pub pool: PoolKey,
+    /// The log's emitter address.
     pub emitter: Address,
+    /// The log's `topic0` signature hash.
     pub topic0: B256,
+    /// The high-level event class.
     pub kind: AdapterEventKind,
+    /// Cache mutations this event applies.
     pub updates: Vec<StateUpdate>,
+    /// Quality of the emitted updates (exact vs. needs-repair).
     pub quality: UpdateQuality,
+    /// Follow-up repair action to combine after applying `updates`.
     pub repair: RepairAction,
 }
 
@@ -610,9 +757,13 @@ impl AdapterEvent {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterEventReport {
+    /// The pool the event routed to.
     pub pool: PoolKey,
+    /// The decoded semantic event.
     pub event: AdapterEvent,
+    /// The diff actually applied to the cache.
     pub applied: StateDiff,
+    /// The combined follow-up repair (event repair + `after_apply`).
     pub repair: RepairAction,
 }
 
@@ -620,12 +771,19 @@ pub struct AdapterEventReport {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AdapterEventKind {
+    /// A swap (trade) event.
     Swap,
+    /// Liquidity added (mint / add_liquidity).
     LiquidityAdded,
+    /// Liquidity removed (burn / remove_liquidity).
     LiquidityRemoved,
+    /// A reserves-sync event carrying absolute state (Uniswap V2 / Solidly).
     Sync,
+    /// A deposit into a vault-style pool.
     Deposit,
+    /// A withdrawal from a vault-style pool.
     Withdraw,
+    /// An event the adapter recognized but does not classify further.
     Unknown,
 }
 
@@ -633,11 +791,14 @@ pub enum AdapterEventKind {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdapterEventResult {
+    /// The decoded event, if the log was recognized and well-formed.
     pub event: Option<AdapterEvent>,
+    /// A structured decode error, if the log was recognized but malformed.
     pub error: Option<AdapterEventError>,
 }
 
 impl AdapterEventResult {
+    /// A successful decode carrying `event`.
     pub fn event(event: AdapterEvent) -> Self {
         Self {
             event: Some(event),
@@ -645,10 +806,12 @@ impl AdapterEventResult {
         }
     }
 
+    /// The log was not for this adapter/pool — neither event nor error.
     pub fn ignored() -> Self {
         Self::default()
     }
 
+    /// A recognized-but-malformed log carrying a structured `error`.
     pub fn error(error: AdapterEventError) -> Self {
         Self {
             event: None,
@@ -661,9 +824,18 @@ impl AdapterEventResult {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterEventError {
+    /// The log matched a watched topic but its payload could not be decoded.
     MalformedLog(&'static str),
-    MissingState { address: Address, slot: U256 },
+    /// Decoding needed cached state that was absent at `address`/`slot`.
+    MissingState {
+        /// The contract whose slot was needed.
+        address: Address,
+        /// The storage slot that was needed.
+        slot: U256,
+    },
+    /// The event or its routing is unsupported for this adapter.
     Unsupported(UnsupportedReason),
+    /// A protocol-specific decode failure.
     Custom(String),
 }
 
@@ -689,10 +861,16 @@ impl std::error::Error for AdapterEventError {}
 /// what callers must handle and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UpdateQuality {
+    /// The updates are exact and unconditional.
     Exact,
+    /// Exact **if** applied — some updates may be skipped on cold slots, in
+    /// which case a resync follows.
     ExactIfApplied,
+    /// The event carries deltas; the affected slots need a repair/resync.
     RequiresRepair,
+    /// State could not be updated precisely; conservatively invalidate.
     ConservativeInvalidation,
+    /// The event produced no state effect.
     Ignored,
 }
 
@@ -700,27 +878,45 @@ pub enum UpdateQuality {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RepairAction {
+    /// No follow-up needed.
     #[default]
     None,
+    /// Re-verify (resync) the listed `(address, slot)` pairs.
     VerifySlots(Vec<(Address, U256)>),
+    /// Invalidate all cached storage for an address.
     PurgeStorage(Address),
+    /// Invalidate specific slots of an address.
     PurgeSlots {
+        /// The contract whose slots to purge.
         address: Address,
+        /// The slots to purge.
         slots: Vec<U256>,
     },
+    /// Re-run cold-start for a pool under `policy` (a caller-side escalation).
     ColdStart {
+        /// The pool to cold-start.
         pool: PoolKey,
+        /// The policy to cold-start it under.
         policy: ColdStartPolicy,
     },
+    /// Resync the storage a V3 liquidity event over `[tick_lower, tick_upper]`
+    /// can dirty (boundary tick info, bitmap words, global liquidity).
     V3TickRange {
+        /// The V3 pool.
         pool: PoolKey,
+        /// The lower boundary tick of the liquidity range.
         tick_lower: i32,
+        /// The upper boundary tick of the liquidity range.
         tick_upper: i32,
     },
+    /// Escalation signal: an incremental V3 re-warm is warranted (hook-only).
     V3Incremental {
+        /// The V3 pool.
         pool: PoolKey,
     },
+    /// Escalation signal: a full V3 re-warm is warranted (hook-only).
     V3Full {
+        /// The V3 pool.
         pool: PoolKey,
     },
 }
@@ -775,9 +971,15 @@ impl RepairAction {
 /// change to all adapters and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColdStartPolicy {
+    /// Warm the full read-set. Currently identical to `Eager` (no adapter
+    /// branches the two); reserved as a distinct policy for stricter future
+    /// miss handling.
     Strict,
+    /// Warm the full read-set — the common default.
     Eager,
+    /// Warm only the hot slots now and defer the rest as [`DeferredWork`].
     Lazy,
+    /// Warm only the minimal hot slots (e.g. slot0 + liquidity), no tick warming.
     HotSlotsOnly,
 }
 
@@ -785,9 +987,13 @@ pub enum ColdStartPolicy {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColdStartOutcome {
+    /// Fully warmed and ready to simulate.
     Ready(ColdStartReport),
+    /// Warmed enough to be ready, with `DeferredWork` left to run later (`Lazy`).
     ReadyWithDeferred(ColdStartReport, Vec<DeferredWork>),
+    /// Warmed but a mandatory slot needs repair (e.g. an archive miss).
     NeedsRepair(ColdStartReport, RepairAction),
+    /// The pool/protocol/layout is not supported.
     Unsupported(UnsupportedReason),
 }
 
@@ -795,12 +1001,19 @@ pub enum ColdStartOutcome {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColdStartReport {
+    /// The pool this report is for.
     pub pool: PoolKey,
+    /// The policy the cold-start ran under.
     pub policy: ColdStartPolicy,
+    /// The pool's resulting status.
     pub status: PoolStatus,
+    /// Every slot the run requested be verified.
     pub verified_slots: Vec<(Address, U256)>,
+    /// The slots whose value changed and were injected.
     pub changed_slots: Vec<SlotChange>,
+    /// The diff applied to the cache during the run.
     pub applied: StateDiff,
+    /// Deferred work produced by a `Lazy` run (empty otherwise).
     pub deferred: Vec<DeferredWork>,
     /// Verified-code-seed results, when seeding ran for this cold-start (an
     /// account-fields fetcher was present, seeding was enabled, and the adapter
@@ -809,6 +1022,7 @@ pub struct ColdStartReport {
 }
 
 impl ColdStartReport {
+    /// An empty report for `pool` under `policy` (status [`PoolStatus::Pending`]).
     pub fn new(pool: PoolKey, policy: ColdStartPolicy) -> Self {
         Self {
             pool,
@@ -827,12 +1041,18 @@ impl ColdStartReport {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeferredWork {
+    /// Warm (verify) these `(address, slot)` pairs when the consumer is ready.
     VerifySlots(Vec<(Address, U256)>),
+    /// A repair action deferred for later execution.
     Repair(RepairAction),
+    /// Re-cold-start a pool under `policy`, deferred to the caller.
     ColdStart {
+        /// The pool to cold-start.
         pool: PoolKey,
+        /// The policy to cold-start it under.
         policy: ColdStartPolicy,
     },
+    /// Protocol-specific deferred work, described by a string tag.
     Custom(String),
 }
 
@@ -847,7 +1067,9 @@ pub enum DeferredWork {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeferredOutcome {
+    /// Slot changes produced by warming the handled `VerifySlots` work.
     pub verified: Vec<SlotChange>,
+    /// Deferred work this driver did not execute (pushed on verbatim).
     pub unhandled: Vec<DeferredWork>,
 }
 
@@ -862,9 +1084,13 @@ impl DeferredOutcome {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnsupportedReason {
+    /// No adapter is registered / implemented for this protocol.
     Protocol(ProtocolId),
+    /// Required metadata (e.g. a storage layout) is missing.
     MissingMetadata(&'static str),
+    /// The event uses adapter-defined routing that this path cannot resolve.
     AdapterDefinedRouting,
+    /// A protocol-specific unsupported reason.
     Custom(String),
 }
 
