@@ -27,7 +27,6 @@ use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 
-use evm_amm_state::adapters::sim::{QuoteExactInputSingleParams, quoteExactInputSingleCall};
 use evm_amm_state::adapters::storage::{
     V3StorageLayout, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
     v3_word_position,
@@ -38,6 +37,25 @@ use evm_amm_state::adapters::{
     PoolRegistration, ProtocolMetadata, SimConfig, V3Metadata,
 };
 use evm_fork_cache::cache::EvmCache;
+
+// Local QuoterV2 ABI: the crate's own quote-call bindings are crate-internal.
+alloy_sol_types::sol! {
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function quoteExactInputSingle(QuoteExactInputSingleParams params)
+        returns (
+            uint256 amountOut,
+            uint160 sqrtPriceX96After,
+            uint32 initializedTicksCrossed,
+            uint256 gasEstimate
+        );
+}
 
 const FORK_BLOCK: u64 = 20_000_000;
 

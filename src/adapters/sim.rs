@@ -18,7 +18,6 @@
 //! live backend, or installed as a fixture for offline tests.
 
 use alloy_primitives::{Address, Bytes, U256, address};
-use alloy_sol_types::sol;
 
 use super::{AdapterCache, CallOutcome};
 
@@ -193,92 +192,104 @@ pub fn quote_via_call_from(
     }
 }
 
-sol! {
-    /// Uniswap V3 `QuoterV2.quoteExactInputSingle` (the struct-arg variant).
-    ///
-    /// `sqrtPriceLimitX96 = 0` means "no limit" (quote the full input). Returns
-    /// `amountOut` plus auxiliary fields we ignore.
-    struct QuoteExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint256 amountIn;
-        uint24 fee;
-        uint160 sqrtPriceLimitX96;
+/// `sol!`-generated ABI bindings for the canonical quote entrypoints.
+///
+/// Crate-internal plumbing: the per-protocol `simulate_swap` implementations
+/// build calldata and decode outputs with these. Deliberately not public API
+/// — custom adapters declare their own bindings (see
+/// `examples/custom_adapter.rs`) rather than reusing these.
+pub(crate) mod abi {
+    use alloy_sol_types::sol;
+
+    sol! {
+        /// Uniswap V3 `QuoterV2.quoteExactInputSingle` (the struct-arg variant).
+        ///
+        /// `sqrtPriceLimitX96 = 0` means "no limit" (quote the full input). Returns
+        /// `amountOut` plus auxiliary fields we ignore.
+        struct QuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            uint24 fee;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        function quoteExactInputSingle(QuoteExactInputSingleParams params)
+            returns (
+                uint256 amountOut,
+                uint160 sqrtPriceX96After,
+                uint32 initializedTicksCrossed,
+                uint256 gasEstimate
+            );
+
+        /// Uniswap V2 `UniswapV2Router02.getAmountsOut(amountIn, path)`.
+        ///
+        /// Runs the on-chain `UniswapV2Library` math against the warmed pair
+        /// reserves and returns the amount at each hop; the last element is the
+        /// output for the final token in `path`.
+        function getAmountsOut(uint256 amountIn, address[] path)
+            returns (uint256[] amounts);
+
+        /// Solidly V2 (Velodrome / Aerodrome) `Pool.getAmountOut(amountIn, tokenIn)`.
+        ///
+        /// Subtracts the fee via an external `IPoolFactory(factory).getFee()`
+        /// STATICCALL, then applies the stable (x³y+y³x) or volatile (xy=k) invariant
+        /// in-EVM and returns the `tokenOut` amount. Beyond the reserves it reads
+        /// `factory`/`stable`/`token0`/`decimals0`/`decimals1` from pool storage, so
+        /// the factory's bytecode + those slots must be reachable (not just reserves).
+        function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
+        /// Curve StableSwap (plain pool) `get_dy(i, j, dx)`.
+        ///
+        /// `i`/`j` are the pool's coin indices (the `coins[]` ordering). Applies the
+        /// StableSwap invariant in-EVM against the warmed balances + amplification +
+        /// fee and returns the `j`-coin output for `dx` of coin `i`. This `int128`
+        /// binding serves the StableSwap / StableSwap-NG (int128-index) variants; the
+        /// `uint256` `CurveCryptoSwap::get_dy` below serves CryptoSwap / CryptoSwapNG.
+        /// The Curve adapter selects the correct binding per the pool's
+        /// [`CurveVariant`](crate::adapters::CurveVariant).
+        function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
+
+        /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.
+        ///
+        /// `kind = 0` is `GIVEN_IN`. Returns the signed asset deltas (per `assets`
+        /// index): positive = owed to the vault (input), negative = paid out by the
+        /// vault (output).
+        function queryBatchSwap(
+            uint8 kind,
+            BatchSwapStep[] swaps,
+            address[] assets,
+            FundManagement funds
+        ) returns (int256[] assetDeltas);
+
+        struct BatchSwapStep {
+            bytes32 poolId;
+            uint256 assetInIndex;
+            uint256 assetOutIndex;
+            uint256 amount;
+            bytes userData;
+        }
+
+        struct FundManagement {
+            address sender;
+            bool fromInternalBalance;
+            address recipient;
+            bool toInternalBalance;
+        }
     }
 
-    function quoteExactInputSingle(QuoteExactInputSingleParams params)
-        returns (
-            uint256 amountOut,
-            uint160 sqrtPriceX96After,
-            uint32 initializedTicksCrossed,
-            uint256 gasEstimate
-        );
-
-    /// Uniswap V2 `UniswapV2Router02.getAmountsOut(amountIn, path)`.
-    ///
-    /// Runs the on-chain `UniswapV2Library` math against the warmed pair
-    /// reserves and returns the amount at each hop; the last element is the
-    /// output for the final token in `path`.
-    function getAmountsOut(uint256 amountIn, address[] path)
-        returns (uint256[] amounts);
-
-    /// Solidly V2 (Velodrome / Aerodrome) `Pool.getAmountOut(amountIn, tokenIn)`.
-    ///
-    /// Subtracts the fee via an external `IPoolFactory(factory).getFee()`
-    /// STATICCALL, then applies the stable (x³y+y³x) or volatile (xy=k) invariant
-    /// in-EVM and returns the `tokenOut` amount. Beyond the reserves it reads
-    /// `factory`/`stable`/`token0`/`decimals0`/`decimals1` from pool storage, so
-    /// the factory's bytecode + those slots must be reachable (not just reserves).
-    function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
-
-    /// Curve StableSwap (plain pool) `get_dy(i, j, dx)`.
-    ///
-    /// `i`/`j` are the pool's coin indices (the `coins[]` ordering). Applies the
-    /// StableSwap invariant in-EVM against the warmed balances + amplification +
-    /// fee and returns the `j`-coin output for `dx` of coin `i`. This `int128`
-    /// binding serves the StableSwap / StableSwap-NG (int128-index) variants; the
-    /// `uint256` `CurveCryptoSwap::get_dy` below serves CryptoSwap / CryptoSwapNG.
-    /// The Curve adapter selects the correct binding per the pool's
-    /// [`CurveVariant`](super::CurveVariant).
-    function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
-
-    /// Balancer V2 `Vault.queryBatchSwap(kind, swaps, assets, funds)`.
-    ///
-    /// `kind = 0` is `GIVEN_IN`. Returns the signed asset deltas (per `assets`
-    /// index): positive = owed to the vault (input), negative = paid out by the
-    /// vault (output).
-    function queryBatchSwap(
-        uint8 kind,
-        BatchSwapStep[] swaps,
-        address[] assets,
-        FundManagement funds
-    ) returns (int256[] assetDeltas);
-
-    struct BatchSwapStep {
-        bytes32 poolId;
-        uint256 assetInIndex;
-        uint256 assetOutIndex;
-        uint256 amount;
-        bytes userData;
-    }
-
-    struct FundManagement {
-        address sender;
-        bool fromInternalBalance;
-        address recipient;
-        bool toInternalBalance;
+    sol! {
+        /// Curve CryptoSwap (Curve v2, e.g. tricrypto) `get_dy(i, j, dx)` — the
+        /// **uint256-index** variant (classic/NG StableSwap use the `int128`
+        /// `get_dy` above). Namespaced under an interface so its generated
+        /// `CurveCryptoSwap::get_dyCall` does not collide with the top-level
+        /// `int128` `get_dyCall`. Same semantics: chain code applies the CryptoSwap
+        /// invariant against the warmed state; this crate only builds calldata and
+        /// decodes the `uint256` output.
+        interface CurveCryptoSwap {
+            function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
+        }
     }
 }
 
-sol! {
-    /// Curve CryptoSwap (Curve v2, e.g. tricrypto) `get_dy(i, j, dx)` — the
-    /// **uint256-index** variant (classic/NG StableSwap use the `int128`
-    /// `get_dy` above). Namespaced under an interface so its generated
-    /// `CurveCryptoSwap::get_dyCall` does not collide with the top-level
-    /// `int128` `get_dyCall`. Same semantics: chain code applies the CryptoSwap
-    /// invariant against the warmed state; this crate only builds calldata and
-    /// decodes the `uint256` output.
-    interface CurveCryptoSwap {
-        function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
-    }
-}
+pub(crate) use abi::*;

@@ -32,7 +32,6 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{Filter, Log as RpcLog, TransactionRequest};
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
-use evm_amm_state::adapters::sim::{CurveCryptoSwap, get_dyCall};
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartPolicy, CurveAdapter, CurveMetadata,
     CurveVariant, PoolKey, PoolRegistration, ProtocolMetadata, SimConfig,
@@ -43,6 +42,16 @@ use evm_fork_cache::reactive::{
     ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
 };
 use futures::StreamExt;
+
+// Local `get_dy` quote ABI (the crate's own bindings are crate-internal):
+// builds the ground-truth `eth_call`s the soak's parity checks compare against.
+alloy_sol_types::sol! {
+    function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
+
+    interface CurveCryptoSwap {
+        function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
+    }
+}
 
 // 3pool (StableSwap, DAI/USDC/USDT).
 const THREEPOOL: Address = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");

@@ -40,14 +40,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
-use alloy_primitives::B256;
-use alloy_primitives::{Address, Log, U256};
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
-use alloy_sol_types::SolEvent;
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
-use alloy_sol_types::sol;
-
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use super::ProtocolMetadata;
 #[cfg(feature = "solidly-v2")]
@@ -61,6 +54,11 @@ use super::{AdapterCache, AdapterRegistry, EventSource, PoolKey, PoolRegistratio
 use crate::adapters::storage::SolidlyStorageLayout;
 #[cfg(feature = "uniswap-v3")]
 use crate::adapters::storage::V3StorageLayout;
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
+use alloy_primitives::B256;
+use alloy_primitives::{Address, Log, U256};
+#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
+use alloy_sol_types::SolEvent;
 
 /// Factory-level derivation helpers.
 pub mod derive {
@@ -350,21 +348,32 @@ const PANCAKE_V3_QUOTER_V2: Address =
 #[cfg(feature = "solidly-v2")]
 const SOLIDLY_GET_POOL_BASE_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
 
+/// Uniswap V2 `PairCreated` factory event (crate-internal), wrapped like
+/// [`solidly_events`] so the binding stays out of the public API.
 #[cfg(feature = "uniswap-v2")]
-sol! {
-    event PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength);
+mod v2_factory_events {
+    alloy_sol_types::sol! {
+        event PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength);
+    }
 }
+#[cfg(feature = "uniswap-v2")]
+use v2_factory_events::PairCreated;
 
+/// CL-family factory pool-creation events (crate-internal, not public API).
 #[cfg(feature = "uniswap-v3")]
-sol! {
-    /// Uniswap/Pancake-style fee-keyed pool-creation event.
-    event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool);
+mod cl_factory_events {
+    alloy_sol_types::sol! {
+        /// Uniswap/Pancake-style fee-keyed pool-creation event.
+        event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool);
 
-    /// Slipstream/Aerodrome CL tickSpacing-keyed pool-creation event. The
-    /// indexed key is `tickSpacing` (int24) rather than a fee; the pool address
-    /// and (unindexed) fee follow in the data.
-    event PoolCreatedTickSpacing(address indexed token0, address indexed token1, int24 indexed tickSpacing, address pool, uint24 fee);
+        /// Slipstream/Aerodrome CL tickSpacing-keyed pool-creation event. The
+        /// indexed key is `tickSpacing` (int24) rather than a fee; the pool address
+        /// and (unindexed) fee follow in the data.
+        event PoolCreatedTickSpacing(address indexed token0, address indexed token1, int24 indexed tickSpacing, address pool, uint24 fee);
+    }
 }
+#[cfg(feature = "uniswap-v3")]
+use cl_factory_events::{PoolCreated, PoolCreatedTickSpacing};
 
 /// Solidly V2 (Aerodrome / Velodrome V2) pool-creation event, wrapped in its own
 /// module so the generated struct keeps the on-chain name `PoolCreated` (whose

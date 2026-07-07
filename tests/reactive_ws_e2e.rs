@@ -38,7 +38,6 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{Filter, Log as RpcLog, TransactionRequest};
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
-use evm_amm_state::adapters::sim::getAmountsOutCall;
 use evm_amm_state::adapters::storage::V2_RESERVES_SLOT;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmReactiveHandler, ColdStartPolicy, PoolKey, PoolRegistration,
@@ -51,6 +50,10 @@ use evm_fork_cache::reactive::{
 };
 use futures::StreamExt;
 
+// Local Router02 ABI: the crate's own quote-call bindings are crate-internal.
+alloy_sol_types::sol! {
+    function getAmountsOut(uint256 amountIn, address[] path) returns (uint256[] amounts);
+}
 const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 const V2_ROUTER_02: Address = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");

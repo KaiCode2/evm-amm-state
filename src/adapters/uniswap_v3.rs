@@ -19,13 +19,17 @@ use crate::adapters::storage::{
     v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
-use alloy_sol_types::{SolCall, SolEvent, sol};
+use alloy_sol_types::{SolCall, SolEvent};
 
-sol! {
-    event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
-    event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
-    event Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+/// `sol!`-generated pool event bindings (crate-internal, not public API).
+mod abi {
+    alloy_sol_types::sol! {
+        event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
+        event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+        event Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+    }
 }
+use abi::{Burn, Mint, Swap};
 
 /// PancakeSwap V3 `Swap` appends `protocolFeesToken0`/`protocolFeesToken1`
 /// (`uint128`) to the Uniswap V3 event, so its `topic0` differs (`0x19b47279…`

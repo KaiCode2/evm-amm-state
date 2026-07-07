@@ -44,10 +44,6 @@ use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 
-use evm_amm_state::adapters::sim::{
-    BatchSwapStep, CurveCryptoSwap, FundManagement, QuoteExactInputSingleParams, get_dyCall,
-    getAmountOutCall, getAmountsOutCall, queryBatchSwapCall, quoteExactInputSingleCall,
-};
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, BalancerV2Adapter, BalancerV2Metadata, ColdStartPolicy,
@@ -62,6 +58,56 @@ alloy_sol_types::sol! {
     /// storage-slot layout against the live pool's authoritative reserves.
     function reserve0() returns (uint256);
     function reserve1() returns (uint256);
+
+    // Local quote-entrypoint ABI (the crate's own bindings are crate-internal):
+    // builds the ground-truth `eth_call`s the parity assertions compare against.
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function quoteExactInputSingle(QuoteExactInputSingleParams params)
+        returns (
+            uint256 amountOut,
+            uint160 sqrtPriceX96After,
+            uint32 initializedTicksCrossed,
+            uint256 gasEstimate
+        );
+
+    function getAmountsOut(uint256 amountIn, address[] path) returns (uint256[] amounts);
+
+    function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
+    function get_dy(int128 i, int128 j, uint256 dx) returns (uint256 dy);
+
+    function queryBatchSwap(
+        uint8 kind,
+        BatchSwapStep[] swaps,
+        address[] assets,
+        FundManagement funds
+    ) returns (int256[] assetDeltas);
+
+    struct BatchSwapStep {
+        bytes32 poolId;
+        uint256 assetInIndex;
+        uint256 assetOutIndex;
+        uint256 amount;
+        bytes userData;
+    }
+
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address recipient;
+        bool toInternalBalance;
+    }
+
+    interface CurveCryptoSwap {
+        function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
+    }
 }
 
 const FORK_BLOCK: u64 = 20_000_000;

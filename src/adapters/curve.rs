@@ -45,56 +45,63 @@ use super::{
     SlotChange, StateView, UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
+use alloy_sol_types::{SolCall, SolEvent};
 
-sol! {
-    // Classic Curve StableSwap plain-pool events. Only the signature hashes are
-    // used for topic routing; the liquidity-event payloads are not decoded (the
-    // reactive path resyncs the discovered slots rather than applying deltas).
-    event TokenExchange(address indexed buyer, int128 sold_id, uint256 tokens_sold, int128 bought_id, uint256 tokens_bought);
-    event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
-    event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 token_supply);
-    event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_amount);
-    event RemoveLiquidityImbalance(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
-}
+/// `sol!`-generated event bindings for topic routing (crate-internal, not
+/// public API).
+mod abi {
+    use alloy_sol_types::sol;
 
-sol! {
-    // CryptoSwap (Curve v2, e.g. tricrypto2) events. Namespaced under an interface
-    // so the generated types don't collide with the StableSwap ones above. All
-    // signatures verified on-chain against tricrypto2 (eth_getLogs topic0 histogram).
-    // Only `TokenExchange` is decode-validated before emitting a Swap; the
-    // liquidity events route on topic only (the reactive path resyncs discovered
-    // slots, not deltas). Arities are derived from n_coins at routing time; these
-    // N=3 decls are the `#[cfg(test)]` reference for the derived hashes.
-    //
-    // `RemoveLiquidityOne` here is the **3-arg** form (token_amount, coin_index,
-    // coin_amount) — emitted by BOTH CryptoSwap v2 AND StableSwap-NG (classic
-    // StableSwap uses the 2-arg form above), so the StableSwap routing reuses this
-    // hash. CryptoSwap v2 has no RemoveLiquidityImbalance.
-    interface CurveCryptoSwapEvents {
-        event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought);
-        event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply);
-        event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256 token_supply);
-        event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount);
+    sol! {
+        // Classic Curve StableSwap plain-pool events. Only the signature hashes are
+        // used for topic routing; the liquidity-event payloads are not decoded (the
+        // reactive path resyncs the discovered slots rather than applying deltas).
+        event TokenExchange(address indexed buyer, int128 sold_id, uint256 tokens_sold, int128 bought_id, uint256 tokens_bought);
+        event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
+        event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 token_supply);
+        event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_amount);
+        event RemoveLiquidityImbalance(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
+    }
+
+    sol! {
+        // CryptoSwap (Curve v2, e.g. tricrypto2) events. Namespaced under an interface
+        // so the generated types don't collide with the StableSwap ones above. All
+        // signatures verified on-chain against tricrypto2 (eth_getLogs topic0 histogram).
+        // Only `TokenExchange` is decode-validated before emitting a Swap; the
+        // liquidity events route on topic only (the reactive path resyncs discovered
+        // slots, not deltas). Arities are derived from n_coins at routing time; these
+        // N=3 decls are the `#[cfg(test)]` reference for the derived hashes.
+        //
+        // `RemoveLiquidityOne` here is the **3-arg** form (token_amount, coin_index,
+        // coin_amount) — emitted by BOTH CryptoSwap v2 AND StableSwap-NG (classic
+        // StableSwap uses the 2-arg form above), so the StableSwap routing reuses this
+        // hash. CryptoSwap v2 has no RemoveLiquidityImbalance.
+        interface CurveCryptoSwapEvents {
+            event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought);
+            event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply);
+            event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256 token_supply);
+            event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount);
+        }
+    }
+
+    sol! {
+        // Tricrypto-NG (Curve's newest crypto pools) events — EXTENDED forms with
+        // extra `fee`/`packed_price_scale` fields, so their signature hashes differ
+        // from CryptoSwap v2's. All verified on-chain against tricryptoUSDC + USDT
+        // (eth_getLogs topic0 histogram). `RemoveLiquidity` is identical to v2 (so it
+        // reuses `CurveCryptoSwapEvents::RemoveLiquidity`). `ClaimAdminFee` is routed
+        // because `claim_admin_fees` can update D/price_scale (the crypto read-set).
+        // Arities are derived from n_coins at routing time; these N=3 decls are the
+        // `#[cfg(test)]` reference + the TokenExchange decode-validation type.
+        interface CurveTricryptoNgEvents {
+            event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought, uint256 fee, uint256 packed_price_scale);
+            event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply, uint256 packed_price_scale);
+            event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount, uint256 approx_fee, uint256 packed_price_scale);
+            event ClaimAdminFee(address indexed admin, uint256 tokens);
+        }
     }
 }
-
-sol! {
-    // Tricrypto-NG (Curve's newest crypto pools) events — EXTENDED forms with
-    // extra `fee`/`packed_price_scale` fields, so their signature hashes differ
-    // from CryptoSwap v2's. All verified on-chain against tricryptoUSDC + USDT
-    // (eth_getLogs topic0 histogram). `RemoveLiquidity` is identical to v2 (so it
-    // reuses `CurveCryptoSwapEvents::RemoveLiquidity`). `ClaimAdminFee` is routed
-    // because `claim_admin_fees` can update D/price_scale (the crypto read-set).
-    // Arities are derived from n_coins at routing time; these N=3 decls are the
-    // `#[cfg(test)]` reference + the TokenExchange decode-validation type.
-    interface CurveTricryptoNgEvents {
-        event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought, uint256 fee, uint256 packed_price_scale);
-        event AddLiquidity(address indexed provider, uint256[3] token_amounts, uint256 fee, uint256 token_supply, uint256 packed_price_scale);
-        event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount, uint256 approx_fee, uint256 packed_price_scale);
-        event ClaimAdminFee(address indexed admin, uint256 tokens);
-    }
-}
+use abi::{CurveCryptoSwapEvents, CurveTricryptoNgEvents, RemoveLiquidityOne, TokenExchange};
 
 /// The `dx` used by the cold-start discover call.
 ///
@@ -816,6 +823,7 @@ impl AdapterColdStartPlanner for CurveColdStartPlanner {
 
 #[cfg(test)]
 mod tests {
+    use super::abi::{AddLiquidity, RemoveLiquidity, RemoveLiquidityImbalance};
     use super::*;
 
     // The arity-3 topics derived from `n_coins` must equal the `sol!`-macro

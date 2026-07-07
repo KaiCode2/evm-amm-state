@@ -12,13 +12,17 @@ use super::{
     SolidlyV2Metadata, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
+use alloy_sol_types::{SolCall, SolEvent};
 
-sol! {
-    // Velodrome V2 / Aerodrome pools emit reserves as two separate uint256 values
-    // (unlike Uniswap V2's packed uint112,uint112).
-    event Sync(uint256 reserve0, uint256 reserve1);
+/// `sol!`-generated pool event binding (crate-internal, not public API).
+mod abi {
+    alloy_sol_types::sol! {
+        // Velodrome V2 / Aerodrome pools emit reserves as two separate uint256 values
+        // (unlike Uniswap V2's packed uint112,uint112).
+        event Sync(uint256 reserve0, uint256 reserve1);
+    }
 }
+use abi::Sync;
 
 /// Adapter for Solidly V2 (Aerodrome / Velodrome V2) reserves pools.
 ///

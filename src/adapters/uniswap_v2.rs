@@ -13,11 +13,15 @@ use super::{
     StateDiff, StateUpdate, StateView, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
+use alloy_sol_types::{SolCall, SolEvent};
 
-sol! {
-    event Sync(uint112 reserve0, uint112 reserve1);
+/// `sol!`-generated pair event binding (crate-internal, not public API).
+mod abi {
+    alloy_sol_types::sol! {
+        event Sync(uint112 reserve0, uint112 reserve1);
+    }
 }
+use abi::Sync;
 
 /// Adapter for Uniswap V2 constant-product pairs.
 #[derive(Clone, Debug, Default)]

@@ -13,15 +13,25 @@ use super::{
     RepairAction, SlotChange, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
-use alloy_sol_types::{SolCall, SolEvent, sol};
+use alloy_sol_types::{SolCall, SolEvent};
 
-sol! {
-    event Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
-    /// Emitted by the vault on a join or exit — it changes the pool's vault
-    /// balances, so it is subscribed and resynced (event-sourcing its `deltas` /
-    /// `protocolFeeAmounts` is a follow-up). `topic0 = 0xe5ce2490…`.
-    event PoolBalanceChanged(bytes32 indexed poolId, address indexed liquidityProvider, address[] tokens, int256[] deltas, uint256[] protocolFeeAmounts);
+/// `sol!`-generated vault ABI bindings (crate-internal, not public API):
+/// the `Swap` / `PoolBalanceChanged` events and the `getPoolTokens`
+/// cold-start discovery call.
+mod abi {
+    alloy_sol_types::sol! {
+        event Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+        /// Emitted by the vault on a join or exit — it changes the pool's vault
+        /// balances, so it is subscribed and resynced (event-sourcing its `deltas` /
+        /// `protocolFeeAmounts` is a follow-up). `topic0 = 0xe5ce2490…`.
+        event PoolBalanceChanged(bytes32 indexed poolId, address indexed liquidityProvider, address[] tokens, int256[] deltas, uint256[] protocolFeeAmounts);
+
+        /// Balancer V2 vault `getPoolTokens` for cold-start discovery.
+        function getPoolTokens(bytes32 poolId)
+            returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock);
+    }
 }
+use abi::{PoolBalanceChanged, Swap, getPoolTokensCall};
 
 /// Width of the vault `BalanceAllocation` `cash` field (bits): a packed balance is
 /// `[lastChangeBlock : top 32][managed : bits 112–223][cash : bits 0–111]`.
@@ -295,13 +305,6 @@ fn decode_liquidity_change(pool: &PoolRegistration, log: &Log) -> AdapterEventRe
         )
         .with_repair(repair),
     )
-}
-
-sol! {
-    /// Local Balancer V2 vault `getPoolTokens` ABI for cold-start discovery,
-    /// kept beside the adapter so it compiles under the `balancer-v2` feature.
-    function getPoolTokens(bytes32 poolId)
-        returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock);
 }
 
 /// Adapter for Balancer V2 (shared-vault) pools.
