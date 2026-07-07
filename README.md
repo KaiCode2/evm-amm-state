@@ -186,10 +186,11 @@ cold start is fast by default: before falling back to local discovery (which run
 the `get_dy` / `getPoolTokens` view-call in local revm over a cold cache, faulting
 each SLOAD serially over RPC), `cold_start_many` derives the read-set with a
 single `eth_createAccessList` and bulk-loads it, so the discover call then runs
-warm. `AdapterRegistry::cold_start_primed(pool, cache, provider, policy)` is the
-single-pool async entry point. This needs no configuration and no new API on the
-happy path; a provider that lacks `eth_createAccessList` (or any per-pool failure)
-transparently falls back to local discovery. Opt out with
+warm through the same provider and batch storage fetcher installed on the
+`EvmCache`. `AdapterRegistry::cold_start_primed(pool, cache, policy)` is the
+single-pool async entry point. This needs no configuration and no separate RPC
+handle on the happy path; a provider that lacks `eth_createAccessList` (or any
+per-pool failure) transparently falls back to local discovery. Opt out with
 `AdapterRegistry::with_access_list_discovery(false)`.
 
 ### Extending with a new AMM

@@ -1017,7 +1017,9 @@ mod tests {
                     .with_coins([Address::repeat_byte(0x01), Address::repeat_byte(0x02)])
                     .with_code_seed(runtime.clone()),
             ));
-        let seeds = adapter.code_seeds(&seeded).expect("code_seeds never errors");
+        let seeds = adapter
+            .code_seeds(&seeded)
+            .expect("code_seeds never errors");
         assert_eq!(seeds, vec![AdapterCodeSeed::new(pool, runtime)]);
 
         // No code_seed (the default): no seeds, not an error.

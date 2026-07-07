@@ -182,7 +182,12 @@ async fn main() -> Result<()> {
                     "a known-read-set Curve pool must be one-shot eligible"
                 );
                 let outcomes = curve_registry()
-                    .cold_start_many(&mut pools, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+                    .cold_start_many(
+                        &mut pools,
+                        &mut cache,
+                        provider.as_ref(),
+                        ColdStartPolicy::Eager,
+                    )
                     .await?;
                 ensure_ready(&outcomes[0], "cold_start_many")?;
                 Ok(())
@@ -205,7 +210,7 @@ async fn main() -> Result<()> {
             let mut cache = cache(provider.clone(), block).await;
             let mut reg = curve_registration(Vec::new(), None);
             let outcome = curve_registry()
-                .cold_start_primed(&mut reg, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+                .cold_start_primed(&mut reg, &mut cache, ColdStartPolicy::Eager)
                 .await?;
             ensure_ready(&outcome, "cold_start_primed")?;
             Ok(())
@@ -302,7 +307,10 @@ async fn discover_once(provider: SharedProvider, block: BlockId) -> Result<Vec<U
     })
 }
 
-fn curve_registration(discovered_slots: Vec<U256>, code_seed: Option<alloy_primitives::Bytes>) -> PoolRegistration {
+fn curve_registration(
+    discovered_slots: Vec<U256>,
+    code_seed: Option<alloy_primitives::Bytes>,
+) -> PoolRegistration {
     let mut metadata = CurveMetadata::default()
         .with_coins(vec![USDT, WBTC, WETH])
         .with_discovered_slots(discovered_slots)

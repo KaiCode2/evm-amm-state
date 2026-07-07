@@ -122,18 +122,21 @@ set (or tick-bitmap program) hydrated in one bundled `eth_call`.
 **Fast first boot (no prior read-set).** The discovery cost above is dominated by
 *serial* per-slot faulting. `AdapterRegistry::cold_start_primed` (and
 `cold_start_many`) instead derive the read-set with a single `eth_createAccessList`
-and bulk-load it, so the discover call then runs warm — no serial faulting.
-Measured on a public endpoint (Tricrypto2, via `curve_cold_start_phases`,
-mid-2026): local discovery **~728 ms → access-list first boot ~431 ms (~1.7×
-faster)**, closing further toward the ~100 ms known-read-set paths on
-higher-latency providers, where serial faulting is punished more per round-trip.
-This needs no prior read-set and no configuration; a provider without
-`eth_createAccessList` transparently falls back to local discovery.
+and bulk-load it through the `EvmCache`, so the discover call then runs warm — no
+serial faulting.
+Measured on July 7, 2026, using the paid Alchemy mainnet endpoint from
+`E2E_RPC_URL` in `.env` with the benchmark's gzip-enabled HTTP client
+(`CURVE_PHASES_ITERS=5`, Tricrypto2, block `25_481_590`): local discovery
+**717.8 ms → access-list first boot 483.6 ms (~1.5× faster)**. Known-read-set
+paths stayed near the one-shot floor: verify-only `cold_start` **116.9 ms** and
+`cold_start_many` **110.7 ms**.
+This needs no prior read-set, no configuration, and no separate RPC handle; a
+provider without `eth_createAccessList` transparently falls back to local
+discovery.
 
-Once the read-set is known, the gap closes to the one-shot figures above (the
-same Curve 3pool row: **~361 ms → ~75 ms**). Two paths reuse a persisted
-`CurveMetadata.discovered_slots` (from a prior discovery, a block trace, or a
-registry):
+Once the read-set is known, the gap closes to the one-shot figures above. Two
+paths reuse a persisted `CurveMetadata.discovered_slots` (from a prior discovery,
+a block trace, or a registry):
 
 - **verify-only `cold_start`** — the planner skips discovery and warms exactly
   the known slots in a single verify round;
@@ -145,7 +148,7 @@ times all four (discovery, access-list first boot, verify-only, `cold_start_many
 against a live pool and prints the breakdown — run it for numbers on your endpoint:
 
 ```bash
-E2E_RPC_URL=<archive-url> cargo run --release --example curve_cold_start_phases
+E2E_RPC_URL=<archive-url> CURVE_PHASES_ITERS=5 cargo run --release --example curve_cold_start_phases
 ```
 
 The optional `CurveMetadata::with_code_seed` removes the one lazy code fetch a

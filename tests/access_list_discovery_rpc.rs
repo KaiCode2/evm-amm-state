@@ -105,15 +105,10 @@ async fn assert_primed_matches_local(
 
     // Access-list-primed (the two-shot path).
     let primed_provider = provider(url).await?;
-    let mut primed_cache = EvmCache::at_block(primed_provider.clone(), block).await;
+    let mut primed_cache = EvmCache::at_block(primed_provider, block).await;
     let mut primed = registration();
     let primed_outcome = curve_registry()
-        .cold_start_primed(
-            &mut primed,
-            &mut primed_cache,
-            primed_provider.as_ref(),
-            ColdStartPolicy::Eager,
-        )
+        .cold_start_primed(&mut primed, &mut primed_cache, ColdStartPolicy::Eager)
         .await?;
     assert!(
         matches!(primed_outcome, ColdStartOutcome::Ready(_)),
@@ -130,7 +125,10 @@ async fn assert_primed_matches_local(
         primed_slots, local_slots,
         "access-list-primed read-set must equal the local-discovery read-set for {pool}"
     );
-    eprintln!("{pool}: primed read-set matches local ({} slots)", primed_slots.len());
+    eprintln!(
+        "{pool}: primed read-set matches local ({} slots)",
+        primed_slots.len()
+    );
     Ok(())
 }
 
@@ -141,8 +139,13 @@ async fn access_list_primed_matches_local_stableswap_3pool() -> Result<()> {
         eprintln!("E2E_RPC_URL unset; skipping");
         return Ok(());
     };
-    assert_primed_matches_local(&url, CURVE_3POOL, vec![DAI, USDC, USDT], CurveVariant::StableSwap)
-        .await
+    assert_primed_matches_local(
+        &url,
+        CURVE_3POOL,
+        vec![DAI, USDC, USDT],
+        CurveVariant::StableSwap,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -152,6 +155,11 @@ async fn access_list_primed_matches_local_cryptoswap_tricrypto2() -> Result<()> 
         eprintln!("E2E_RPC_URL unset; skipping");
         return Ok(());
     };
-    assert_primed_matches_local(&url, TRICRYPTO2, vec![USDT, WBTC, WETH], CurveVariant::CryptoSwap)
-        .await
+    assert_primed_matches_local(
+        &url,
+        TRICRYPTO2,
+        vec![USDT, WBTC, WETH],
+        CurveVariant::CryptoSwap,
+    )
+    .await
 }

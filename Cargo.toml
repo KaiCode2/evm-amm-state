@@ -61,10 +61,10 @@ curve = ["adapters"]      # Curve StableSwap plain pools (get_dy)
 experimental-protocols = []
 
 [dependencies]
-# Companion crate. Uses the public 0.2.1 release for bulk storage extraction,
-# custom storage programs, typed errors, reactive resync, and trace-based
-# storage-slot discovery.
-evm-fork-cache = "0.2.1"
+# Companion crate. Temporarily pinned to the access-list read-set prewarm commit
+# so this branch can use cache-owned `eth_createAccessList` warming without
+# duplicating the primitive locally.
+evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "0c9af358d90c87e6452d5b3f1e252822043269f2" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -72,11 +72,6 @@ alloy-primitives = { version = "1.4", features = ["map"] }
 alloy-provider = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
-
-# Lenient deserialization of the `eth_createAccessList` response: geth returns
-# `"storageKeys": null` for touched accounts with no storage access, which alloy's
-# own `AccessListItem` rejects. Already in the graph via alloy/revm.
-serde = { version = "1", features = ["derive"] }
 
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee"] }
 

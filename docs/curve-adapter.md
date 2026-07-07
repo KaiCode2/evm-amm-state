@@ -86,9 +86,10 @@ distinguishes a genuine zero from a fetch failure.
 The local discover faults each `get_dy` SLOAD serially over RPC — the dominant
 cost of a first boot. `AdapterRegistry::cold_start_primed` (and `cold_start_many`)
 accelerate it: they derive the read-set with **one `eth_createAccessList`**,
-bulk-load it, then run the discover **warm**. This needs no prior read-set; a
-provider without `eth_createAccessList` transparently falls back to the plain
-local discovery above. See [`docs/benchmarks.md`](benchmarks.md#curve-cold-start-discovery-vs-a-known-read-set).
+bulk-load it through the `EvmCache`, then run the discover **warm**. This needs
+no prior read-set or separate RPC handle; a provider without `eth_createAccessList`
+transparently falls back to the plain local discovery above. See
+[`docs/benchmarks.md`](benchmarks.md#curve-cold-start-discovery-vs-a-known-read-set).
 
 **Verify-only** — the read-set is already known (`discovered_slots` pre-populated
 from a prior discovery, a block trace, or a registry). The planner **skips

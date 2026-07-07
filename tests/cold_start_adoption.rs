@@ -14,7 +14,6 @@ use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types_eth::{AccessList, AccessListItem, AccessListResult};
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
 
@@ -31,8 +30,8 @@ use evm_amm_state::adapters::{
     V3ImmutablePatchValues, V3Metadata, uniswap_v2_pair_runtime_code_hash, uniswap_v3_code_seed,
     uniswap_v3_max_liquidity_per_tick,
 };
-use evm_fork_cache::AccountFieldsSample;
 use evm_fork_cache::cache::{AccountFieldsFetchFn, CodeSeedState, EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::{AccountFieldsSample, StorageAccessList};
 use revm::state::{AccountInfo, Bytecode};
 
 // --- helpers (kept local so this manager file owns its fixtures) ---
@@ -1763,19 +1762,16 @@ async fn curve_cold_start_primed_access_list_avoids_serial_faults() -> Result<()
     )));
     let mut cache = EvmCache::new(provider.clone()).await;
 
-    // Batch gas price (eth_gasPrice), fetched once before the access-list probe.
-    asserter.push_success(&U256::from(1_000_000_000_u64));
-    // Shot 1: createAccessList reports the pool touches slot 0.
-    asserter.push_success(&AccessListResult {
-        access_list: AccessList(vec![AccessListItem {
-            address: pool,
-            storage_keys: vec![B256::ZERO],
-        }]),
-        gas_used: U256::ZERO,
-        error: None,
-    });
-    // Shot 2: the bundled storage program returns slot 0's value (32 bytes).
-    asserter.push_success(&Bytes::from(fresh.to_be_bytes::<32>().to_vec()));
+    let access_list_calls = Arc::new(AtomicUsize::new(0));
+    let access_list_calls_for_fetcher = access_list_calls.clone();
+    cache.set_access_list_fetcher(Arc::new(move |call, _block| {
+        access_list_calls_for_fetcher.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(call.to, pool, "priming must ask for the pool discover call");
+        let mut access = StorageAccessList::default();
+        access.accounts.insert(pool);
+        access.slots.insert((pool, U256::ZERO));
+        Ok(access)
+    }));
 
     // Runtime so the warm discover's `get_dy` executes + the account is present
     // (no account fetch); ZERO is the discover call's gas-credited beneficiary;
@@ -1802,7 +1798,7 @@ async fn curve_cold_start_primed_access_list_avoids_serial_faults() -> Result<()
         ));
 
     let outcome = registry
-        .cold_start_primed(&mut registration, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .cold_start_primed(&mut registration, &mut cache, ColdStartPolicy::Eager)
         .await?;
 
     assert!(
@@ -1822,11 +1818,10 @@ async fn curve_cold_start_primed_access_list_avoids_serial_faults() -> Result<()
         Some(fresh),
         "slot 0 warmed to the fresh value"
     );
-    // Exactly createAccessList + one bundled load were issued: a serial slot
-    // fault would have needed a third (un-queued) request and failed the run.
-    assert!(
-        asserter.read_q().is_empty(),
-        "no serial per-slot faults: only createAccessList + one bundled load"
+    assert_eq!(
+        access_list_calls.load(Ordering::SeqCst),
+        1,
+        "the access-list read-set should be derived once through the cache fetcher"
     );
     Ok(())
 }
@@ -1875,7 +1870,7 @@ async fn curve_cold_start_primed_falls_back_when_access_list_unsupported() -> Re
         ));
 
     let outcome = registry
-        .cold_start_primed(&mut registration, &mut cache, provider.as_ref(), ColdStartPolicy::Eager)
+        .cold_start_primed(&mut registration, &mut cache, ColdStartPolicy::Eager)
         .await?;
 
     assert!(
