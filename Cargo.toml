@@ -96,6 +96,9 @@ tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 # `plotters` deps — keeps the build lean and, since the crate deliberately ships
 # without rayon, avoids reintroducing it even in the dev/bench build.
 criterion = { version = "0.5", default-features = false }
+# The live V3-liquidity parity test parses `trace_replayTransaction` stateDiff as
+# raw JSON (per-tx storage before/after ground truth). Dev-only.
+serde_json = "1.0"
 
 # Runnable adapters-path demo: register -> cold-start -> WS event subscribe ->
 # reactive apply -> simulate_swap. Env-gated; no-ops if the RPC/WS URL is unset.
@@ -192,6 +195,13 @@ required-features = ["uniswap-v3"]
 # and partial-window equivalence against on-chain ground truth.
 [[test]]
 name = "v3_full_sync_rpc"
+required-features = ["uniswap-v3"]
+
+# Live parity for event-sourced V3 Mint/Burn (env-gated, #[ignore]): for a real
+# add- and remove-liquidity tx, apply the event and assert the adapter's writes
+# reproduce the on-chain per-tx storage diff (trace_replayTransaction stateDiff).
+[[test]]
+name = "v3_liquidity_rpc"
 required-features = ["uniswap-v3"]
 
 [[test]]
