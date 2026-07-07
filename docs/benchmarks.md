@@ -111,6 +111,36 @@ Interpretation:
   `debug_traceBlockByNumber` integration should populate it from traces, avoiding
   the view-call discover round and keeping the one-shot refresh path.
 
+### Curve cold-start: discovery vs a known read-set
+
+A Curve pool's *first* cold start is a discover→verify run: it fetches the pool's
+Vyper runtime and executes `get_dy` in a local revm over a cold cache, lazily
+faulting in each slot it SLOADs. That first-discovery cost — not warmed quoting —
+is what makes a cold Curve boot lag Uniswap V2/V3, whose hot state is a known slot
+set (or tick-bitmap program) hydrated in one bundled `eth_call`.
+
+Once the read-set is known, the gap closes to the one-shot figures above (the
+same Curve 3pool row: **~361 ms → ~75 ms**). Two paths reuse a persisted
+`CurveMetadata.discovered_slots` (from a prior discovery, a block trace, or a
+registry):
+
+- **verify-only `cold_start`** — the planner skips discovery and warms exactly
+  the known slots in a single verify round;
+- **`cold_start_many`** — the same read-set becomes one bundled storage program,
+  the identical fast path Uniswap V2/V3 take.
+
+[`examples/curve_cold_start_phases.rs`](../examples/curve_cold_start_phases.rs)
+times all three (discovery vs verify-only vs `cold_start_many`) against a live
+pool and prints the breakdown — run it for numbers on your own endpoint:
+
+```bash
+E2E_RPC_URL=<archive-url> cargo run --release --example curve_cold_start_phases
+```
+
+The optional `CurveMetadata::with_code_seed` removes the one lazy code fetch a
+Curve pool otherwise pays on its first quote, matching the fully-offline V2/V3
+profile after bootstrap.
+
 ### Event-time trace resync
 
 [`examples/trace_resync_latency.rs`](../examples/trace_resync_latency.rs)
