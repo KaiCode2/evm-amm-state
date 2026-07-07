@@ -114,16 +114,24 @@ impl From<evm_fork_cache::CacheError> for CacheError {
 
 /// Cache facade used by protocol adapters.
 pub trait AdapterCache: StateView {
+    /// The cached value of `slot` at `address`, or `None` if not warmed.
     fn cached_storage(&self, address: Address, slot: U256) -> Option<U256>;
 
+    /// Apply state updates to the cache, returning the resulting diff (including
+    /// any updates skipped because their base slot was cold).
     fn apply_updates(&mut self, updates: &[StateUpdate]) -> StateDiff;
 
+    /// Authoritatively re-fetch the given slots and inject any that changed,
+    /// returning the changes.
     fn verify_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>, CacheError>;
 
+    /// Invalidate all cached storage for `address`, returning the diff.
     fn purge_storage(&mut self, address: Address) -> StateDiff;
 
+    /// Invalidate the given `slots` of `address`, returning the diff.
     fn purge_slots(&mut self, address: Address, slots: &[U256]) -> StateDiff;
 
+    /// Read one storage slot (from cache, or lazily from the backend).
     fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256, CacheError>;
 
     /// Read many storage slots, returning one value per input slot in the SAME
@@ -137,6 +145,8 @@ pub trait AdapterCache: StateView {
             .collect()
     }
 
+    /// Execute a raw EVM call against the cached state. `commit = false` runs it
+    /// read-only (the quote path); `true` persists the resulting state changes.
     fn call_raw(
         &mut self,
         from: Address,

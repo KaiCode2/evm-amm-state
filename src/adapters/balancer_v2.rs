@@ -26,6 +26,7 @@ sol! {
         returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock);
 }
 
+/// Adapter for Balancer V2 (shared-vault) pools.
 #[derive(Clone, Debug, Default)]
 pub struct BalancerV2Adapter {
     _private: (),

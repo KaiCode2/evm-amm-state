@@ -49,18 +49,24 @@ pub struct AdapterDriver {
 }
 
 impl AdapterDriver {
+    /// A driver over `registry`.
     pub fn new(registry: AdapterRegistry) -> Self {
         Self { registry }
     }
 
+    /// Borrow the underlying registry.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
     }
 
+    /// Consume the driver, returning its registry.
     pub fn into_registry(self) -> AdapterRegistry {
         self.registry
     }
 
+    /// Route and apply a single log, returning its report (`None` if unrouted).
+    /// Returns a [`DriverError`] for a routed-but-malformed log; use
+    /// [`apply_logs`](Self::apply_logs) for batch-robust application.
     pub fn apply_log<C>(
         &self,
         cache: &mut C,

@@ -98,6 +98,7 @@ pub struct AdapterCodeSeed {
 }
 
 impl AdapterCodeSeed {
+    /// A seed for `address`, computing the code hash from `runtime_bytecode`.
     pub fn new(address: Address, runtime_bytecode: impl Into<Bytes>) -> Self {
         let runtime_bytecode = runtime_bytecode.into();
         let code_hash = runtime_code_hash(&runtime_bytecode);
@@ -108,6 +109,7 @@ impl AdapterCodeSeed {
         }
     }
 
+    /// A seed with a precomputed `code_hash` (skips re-hashing the bytecode).
     pub fn with_code_hash(
         address: Address,
         runtime_bytecode: impl Into<Bytes>,
@@ -231,54 +233,72 @@ pub struct BytecodePatch {
 }
 
 impl BytecodePatch {
+    /// A patch covering `length` bytes at `offset` in the runtime bytecode.
     pub const fn new(offset: usize, length: usize) -> Self {
         Self { offset, length }
     }
 }
 
 /// Immutable byte ranges for a V3-style pool runtime template.
+///
+/// Each field lists the byte ranges in the template occupied by that Solidity
+/// immutable, patched per-pool at render time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V3ImmutablePatches {
+    /// Ranges holding the pool's own address (`NoDelegateCall` self-address).
     pub pool_address: &'static [BytecodePatch],
+    /// Ranges holding the factory/deployer address.
     pub factory: &'static [BytecodePatch],
+    /// Ranges holding `token0`.
     pub token0: &'static [BytecodePatch],
+    /// Ranges holding `token1`.
     pub token1: &'static [BytecodePatch],
+    /// Ranges holding the fee.
     pub fee: &'static [BytecodePatch],
+    /// Ranges holding the tick spacing.
     pub tick_spacing: &'static [BytecodePatch],
+    /// Ranges holding `maxLiquidityPerTick`.
     pub max_liquidity_per_tick: &'static [BytecodePatch],
 }
 
 impl V3ImmutablePatches {
+    /// Set the pool-address patch ranges.
     pub fn with_pool_address(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.pool_address = patches;
         self
     }
 
+    /// Set the factory patch ranges.
     pub fn with_factory(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.factory = patches;
         self
     }
 
+    /// Set the `token0` patch ranges.
     pub fn with_token0(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.token0 = patches;
         self
     }
 
+    /// Set the `token1` patch ranges.
     pub fn with_token1(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.token1 = patches;
         self
     }
 
+    /// Set the fee patch ranges.
     pub fn with_fee(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.fee = patches;
         self
     }
 
+    /// Set the tick-spacing patch ranges.
     pub fn with_tick_spacing(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.tick_spacing = patches;
         self
     }
 
+    /// Set the `maxLiquidityPerTick` patch ranges.
     pub fn with_max_liquidity_per_tick(mut self, patches: &'static [BytecodePatch]) -> Self {
         self.max_liquidity_per_tick = patches;
         self
@@ -295,6 +315,7 @@ pub struct V3RuntimeBytecodeTemplate {
 }
 
 impl V3RuntimeBytecodeTemplate {
+    /// A template from `runtime_bytecode` and its immutable patch locations.
     pub fn new(runtime_bytecode: impl Into<Bytes>, immutables: V3ImmutablePatches) -> Self {
         Self {
             runtime_bytecode: runtime_bytecode.into(),
@@ -352,28 +373,46 @@ impl V3RuntimeBytecodeTemplate {
 /// Per-pool immutable values used to render a V3 runtime bytecode template.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct V3ImmutablePatchValues {
+    /// The pool's own address.
     pub pool_address: Option<Address>,
+    /// The factory/deployer address.
     pub factory: Option<Address>,
+    /// The pool's `token0`.
     pub token0: Option<Address>,
+    /// The pool's `token1`.
     pub token1: Option<Address>,
+    /// The pool fee.
     pub fee: Option<u32>,
+    /// The pool's tick spacing.
     pub tick_spacing: Option<i32>,
+    /// The pool's `maxLiquidityPerTick`.
     pub max_liquidity_per_tick: Option<U256>,
 }
 
+/// Why rendering a V3 runtime bytecode template failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BytecodeTemplateError {
+    /// A patch range was declared for `field` but no value was supplied.
     MissingImmutable {
+        /// The immutable whose value was missing.
         field: &'static str,
     },
+    /// A patch range's `length` cannot hold the immutable's encoded value.
     InvalidPatchLength {
+        /// The immutable being patched.
         field: &'static str,
+        /// The declared patch length that is too small.
         length: usize,
     },
+    /// A patch range falls outside the template bytecode.
     PatchOutOfBounds {
+        /// The immutable being patched.
         field: &'static str,
+        /// The patch's byte offset.
         offset: usize,
+        /// The patch's byte length.
         length: usize,
+        /// The template bytecode's length.
         bytecode_len: usize,
     },
 }

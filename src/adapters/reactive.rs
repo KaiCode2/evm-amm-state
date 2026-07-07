@@ -27,14 +27,17 @@ pub struct AmmReactiveHandler {
 }
 
 impl AmmReactiveHandler {
+    /// Wrap an [`AdapterRegistry`] as a reactive handler.
     pub fn new(registry: AdapterRegistry) -> Self {
         Self { registry }
     }
 
+    /// This handler's stable id in the reactive runtime.
     pub fn id(&self) -> HandlerId {
         HandlerId::new(HANDLER_ID)
     }
 
+    /// The log interests (emitter/topic filters) for every tracked pool.
     pub fn interests(&self) -> Vec<ReactiveInterest<Ethereum>> {
         self.registry
             .pools()
@@ -43,6 +46,7 @@ impl AmmReactiveHandler {
             .collect()
     }
 
+    /// The wrapped registry.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
     }

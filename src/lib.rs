@@ -23,5 +23,10 @@
 //! cold-starts a pool, subscribes to its events over a WebSocket endpoint,
 //! applies them reactively, and simulates a swap against the live-synced state.
 
+// The public API is broad and stability-sensitive; require docs on every public
+// item so the surface stays fully documented as it grows (CI's `-D warnings`
+// promotes this to an error).
+#![warn(missing_docs)]
+
 // Always compiled — the adapter layer has no heavy deps.
 pub mod adapters;

@@ -19,6 +19,7 @@ sol! {
     event Sync(uint112 reserve0, uint112 reserve1);
 }
 
+/// Adapter for Uniswap V2 constant-product pairs.
 #[derive(Clone, Debug, Default)]
 pub struct UniswapV2Adapter {
     _private: (),
