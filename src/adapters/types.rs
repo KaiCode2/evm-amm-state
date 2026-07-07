@@ -549,6 +549,18 @@ pub struct BalancerV2Metadata {
     /// balance-mapping layout or doing lossy event-delta arithmetic. Empty
     /// until the discover→verify cold-start runs.
     pub balance_slots: Vec<U256>,
+    /// Per-token vault `cash`-balance locations (see [`BalancerTokenBalance`]),
+    /// derived by the discover cold-start's probe.
+    ///
+    /// Lets the reactive `Swap` path **event-source** the exact `cash` delta with
+    /// no RPC — writing each swapped token's packed balance directly from the
+    /// event's `amountIn`/`amountOut` — falling back to a [`balance_slots`] resync
+    /// when a token is absent here (a slots-only pre-population, or a managed-
+    /// balance pool where `cash != getPoolTokens` balance). Empty until a discover
+    /// cold-start builds it.
+    ///
+    /// [`balance_slots`]: Self::balance_slots
+    pub token_cash: Vec<BalancerTokenBalance>,
 }
 
 impl BalancerV2Metadata {
@@ -574,6 +586,49 @@ impl BalancerV2Metadata {
     pub fn with_balance_slots(mut self, balance_slots: impl IntoIterator<Item = U256>) -> Self {
         self.balance_slots = balance_slots.into_iter().collect();
         self
+    }
+
+    /// Set (replace) the per-token vault `cash`-balance locations.
+    pub fn with_token_cash(
+        mut self,
+        token_cash: impl IntoIterator<Item = BalancerTokenBalance>,
+    ) -> Self {
+        self.token_cash = token_cash.into_iter().collect();
+        self
+    }
+}
+
+/// Location of one token's packed `cash` balance in the Balancer V2 vault storage.
+///
+/// Vault balances are a packed `bytes32`
+/// (`[lastChangeBlock : top 32][managed : bits 112–223][cash : bits 0–111]`); a
+/// swap changes only the 112-bit `cash` field. This records where a given token's
+/// `cash` lives so the reactive `Swap` path can write it directly. For a TWO_TOKEN
+/// pool both tokens share one slot — one at the low field, one at the high field —
+/// so `slot` can repeat across two entries with different [`high_field`].
+///
+/// [`high_field`]: Self::high_field
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BalancerTokenBalance {
+    /// The token whose vault `cash` balance this locates.
+    pub token: Address,
+    /// The vault storage slot holding the packed balance.
+    pub slot: U256,
+    /// Whether `cash` is the **high** 112-bit field (bits 112–223) of `slot`
+    /// rather than the low field (bits 0–111). `true` only for the second token of
+    /// a TWO_TOKEN pool's shared slot.
+    pub high_field: bool,
+}
+
+impl BalancerTokenBalance {
+    /// Construct a token cash-balance location.
+    pub fn new(token: Address, slot: U256, high_field: bool) -> Self {
+        Self {
+            token,
+            slot,
+            high_field,
+        }
     }
 }
 

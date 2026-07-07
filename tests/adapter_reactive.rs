@@ -14,11 +14,11 @@ use evm_amm_state::adapters::storage::{
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
 };
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerV2Adapter, BalancerV2Metadata,
-    ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
-    CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
-    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
-    uniswap_v2_pair_runtime_code_hash,
+    AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerTokenBalance, BalancerV2Adapter,
+    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter,
+    CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolMetadata, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
+    V3Metadata, uniswap_v2_pair_runtime_code_hash,
 };
 // The reactive-runtime seam these tests exercise (raw `EvmCache::apply_updates`
 // and the upstream `ResyncedReport`/`InvalidationRequest`) speaks the upstream
@@ -809,6 +809,298 @@ async fn balancer_shared_emitter_routes_by_pool_id() -> Result<()> {
             .iter()
             .any(|signal| signal.kind.as_ref() == "amm.event")
     );
+    Ok(())
+}
+
+/// Register a Balancer pool with a fully-probed `token_cash` map so the reactive
+/// `Swap` path can event-source the vault balances directly.
+fn balancer_registry_with_metadata(
+    vault: Address,
+    pool_id: B256,
+    metadata: BalancerV2Metadata,
+) -> AdapterRegistry {
+    let adapter = Arc::new(BalancerV2Adapter::default());
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter.clone()).unwrap();
+    let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
+        .with_state_address(vault)
+        .with_metadata(ProtocolMetadata::BalancerV2(metadata));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+    registry.register_pool(registration).unwrap();
+    registry
+}
+
+/// A warm `TWO_TOKEN` swap event-sources both balances in the single shared vault
+/// slot: `tokenIn`'s low field gains `amountIn`, `tokenOut`'s high field loses
+/// `amountOut`, in one combined write — exactly, with no resync.
+#[tokio::test]
+async fn balancer_swap_event_sources_two_token_shared_slot() -> Result<()> {
+    let vault = Address::repeat_byte(0x52);
+    let pool_id = B256::repeat_byte(0xc3);
+    let token_in = Address::repeat_byte(0x01);
+    let token_out = Address::repeat_byte(0x02);
+    let slot = U256::from(0x77_u64);
+    // Shared word: [lastChangeBlock:32][cash_high(out)=1000][cash_low(in)=500].
+    let block_stamp = U256::from(0xABCD_u64);
+    let warm = (block_stamp << 224) | (U256::from(1000_u64) << 112) | U256::from(500_u64);
+
+    let metadata = BalancerV2Metadata::default()
+        .with_vault(vault)
+        .with_tokens([token_in, token_out])
+        .with_balance_slots([slot])
+        .with_token_cash([
+            BalancerTokenBalance::new(token_in, slot, false),
+            BalancerTokenBalance::new(token_out, slot, true),
+        ]);
+
+    let log = rpc_log(
+        vault,
+        vec![
+            balancer_swap_topic(),
+            pool_id,
+            topic_address(token_in),
+            topic_address(token_out),
+        ],
+        abi_words([U256::from(30_u64), U256::from(20_u64)]),
+        20,
+        0,
+        0,
+    );
+
+    let mut cache = setup_cache().await?;
+    cache.apply_updates(&[StateUpdate::slot(vault, slot, warm)]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(
+        balancer_registry_with_metadata(vault, pool_id, metadata),
+    )))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(20, 0))]),
+    )?;
+
+    let raw = cache.cached_storage_value(vault, slot).unwrap();
+    assert_eq!(
+        raw & low_mask(112),
+        U256::from(530_u64),
+        "tokenIn cash += amountIn"
+    );
+    assert_eq!(
+        (raw >> 112) & low_mask(112),
+        U256::from(980_u64),
+        "tokenOut cash -= amountOut"
+    );
+    assert_eq!(raw >> 224, block_stamp, "lastChangeBlock is preserved");
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput
+    );
+    assert!(
+        report.applied[0].resyncs.is_empty(),
+        "a warm event-source must not schedule a resync"
+    );
+    Ok(())
+}
+
+/// A warm `GENERAL` swap event-sources two distinct per-token vault slots: one
+/// `+amountIn` write and one `-amountOut` write, exactly, with no resync.
+#[tokio::test]
+async fn balancer_swap_event_sources_general_separate_slots() -> Result<()> {
+    let vault = Address::repeat_byte(0x53);
+    let pool_id = B256::repeat_byte(0xd4);
+    let token_in = Address::repeat_byte(0x03);
+    let token_out = Address::repeat_byte(0x04);
+    let slot_in = U256::from(0x11_u64);
+    let slot_out = U256::from(0x22_u64);
+    let stamp = U256::from(7_u64) << 224;
+
+    let metadata = BalancerV2Metadata::default()
+        .with_vault(vault)
+        .with_tokens([token_in, token_out])
+        .with_balance_slots([slot_in, slot_out])
+        .with_token_cash([
+            BalancerTokenBalance::new(token_in, slot_in, false),
+            BalancerTokenBalance::new(token_out, slot_out, false),
+        ]);
+
+    let log = rpc_log(
+        vault,
+        vec![
+            balancer_swap_topic(),
+            pool_id,
+            topic_address(token_in),
+            topic_address(token_out),
+        ],
+        abi_words([U256::from(10_u64), U256::from(20_u64)]),
+        21,
+        0,
+        0,
+    );
+
+    let mut cache = setup_cache().await?;
+    cache.apply_updates(&[
+        StateUpdate::slot(vault, slot_in, stamp | U256::from(100_u64)),
+        StateUpdate::slot(vault, slot_out, stamp | U256::from(200_u64)),
+    ]);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(
+        balancer_registry_with_metadata(vault, pool_id, metadata),
+    )))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(21, 0))]),
+    )?;
+
+    let raw_in = cache.cached_storage_value(vault, slot_in).unwrap();
+    let raw_out = cache.cached_storage_value(vault, slot_out).unwrap();
+    assert_eq!(
+        raw_in & low_mask(112),
+        U256::from(110_u64),
+        "tokenIn cash += amountIn"
+    );
+    assert_eq!(
+        raw_out & low_mask(112),
+        U256::from(180_u64),
+        "tokenOut cash -= amountOut"
+    );
+    assert_eq!(raw_in >> 224, U256::from(7_u64), "in-slot block preserved");
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput
+    );
+    assert!(report.applied[0].resyncs.is_empty());
+    Ok(())
+}
+
+/// A `Swap` on a pool whose `token_cash` is unknown (never probed) cannot be
+/// event-sourced, so it falls back to a `VerifySlots` resync of the known balance
+/// slots rather than writing the wrong storage.
+#[tokio::test]
+async fn balancer_swap_without_token_cash_falls_back_to_resync() -> Result<()> {
+    let vault = Address::repeat_byte(0x54);
+    let pool_id = B256::repeat_byte(0xe5);
+    let slot = U256::from(0x33_u64);
+    let metadata = BalancerV2Metadata::default()
+        .with_vault(vault)
+        .with_balance_slots([slot]); // slots known, but no token_cash map.
+
+    let log = rpc_log(
+        vault,
+        vec![
+            balancer_swap_topic(),
+            pool_id,
+            topic_address(Address::repeat_byte(0x05)),
+            topic_address(Address::repeat_byte(0x06)),
+        ],
+        abi_words([U256::from(10_u64), U256::from(20_u64)]),
+        22,
+        0,
+        0,
+    );
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(
+        balancer_registry_with_metadata(vault, pool_id, metadata),
+    )))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(22, 0))]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(
+        report.applied[0].resyncs.len(),
+        1,
+        "unmapped swap must resync"
+    );
+    assert!(matches!(
+        report.applied[0].resyncs[0].targets.as_slice(),
+        [ResyncTarget::StorageSlots { address, slots }]
+            if *address == vault && slots == &vec![slot]
+    ));
+    Ok(())
+}
+
+/// A `PoolBalanceChanged` (join/exit) is now subscribed: it routes to the adapter,
+/// is classified by delta sign, and resyncs the vault balance slots (event-sourcing
+/// its deltas is a follow-up). Validates the new subscription + routing.
+#[tokio::test]
+async fn balancer_pool_balance_changed_routes_and_resyncs() -> Result<()> {
+    let vault = Address::repeat_byte(0x55);
+    let pool_id = B256::repeat_byte(0xf6);
+    let token = Address::repeat_byte(0x07);
+    let slot = U256::from(0x44_u64);
+    let metadata = BalancerV2Metadata::default()
+        .with_vault(vault)
+        .with_tokens([token])
+        .with_balance_slots([slot]);
+
+    // ABI body for (address[1], int256[1] = [+500], uint256[1] = [0]): three
+    // dynamic arrays, so three head offsets then each array's [len, element].
+    let body: Vec<u8> = [
+        word(U256::from(0x60_u64)),
+        word(U256::from(0xa0_u64)),
+        word(U256::from(0xe0_u64)),
+        word(U256::from(1_u64)),
+        address_word(token),
+        word(U256::from(1_u64)),
+        word(U256::from(500_u64)), // positive delta -> LiquidityAdded
+        word(U256::from(1_u64)),
+        word(U256::ZERO),
+    ]
+    .concat();
+
+    let log = rpc_log(
+        vault,
+        vec![
+            keccak256("PoolBalanceChanged(bytes32,address,address[],int256[],uint256[])"),
+            pool_id,
+            topic_address(Address::repeat_byte(0x99)), // liquidityProvider
+        ],
+        body,
+        23,
+        0,
+        0,
+    );
+
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(AmmReactiveHandler::new(
+        balancer_registry_with_metadata(vault, pool_id, metadata),
+    )))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(ReactiveInput::Log(log), included_context(23, 0))]),
+    )?;
+
+    assert_eq!(
+        report.applied.len(),
+        1,
+        "PoolBalanceChanged must route to the adapter"
+    );
+    assert_eq!(
+        tag_value(&report.applied[0].tags, "protocol"),
+        Some("BalancerV2")
+    );
+    assert_eq!(
+        report.applied[0].resyncs.len(),
+        1,
+        "join/exit must resync the balances"
+    );
+    assert!(matches!(
+        report.applied[0].resyncs[0].targets.as_slice(),
+        [ResyncTarget::StorageSlots { address, slots }]
+            if *address == vault && slots == &vec![slot]
+    ));
     Ok(())
 }
 

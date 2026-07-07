@@ -96,8 +96,9 @@ tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 # `plotters` deps — keeps the build lean and, since the crate deliberately ships
 # without rayon, avoids reintroducing it even in the dev/bench build.
 criterion = { version = "0.5", default-features = false }
-# The live V3-liquidity parity test parses `trace_replayTransaction` stateDiff as
-# raw JSON (per-tx storage before/after ground truth). Dev-only.
+# The live V3-liquidity and Balancer event-sourcing parity tests parse
+# `trace_replayTransaction` stateDiff as raw JSON (per-tx storage before/after
+# ground truth). Dev-only.
 serde_json = "1.0"
 
 # Runnable adapters-path demo: register -> cold-start -> WS event subscribe ->
@@ -203,6 +204,14 @@ required-features = ["uniswap-v3"]
 [[test]]
 name = "v3_liquidity_rpc"
 required-features = ["uniswap-v3"]
+
+# Live parity for event-sourced Balancer V2 swaps (env-gated, #[ignore]): for a
+# real vault swap on both a TWO_TOKEN and a GENERAL pool, apply the event and
+# assert the adapter's writes reproduce the on-chain per-tx cash deltas
+# (trace_replayTransaction stateDiff).
+[[test]]
+name = "balancer_liquidity_rpc"
+required-features = ["balancer-v2"]
 
 [[test]]
 name = "reactive_ws_e2e"
