@@ -998,6 +998,87 @@ async fn balancer_cold_start_discover_verify_ready() -> Result<()> {
     Ok(())
 }
 
+// Verify-only fast path (Balancer): when the balance read-set is already known
+// (balance_slots pre-populated), cold-start skips the getPoolTokens discovery.
+// No vault runtime is installed, so a discover call would fail — reaching Ready
+// proves no discovery ran. The single verify round warms the known slot, and the
+// config-supplied tokens are preserved (no getPoolTokens decode to repopulate).
+#[tokio::test(flavor = "multi_thread")]
+async fn balancer_cold_start_verify_only_skips_discovery() -> Result<()> {
+    let vault = Address::repeat_byte(0x32);
+    let mut pid = [0u8; 32];
+    pid[..20].fill(0x11);
+    pid[20..].fill(0x22);
+    let pool_id = B256::from(pid);
+    let token0 = Address::repeat_byte(0xc0);
+    let token1 = Address::repeat_byte(0xc1);
+    let stale = U256::from(1_u64);
+    let fresh = U256::from(1000_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    // Bare, code-less vault: the known slot injects offline (account exists), and
+    // a discover getPoolTokens would fail on code-less code — so reaching Ready
+    // proves the verify-only path skipped discovery.
+    install_default_account(&mut cache, vault);
+    cache
+        .db_mut()
+        .insert_account_storage(vault, U256::from(2), stale)?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([((vault, U256::from(2)), fresh)]),
+        Vec::new(),
+    ));
+
+    let registry = balancer_registry();
+    let mut registration = PoolRegistration::new(PoolKey::BalancerV2(pool_id))
+        .with_state_address(vault)
+        .with_metadata(ProtocolMetadata::BalancerV2(
+            BalancerV2Metadata::default()
+                .with_vault(vault)
+                .with_tokens([token0, token1])
+                // A pre-populated read-set selects the verify-only fast path.
+                .with_balance_slots([U256::from(2)]),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "verify-only cold-start should reach Ready without discovery, got {outcome:?}"
+    );
+    assert_eq!(registration.status, PoolStatus::Ready);
+    match registration.metadata {
+        ProtocolMetadata::BalancerV2(ref m) => {
+            assert_eq!(m.vault, Some(vault));
+            assert_eq!(
+                m.tokens,
+                vec![token0, token1],
+                "config tokens must be preserved (no getPoolTokens decode ran)"
+            );
+            assert!(
+                m.balance_slots.contains(&U256::from(2)),
+                "the known read-set must be persisted, got {:?}",
+                m.balance_slots
+            );
+            assert_eq!(
+                m.pool_address,
+                Some(Address::repeat_byte(0x11)),
+                "pool_address is still derived from the poolId"
+            );
+        }
+        ref other => panic!("expected BalancerV2 metadata, got {other:?}"),
+    }
+    assert_eq!(
+        cache.cached_storage_value(vault, U256::from(2)),
+        Some(fresh),
+        "the single verify round must refresh the known slot to the fresh value"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the verify-only cold start must be fully offline (no RPC)"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn balancer_cold_start_missing_vault_is_unsupported() -> Result<()> {
     let pool_id = B256::repeat_byte(0x33);

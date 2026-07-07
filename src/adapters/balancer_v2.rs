@@ -75,8 +75,19 @@ impl AmmAdapter for BalancerV2Adapter {
             ));
         };
 
+        // A non-empty `balance_slots` means the vault read-set is already known (a
+        // prior discovery / trace), so the planner runs a verify-only fast path
+        // instead of rediscovering. `tokens` is preserved across a verify-only run
+        // (there is no `getPoolTokens` decode to repopulate it).
+        let (known_slots, tokens) = match &pool.metadata {
+            ProtocolMetadata::BalancerV2(metadata) => {
+                (metadata.balance_slots.clone(), metadata.tokens.clone())
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+
         Ok(Box::new(BalancerV2ColdStartPlanner::new(
-            vault, pool_id, policy,
+            vault, pool_id, known_slots, tokens, policy,
         )))
     }
 
@@ -222,24 +233,31 @@ enum BalancerRepair {
     BalancesUnfetched,
 }
 
-/// Cold-start planner for a Balancer V2 pool: a discover → verify access-list run.
+/// Cold-start planner for a Balancer V2 pool, in one of two modes:
 ///
-/// Balancer pool state lives in the vault behind a non-predictable storage layout,
-/// so the planner cannot name the balance slots up front. Instead round 1 runs a
-/// `getPoolTokens(poolId)` view-call on the vault (`restrict_to = [vault]`) and
-/// captures the `(vault, slot)` pairs it SLOADs. Round 2 authoritatively verifies
-/// exactly those discovered slots so the live balances are warmed. The token list
-/// is decoded from the discover call's return data.
+/// - **Discover → verify** (the balance read-set is unknown). Balancer pool state
+///   lives in the vault behind a non-predictable storage layout, so the planner
+///   cannot name the slots up front: round 1 runs a `getPoolTokens(poolId)`
+///   view-call on the vault (`restrict_to = [vault]`), capturing the
+///   `(vault, slot)` pairs it SLOADs and decoding the token list from the return
+///   data; round 2 authoritatively verifies exactly those slots so the live
+///   balances are warmed.
+/// - **Verify-only** (the read-set is already known — `BalancerV2Metadata`
+///   `balance_slots` pre-populated from a prior discovery or a trace). The planner
+///   skips the `getPoolTokens` discovery — no vault-account fetch and no
+///   cold-cache faulting — and warms exactly the known slots in a **single verify
+///   round**, matching the bundled `cold_start_many` storage-program path. The
+///   config-supplied `tokens` are preserved (there is no decode to repopulate).
 ///
-/// The flow runs for every policy: the vault balances are the hot state, so there
-/// is no verify-only shortcut. The planner stays policy-aware in shape (the policy
-/// is threaded into the report) so later slices can refine `HotSlotsOnly`/`Lazy`.
+/// The planner stays policy-aware in shape (the policy is threaded into the
+/// report) so later slices can refine `HotSlotsOnly`/`Lazy`.
 struct BalancerV2ColdStartPlanner {
     vault: Address,
     pool_id: B256,
     policy: ColdStartPolicy,
     phase: BalancerPhase,
-    /// Tokens decoded from the `getPoolTokens` return data (round 1).
+    /// Tokens decoded from `getPoolTokens` (discover mode) or carried from the
+    /// config-supplied metadata (verify-only mode).
     tokens: Vec<Address>,
     /// The vault balance slots discovered in round 1 and verified in round 2.
     verified_slots: Vec<(Address, U256)>,
@@ -250,14 +268,39 @@ struct BalancerV2ColdStartPlanner {
 }
 
 impl BalancerV2ColdStartPlanner {
-    fn new(vault: Address, pool_id: B256, policy: ColdStartPolicy) -> Self {
+    fn new(
+        vault: Address,
+        pool_id: B256,
+        known_slots: Vec<U256>,
+        tokens: Vec<Address>,
+        policy: ColdStartPolicy,
+    ) -> Self {
+        // A pre-populated balance read-set selects the verify-only fast path:
+        // start in `Verify` with those slots, so `initial_plan` emits one verify
+        // round (no getPoolTokens discover) and `finish` persists them. Sort +
+        // dedup for a stable, minimal fetch set. An empty read-set keeps the
+        // discover->verify default (byte-for-byte unchanged from before).
+        let mut slots = known_slots;
+        slots.sort_unstable();
+        slots.dedup();
+        let (phase, verified_slots) = if slots.is_empty() {
+            (BalancerPhase::Discover, Vec::new())
+        } else {
+            (
+                BalancerPhase::Verify,
+                slots.into_iter().map(|slot| (vault, slot)).collect(),
+            )
+        };
         Self {
             vault,
             pool_id,
             policy,
-            phase: BalancerPhase::Discover,
-            tokens: Vec::new(),
-            verified_slots: Vec::new(),
+            phase,
+            // Discover mode overwrites this from the getPoolTokens decode;
+            // verify-only mode preserves the config-supplied tokens (they came
+            // from the prior discovery that produced the known read-set).
+            tokens,
+            verified_slots,
             changed_slots: Vec::new(),
             repair: None,
         }
@@ -266,6 +309,19 @@ impl BalancerV2ColdStartPlanner {
 
 impl AdapterColdStartPlanner for BalancerV2ColdStartPlanner {
     fn initial_plan(&mut self, _state: &dyn StateView) -> ColdStartPlan {
+        // Verify-only fast path: the balance read-set is already known
+        // (pre-populated in `new`), so skip the `getPoolTokens` discovery — and
+        // the vault-account fetch + cold-cache faulting it needs — and warm
+        // exactly those slots in a single verify round. `on_results` lands
+        // directly in its `Verify` branch. A stale/incomplete set is safe: the
+        // first `simulate_swap` lazily faults anything missing.
+        if matches!(self.phase, BalancerPhase::Verify) {
+            return ColdStartPlan {
+                verify: self.verified_slots.clone(),
+                ..Default::default()
+            };
+        }
+
         // Round 1: ensure the vault's code, then run `getPoolTokens` and capture
         // the vault slots it touches (restricted to the vault so only its balance
         // storage is collected).
