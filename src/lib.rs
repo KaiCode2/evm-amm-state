@@ -27,6 +27,29 @@
 // item so the surface stays fully documented as it grows (CI's `-D warnings`
 // promotes this to an error).
 #![warn(missing_docs)]
+// docs.rs builds with `--cfg docsrs` (see `[package.metadata.docs.rs]`), which
+// enables nightly `doc_cfg`: every feature-gated item renders with its
+// "Available on crate feature … only" badge, derived automatically from the
+// existing `#[cfg]`s with no per-item annotations (auto-cfg is part of
+// `doc_cfg` since 1.92, rust-lang/rust#138907). Inert on stable builds.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// Re-export of [`alloy_primitives`]: the `Address` / `U256` / `B256` / `Log`
+/// vocabulary this crate's API speaks.
+///
+/// Import from here (`evm_amm_state::alloy_primitives`) to use exactly the
+/// version this crate's signatures expect without pinning `alloy-primitives`
+/// yourself.
+pub use alloy_primitives;
+/// Re-export of the [`evm_fork_cache`] companion crate: `EvmCache`, the
+/// reactive runtime, storage programs, and the typed errors that appear on
+/// this crate's driver seam.
+///
+/// `evm-fork-cache` is a 0.x **public dependency**: a semver-breaking bump
+/// there (e.g. 0.2 → 0.3) is necessarily a breaking release of this crate too,
+/// and the two are released in lockstep. Importing it through this re-export
+/// (`evm_amm_state::evm_fork_cache`) guarantees the versions match.
+pub use evm_fork_cache;
 
 // Always compiled — the adapter layer has no heavy deps.
 pub mod adapters;

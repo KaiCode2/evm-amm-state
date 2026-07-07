@@ -29,9 +29,12 @@ exclude = [
 ]
 
 # Build docs.rs with every feature enabled so the `uniswap-v3`-gated `v3_sync`
-# module and the `experimental-protocols` identities render.
+# module and the `experimental-protocols` identities render, and pass
+# `--cfg docsrs` so `doc_auto_cfg` (see lib.rs) stamps feature badges on gated
+# items.
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.

@@ -76,8 +76,11 @@ pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
 pub use reactive::AmmReactiveHandler;
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
-#[cfg(feature = "solidly-v2")]
-pub use storage::SolidlyStorageLayout;
+// Both layout types are always compiled (`storage` is feature-neutral); export
+// them unconditionally — `V3StorageLayout` is the field type of the
+// root-exported `V3Metadata.storage_layout`, and gating `SolidlyStorageLayout`
+// on its adapter feature only hid the root path from mixed builds.
+pub use storage::{SolidlyStorageLayout, V3StorageLayout};
 pub use storage_sync::{
     CALLDATA_SLOT_LOADER_CODE, StorageSyncEncoding, StorageSyncError, StorageSyncSnapshot,
     StorageSyncSpec, build_calldata_slot_loader_program, build_slot_loader_program,
