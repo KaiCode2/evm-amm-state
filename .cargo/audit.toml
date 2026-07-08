@@ -1,0 +1,18 @@
+# cargo-audit policy for evm-amm-state.
+#
+# Run `cargo audit` from the crate root; this ignore-list documents advisories
+# that are present in Cargo.lock but provably outside every build graph.
+
+[advisories]
+ignore = [
+    # tracing-subscriber 0.2.25 (ANSI-escape log poisoning) enters Cargo.lock
+    # only through revm-precompile's OPTIONAL arkworks bn254 backend
+    # (revm-precompile -> ark-bn254 -> ark-relations -> tracing-subscriber).
+    # No feature of this crate (or of its enabled dependency features) turns
+    # that backend on: `cargo tree -i tracing-subscriber@0.2.25 --target all
+    # --all-features` resolves to nothing, so the crate is never compiled,
+    # linked, or shipped — the advisory is lockfile-resolution noise. Remove
+    # this entry when upstream revm-precompile drops or upgrades the arkworks
+    # backend.
+    "RUSTSEC-2025-0055",
+]

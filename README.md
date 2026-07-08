@@ -1,0 +1,484 @@
+# evm-amm-state
+
+[![crates.io](https://img.shields.io/crates/v/evm-amm-state.svg)](https://crates.io/crates/evm-amm-state)
+[![docs.rs](https://img.shields.io/docsrs/evm-amm-state)](https://docs.rs/evm-amm-state)
+[![CI](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml/badge.svg)](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
+
+`evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
+cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
+their on-chain state into the cache, and keeps them current **from chain log
+events**: events that carry absolute state (Uniswap V2 / Solidly `Sync`) are
+applied as exact writes with **no RPC at all**, Uniswap V3 `Mint`/`Burn` and
+Balancer vault `Swap`s are **event-sourced** onto warm tick / cash slots the
+same way, and only genuinely cold slots and delta-only events (Curve, Balancer
+joins/exits) turn into a bounded, hash-pinned storage **resync** (block trace
+first, then bulk-storage / point-read fallback). Once a pool's quote read-set is warmed and current, swap
+**simulations run fully offline** against the live-synced state.
+
+The defining design choice: **no reimplemented AMM math.** Every quote runs the
+protocol's *canonical* on-chain quote entrypoint inside a local revm against the
+warmed cache — the pool's own `get_dy` / `getAmountOut`, or the protocol's
+official router/quoter (Uniswap `QuoterV2` / `Router02`) — then decodes the
+result. There is no `LocalAMM`/`amm-math` formula layer to drift from the real
+contracts.
+
+[`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
+
+## Installation
+
+```bash
+cargo add evm-amm-state
+```
+
+All five protocol adapters are enabled by default; trim to what you use with
+feature flags:
+
+```toml
+[dependencies]
+evm-amm-state = { version = "0.1", default-features = false, features = [
+    "uniswap-v3",
+    "curve",
+] }
+```
+
+Requires Rust **1.88+** (the declared MSRV, checked in CI). The two public
+dependencies whose types appear in this crate's API are re-exported at the
+crate root — import `evm_amm_state::evm_fork_cache` and
+`evm_amm_state::alloy_primitives` instead of pinning them yourself, and the
+versions always match. `evm-fork-cache` is a 0.x companion released in
+lockstep: a breaking bump there is a breaking bump here.
+
+## The pipeline
+
+Each protocol is a single [`AmmAdapter`] implementation; the
+[`AdapterRegistry`] dispatches by pool key.
+
+| Stage | What it does |
+| --- | --- |
+| **Register** | Describe a pool: a [`PoolKey`] + [`ProtocolMetadata`] (tokens, fee, storage layout / coins, …). |
+| **Cold-start** | `registry.cold_start(pool, cache, policy)` warms the pool's read-set into the [`EvmCache`] from forked storage. Named-slot protocols (Uniswap V2/V3, Solidly) warm known slots; layout-free protocols (Balancer, Curve) **discover → verify** the exact slots a quote call SLOADs. Known AMM runtime bytecodes can be seeded first and verified once by `evm-fork-cache` against on-chain `EXTCODEHASH`. |
+| **Subscribe** | `adapter.event_sources(pool)` lists the log topics to subscribe to over a `wss://` endpoint. |
+| **React** | Decoded logs flow through [`AmmSyncEngine`] / [`AmmReactiveHandler`] + the `evm_fork_cache` reactive runtime. Exact-write protocols update cached state with **no RPC**; protocols whose logs do not carry final storage values emit hash-pinned resync requests that `evm-fork-cache` resolves from block traces, bulk storage, or point-read fallback. |
+| **Simulate** | `adapter.simulate_swap(pool, cache, token_in, token_out, amount_in, &config)` executes the pool's own quote against the cached state and returns a [`SwapQuote`] — fully offline. |
+
+[`AmmAdapter`]: src/adapters/traits.rs
+[`AdapterRegistry`]: src/adapters/registry.rs
+[`AmmSyncEngine`]: src/adapters/sync_manager.rs
+[`AmmReactiveHandler`]: src/adapters/reactive.rs
+[`PoolKey`]: src/adapters/types.rs
+[`ProtocolMetadata`]: src/adapters/types.rs
+[`EvmCache`]: https://github.com/KaiCode2/evm-fork-cache
+[`SwapQuote`]: src/adapters/sim.rs
+
+## Supported protocols
+
+| Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
+| --- | --- | --- | --- | --- |
+| Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
+| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → exact tick + global-liquidity writes where warm, resync only cold ticks |
+| Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`), verify-only once known | `Swap` → exact 112-bit cash writes where warm, resync fallback; `PoolBalanceChanged` → resync |
+| Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
+| **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
+
+All protocol adapters are on by default; `pancake-v3` and `slipstream` are
+thin aliases of `uniswap-v3` (one V3-family adapter serves all three). See
+[`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
+per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
+discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
+for the Curve adapter in depth.
+
+> **Slipstream quoting caveat.** Slipstream / Aerodrome CL ships as
+> discovery + cold-start: its own quoter ABI differs (int24 tickSpacing), so
+> discovered registrations leave `fee` unset and `simulate_swap` returns
+> `MissingMetadata` until you supply a Uniswap-compatible quoter + fee — see
+> the [support matrix](docs/protocol-support-matrix.md).
+
+> **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
+> reserves its cold-start warms — the pool's `stable` flag and token `decimals`,
+> plus an external `IPoolFactory(factory).getFee()` STATICCALL (which needs the
+> factory's code and fee slots). With a live-backed cache these fetch lazily on
+> the first quote; for fully-offline Solidly quotes, keep a backend attached or
+> pre-warm that read-set. Uniswap V2/V3 and Curve cold-starts already cover their
+> quote read-set (V3 within its warmed tick window).
+
+### Verified Pool Bytecode Seeding
+
+Known pool runtime bytecodes live in [`src/adapters/bytecodes`](src/adapters/bytecodes)
+as embedded binary artifacts. Before cold-start, an adapter's `code_seeds` returns
+canonical `AdapterCodeSeed`s built by plain functions: `uniswap_v2_pair_code_seed`
+returns the shared pair runtime and its precomputed code hash, and
+`v3_code_seed_from_metadata` renders the V3 pool template from a pool's immutables.
+No per-pool bytecode fields are attached to metadata.
+
+When the cache has an account-fields fetcher available (and seeding is enabled),
+`AdapterRegistry::cold_start` writes these seeds into `EvmCache` with
+`seed_account_code`; `evm-fork-cache` verifies the code hash once against the
+chain. Seeding is a pure optimization: a pool's own runtime code is otherwise
+lazily fetched at first simulate. A code-hash mismatch (or an unverifiable seed)
+is purged and the pool falls back to lazily fetching its real code — it stays
+`Ready`, is never left `Degraded`, and no repair is raised. Verification results
+are surfaced on the cold-start report's `code_seeds` field. Disable seeding
+entirely with `AdapterRegistry::with_code_seeding(false)`.
+
+Uniswap V3 has an embedded pool template and an explicit `uniswap_v3_code_seed`
+helper for callers that already know the pool immutables. Factory-discovered
+Uniswap V3 registrations carry the factory immutable in metadata, allowing
+automatic V3 seeding without assuming a chain-global factory address. Bytecode
+seeding covers Uniswap V2 and the V3 family from embedded/rendered templates.
+Balancer and Curve pools have no shared template, so by default they fetch their
+runtime code lazily on first simulate — but **Curve accepts an optional
+caller-supplied seed** via `CurveMetadata::with_code_seed(runtime)` for callers
+that already know a pool's Vyper runtime (verified once against on-chain code,
+same purge-on-mismatch contract). Since seeding is a pure optimization over that
+lazy fetch, this is only a latency difference, never a correctness one.
+
+### Factory-backed Discovery
+
+`PoolDiscovery` can build cold-start-ready registrations from configured
+factories instead of requiring callers to paste pool addresses. `FactoryConfig`
+is empty by default: callers opt in with explicit factory addresses, e.g.
+`FactoryConfig::default().with_uniswap_v3_factory(factory)`, so chain- and
+fork-specific deployments never inherit an assumed factory.
+
+Discovery ships for every protocol whose pools resolve through the pinned
+cache as a derived factory storage slot, batched by default:
+
+| Protocol | Mechanism |
+| --- | --- |
+| Uniswap V3 / Sushi V3 / Pancake V3 | fee-keyed `getPool[t0][t1][fee]` (via `ClFactorySpec`) |
+| Slipstream / Aerodrome CL | tickSpacing-keyed `getPool[t0][t1][tickSpacing]` (via `ClFactorySpec`) |
+| Uniswap V2 | `getPair[t0][t1]` |
+| Solidly V2 (Aerodrome / Velodrome) | `getPool[t0][t1][bool stable]` (stable + volatile) |
+
+V3-discovered registrations carry `V3Metadata.factory`, which gives bytecode
+seeding the factory immutable it needs to render and verify the expected pool
+runtime. Multiple factories of the same protocol coexist (keyed by
+`(protocol, factory_address)`).
+
+A few AMM shapes are deliberately left to the integrator in 0.1.0 — **Algebra**-style
+CL forks (Camelot, QuickSwap: a different pool engine, not just a discovery
+config), **Curve** (needs the Vyper MetaRegistry view call, not wired this
+release — its adapter still simulates explicitly-registered pools), and
+**Balancer V2** discovery (no on-chain token→pool index, so it needs an async log
+scan). These have first-class, stable escape hatches:
+`register_adapter(Arc<dyn AmmAdapter>)` adds a novel simulation engine and
+`PoolDiscovery::with_factory(Box<dyn PoolFactory>)` adds a novel discovery
+mechanism — a new AMM never requires forking the crate. See
+[`docs/pool-discovery.md`](docs/pool-discovery.md) for the full coverage table,
+adding your own CL fork, and this boundary in depth.
+
+The whole surface is one method — `discovery.find(cache, query)` — over one
+fluent `PoolQuery`:
+
+```rust,ignore
+// one token pair, across every matching factory (V2, V3, forks)
+discovery.find(&mut cache, PoolQuery::pair(weth, usdc))?;
+
+// every pool joining any pair of a token basket — the C(n, 2) combinations
+discovery.find(&mut cache, PoolQuery::basket([weth, usdc, dai, wbtc]))?;
+
+// an explicit set of pairs
+discovery.find(&mut cache, PoolQuery::pairs([(weth, usdc), (weth, dai)]))?;
+
+// scope any of the above to one protocol
+discovery.find(&mut cache, PoolQuery::pair(weth, usdc).on(ProtocolId::UniswapV3))?;
+
+// mix protocols across pairs in ONE batched read — e.g. some pairs only on V2,
+// others only on V3 — with find_many
+discovery.find_many(&mut cache, [
+    PoolQuery::pairs([(weth, usdc)]).on(ProtocolId::UniswapV2),
+    PoolQuery::basket([weth, dai, wbtc]).on(ProtocolId::UniswapV3),
+])?;
+```
+
+An unscoped query spans **every** matching factory and resolves the whole thing
+— all pairs, all factories, all V3 fee tiers — in a **single batched read**
+(`AdapterCache::read_storage_slots`, one bulk `eth_call` on `EvmCache`), so
+request count scales with the number of factories, not with pairs, fee tiers, or
+basket size (a 5-token mainnet basket resolves 49 pools in one round-trip, ~20×
+faster than per-pair scans; see
+[`examples/token_basket_bench.rs`](examples/token_basket_bench.rs)). `.on(p)`
+filters to protocol `p` and errors `DiscoveryError::MissingFactory(p)` when no
+factory is registered for it (an unscoped query never does). External factories
+that only implement `find_pools` (no `candidate_reads`) keep working through a
+per-pair fallback.
+
+### Fast multi-pool bootstrap
+
+`AdapterRegistry::cold_start_many(pools, cache, provider, policy)` warms many
+pools at once: it seeds + verifies all one-shot-eligible pools' code in one
+account-fields call, hydrates them through a single bundled `run_storage_programs`
+`eth_call` (V3 full-sync / V2 flat-slot / Balancer or **Curve** discovered
+read-set), and finalizes them `Ready`, falling back per pool to the conservative
+per-pool `cold_start` for anything without a one-shot program or whose hydration
+fails. `supports_one_shot_hydration` reports which pools take the fast path — a
+Curve pool qualifies once its `discovered_slots` read-set is known (from a prior
+discovery, a trace, or a registry), joining V2/V3 in the same bundled call. Combined with token-basket discovery,
+the happy path is `find(PoolQuery::basket(..)) → cold_start_many → register`,
+with request count driven by bootstrap phases rather than pool count.
+
+### Extending with a new AMM
+
+You can add a brand-new AMM from *outside* the crate — no fork, no `src/` edit —
+via the `Custom` protocol id / pool key / metadata hatches and a minimal
+[`AmmAdapter`] (only `protocol()` + `simulate_swap()`). See the runnable,
+self-contained demo [`examples/custom_adapter.rs`](examples/custom_adapter.rs)
+(`cargo run --example custom_adapter`) and the guide
+[`docs/writing-an-adapter.md`](docs/writing-an-adapter.md).
+
+The V3 cold-start tick-scan radius is per-pool configurable via
+`V3Metadata.warm_word_radius` (default ±2 tick-bitmap words).
+
+## Quickstart
+
+Register a pool, cold-start it into a forked cache, and simulate a swap entirely
+offline once warmed:
+
+```rust,no_run
+use std::sync::Arc;
+
+use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_network::AnyNetwork;
+use alloy_primitives::{U256, address};
+use alloy_provider::{Provider, RootProvider};
+use evm_fork_cache::cache::EvmCache;
+use evm_amm_state::adapters::{
+    AdapterRegistry, AmmAdapter, ColdStartPolicy, PoolKey, PoolRegistration,
+    ProtocolMetadata, SimConfig, ConcentratedLiquidityAdapter, V3Metadata,
+};
+use evm_amm_state::adapters::storage::V3StorageLayout;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = Arc::new(RootProvider::<AnyNetwork>::connect("https://eth.llamarpc.com").await?);
+    let block = provider.get_block_number().await?;
+    let mut cache = EvmCache::at_block(provider, BlockId::Number(BlockNumberOrTag::Number(block))).await;
+
+    let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"); // USDC/WETH 0.05%
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
+
+    let mut reg = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_token0(usdc)
+                .with_token1(weth)
+                .with_fee(500)
+                .with_tick_spacing(10)
+                .with_storage_layout(V3StorageLayout::uniswap(10)),
+        ));
+    registry.cold_start(&mut reg, &mut cache, ColdStartPolicy::Eager)?;
+
+    // Offline from here: no RPC needed to quote.
+    let out = ConcentratedLiquidityAdapter::default().simulate_swap(
+        &reg, &mut cache, usdc, weth, U256::from(1_000_000_u64), &SimConfig::default(),
+    )?;
+    println!("1 USDC -> {} WETH (raw)", out.amount_out);
+    Ok(())
+}
+```
+
+The full **cold-start → WebSocket subscribe → react → simulate** loop is in
+[`examples/adapter_pipeline.rs`](examples/adapter_pipeline.rs):
+
+```bash
+ETH_WS_URL=wss://your-node cargo run --example adapter_pipeline
+# or derive wss:// from an https endpoint:
+E2E_RPC_URL=https://your-archive-node cargo run --example adapter_pipeline
+```
+
+Live sync should use [`AmmSyncEngine`] or, if wiring the upstream runtime
+manually, `ReactiveRuntime::ingest_batch_with_resync`. Plain `ingest_batch`
+decodes and applies direct writes only; it reports Balancer/Curve/V3 repair
+requests without executing the trace/storage resync phase. The boundary and
+fallback policy are documented in
+[`docs/trace-backed-sync.md`](docs/trace-backed-sync.md).
+
+The tracked working set can change mid-lifecycle: `AmmSyncEngine::register_pools`
+adds pools (cold-start them first) and `unregister_pools` /
+`unregister_pools_evicting` remove them — the evicting variant also purges cache
+state owned exclusively by the removed pools, sparing shared-emitter state such
+as the Balancer vault. Each call rebuilds the runtime between batches, so batch
+changes rather than looping.
+
+```mermaid
+flowchart LR
+    A["AMM log"] --> B["Adapter decode"]
+    B --> C{"Event carries final values?"}
+    C -->|yes| D["StateUpdate directly into EvmCache"]
+    C -->|no| E["ResyncRequest for known slots"]
+    E --> F["evm-fork-cache: block trace first"]
+    F --> G["bulk storage / point fallback if unresolved"]
+    D --> H["post-block cached state"]
+    G --> H
+```
+
+### Arbitrage examples
+
+Two end-to-end examples show the canonical use case — pricing swaps across many
+pools offline to find and size a dislocation. Both warm real pools from an
+archive node, then quote entirely offline:
+
+```bash
+# Cross-DEX: quote USDC/WETH across Uniswap V2, V3, and Curve; find the best
+# buy + sell venue and price the round trip.
+E2E_RPC_URL=<archive-url> cargo run --example arbitrage_cross_dex
+# Triangular: walk USDC -> USDT (Curve 3pool) -> WETH (Curve tricrypto2)
+# -> USDC (Uniswap V3) and price the cycle.
+E2E_RPC_URL=<archive-url> cargo run --example arbitrage_triangular
+```
+
+See [`examples/arbitrage_cross_dex.rs`](examples/arbitrage_cross_dex.rs) and
+[`examples/arbitrage_triangular.rs`](examples/arbitrage_triangular.rs).
+
+### One-shot V3 full-pool sync
+
+The [`v3_sync`](src/adapters/v3_sync.rs) module generates a ~360-byte EVM
+program (tick spacing and storage layout baked in as immediates) that is
+injected over a pool's code via an `eth_call` state override
+([`evm-fork-cache`'s bulk-storage transport]) and walks the **entire** tick
+bitmap *inside the EVM* — returning statics, every initialized tick's four
+info words, and the whole observation ring in **one call with zero calldata**.
+Live-measured on the USDC/WETH 0.05% pool: 1,563 ticks + 723 observations →
+7,674 slots injected in ~140 ms for 26 CU (vs ~130k CU as per-slot point
+reads — 7,674 × 17 CU), after
+which a hard multi-tick-crossing quote runs in **~5 ms with zero lazy
+fetches** (vs ~2 s paging ticks over RPC on a windowed cache). A
+calldata-driven **partial** variant refreshes selected bitmap-word ranges
+(the planner-window shape, or dense spacing-1 pools in chunks).
+
+```bash
+E2E_RPC_URL=<https endpoint> cargo run --release --example v3_full_sync
+# live parity suite (state, quote, and partial-window equivalence):
+E2E_RPC_URL=<archive-url> cargo test --test v3_full_sync_rpc -- --ignored
+```
+
+[`evm-fork-cache`'s bulk-storage transport]: https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/bulk-storage-extraction.md
+
+### One-shot flat-slot sync
+
+The [`storage_sync`](src/adapters/storage_sync.rs) module covers adapters whose
+hot state is already known as a slot list:
+
+- **Uniswap V2**: canonical `token0`, `token1`, and packed reserves slots.
+- **Solidly V2**: config-supplied reserve/token slot layout.
+- **Balancer V2**: vault balance slots discovered by cold-start or trace data.
+- **Curve**: pool read-set slots discovered by cold-start or trace data.
+
+Small fixed layouts use generated no-calldata bytecode with slots baked in.
+Larger discovered read-sets use a reusable calldata-driven loader. Both execute
+through the same `eth_call` code-override transport as V3 and inject the returned
+storage words into `EvmCache`.
+
+One-shot syncs (V3 and flat-slot) **warm the cache only** — pool status and
+metadata still come from `registry.cold_start`, and the Balancer/Curve loaders
+require a previously discovered read-set.
+
+```bash
+E2E_RPC_URL=<https endpoint> SYNC_BENCH_ITERS=7 cargo run --release --example sync_latency
+```
+
+Live paid Alchemy RPC measurements on July 2, 2026, showed Balancer and Curve
+refreshes dropping from discover→verify cold-starts around 330–360 ms to
+one-shot storage programs around 75–76 ms once their read-set metadata is known.
+The same run measured Uniswap V3 full-pool loading at 124.8 ms, while loading
+7,670 slots. See
+[`docs/benchmarks.md`](docs/benchmarks.md) for the full table and caveats.
+
+For event-time repair specifically, [`examples/trace_resync_latency.rs`](examples/trace_resync_latency.rs)
+compares a real Curve event through `AmmSyncEngine` with trace-only resync versus
+forced storage-fetch fallback:
+
+```bash
+E2E_RPC_URL=<https endpoint> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
+```
+
+On the same paid Alchemy endpoint, a single Curve 3pool event measured 155.7 ms
+through trace-only resync versus 26.7 ms through direct storage fallback; the
+trace path is expected to amortize across many stale slots in the same block.
+
+## Performance
+
+Once warmed, a quote is a fully-offline revm execution of the pool's own quote
+entrypoint: **~8–9 µs** for constant-product pools (Uniswap V2, Solidly) and
+**~40–85 µs** for the heavier Curve / Balancer / Uniswap V3 quotes, on an M1 Pro.
+Applying a `Sync` event is **~250 ns**. That is `eth_call`-grade correctness
+(it runs the real bytecode) at roughly **1000× lower latency than an RPC
+`eth_call`**, with no reimplemented math to drift. Full methodology, the
+per-protocol table, and a comparison to other approaches are in
+[`docs/benchmarks.md`](docs/benchmarks.md); reproduce with
+`E2E_RPC_URL=<archive-url> cargo bench --bench swap_sim`.
+
+## Crate boundaries
+
+This crate owns generic AMM state loading, event-driven synchronization, and
+offline swap simulation. It deliberately does **not** contain transaction
+signing/broadcasting, strategy scheduling, or multi-leg arbitrage routing (the
+legacy routing layer was removed; it is rebuildable on top of `simulate_swap` —
+the arbitrage examples above show exactly that).
+Standard view interfaces are declared locally with `alloy_sol_types::sol!`, so
+the crate builds from source with no generated bindings crate.
+
+## Examples
+
+**Start here — zero setup, no RPC:** `cargo run --example custom_adapter`
+(defines a novel AMM outside the crate, registers it, quotes both directions).
+Everything else is env-gated and prints a skip message when unset:
+
+| Example | Shows | Needs |
+| --- | --- | --- |
+| [`custom_adapter`](examples/custom_adapter.rs) | third-party adapter, register → quote | — |
+| [`adapter_pipeline`](examples/adapter_pipeline.rs) | register → cold-start → WS react → quote | `ETH_WS_URL` or `E2E_RPC_URL` |
+| [`factory_discovery_live`](examples/factory_discovery_live.rs) | discovery → cold-start → reactive | `E2E_RPC_URL` |
+| [`declarative_discovery`](examples/declarative_discovery.rs) | token-basket `PoolQuery` → `cold_start_many` | `E2E_RPC_URL` |
+| [`token_basket_bench`](examples/token_basket_bench.rs) | batched vs per-pair discovery timing | `E2E_RPC_URL` |
+| [`v3_full_sync`](examples/v3_full_sync.rs) | one-shot full-pool V3 sync + quote parity | `E2E_RPC_URL` |
+| [`verified_bytecode_seed`](examples/verified_bytecode_seed.rs) | seeding + on-chain code-hash verification | `E2E_RPC_URL` |
+| [`sync_latency`](examples/sync_latency.rs) | prior vs one-shot sync latency per protocol | `E2E_RPC_URL` (public fallback) |
+| [`curve_cold_start_phases`](examples/curve_cold_start_phases.rs) | Curve discovery vs verify-only vs bundled | `E2E_RPC_URL` (public fallback) |
+| [`trace_resync_latency`](examples/trace_resync_latency.rs) | event-time trace resync vs storage fallback | `E2E_RPC_URL` |
+| [`arbitrage_cross_dex`](examples/arbitrage_cross_dex.rs) | offline cross-DEX round-trip pricing | `E2E_RPC_URL` (archive) |
+| [`arbitrage_triangular`](examples/arbitrage_triangular.rs) | offline triangular cycle pricing | `E2E_RPC_URL` (archive) |
+
+## Testing
+
+```bash
+cargo test                       # unit + offline integration tests
+cargo test --no-default-features # protocol-neutral core
+```
+
+These run from a clone of the repository. The published crate **excludes the
+integration test suite** (`tests/`) to stay lean, so `cargo test` on a crates.io
+download exercises only the inline unit tests — clone the repo for the full
+suite.
+
+Network-dependent tests are env-gated and `#[ignore]`d. With an archive RPC they
+pin a block, cold-start a real pool, and assert `simulate_swap` **equals the
+on-chain quote** at the same block (`eth_call`), plus a live WebSocket soak that
+keeps state in sync from events only:
+
+```bash
+# RPC parity (mainnet pools; Base for Solidly via host-swap):
+E2E_RPC_URL=<archive-url> cargo test --test adapter_swap_sim_rpc -- --ignored
+# Live WS soak (Uniswap V2, and Curve across all dialects):
+E2E_RPC_URL=<archive-url> cargo test --test reactive_ws_e2e --test reactive_curve_ws_e2e -- --ignored --nocapture
+```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: test / clippy / fmt / docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Lint the whole surface together: every protocol adapter (incl. the
+      # PancakeSwap V3 / Slipstream family flags, which are not in `default`).
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+
+      # Bare adapter build (no protocol adapters) must also compile/lint.
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
+
+      # The crate is adapters-only (the legacy simulation/search path was cut),
+      # so no build should pull in the old heavy deps. Guard against a
+      # regression that re-introduces them.
+      - name: Verify build is heavy-dep-free
+        run: |
+          if cargo tree -e normal --all-features \
+              | grep -E '(amms|amm-math|rayon) v[0-9]'; then
+            echo "::error::build unexpectedly pulled amms/amm-math/rayon"
+            exit 1
+          fi
+          echo "build pulls no amms/amm-math/rayon"
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Tests (default features)
+        run: cargo test
+
+      - name: Tests (no default features)
+        run: cargo test --no-default-features
+
+      - name: Docs
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      # The reserved (unimplemented) protocol variants live behind an
+      # off-by-default feature; make sure enabling it still compiles — both on
+      # top of the default adapters and on the bare no-default surface.
+      - name: Check (experimental protocols)
+        run: cargo check --features experimental-protocols
+      - name: Check (experimental protocols, no default features)
+        run: cargo check --no-default-features --features experimental-protocols
+
+  # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
+  # together, which can mask a protocol whose code/imports are not correctly
+  # `#[cfg]`-gated on its own feature (a `--features <one-protocol>` build then
+  # fails even though the all-features build is green — exactly the class of bug
+  # the Solidly adapter audit caught). Building/linting each protocol adapter on
+  # its own surfaces that immediately. Clippy `--all-targets` compiles the lib
+  # plus any target whose `required-features` are satisfied by the isolated set
+  # (e.g. the single-protocol `reactive_ws_e2e` / `reactive_curve_ws_e2e` tests
+  # and the `adapter_pipeline` example — desirable extra lint coverage);
+  # multi-protocol integration tests whose `required-features` exceed the
+  # isolated set are skipped, so their behaviour coverage stays in the
+  # all-features `cargo test` above.
+  isolation:
+    name: clippy (isolated · ${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - uniswap-v2
+          - uniswap-v3
+          - pancake-v3
+          - slipstream
+          - balancer-v2
+          - solidly-v2
+          - curve
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (adapters + ${{ matrix.feature }} only)
+        run: cargo clippy --no-default-features --features adapters,${{ matrix.feature }} --all-targets --no-deps -- -D warnings
+
+  # Guard the declared MSRV (Cargo.toml `rust-version`). The `stable` jobs above
+  # use whatever stable is current, so without this a >1.88 API or a dep MSRV
+  # bump would pass CI yet break downstream consumers pinned to 1.88. `check`
+  # (not test) keeps it cheap; it is the build that the MSRV claim is about.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        run: cargo check --all-features
