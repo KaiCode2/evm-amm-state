@@ -56,7 +56,9 @@ pub mod adapters;
 
 /// Compiles the README's code samples as doctests so the quickstart cannot
 /// drift from the real API. Exists only under `cfg(doctest)` — it is never
-/// part of the built crate or the rendered docs.
-#[cfg(doctest)]
+/// part of the built crate or the rendered docs. Gated on `uniswap-v3`
+/// because the quickstart registers the V3-family adapter; the default and
+/// all-features test runs (local + CI) still compile it.
+#[cfg(all(doctest, feature = "uniswap-v3"))]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
