@@ -53,3 +53,10 @@ pub use evm_fork_cache;
 
 // Always compiled — the adapter layer has no heavy deps.
 pub mod adapters;
+
+/// Compiles the README's code samples as doctests so the quickstart cannot
+/// drift from the real API. Exists only under `cfg(doctest)` — it is never
+/// part of the built crate or the rendered docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

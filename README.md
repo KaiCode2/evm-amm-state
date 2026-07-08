@@ -1,5 +1,11 @@
 # evm-amm-state
 
+[![crates.io](https://img.shields.io/crates/v/evm-amm-state.svg)](https://crates.io/crates/evm-amm-state)
+[![docs.rs](https://img.shields.io/docsrs/evm-amm-state)](https://docs.rs/evm-amm-state)
+[![CI](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml/badge.svg)](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
+
 `evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
 cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
 their on-chain state into the cache, and keeps them current **from chain log
@@ -19,6 +25,30 @@ result. There is no `LocalAMM`/`amm-math` formula layer to drift from the real
 contracts.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
+
+## Installation
+
+```bash
+cargo add evm-amm-state
+```
+
+All five protocol adapters are enabled by default; trim to what you use with
+feature flags:
+
+```toml
+[dependencies]
+evm-amm-state = { version = "0.1", default-features = false, features = [
+    "uniswap-v3",
+    "curve",
+] }
+```
+
+Requires Rust **1.88+** (the declared MSRV, checked in CI). The two public
+dependencies whose types appear in this crate's API are re-exported at the
+crate root — import `evm_amm_state::evm_fork_cache` and
+`evm_amm_state::alloy_primitives` instead of pinning them yourself, and the
+versions always match. `evm-fork-cache` is a 0.x companion released in
+lockstep: a breaking bump there is a breaking bump here.
 
 ## The pipeline
 
@@ -52,11 +82,18 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
-All protocol features are on by default. See
+All protocol adapters are on by default; `pancake-v3` and `slipstream` are
+thin aliases of `uniswap-v3` (one V3-family adapter serves all three). See
 [`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
 per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
 discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
+
+> **Slipstream quoting caveat.** Slipstream / Aerodrome CL ships as
+> discovery + cold-start: its own quoter ABI differs (int24 tickSpacing), so
+> discovered registrations leave `fee` unset and `simulate_swap` returns
+> `MissingMetadata` until you supply a Uniswap-compatible quoter + fee — see
+> the [support matrix](docs/protocol-support-matrix.md).
 
 > **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
 > reserves its cold-start warms — the pool's `stable` flag and token `decimals`,
@@ -199,7 +236,7 @@ The V3 cold-start tick-scan radius is per-pool configurable via
 Register a pool, cold-start it into a forked cache, and simulate a swap entirely
 offline once warmed:
 
-```rust,ignore
+```rust,no_run
 use std::sync::Arc;
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
@@ -387,6 +424,27 @@ legacy routing layer was removed; it is rebuildable on top of `simulate_swap` �
 the arbitrage examples above show exactly that).
 Standard view interfaces are declared locally with `alloy_sol_types::sol!`, so
 the crate builds from source with no generated bindings crate.
+
+## Examples
+
+**Start here — zero setup, no RPC:** `cargo run --example custom_adapter`
+(defines a novel AMM outside the crate, registers it, quotes both directions).
+Everything else is env-gated and prints a skip message when unset:
+
+| Example | Shows | Needs |
+| --- | --- | --- |
+| [`custom_adapter`](examples/custom_adapter.rs) | third-party adapter, register → quote | — |
+| [`adapter_pipeline`](examples/adapter_pipeline.rs) | register → cold-start → WS react → quote | `ETH_WS_URL` or `E2E_RPC_URL` |
+| [`factory_discovery_live`](examples/factory_discovery_live.rs) | discovery → cold-start → reactive | `E2E_RPC_URL` |
+| [`declarative_discovery`](examples/declarative_discovery.rs) | token-basket `PoolQuery` → `cold_start_many` | `E2E_RPC_URL` |
+| [`token_basket_bench`](examples/token_basket_bench.rs) | batched vs per-pair discovery timing | `E2E_RPC_URL` |
+| [`v3_full_sync`](examples/v3_full_sync.rs) | one-shot full-pool V3 sync + quote parity | `E2E_RPC_URL` |
+| [`verified_bytecode_seed`](examples/verified_bytecode_seed.rs) | seeding + on-chain code-hash verification | `E2E_RPC_URL` |
+| [`sync_latency`](examples/sync_latency.rs) | prior vs one-shot sync latency per protocol | `E2E_RPC_URL` (public fallback) |
+| [`curve_cold_start_phases`](examples/curve_cold_start_phases.rs) | Curve discovery vs verify-only vs bundled | `E2E_RPC_URL` (public fallback) |
+| [`trace_resync_latency`](examples/trace_resync_latency.rs) | event-time trace resync vs storage fallback | `E2E_RPC_URL` |
+| [`arbitrage_cross_dex`](examples/arbitrage_cross_dex.rs) | offline cross-DEX round-trip pricing | `E2E_RPC_URL` (archive) |
+| [`arbitrage_triangular`](examples/arbitrage_triangular.rs) | offline triangular cycle pricing | `E2E_RPC_URL` (archive) |
 
 ## Testing
 
