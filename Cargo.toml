@@ -231,6 +231,15 @@ name = "swap_sim"
 harness = false
 required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "curve"]
 
+# Fully-OFFLINE reactive-apply micro-benchmarks (mock-backed cache, pre-warmed
+# packed words): the event-sourced hot paths — V2 Sync, V3 Mint/Burn onto warm
+# ticks, Balancer Swap onto probed cash fields. No RPC, no env; runs anywhere,
+# including CI, for regression tracking.
+[[bench]]
+name = "reactive_apply"
+harness = false
+required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2"]
+
 # One-shot V3 full-pool sync via a generated eth_call storage program:
 # the whole tick range + observation ring in a single call, quote-parity
 # checked against the classic windowed cold start (env-gated).

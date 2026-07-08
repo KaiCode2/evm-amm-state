@@ -23,9 +23,13 @@ qualitatively, to the other ways people price AMM swaps.
 - **Reproduce:**
   ```bash
   E2E_RPC_URL=<archive-url> cargo bench --bench swap_sim
+  cargo bench --bench reactive_apply     # fully offline — no env needed
   ```
-  (Env-gated — a no-op without the URL. Solidly uses Base: `E2E_BASE_RPC_URL`,
-  or an Alchemy `E2E_RPC_URL` with `eth-mainnet`→`base-mainnet`.)
+  (`swap_sim` is env-gated — a no-op without the URL; Solidly uses Base:
+  `E2E_BASE_RPC_URL`, or an Alchemy `E2E_RPC_URL` with
+  `eth-mainnet`→`base-mainnet`. `reactive_apply` measures the event-sourced
+  apply paths against a mock-backed cache with pre-warmed packed words, so it
+  runs anywhere, including CI.)
 
 ## Results
 
@@ -65,14 +69,26 @@ qualitatively, to the other ways people price AMM swaps.
 
 ### Reactive event apply & cold-start
 
+Every event-sourced apply below is one `AdapterDriver::apply_log`: topic
+routing, ABI decode, packed-word arithmetic, and the exact cache write(s) —
+no RPC. The V2 row is measured in both harnesses (RPC-warmed `swap_sim` and
+offline `reactive_apply`) and agrees; the other apply rows come from
+[`benches/reactive_apply.rs`](../benches/reactive_apply.rs) (offline, July
+2026, same host).
+
 | Operation | Time | Notes |
 | --- | ---: | --- |
-| Apply one `Sync` (Uniswap V2 exact write) | **~249 ns** | decode + route + masked slot write; ~4M events/sec |
+| Apply one Uniswap V2 `Sync` (exact write) | **~250–285 ns** | one masked reserves-word write; ~3.5–4M events/sec |
+| Apply one Balancer V2 `Swap` (TWO_TOKEN, event-sourced) | **~430 ns** | both 112-bit cash fields, one shared-slot write |
+| Apply one Balancer V2 `Swap` (GENERAL, event-sourced) | **~520 ns** | two per-token cash-field writes |
+| Apply one Uniswap V3 `Mint` (warm ticks, event-sourced) | **~1.4 µs** | packed gross/net on both boundary ticks + in-range global liquidity |
+| Apply one Uniswap V3 `Burn` (warm ticks, event-sourced) | **~1.4 µs** | the same three writes, negated |
 | Cold-start one pool (Uniswap V3) | **~1.06 s** | **one-time, network-bound** — archive-node latency dominates; amortized over every later offline quote |
 
-The reactive exact-write path is effectively free relative to a quote. Cold-start
-is a one-time setup cost gated by RPC latency, not a steady-state cost — the
-crate's design pays it once and then quotes offline forever.
+The reactive event-sourced paths are effectively free relative to a quote
+(hundreds of nanoseconds to ~1.4 µs vs 8–85 µs). Cold-start is a one-time
+setup cost gated by RPC latency, not a steady-state cost — the crate's design
+pays it once and then quotes offline forever.
 
 ### One-shot sync latency — network-bound state loading
 
