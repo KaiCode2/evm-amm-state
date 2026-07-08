@@ -60,8 +60,15 @@ call.
 - **Discovery-integrated `Bootstrapper`**: pair bulk discovery with
   `cold_start_many` behind strategy knobs
   (docs/high-performance-bootstrap-defaults.md).
-- **Incremental interests refresh** on `AmmSyncEngine::register_pools` once
-  the `evm-fork-cache` interests API lands (rebuild-based today).
+- **Incremental interests refresh in `AmmSyncEngine`** — the upstream API
+  already shipped in `evm-fork-cache` 0.2 (`ReactiveRuntime::unregister_handler`
+  plus per-owner `add_interest_owner(_with_backfill)` / `remove_interest_owner`
+  / `sync_handler_interests` on the subscription engine); what remains is
+  adoption **here**: `register_pools` / `replace_registry` still construct a
+  fresh `ReactiveRuntime` per registry change, discarding accumulated reorg
+  tracking between batches. Refresh the `AmmReactiveHandler` registration on
+  the live runtime instead, and thread backfill-aware owner updates through
+  for subscriber-driven callers.
 
 ## Scope
 
