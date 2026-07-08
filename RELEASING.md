@@ -45,16 +45,26 @@ cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' || 
 cargo +1.88 check --all-features
 ```
 
-Last run 2026-07-05 against the published `evm-fork-cache` 0.2.1: **all green.**
+Last full run 2026-07-08 on the v0.1.0 release-polish branch: **all green.**
 
-Optional but recommended — the env-gated network tests against an archive node
-(`E2E_RPC_URL` lives in `.env`, gitignored; never commit or echo it):
+**Required before a release** — the env-gated live suites are the only
+on-chain ground truth (quote parity per protocol, factory base-slot/CREATE2
+constants, one-shot V3 sync parity, and the per-transaction `stateDiff`
+write-parity suites for the event-sourced paths). Run the whole ignored set
+against an archive node (`E2E_RPC_URL` lives in `.env`, gitignored; never
+commit or echo it):
 
 ```bash
 set -a; . ./.env; set +a
-cargo test --test adapter_swap_sim_rpc -- --ignored          # RPC parity (mainnet + Base)
-cargo test --test reactive_ws_e2e --test reactive_curve_ws_e2e -- --ignored --nocapture  # live WS soak
+cargo test --all-features -- --ignored --nocapture
 ```
+
+That covers all eight live files: `adapter_swap_sim_rpc` (mainnet + Base),
+`v3_liquidity_rpc` + `balancer_liquidity_rpc` (per-tx write parity),
+`v3_full_sync_rpc`, `discovery_cl_rpc`, `discovery_solidly_rpc`, and the
+`reactive_ws_e2e` / `reactive_curve_ws_e2e` WS soaks. The same set runs
+weekly in CI via `.github/workflows/live.yml` (needs the `E2E_RPC_URL`
+repo secret).
 
 ## 2. Package hygiene
 
@@ -63,19 +73,20 @@ cargo test --test reactive_ws_e2e --test reactive_curve_ws_e2e -- --ignored --no
   `description`, `repository`, `documentation`, `readme`, `keywords`,
   `categories`, `rust-version` (MSRV `1.88`).
 - The `[package].exclude` list drops the test suite, CI config, maintainer docs
-  (ROADMAP/RELEASING), and superseded design specs. **Keep `exclude` inside the
+  (ROADMAP/RELEASING), and superseded design specs — the seven user-facing
+  `docs/` guides, all examples, both benches, and `.cargo/audit.toml` ship. **Keep `exclude` inside the
   `[package]` table** — writing it after a `[package.metadata.*]` header
   silently reparents it under that sub-table and Cargo ships everything (this
   regressed once; fixed in `9036873`).
 - Inspect what would ship:
   ```bash
-  cargo package --list        # ~50 files: src, examples, benches, the five
-                              # docs/ guides, README, licenses, changelog
+  cargo package --list        # ~56 files: src, examples, both benches, the
+                              # seven docs/ guides, README, licenses, changelog
   cargo publish --dry-run
   ```
-  Last run 2026-07-05: **50 files, 768.6 KiB (207.6 KiB compressed), verifies
-  clean.** (`cargo publish` prints `ignoring test …` for the excluded `[[test]]`
-  targets — expected and harmless.)
+  Last run 2026-07-08: **56 files, verifies clean.** (`cargo publish` prints
+  `ignoring test …` for the excluded `[[test]]` targets — expected and
+  harmless.)
 
 ## 3. Version & changelog
 
@@ -95,15 +106,28 @@ git push origin v0.1.0
 cargo publish
 ```
 
-## 5. Post-publish cleanup
+**If commits land on `main` after the tag exists** (this happened during
+v0.1.0 prep: six PRs merged after the tag was cut), the tag must be re-pointed
+at the final commit *before* `cargo publish` — a stale tag silently publishes
+old code's provenance (`.cargo_vcs_info.json`, the GitHub release link, and
+the changelog's `[x.y.z]` anchor all disagree with the crate contents):
 
-- Remove the three `Authenticate git for private companion crates` steps (in the
-  `check`, `isolation`, and `msrv` jobs) and the `CARGO_NET_GIT_FETCH_WITH_CLI`
-  env from [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and delete the
-  `PRIVATE_REPO_TOKEN` repo secret — CI no longer needs private git access now
-  that the dependency is on crates.io. (The `ci.yml` push must go over SSH: the
-  gh OAuth token lacks `workflow` scope.)
-- Verify the published docs render on docs.rs.
+```bash
+git push origin :refs/tags/v0.1.0          # delete the remote tag
+git tag -fa v0.1.0 -m "evm-amm-state 0.1.0" <final-commit>
+git push origin v0.1.0
+```
+
+## 5. Post-publish checks
+
+- Verify the published docs render on docs.rs: feature badges appear on the
+  gated modules (`v3_sync`, the per-protocol adapters) and no `sol!`-generated
+  ABI types leak into the item list.
+- Confirm the README badges resolve (crates.io version, docs.rs).
+- Configure the `E2E_RPC_URL` repo secret and run the `Live (env-gated) tests`
+  workflow once via `workflow_dispatch` to seed the weekly schedule.
+  (Reminder: any `.github/workflows/*` push must go over SSH — the gh OAuth
+  token lacks `workflow` scope.)
 
 ## Quick status
 
@@ -114,6 +138,7 @@ cargo publish
 | CI matrix green vs published 0.2.1 (fmt / clippy×N / tests×3 / docs / isolation / dep-leak / MSRV 1.88) | ✅ |
 | License files present (`LICENSE-APACHE` + `LICENSE-MIT`) | ✅ |
 | `evm-fork-cache` resolvable from crates.io | ✅ |
-| `cargo publish --dry-run` clean (50 files) | ✅ |
-| Release work merged to `main` | ⏳ pending |
-| Tagged `v0.1.0` + `cargo publish` | ⏳ pending |
+| `cargo publish --dry-run` clean (56 files) | ✅ |
+| Release work merged to `main` | ✅ (hardening tiers 0–2, #30/#31/#33, release-review polish) |
+| `v0.1.0` tag re-pointed at the final commit | ⏳ pending (currently on `6187d50`, six merges behind) |
+| `cargo publish` | ⏳ pending |

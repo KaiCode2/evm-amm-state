@@ -20,43 +20,48 @@ checkpoint before implementation.
 
 ## Release Plan
 
-### 0.1.0 (current)
+### 0.1.0 (current — release candidate)
 
 The adapters-and-cache-orchestration deliverable, feature-complete for five
 protocol families (Uniswap V2, the concentrated-liquidity family — Uniswap V3 /
 PancakeSwap V3 / Slipstream — Balancer V2, Solidly V2, and Curve) plus the
-offline `simulate_swap` surface. Pools are supplied by the consumer
-(`register_pool`); the crate does not yet discover them.
+offline `simulate_swap` surface — **including declarative factory discovery**,
+which was originally slated for 0.2.0 and shipped early (design in
+[docs/factory-discovery-spec.md](docs/factory-discovery-spec.md)):
+`PoolDiscovery::{find, find_many}` over a fluent `PoolQuery` resolves pools
+derive-first in one batched read across Uniswap V2 / the CL family / Solidly,
+with optional CREATE2 cross-checks, creation-event decoding
+(`DiscoverySource::CreationEvent`), a defaulted per-adapter
+`AmmAdapter::pool_factories(&FactoryConfig)` hook, and first-class escape
+hatches (`register_adapter`, `PoolDiscovery::with_factory`). Reactive sync
+event-sources V2/Solidly `Sync`, V3 `Mint`/`Burn` onto warm ticks, and
+Balancer vault `Swap`s onto probed cash fields; Balancer/Curve cold-starts
+take a verify-only fast path once their read-set is known, and
+`cold_start_many` bundles every one-shot-eligible pool into one hydration
+call.
 
-### 0.2.0: Factory discovery (planned — full design in [docs/factory-discovery-spec.md](docs/factory-discovery-spec.md))
+### 0.1.x / 0.2.0 candidates (post-release)
 
-**Goal:** make pool discovery **declarative** — consumers say *what* they want
-("the WETH/USDC 0.3% V3 pool", "every pool between WBTC/WETH") instead of
-hand-registering addresses. Two halves over one vocabulary:
-
-- **Pull (primary UX):** resolve existing pools **derive-first** for the hot
-  protocols — compute the factory's `getPair`/`getPool` mapping slot in Rust
-  and point-read it (batchable; bulk watchlists ride the `storage_sync`
-  loader), with CREATE2 derivation as the zero-I/O path + cross-check —
-  falling back to executing the factory's own view function in revm for the
-  protocols that are hard to recreate (Curve MetaRegistry
-  `find_pools_for_coins`, unknown forks). Balancer (no on-chain pair index)
-  backfills via a Vault log scan helper. Returns cold-start-ready
-  `PoolRegistration`s. Fully unblocked today; needs nothing from the
-  upstream interests work.
-- **Push:** subscribe to factory creation events (`PairCreated` /
-  `PoolCreated` / Vault `PoolRegistered`) and admit new pools between batches
-  via `AmmSyncEngine::register_pools` (rebuild-based now; incremental once the
-  `evm-fork-cache` interests-refresh API lands).
-
-Shape: a `PoolFactory` trait (queries + creation decode) built per protocol by
-a **defaulted** `AmmAdapter::pool_factory(&FactoryConfig)` hook, fronted by
-`PoolDiscovery::{find, find_all, creation_sources, decode_creation}`.
-`FactoryConfig` mirrors `SimConfig` (mainnet defaults + `with_*` overrides).
-Everything additive/`#[non_exhaustive]`; third-party adapters compile
-unchanged. Bonus: Curve variant detection becomes registry *provenance*
-instead of a heuristic. Slicing, per-protocol mechanics, and open questions
-live in the spec.
+- **Access-list two-shot cold-start warming** — `eth_createAccessList` fast
+  first boot + `cold_start_primed` (implemented on PR #32; deliberately held
+  out of 0.1.0 to keep the release frozen; first candidate to land after).
+- **Balancer V2 discovery** via an async Vault `PoolRegistered` log-scan
+  helper (Balancer has no on-chain token→pool index).
+- **Curve discovery** via an in-EVM MetaRegistry `find_pools_for_coins`
+  view call (dropped from 0.1.0: the live registry call reverted under the
+  pinned-cache harness; needs its own transport shape).
+- **Balancer `PoolBalanceManaged`**: subscribe + resync the asset-manager
+  cash↔managed rebalance event. Today the cash probe refuses managed fields
+  (a managed pool resyncs instead of event-sourcing), so exposure is
+  negligible — subscribing closes it fully.
+- **Algebra-style CL forks** (Camelot / QuickSwap): a different pool engine
+  (dynamic fees, `globalState` packing, `tickTable`) — a new adapter, not a
+  discovery config.
+- **Discovery-integrated `Bootstrapper`**: pair bulk discovery with
+  `cold_start_many` behind strategy knobs
+  (docs/high-performance-bootstrap-defaults.md).
+- **Incremental interests refresh** on `AmmSyncEngine::register_pools` once
+  the `evm-fork-cache` interests API lands (rebuild-based today).
 
 ## Scope
 
