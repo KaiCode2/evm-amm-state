@@ -3,11 +3,12 @@
 `evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
 cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
 their on-chain state into the cache, and keeps them current **from chain log
-events**: protocols whose events carry absolute state (Uniswap V2 / Solidly
-`Sync`) are updated with **no RPC at all**, while protocols whose events carry
-only deltas (Uniswap V3 liquidity, Balancer, Curve) turn each event into a
-bounded, hash-pinned storage **resync** (block trace first, then bulk-storage /
-point-read fallback). Once a pool's quote read-set is warmed and current, swap
+events**: events that carry absolute state (Uniswap V2 / Solidly `Sync`) are
+applied as exact writes with **no RPC at all**, Uniswap V3 `Mint`/`Burn` and
+Balancer vault `Swap`s are **event-sourced** onto warm tick / cash slots the
+same way, and only genuinely cold slots and delta-only events (Curve, Balancer
+joins/exits) turn into a bounded, hash-pinned storage **resync** (block trace
+first, then bulk-storage / point-read fallback). Once a pool's quote read-set is warmed and current, swap
 **simulations run fully offline** against the live-synced state.
 
 The defining design choice: **no reimplemented AMM math.** Every quote runs the
@@ -47,7 +48,7 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
 | Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → exact tick + global-liquidity writes where warm, resync only cold ticks |
-| Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`) | `Swap` → balance-slot resync |
+| Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`), verify-only once known | `Swap` → exact 112-bit cash writes where warm, resync fallback; `PoolBalanceChanged` → resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
@@ -105,7 +106,7 @@ is empty by default: callers opt in with explicit factory addresses, e.g.
 fork-specific deployments never inherit an assumed factory.
 
 Discovery ships for every protocol whose pools resolve through the pinned
-cache — a derived factory storage slot or a MetaRegistry view call:
+cache as a derived factory storage slot, batched by default:
 
 | Protocol | Mechanism |
 | --- | --- |

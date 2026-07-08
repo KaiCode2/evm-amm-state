@@ -71,10 +71,11 @@ and fork-specific deployments never inherit an assumed factory address.
 
 ## Protocol coverage
 
-Each supported protocol resolves through the pinned cache by one of two
-mechanisms: a **DerivedSlot** read (a Rust-computed factory storage slot,
-resolved in the batched `read_storage_slots`) or a **ViewCall** (an on-chain
-`view` executed in revm through [`AdapterCache::call_raw`]).
+Each supported protocol resolves through the pinned cache by the same
+mechanism: a **DerivedSlot** read — a Rust-computed factory storage slot,
+resolved in the batched `read_storage_slots`. (An in-EVM view-call mechanism —
+what Curve's Vyper MetaRegistry would need — is deliberately not built in; see
+the protocol boundary below.)
 
 | Protocol | Mechanism | Notes |
 | --- | --- | --- |

@@ -68,8 +68,9 @@ liquidity sync because it does not execute the resync phase.
 | Uniswap V2 `Sync` | exact masked reserve write |
 | Solidly V2 `Sync` | exact reserve writes when layout is configured |
 | V3 `Swap` | exact slot0/liquidity write |
-| V3 `Mint`/`Burn` | resync computed tick, bitmap, and liquidity slots |
-| Balancer V2 `Swap` | resync known Vault balance slots |
+| V3 `Mint`/`Burn` | exact packed `liquidityGross`/`liquidityNet`, bitmap-bit, and in-range global-liquidity writes for warm (in-window) ticks; resync the computed tick/bitmap/liquidity slots only for cold ticks |
+| Balancer V2 `Swap` | exact 112-bit `cash`-field writes when both tokens' probed cash locations are warm; resync known Vault balance slots otherwise |
+| Balancer V2 `PoolBalanceChanged` | resync known Vault balance slots |
 | Curve swap/liquidity events | resync known pool read-set slots |
 
 The steady-state invariant is: a supported, ready pool either applies a log

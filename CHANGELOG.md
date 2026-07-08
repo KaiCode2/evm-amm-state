@@ -82,13 +82,20 @@ register → cold-start → subscribe → react → simulate.
   event for warm (in-window) ticks with no RPC, and only genuinely-cold ticks
   fall back to a targeted resync.
 - **Balancer V2** — `Vault.queryBatchSwap` quotes; discover→verify cold-start
-  (`getPoolTokens` read-set); `Swap` → balance-slot resync.
+  (`getPoolTokens` read-set), with a **verify-only fast path** when the
+  read-set is already known; `Swap` → **event-sourced** exact 112-bit
+  `cash`-field writes where the probed cash locations are warm (TWO_TOKEN and
+  GENERAL specializations), balance-slot resync as fallback;
+  `PoolBalanceChanged` → balance-slot resync.
 - **Solidly V2** (Aerodrome / Velodrome) — pool `getAmountOut` quotes;
   config-supplied storage layout; `Sync` → two exact slot writes.
 - **Curve** — StableSwap, StableSwap-NG, CryptoSwap v2, and Tricrypto-NG
   dialects through one adapter; pool `get_dy` quotes; discover→verify
-  cold-start; `TokenExchange` + liquidity events → discovered-slot resync.
-  Event signatures and `get_dy` ABIs verified on-chain per dialect.
+  cold-start, with a **verify-only fast path** when `discovered_slots` is
+  pre-populated and an optional caller-supplied bytecode seed
+  (`CurveMetadata::with_code_seed`); `TokenExchange` + liquidity events →
+  discovered-slot resync. Event signatures and `get_dy` ABIs verified on-chain
+  per dialect.
 
 **Simulation** — `simulate_swap` runs each pool's **own** canonical on-chain
 quote entrypoint inside a local revm against the warmed cache, then decodes the
@@ -98,9 +105,11 @@ result. There is **no reimplemented AMM math**.
 common case. Pools whose events carry absolute state are event-sourced with exact
 writes (Uniswap V2 / Solidly `Sync`); Uniswap V3 `Mint`/`Burn` are event-sourced
 too, applying the exact liquidity delta to the warmed tick/bitmap/liquidity slots
-and resyncing only ticks outside the warmed window; Balancer / Curve events carry
-deltas over a non-predictable layout and re-verify the discovered slots
-(`VerifySlots`).
+and resyncing only ticks outside the warmed window; Balancer V2 `Swap`s
+event-source the vault's packed 112-bit `cash` fields directly when the probed
+cash locations are warm, falling back to a slot resync on gaps; Curve events
+(and Balancer joins/exits) carry deltas over a non-predictable layout and
+re-verify the discovered slots (`VerifySlots`).
 
 **Testing & CI**
 
@@ -108,8 +117,12 @@ deltas over a non-predictable layout and re-verify the discovered slots
   react→simulate pipeline tests.
 - Env-gated, `#[ignore]`d network tests: RPC parity (fork at a pinned block,
   cold-start a real pool, assert `simulate_swap` == on-chain `eth_call` quote —
-  mainnet pools plus a Base pool for Solidly) and a live WebSocket soak that
-  keeps state in sync from events only.
+  mainnet pools plus a Base pool for Solidly), a live WebSocket soak that
+  keeps state in sync from events only, and per-transaction **write parity**
+  for the event-sourced paths: for real add/remove-liquidity and vault-swap
+  transactions, the adapter's writes are asserted equal to the on-chain
+  `trace_replayTransaction` storage diff (`tests/v3_liquidity_rpc.rs`,
+  `tests/balancer_liquidity_rpc.rs`).
 - CI runs fmt, clippy (all-features + a **per-protocol isolation matrix** +
   no-default-features), tests (all-features / default / no-default), doc
   (`-D warnings`), and a heavy-dependency leak guard.
@@ -129,7 +142,10 @@ pool's canonical runtime bytecode into `EvmCache` at cold-start (via
 the on-chain `EXTCODEHASH` instead of paying an `eth_getCode`. Uniswap V2 shares
 one embedded pair runtime across every pair; Uniswap V3 patches the pool's
 Solidity immutables (factory, token0/1, fee, tickSpacing, maxLiquidityPerTick,
-and the `NoDelegateCall` self-address) into an embedded template. Seeding is a
+and the `NoDelegateCall` self-address) into an embedded template. Curve has no
+shared template, but a caller that already knows a pool's Vyper runtime can
+attach it with `CurveMetadata::with_code_seed` — verified once against on-chain
+code under the same purge-on-mismatch contract. Seeding is a
 pure optimization: a hash mismatch, an unverifiable seed, a warm-cache code
 conflict, or a template render error all degrade to lazily fetching the real
 code — never a fatal error or a permanently `Degraded` pool — and every seeded
@@ -142,10 +158,9 @@ offsets are pinned to chain-truth code hashes across tickSpacings 1/10/60
 
 **Factory-backed pool discovery (`adapters::factory`)** — build
 cold-start-ready `PoolRegistration`s from configured factories instead of pasted
-addresses, across every protocol whose pools resolve through the pinned cache.
-Two discovery mechanisms: a **DerivedSlot** read (a Rust-computed factory
-storage slot, resolved in the batched read) and a **ViewCall** (an on-chain
-`view` executed in revm via `AdapterCache::call_raw`). Coverage:
+addresses, across every protocol whose pools resolve through the pinned cache
+via a **DerivedSlot** read — a Rust-computed factory storage slot, resolved in
+the batched read. Coverage:
 
 - **Concentrated liquidity** — one generalized `ClFactorySpec` drives the whole
   UniV3-mechanics family through a single `ConcentratedLiquidityFactory`: fee-keyed
@@ -200,7 +215,8 @@ registrations, and callers still decide when to cold-start them.
 default for warming many pools at once: it seeds + verifies every
 one-shot-eligible pool's code in one account-fields call, hydrates them all
 through a single bundled `run_storage_programs` `eth_call` (V3 full-sync / V2
-flat-slot), and finalizes `Ready` — falling back per pool to the normal
+flat-slot / Balancer and Curve discovered read-sets — a discover→verify pool
+qualifies once its `discovered_slots` are known), and finalizes `Ready` — falling back per pool to the normal
 `cold_start` for anything without a one-shot program or whose hydration fails.
 `supports_one_shot_hydration` reports eligibility. `examples/factory_discovery_live.rs`
 uses the `find(PoolQuery) → cold_start_many → register` path.
@@ -265,7 +281,6 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
   is rebuildable on top of `simulate_swap`.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
-[`Cargo.toml`]: Cargo.toml
 [`AmmAdapter`]: src/adapters/traits.rs
 [Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0
