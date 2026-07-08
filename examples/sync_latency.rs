@@ -82,7 +82,14 @@ impl SyncStats {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let url = std::env::var("E2E_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+    let url = std::env::var("E2E_RPC_URL").unwrap_or_else(|_| {
+        eprintln!(
+            "E2E_RPC_URL unset - falling back to {DEFAULT_RPC_URL}. Public endpoints \
+             rate-limit multi-iteration runs and can abort this example mid-way; set \
+             E2E_RPC_URL to a paid/archive endpoint for reliable numbers."
+        );
+        DEFAULT_RPC_URL.to_string()
+    });
     let iterations = std::env::var("SYNC_BENCH_ITERS")
         .ok()
         .and_then(|value| value.parse().ok())
