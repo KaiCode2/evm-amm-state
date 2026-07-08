@@ -87,6 +87,10 @@ const UNISWAP_V3_IMMUTABLE_PATCHES: V3ImmutablePatches = V3ImmutablePatches {
 };
 
 /// Runtime bytecode to seed for one on-chain account before cold-start.
+///
+/// `#[non_exhaustive]`: Construct via [`AdapterCodeSeed::new`] or
+/// [`AdapterCodeSeed::with_code_hash`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterCodeSeed {
     /// Account whose canonical runtime bytecode is being seeded.
@@ -224,6 +228,10 @@ fn runtime_code_hash(runtime_bytecode: &Bytes) -> B256 {
 }
 
 /// A byte range in deployed runtime bytecode occupied by one immutable value.
+///
+/// `#[non_exhaustive]`: Construct via [`BytecodePatch::new`] (`const`, so `static` patch tables
+/// keep working).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BytecodePatch {
     /// Byte offset into the runtime bytecode.
@@ -243,6 +251,9 @@ impl BytecodePatch {
 ///
 /// Each field lists the byte ranges in the template occupied by that Solidity
 /// immutable, patched per-pool at render time.
+///
+/// `#[non_exhaustive]`: Construct via `Default` plus the `with_*` builders.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V3ImmutablePatches {
     /// Ranges holding the pool's own address (`NoDelegateCall` self-address).
@@ -306,6 +317,9 @@ impl V3ImmutablePatches {
 }
 
 /// A V3-style pool runtime template plus immutable patch locations.
+///
+/// `#[non_exhaustive]`: Construct via [`V3RuntimeBytecodeTemplate::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V3RuntimeBytecodeTemplate {
     /// Deployed runtime bytecode before per-pool immutable replacement.
@@ -371,6 +385,10 @@ impl V3RuntimeBytecodeTemplate {
 }
 
 /// Per-pool immutable values used to render a V3 runtime bytecode template.
+///
+/// `#[non_exhaustive]`: Construct via `Default` plus the `with_*` builders (fields stay `pub`
+/// for direct assignment).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct V3ImmutablePatchValues {
     /// The pool's own address.
@@ -389,7 +407,54 @@ pub struct V3ImmutablePatchValues {
     pub max_liquidity_per_tick: Option<U256>,
 }
 
+impl V3ImmutablePatchValues {
+    /// Set the pool's own address.
+    pub fn with_pool_address(mut self, pool_address: Address) -> Self {
+        self.pool_address = Some(pool_address);
+        self
+    }
+
+    /// Set the factory/deployer address.
+    pub fn with_factory(mut self, factory: Address) -> Self {
+        self.factory = Some(factory);
+        self
+    }
+
+    /// Set `token0`.
+    pub fn with_token0(mut self, token0: Address) -> Self {
+        self.token0 = Some(token0);
+        self
+    }
+
+    /// Set `token1`.
+    pub fn with_token1(mut self, token1: Address) -> Self {
+        self.token1 = Some(token1);
+        self
+    }
+
+    /// Set the pool fee.
+    pub fn with_fee(mut self, fee: u32) -> Self {
+        self.fee = Some(fee);
+        self
+    }
+
+    /// Set the tick spacing.
+    pub fn with_tick_spacing(mut self, tick_spacing: i32) -> Self {
+        self.tick_spacing = Some(tick_spacing);
+        self
+    }
+
+    /// Set `maxLiquidityPerTick`.
+    pub fn with_max_liquidity_per_tick(mut self, max_liquidity_per_tick: U256) -> Self {
+        self.max_liquidity_per_tick = Some(max_liquidity_per_tick);
+        self
+    }
+}
+
 /// Why rendering a V3 runtime bytecode template failed.
+///
+/// `#[non_exhaustive]` — an open error vocabulary.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BytecodeTemplateError {
     /// A patch range was declared for `field` but no value was supplied.

@@ -444,18 +444,15 @@ async fn v3_bytecode_template_patches_immutables_with_explicit_factory() -> Resu
     let token1 = Address::repeat_byte(0xc3);
     let fee = 500u32;
     let tick_spacing = 60;
-    let seed = uniswap_v3_code_seed(
-        pool,
-        &V3ImmutablePatchValues {
-            pool_address: Some(pool),
-            factory: Some(factory),
-            token0: Some(token0),
-            token1: Some(token1),
-            fee: Some(fee),
-            tick_spacing: Some(tick_spacing),
-            max_liquidity_per_tick: uniswap_v3_max_liquidity_per_tick(tick_spacing),
-        },
-    )?;
+    let mut immutables = V3ImmutablePatchValues::default()
+        .with_pool_address(pool)
+        .with_factory(factory)
+        .with_token0(token0)
+        .with_token1(token1)
+        .with_fee(fee)
+        .with_tick_spacing(tick_spacing);
+    immutables.max_liquidity_per_tick = uniswap_v3_max_liquidity_per_tick(tick_spacing);
+    let seed = uniswap_v3_code_seed(pool, &immutables)?;
     let expected_hash = seed.code_hash;
 
     let mut cache = setup_cache().await?;

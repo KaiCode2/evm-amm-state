@@ -59,12 +59,8 @@ impl AdapterCache for MockCache {
                         .insert((*address, *slot), *value)
                         .unwrap_or_default();
                     if old != *value {
-                        diff.slots.push(SlotChange {
-                            address: *address,
-                            slot: *slot,
-                            old,
-                            new: *value,
-                        });
+                        diff.slots
+                            .push(SlotChange::new(*address, *slot, old, *value));
                     }
                 }
                 StateUpdate::SlotMasked {
@@ -77,20 +73,11 @@ impl AdapterCache for MockCache {
                         let new = (old & !*mask) | (*value & *mask);
                         self.storage.insert((*address, *slot), new);
                         if old != new {
-                            diff.slots.push(SlotChange {
-                                address: *address,
-                                slot: *slot,
-                                old,
-                                new,
-                            });
+                            diff.slots.push(SlotChange::new(*address, *slot, old, new));
                         }
                     } else {
-                        diff.skipped_masks.push(SkippedMask {
-                            address: *address,
-                            slot: *slot,
-                            mask: *mask,
-                            value: *value,
-                        });
+                        diff.skipped_masks
+                            .push(SkippedMask::new(*address, *slot, *mask, *value));
                     }
                 }
                 StateUpdate::SlotDelta {
@@ -102,19 +89,11 @@ impl AdapterCache for MockCache {
                         let new = delta.apply(old);
                         self.storage.insert((*address, *slot), new);
                         if old != new {
-                            diff.slots.push(SlotChange {
-                                address: *address,
-                                slot: *slot,
-                                old,
-                                new,
-                            });
+                            diff.slots.push(SlotChange::new(*address, *slot, old, new));
                         }
                     } else {
-                        diff.skipped.push(SkippedDelta {
-                            address: *address,
-                            slot: *slot,
-                            delta: *delta,
-                        });
+                        diff.skipped
+                            .push(SkippedDelta::new(*address, *slot, *delta));
                     }
                 }
                 StateUpdate::Purge { address, .. } => {

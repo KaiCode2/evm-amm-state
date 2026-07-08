@@ -123,7 +123,8 @@ pub trait AmmAdapter: Send + Sync {
     /// returning the protocol's canonical `amount_out`.
     ///
     /// The implementation builds the protocol's canonical *quote* calldata and
-    /// runs it via [`AdapterCache::call_raw`] with `from = ZERO`,
+    /// runs it via [`AdapterCache::call_raw`] with `from = config.from` (default
+    /// `ZERO`, see [`SimConfig::from`]),
     /// `to = <quote target>`, `commit = false` against the cold-start snapshot,
     /// then decodes `amount_out` from the [`ExecutionResult`] output. The
     /// deployed contract bytecode does the AMM math — there is no `amm-math` /

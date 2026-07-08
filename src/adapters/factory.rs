@@ -1316,35 +1316,21 @@ impl PoolDiscovery {
         self.factories.push(factory);
     }
 
-    /// Shared batched resolution core behind [`find`](Self::find).
-    ///
-    /// Considers only factories matching `protocol` (all factories when
-    /// `protocol` is `None`) and partitions them into two groups by whether they
-    /// opt into batched discovery:
-    ///
-    /// - *Batchable* factories (non-empty [`candidate_reads`]) contribute their
-    ///   candidate slots to a single shared set. The whole set is de-duplicated
-    ///   and resolved with exactly ONE [`AdapterCache::read_storage_slots`] call
-    ///   — regardless of factory or pair count — then handed back to each
-    ///   factory's [`assemble_pairs`] to build its pools. The built-in Uniswap V2
-    ///   and V3 factories are batchable.
-    /// - *Legacy* factories (default empty [`candidate_reads`], i.e. they only
-    ///   implement [`find_pools`]) fall back to a per-pair [`find_pools`] call, so
-    ///   externally-implemented factories keep working.
-    ///
-    /// [`candidate_reads`]: PoolFactory::candidate_reads
-    /// [`assemble_pairs`]: PoolFactory::assemble_pairs
-    /// [`find_pools`]: PoolFactory::find_pools
     /// Discover pools for several [`PoolQuery`]s at once, resolving the candidate
     /// slots of *all* of them in a single batched read and returning the
-    /// de-duplicated union.
+    /// de-duplicated union. This is the shared resolution core behind
+    /// [`find`](Self::find).
     ///
     /// Each query is scoped independently, so one call can mix protocols across
     /// pairs — some pairs only on Uniswap V2, others only on V3 — without extra
-    /// round-trips. Batchable factories (the built-in V2/V3) contribute their
-    /// candidate mapping slots to ONE [`AdapterCache::read_storage_slots`] call
-    /// (a single bulk `eth_call` on an `EvmCache`); external factories that only
-    /// implement [`find_pools`](PoolFactory::find_pools) fall back per pair. A
+    /// round-trips. *Batchable* factories (non-empty
+    /// [`candidate_reads`](PoolFactory::candidate_reads); the built-in V2/V3)
+    /// contribute their candidate mapping slots to ONE
+    /// [`AdapterCache::read_storage_slots`] call — a single bulk `eth_call` on an
+    /// `EvmCache`, regardless of factory or pair count — then each factory's
+    /// [`assemble_pairs`](PoolFactory::assemble_pairs) builds its pools from the
+    /// shared answers. External factories that only implement
+    /// [`find_pools`](PoolFactory::find_pools) fall back per pair. A
     /// query scoped with [`PoolQuery::on`] to a protocol with no registered
     /// factory yields [`DiscoveryError::MissingFactory`]; an empty query list is
     /// `Ok(vec![])`.

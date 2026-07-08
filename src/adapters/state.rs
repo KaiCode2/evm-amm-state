@@ -19,6 +19,11 @@ use alloy_primitives::{Address, U256};
 ///
 /// Crate-owned mirror of [`evm_fork_cache::SlotDelta`]. Both directions
 /// **saturate**: `Add` clamps at `U256::MAX`, `Sub` at `U256::ZERO`.
+///
+/// Deliberately exhaustive (not `#[non_exhaustive]`): `Add`/`Sub` is the
+/// complete relative-mutation vocabulary, and matching both is semantically
+/// meaningful for consumers (e.g. inverting a delta). A genuinely new mutation
+/// kind would change apply semantics and warrants a breaking release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotDelta {
     /// Add to the current value, saturating at `U256::MAX`.
@@ -192,6 +197,9 @@ impl From<PurgeScope> for evm_fork_cache::PurgeScope {
 /// (`ZERO` if previously uncached), `new` is the resulting value.
 ///
 /// Crate-owned mirror of [`evm_fork_cache::SlotChange`].
+///
+/// `#[non_exhaustive]`: Construct via [`SlotChange::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotChange {
     /// Contract whose storage changed.
@@ -202,6 +210,18 @@ pub struct SlotChange {
     pub old: U256,
     /// Freshly-fetched / just-written value.
     pub new: U256,
+}
+
+impl SlotChange {
+    /// A change record for `slot` on `address`: `old` -> `new`.
+    pub fn new(address: Address, slot: U256, old: U256, new: U256) -> Self {
+        Self {
+            address,
+            slot,
+            old,
+            new,
+        }
+    }
 }
 
 impl From<evm_fork_cache::SlotChange> for SlotChange {
@@ -219,6 +239,9 @@ impl From<evm_fork_cache::SlotChange> for SlotChange {
 /// because the slot's current value is unknown (cold).
 ///
 /// Crate-owned mirror of [`evm_fork_cache::SkippedDelta`].
+///
+/// `#[non_exhaustive]`: Construct via [`SkippedDelta::new`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SkippedDelta {
     /// Contract whose storage slot the delta targeted.
@@ -227,6 +250,17 @@ pub struct SkippedDelta {
     pub slot: U256,
     /// The delta that was not applied.
     pub delta: SlotDelta,
+}
+
+impl SkippedDelta {
+    /// A skipped-delta record for cold `slot` on `address`.
+    pub fn new(address: Address, slot: U256, delta: SlotDelta) -> Self {
+        Self {
+            address,
+            slot,
+            delta,
+        }
+    }
 }
 
 impl From<evm_fork_cache::SkippedDelta> for SkippedDelta {
@@ -243,6 +277,9 @@ impl From<evm_fork_cache::SkippedDelta> for SkippedDelta {
 /// the target slot's current value is unknown (cold).
 ///
 /// Crate-owned mirror of [`evm_fork_cache::SkippedMask`].
+///
+/// `#[non_exhaustive]`: Construct via [`SkippedMask::new`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SkippedMask {
     /// Contract whose storage slot the masked write targeted.
@@ -253,6 +290,18 @@ pub struct SkippedMask {
     pub mask: U256,
     /// The value bits that were not applied.
     pub value: U256,
+}
+
+impl SkippedMask {
+    /// A skipped-mask record for cold `slot` on `address`.
+    pub fn new(address: Address, slot: U256, mask: U256, value: U256) -> Self {
+        Self {
+            address,
+            slot,
+            mask,
+            value,
+        }
+    }
 }
 
 impl From<evm_fork_cache::SkippedMask> for SkippedMask {

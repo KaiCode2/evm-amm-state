@@ -373,11 +373,7 @@ async fn code_verification_results_are_surfaced_in_report() -> Result<()> {
     assert_eq!(seeds.mismatched.len(), 1, "the mismatch must be reported");
     assert_eq!(
         seeds.mismatched[0],
-        CodeSeedMismatch {
-            address: pool,
-            expected: uniswap_v2_pair_runtime_code_hash(),
-            actual: wrong_hash,
-        }
+        CodeSeedMismatch::new(pool, uniswap_v2_pair_runtime_code_hash(), wrong_hash)
     );
     Ok(())
 }

@@ -52,19 +52,15 @@ fn assert_v3_render(
     tick_spacing: i32,
     expected: B256,
 ) {
-    let seed = uniswap_v3_code_seed(
-        pool,
-        &V3ImmutablePatchValues {
-            pool_address: Some(pool),
-            factory: Some(CANONICAL_V3_FACTORY),
-            token0: Some(token0),
-            token1: Some(token1),
-            fee: Some(fee),
-            tick_spacing: Some(tick_spacing),
-            max_liquidity_per_tick: uniswap_v3_max_liquidity_per_tick(tick_spacing),
-        },
-    )
-    .expect("render V3 template");
+    let mut immutables = V3ImmutablePatchValues::default()
+        .with_pool_address(pool)
+        .with_factory(CANONICAL_V3_FACTORY)
+        .with_token0(token0)
+        .with_token1(token1)
+        .with_fee(fee)
+        .with_tick_spacing(tick_spacing);
+    immutables.max_liquidity_per_tick = uniswap_v3_max_liquidity_per_tick(tick_spacing);
+    let seed = uniswap_v3_code_seed(pool, &immutables).expect("render V3 template");
     assert_eq!(
         seed.code_hash, expected,
         "rendered V3 runtime for {pool:?} (fee={fee}, tickSpacing={tick_spacing}) \

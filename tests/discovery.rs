@@ -53,11 +53,8 @@ impl AdapterCache for CountingCache {
     fn verify_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>, CacheError> {
         Ok(slots
             .iter()
-            .map(|(a, s)| SlotChange {
-                address: *a,
-                slot: *s,
-                old: U256::ZERO,
-                new: self.storage(*a, *s).unwrap_or_default(),
+            .map(|(a, s)| {
+                SlotChange::new(*a, *s, U256::ZERO, self.storage(*a, *s).unwrap_or_default())
             })
             .collect())
     }

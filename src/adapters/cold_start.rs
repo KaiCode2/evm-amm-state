@@ -55,6 +55,9 @@ use super::v3_sync::{V3SyncError, V3SyncSpec, decode_full_sync, full_sync_progra
 /// so the pool falls back to lazily fetching its real code.
 ///
 /// [`ColdStartReport`]: super::ColdStartReport
+///
+/// `#[non_exhaustive]`: Construct via `Default` and field assignment.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CodeSeedReport {
     /// Seeds confirmed against on-chain code (`CodeSeedState::Verified`).
@@ -85,6 +88,9 @@ impl From<evm_fork_cache::cache::CodeVerifyReport> for CodeSeedReport {
 /// One contradicted code-seed claim from verification.
 ///
 /// Crate-owned mirror of [`evm_fork_cache::cache::CodeMismatch`].
+///
+/// `#[non_exhaustive]`: Construct via [`CodeSeedMismatch::new`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeSeedMismatch {
     /// The seeded address.
@@ -93,6 +99,17 @@ pub struct CodeSeedMismatch {
     pub expected: B256,
     /// The on-chain `EXTCODEHASH` observed at the pinned block.
     pub actual: B256,
+}
+
+impl CodeSeedMismatch {
+    /// A mismatch record: `address` claimed `expected`, the chain holds `actual`.
+    pub fn new(address: Address, expected: B256, actual: B256) -> Self {
+        Self {
+            address,
+            expected,
+            actual,
+        }
+    }
 }
 
 impl From<evm_fork_cache::cache::CodeMismatch> for CodeSeedMismatch {
@@ -110,6 +127,10 @@ impl From<evm_fork_cache::cache::CodeMismatch> for CodeSeedMismatch {
 ///
 /// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartPlan`]. All four
 /// phases are optional; an empty plan is a valid no-op round.
+///
+/// `#[non_exhaustive]`: Construct via `Default` and field assignment, so future phases (e.g. the
+/// upstream root-probe baseline) can land without breaking planner authors.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartPlan {
     /// Slots to authoritatively re-fetch, classify, and inject when changed.
@@ -140,6 +161,9 @@ impl From<ColdStartPlan> for evm_fork_cache::cold_start::ColdStartPlan {
 /// the discover phase.
 ///
 /// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartCall`].
+///
+/// `#[non_exhaustive]`: Construct via [`ColdStartCall::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ColdStartCall {
     /// Transaction sender.
@@ -150,6 +174,25 @@ pub struct ColdStartCall {
     pub calldata: Bytes,
     /// When set, filters captured slots and accounts to these addresses.
     pub restrict_to: Option<Vec<Address>>,
+}
+
+impl ColdStartCall {
+    /// A discover view-call from `from` to `to` with `calldata`, capturing every
+    /// touched slot and account (no `restrict_to` filter).
+    pub fn new(from: Address, to: Address, calldata: impl Into<Bytes>) -> Self {
+        Self {
+            from,
+            to,
+            calldata: calldata.into(),
+            restrict_to: None,
+        }
+    }
+
+    /// Filter the captured slots and accounts to `addresses`.
+    pub fn with_restrict_to(mut self, addresses: impl IntoIterator<Item = Address>) -> Self {
+        self.restrict_to = Some(addresses.into_iter().collect());
+        self
+    }
 }
 
 impl From<ColdStartCall> for evm_fork_cache::cold_start::ColdStartCall {
@@ -169,6 +212,9 @@ impl From<ColdStartCall> for evm_fork_cache::cold_start::ColdStartCall {
 /// `fetched` / `probed` carry one [`SlotOutcome`] per declared verify / probe
 /// slot; `verified` carries only the slots whose value changed; `discovered`
 /// carries one [`ColdStartCallResult`] per discover call.
+///
+/// `#[non_exhaustive]`: Construct via `Default` and field assignment.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartResults {
     /// Slots whose value changed and were injected (one per change).
@@ -200,12 +246,22 @@ impl From<evm_fork_cache::cold_start::ColdStartResults> for ColdStartResults {
 /// the storage/account access list it touched.
 ///
 /// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartCallResult`].
+///
+/// `#[non_exhaustive]`: Construct via [`ColdStartCallResult::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ColdStartCallResult {
     /// The classified outcome of the view-call.
     pub result: CallOutcome,
     /// The storage slots and accounts the call touched (after `restrict_to`).
     pub access: StorageAccessList,
+}
+
+impl ColdStartCallResult {
+    /// A discover-call result from its classified outcome and access list.
+    pub fn new(result: CallOutcome, access: StorageAccessList) -> Self {
+        Self { result, access }
+    }
 }
 
 impl From<evm_fork_cache::cold_start::ColdStartCallResult> for ColdStartCallResult {
@@ -221,6 +277,9 @@ impl From<evm_fork_cache::cold_start::ColdStartCallResult> for ColdStartCallResu
 ///
 /// Crate-owned mirror of `evm_fork_cache`'s `StorageAccessList` (the access-set
 /// surface a discover call captures).
+///
+/// `#[non_exhaustive]`: Construct via `Default` and field assignment.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct StorageAccessList {
     /// Accounts the call touched.
@@ -275,6 +334,9 @@ impl From<evm_fork_cache::cold_start::SlotFetch> for SlotFetch {
 /// Crate-owned mirror of `evm_fork_cache`'s `SlotOutcome`: produced for **every**
 /// requested verify / probe slot (unlike [`SlotChange`], which records only
 /// changed slots).
+///
+/// `#[non_exhaustive]`: Construct via [`SlotOutcome::new`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotOutcome {
     /// Contract whose storage slot was fetched.
@@ -283,6 +345,17 @@ pub struct SlotOutcome {
     pub slot: U256,
     /// The classified result of fetching this slot.
     pub fetch: SlotFetch,
+}
+
+impl SlotOutcome {
+    /// The classified outcome of fetching `slot` on `address`.
+    pub fn new(address: Address, slot: U256, fetch: SlotFetch) -> Self {
+        Self {
+            address,
+            slot,
+            fetch,
+        }
+    }
 }
 
 impl From<evm_fork_cache::cold_start::SlotOutcome> for SlotOutcome {
@@ -323,6 +396,9 @@ impl From<ColdStartStep> for evm_fork_cache::cold_start::ColdStartStep {
 ///
 /// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartRunReport`],
 /// carrying the accumulated per-run counters.
+///
+/// `#[non_exhaustive]`: Construct via `Default` and field assignment.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartRunReport {
     /// Number of rounds executed.

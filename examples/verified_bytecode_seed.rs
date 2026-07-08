@@ -51,19 +51,16 @@ async fn main() -> Result<()> {
     cache.seed_account_code(v2_seed.address, v2_seed.runtime_bytecode)?;
 
     let v3_tick_spacing = 10;
-    let v3_seed = uniswap_v3_code_seed(
-        UNISWAP_V3_USDC_WETH_500,
-        &V3ImmutablePatchValues {
-            pool_address: Some(UNISWAP_V3_USDC_WETH_500),
-            factory: Some(CANONICAL_UNISWAP_V3_FACTORY),
-            token0: Some(USDC),
-            token1: Some(WETH),
-            fee: Some(500),
-            tick_spacing: Some(v3_tick_spacing),
-            max_liquidity_per_tick: uniswap_v3_max_liquidity_per_tick(v3_tick_spacing),
-        },
-    )
-    .context("render Uniswap V3 code seed from explicit immutable values")?;
+    let mut v3_immutables = V3ImmutablePatchValues::default()
+        .with_pool_address(UNISWAP_V3_USDC_WETH_500)
+        .with_factory(CANONICAL_UNISWAP_V3_FACTORY)
+        .with_token0(USDC)
+        .with_token1(WETH)
+        .with_fee(500)
+        .with_tick_spacing(v3_tick_spacing);
+    v3_immutables.max_liquidity_per_tick = uniswap_v3_max_liquidity_per_tick(v3_tick_spacing);
+    let v3_seed = uniswap_v3_code_seed(UNISWAP_V3_USDC_WETH_500, &v3_immutables)
+        .context("render Uniswap V3 code seed from explicit immutable values")?;
     let v3_len = v3_seed.runtime_bytecode.len();
     let v3_hash = v3_seed.code_hash;
     cache.seed_account_code(v3_seed.address, v3_seed.runtime_bytecode)?;
