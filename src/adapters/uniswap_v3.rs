@@ -1019,6 +1019,31 @@ mod tests {
         assert!(apply_liquidity_delta(pack_gross_net(3, 3), 4, false, true).is_none());
     }
 
+    // Pin the contract at the exact 128-bit boundaries: checked arithmetic
+    // (`None` -> the caller resyncs the tick) — never a wrap or saturation
+    // silently packed into a wrong word.
+    #[test]
+    fn liquidity_delta_boundary_values_reject_not_wrap() {
+        // Filling gross to exactly u128::MAX is representable...
+        let (w, was, now) =
+            apply_liquidity_delta(pack_gross_net(u128::MAX - 4, 0), 4, true, true).unwrap();
+        assert_eq!(gross(w), u128::MAX);
+        assert!(was && now);
+        // ...one more unit is None, not a wrap to zero.
+        assert!(apply_liquidity_delta(pack_gross_net(u128::MAX, 0), 1, true, true).is_none());
+        // Net overflow at i128::MAX (mint at the lower tick adds to net).
+        assert!(apply_liquidity_delta(pack_gross_net(0, i128::MAX), 1, true, true).is_none());
+        // Net underflow at i128::MIN (mint at the upper tick subtracts).
+        assert!(apply_liquidity_delta(pack_gross_net(0, i128::MIN), 1, true, false).is_none());
+        // An amount above i128::MAX cannot be a valid net move: rejected up front.
+        assert!(apply_liquidity_delta(pack_gross_net(0, 0), 1u128 << 127, true, true).is_none());
+        // The largest representable amount round-trips exactly.
+        let amount = i128::MAX as u128;
+        let (w, _, _) = apply_liquidity_delta(pack_gross_net(0, 0), amount, true, true).unwrap();
+        assert_eq!(gross(w), amount);
+        assert_eq!(net(w), i128::MAX);
+    }
+
     #[test]
     fn bit_position_matches_uniswap_position_low_byte() {
         // spacing 1: compressed == tick; bit = tick mod 256 (floor for negatives).

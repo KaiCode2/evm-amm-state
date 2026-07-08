@@ -11,7 +11,7 @@ use anyhow::Result;
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmAdapter, AmmSyncEngine, BalancerV2Adapter, BalancerV2Metadata,
     CurveAdapter, CurveMetadata, CurveVariant, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolMetadata,
+    ProtocolMetadata, SolidlyStorageLayout, SolidlyV2Adapter, SolidlyV2Metadata,
 };
 use evm_fork_cache::cache::{
     BlockStateAccountDiff, BlockStateDiff, BlockStateStorageDiff, EvmCache,
@@ -506,6 +506,76 @@ async fn sync_engine_eviction_purges_exclusive_state_only() -> Result<()> {
     // The co-tenant pool is still registered and Ready.
     assert_eq!(
         engine.registry().pool(&key_b).expect("pool b").status,
+        PoolStatus::Ready
+    );
+    Ok(())
+}
+
+fn solidly_sync_topic() -> B256 {
+    keccak256(b"Sync(uint256,uint256)")
+}
+
+fn solidly_registry(pool: Address, r0_slot: U256, r1_slot: U256) -> Result<AdapterRegistry> {
+    let layout =
+        SolidlyStorageLayout::new(r0_slot, r1_slot, U256::from(12_u64), U256::from(13_u64));
+    let adapter = Arc::new(SolidlyV2Adapter::default());
+    let mut registration = PoolRegistration::new(PoolKey::SolidlyV2(pool))
+        .with_state_address(pool)
+        .with_status(PoolStatus::Ready)
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ));
+    let sources = adapter.event_sources(&registration);
+    registration = registration.with_event_sources(sources);
+
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter)?;
+    registry.register_pool(registration)?;
+    Ok(registry)
+}
+
+// Solidly is the exact-write protocol on the engine: a `Sync` event carries the
+// absolute reserves, so `AmmSyncEngine` must apply both slot writes directly
+// from the payload with ZERO resync work — no block trace, no storage fetch —
+// and leave the pool `Ready`. (The panicking fetchers make any fallback loud.)
+#[tokio::test]
+async fn sync_engine_applies_solidly_sync_exactly_with_no_resync() -> Result<()> {
+    let pool = Address::repeat_byte(0x51);
+    let (r0_slot, r1_slot) = (U256::from(10_u64), U256::from(11_u64));
+    let mut cache = setup_cache().await?;
+    cache.set_block_state_diff_fetcher(Arc::new(|block| {
+        panic!("exact event-sourcing must not request a block trace: {block:?}")
+    }));
+    cache.set_storage_batch_fetcher(Arc::new(|requests, _block| {
+        panic!("exact event-sourcing must not fetch storage: {requests:?}")
+    }));
+
+    let registry = solidly_registry(pool, r0_slot, r1_slot)?;
+    let mut engine = AmmSyncEngine::new(registry)?;
+
+    let (reserve0, reserve1) = (U256::from(123_456_u64), U256::from(789_012_u64));
+    let log = rpc_log(
+        pool,
+        vec![solidly_sync_topic()],
+        abi_words([reserve0, reserve1]),
+        90,
+    );
+    let report = engine.ingest_batch(&mut cache, batch(log, 90))?;
+
+    assert_eq!(report.reactive.applied.len(), 1);
+    assert_eq!(report.resync_state_updates, 0, "Sync is exact: no resync");
+    assert_eq!(report.resync_failures, 0);
+    assert!(report.degraded_pools.is_empty());
+    assert_eq!(cache.cached_storage_value(pool, r0_slot), Some(reserve0));
+    assert_eq!(cache.cached_storage_value(pool, r1_slot), Some(reserve1));
+    assert_eq!(
+        engine
+            .registry()
+            .pool(&PoolKey::SolidlyV2(pool))
+            .expect("registered pool")
+            .status,
         PoolStatus::Ready
     );
     Ok(())

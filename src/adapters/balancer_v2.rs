@@ -883,6 +883,41 @@ mod tests {
         assert!(apply_cash_delta(full, false, true, U256::from(1_u64)).is_none());
     }
 
+    // Pin the 112-bit field contract at its exact boundaries: checked
+    // (`None` -> the reactive path falls back to a resync), and an in-range
+    // write never disturbs the co-tenant field of a TWO_TOKEN shared slot.
+    #[test]
+    fn cash_delta_exact_112_bit_boundary_behavior() {
+        let max_cash = cash_mask();
+        // Filling to exactly 2^112 - 1 is representable...
+        let almost = set_cash_field(U256::ZERO, false, max_cash - U256::from(3_u64));
+        let full = apply_cash_delta(almost, false, true, U256::from(3_u64)).unwrap();
+        assert_eq!(cash_field(full, false), max_cash);
+        // ...one more unit is None — never a carry into the neighbouring bits.
+        assert!(apply_cash_delta(full, false, true, U256::from(1_u64)).is_none());
+        // Same at the high field; the low co-tenant cash must stay untouched.
+        let low_cotenant = U256::from(77_u64);
+        let both = set_cash_field(
+            set_cash_field(U256::ZERO, false, low_cotenant),
+            true,
+            max_cash - U256::from(1_u64),
+        );
+        let bumped = apply_cash_delta(both, true, true, U256::from(1_u64)).unwrap();
+        assert_eq!(cash_field(bumped, true), max_cash);
+        assert_eq!(cash_field(bumped, false), low_cotenant);
+        assert!(apply_cash_delta(bumped, true, true, U256::from(1_u64)).is_none());
+        // Subtracting below zero rejects.
+        let two = set_cash_field(U256::ZERO, false, U256::from(2_u64));
+        assert!(apply_cash_delta(two, false, false, U256::from(3_u64)).is_none());
+        // A full-width U256 amount cannot smuggle past the 112-bit check, while
+        // the exact field maximum as an amount is accepted.
+        assert!(
+            apply_cash_delta(U256::ZERO, false, true, U256::from(1_u64) << CASH_BITS).is_none()
+        );
+        let filled = apply_cash_delta(U256::ZERO, false, true, max_cash).unwrap();
+        assert_eq!(cash_field(filled, false), max_cash);
+    }
+
     #[test]
     fn probe_locates_two_token_shared_slot() {
         let vault = addr(0xba);
