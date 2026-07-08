@@ -110,17 +110,21 @@ engine.register_pools([registration])?;
 That API is correct and conservative, but it is not the fastest available
 route.
 
-Factory discovery currently resolves derived mapping slots one at a time:
+At the time of this analysis, factory discovery resolved derived mapping slots
+one at a time:
 
-- V2 reads one `getPair[token0][token1]` slot.
-- V3 loops fee tiers and reads one `getPool[token0][token1][fee]` slot per tier.
-- For every found V3 pool it also reads `feeAmountTickSpacing[fee]`.
+- V2 read one `getPair[token0][token1]` slot.
+- V3 looped fee tiers and read one `getPool[token0][token1][fee]` slot per tier.
+- For every found V3 pool it also read `feeAmountTickSpacing[fee]`.
 
-For USDC/WETH this is nine derived-slot reads. These reads are cheap, but they
-are not currently planned as one bulk watchlist.
+For USDC/WETH this was nine derived-slot reads — cheap, but not planned as one
+bulk watchlist. **Shipped since:** `PoolDiscovery::find` / `find_many` now
+gather every factory's candidate slots (`PoolFactory::candidate_reads`) into a
+single batched `read_storage_slots` call.
 
-Cold-start currently runs one pool at a time through the generic cold-start
-planner. V3 is necessarily dependent in this planner:
+Cold-start, at the time of this analysis, ran one pool at a time through the
+generic cold-start planner (the shipped `cold_start_many` now bundles
+one-shot-eligible pools; the per-pool planner remains the fallback). V3 is necessarily dependent in this planner:
 
 1. read `slot0` + global liquidity;
 2. derive the current bitmap word window from `slot0`;
@@ -129,9 +133,10 @@ planner. V3 is necessarily dependent in this planner:
 5. read tick info slots.
 
 Even when the underlying `EvmCache` storage fetcher uses bulk extraction inside a
-round, the high-level call shape still prevents collapsing all pools and all
-known work into a single bootstrap plan. V3 cold-start also does not use the
-existing one-shot V3 sync program.
+round, the high-level call shape still prevented collapsing all pools and all
+known work into a single bootstrap plan, and V3 cold-start did not yet use the
+one-shot V3 sync program (both are addressed by `cold_start_many`; a unified
+discovery-to-ready `Bootstrapper` remains future work, below).
 
 ## Existing fast primitives
 
@@ -279,8 +284,9 @@ that must be visible in the returned plan/report, not hidden behind a slow call.
 
 ## Migration checklist
 
-1. Add a bulk factory read planner that can turn `PoolQuery`/typed protocol
-   queries into derived storage reads without executing them one at a time.
+1. **Done.** `PoolDiscovery::find`/`find_many` turn `PoolQuery`s into derived
+   candidate reads resolved in one batched `read_storage_slots` call
+   (`PoolFactory::candidate_reads` + `assemble_pairs`).
 2. Add a `BootstrapPlan` or `AdapterBootstrapPlanner` trait for protocol
    adapters to contribute code seeds, metadata requirements, storage programs,
    and fallback reasons.

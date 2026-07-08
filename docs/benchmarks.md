@@ -29,12 +29,15 @@ qualitatively, to the other ways people price AMM swaps.
 
 ## Results
 
-> Point-in-time medians from a single host and run (mid-2026, the Methodology
-> host above) — treat them as order-of-magnitude, and re-run the reproduce
-> command for numbers on your own machine. `cargo bench` prints full Criterion
-> statistics (mean / median / std-dev / outliers) to stdout and writes HTML
-> reports under `target/criterion/`; the medians below are the headline figures
-> from that output.
+> Point-in-time medians from a single host and run (July 2026, the v0.1.0
+> release candidate, the Methodology host above) — treat them as
+> order-of-magnitude, and re-run the reproduce command for numbers on your own
+> machine. `cargo bench` prints Criterion's timing estimates
+> (`time: [low mid high]` plus outlier counts) to stdout — add `-- --verbose`
+> for mean/median/std-dev — and saves baseline data under `target/criterion/`.
+> (This crate builds criterion without the `plotters` backend, so HTML reports
+> are only generated if `gnuplot` is installed.) The medians below are the
+> headline figures from that output.
 
 ### `simulate_swap` — one offline quote (the repeated hot path)
 
@@ -147,7 +150,7 @@ profile after bootstrap.
 measures the live reactive repair path for a real Curve 3pool event:
 
 ```bash
-E2E_RPC_URL=<https-mainnet-rpc> TRACE_RESYNC_ITERS=3 cargo run --release --example trace_resync_latency
+E2E_RPC_URL=<https-mainnet-rpc> TRACE_RESYNC_ITERS=7 cargo run --release --example trace_resync_latency
 ```
 
 The example finds a recent `TokenExchange`, cold-starts the pool at the previous

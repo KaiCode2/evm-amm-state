@@ -14,7 +14,7 @@ All the types below live in `evm_amm_state::adapters`.
 ## The `AmmAdapter` trait
 
 An adapter is one implementation of [`AmmAdapter`](../src/adapters/traits.rs).
-It has **one required method** and six defaulted ones:
+It has **one required method**; every other method (nine today) is defaulted:
 
 | Method | Required? | Default |
 | --- | --- | --- |
@@ -22,7 +22,9 @@ It has **one required method** and six defaulted ones:
 | `protocols(&self) -> Vec<ProtocolId>` | no | `[self.protocol()]` |
 | `event_sources(&self, pool) -> Vec<EventSource>` | no | the pool's configured sources |
 | `route_log(&self, log, registry) -> Option<PoolKey>` | no | generic address routing |
+| `pool_factories(&self, config) -> Vec<Box<dyn PoolFactory>>` | no | `[]` (no factory discovery) |
 | `cold_start_planner(&self, pool, policy)` | no | `Err(UnsupportedReason::Protocol(..))` |
+| `code_seeds(&self, pool)` | no | `Ok(vec![])` (no bytecode seeding) |
 | `decode_event(&self, pool, log, view)` | no | `AdapterEventResult::ignored()` |
 | `after_apply(&self, pool, event, diff)` | no | `RepairAction::None` |
 | `simulate_swap(&self, pool, cache, token_in, token_out, amount_in, config)` | no | `Err(SimError::Unsupported(..))` |

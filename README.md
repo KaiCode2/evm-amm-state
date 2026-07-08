@@ -309,7 +309,8 @@ injected over a pool's code via an `eth_call` state override
 bitmap *inside the EVM* — returning statics, every initialized tick's four
 info words, and the whole observation ring in **one call with zero calldata**.
 Live-measured on the USDC/WETH 0.05% pool: 1,563 ticks + 723 observations →
-7,674 slots injected in ~140 ms for 26 CU (vs ~153k CU as point reads), after
+7,674 slots injected in ~140 ms for 26 CU (vs ~130k CU as per-slot point
+reads — 7,674 × 17 CU), after
 which a hard multi-tick-crossing quote runs in **~5 ms with zero lazy
 fetches** (vs ~2 s paging ticks over RPC on a windowed cache). A
 calldata-driven **partial** variant refreshes selected bitmap-word ranges

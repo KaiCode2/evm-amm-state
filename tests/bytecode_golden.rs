@@ -7,7 +7,7 @@
 //! pool's immutables must reproduce the exact hash. This is what catches a
 //! corrupted artifact or a wrong patch offset **offline**, with no RPC — the
 //! live `verified_bytecode_seed` example proves the same thing against a live
-//! node, but only when `E2E_RPC_URL` is set.
+//! node when `E2E_RPC_URL` is set; this test file itself needs no env at all.
 //!
 //! The V3 pools span tickSpacings 1 / 10 / 60 (fees 0.01% / 0.05% / 0.3%) with
 //! two distinct token pairs, so a wrong offset on `token0`, `token1`, `fee`,

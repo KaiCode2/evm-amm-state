@@ -21,7 +21,8 @@
 //!    ±2-word active window (the planner-round shape, collapsed to one call).
 //!
 //! RPC economics (Alchemy): the full sync is ONE `eth_call` = 26 CU (20 via
-//! `eth_callMany`) versus ~134k CU for the same slots as point reads.
+//! `eth_callMany`) versus ~130k CU for the same slots as per-slot point reads
+//! (7,674 `eth_getStorageAt` x 17 CU).
 //!
 //! ```text
 //! E2E_RPC_URL=<https endpoint> cargo run --release --example v3_full_sync

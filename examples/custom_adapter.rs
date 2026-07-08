@@ -23,8 +23,8 @@
 //! 3. [`ProtocolMetadata::Custom(Arc<dyn Any + Send + Sync>)`] — an opaque,
 //!    per-pool config blob you define, recovered inside the adapter with
 //!    `downcast_ref`.
-//! 4. The [`AmmAdapter`] trait — one *required* method (`protocol`); the other
-//!    six are defaulted, so a minimal adapter overrides only `protocol` +
+//! 4. The [`AmmAdapter`] trait — one *required* method (`protocol`); the rest
+//!    are defaulted, so a minimal adapter overrides only `protocol` +
 //!    `simulate_swap`.
 //! 5. [`AdapterRegistry::register_adapter`] + dispatch by
 //!    [`AdapterRegistry::adapter`]`(pool.protocol())`.
