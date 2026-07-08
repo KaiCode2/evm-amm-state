@@ -40,7 +40,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-#[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3"))]
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use super::ProtocolMetadata;
 #[cfg(feature = "solidly-v2")]

@@ -292,4 +292,8 @@ pub(crate) mod abi {
     }
 }
 
+// In a bare `adapters`-only build every consumer (the per-protocol
+// `simulate_swap` impls) is compiled out, leaving this re-export unused —
+// that build is expected, not a bug.
+#[allow(unused_imports)]
 pub(crate) use abi::*;
