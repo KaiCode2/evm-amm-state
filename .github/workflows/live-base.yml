@@ -1,0 +1,32 @@
+name: Stage 10 Base live gates
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: evm-amm-state
+
+jobs:
+  base-rpc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: evm-amm-state
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-fork-cache
+          path: evm-fork-cache
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: evm-amm-state
+
+      - name: Solidly and Slipstream parity
+        env:
+          E2E_BASE_RPC_URL: ${{ secrets.E2E_BASE_RPC_URL }}
+        run: ./scripts/stage10-base-live-gates.sh

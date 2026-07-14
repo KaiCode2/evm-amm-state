@@ -21,18 +21,39 @@
 //! a mandatory slot's verdict from `Value` / `Zero` / `FetchFailed`, so a genuine
 //! on-chain zero and a transient archive miss become *distinguishable* repairs.
 
+#[cfg(feature = "live-runtime")]
+use alloy_eips::BlockId;
+#[cfg(feature = "live-runtime")]
+use alloy_primitives::keccak256;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use evm_fork_cache::CacheError as UpstreamCacheError;
+#[cfg(feature = "live-runtime")]
+use evm_fork_cache::bulk_storage::run_storage_program;
 use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_programs};
 use evm_fork_cache::cache::{CodeSeedState, EvmCache};
 use evm_fork_cache::cold_start::ColdStartConfig;
+#[cfg(feature = "live-runtime")]
+use evm_fork_cache::cold_start::{
+    AccountCodeClaim, AccountProofOutcome, AccountProofRoundFetcher, AccountProofRoundRequest,
+    PreparedAccountPatch, PreparedAccountValue, StorageRoundFetcher, StorageRoundRequest,
+};
+#[cfg(feature = "live-runtime")]
+use std::collections::BTreeMap;
+#[cfg(feature = "live-runtime")]
+use std::sync::Arc;
 
 use super::bytecode::AdapterCodeSeed;
 use super::state::UpstreamStateView;
+#[cfg(feature = "live-runtime")]
+use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::storage_sync::{StorageSyncSpec, decode_storage_sync, storage_sync_spec_for_pool};
 use super::{
     AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
     PoolRegistration, PoolStatus, SlotChange, StateView, UnsupportedReason,
+};
+#[cfg(feature = "live-runtime")]
+use super::{
+    AmmPreparedPoolState, AmmPreparedStorage, AmmStatePoint, ProtocolMetadata, UniswapV2Metadata,
 };
 
 #[cfg(feature = "uniswap-v3")]
@@ -125,7 +146,7 @@ impl From<evm_fork_cache::cache::CodeMismatch> for CodeSeedMismatch {
 /// A single round of cold-start work, declared by an
 /// [`AdapterColdStartPlanner`].
 ///
-/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartPlan`]. All four
+/// Crate-owned mirror of [`evm_fork_cache::cold_start::ColdStartPlan`]. All five
 /// phases are optional; an empty plan is a valid no-op round.
 ///
 /// `#[non_exhaustive]`: Construct via `Default` and field assignment, so future phases (e.g. the
@@ -137,6 +158,8 @@ pub struct ColdStartPlan {
     pub verify: Vec<(Address, U256)>,
     /// Slots to classify at the pinned block without injecting.
     pub probe: Vec<(Address, U256)>,
+    /// Accounts whose storage roots should be observed without injection.
+    pub probe_roots: Vec<Address>,
     /// Accounts to pre-seed into the cache before discovery.
     pub accounts: Vec<Address>,
     /// View-calls whose touched slots and accounts are captured.
@@ -150,9 +173,7 @@ impl From<ColdStartPlan> for evm_fork_cache::cold_start::ColdStartPlan {
             probe: plan.probe,
             accounts: plan.accounts,
             discover: plan.discover.into_iter().map(Into::into).collect(),
-            // Root-only account probes (0.2.0, Phase-8 root baseline) are not
-            // yet part of the adapter planner vocabulary.
-            probe_roots: Vec::new(),
+            probe_roots: plan.probe_roots,
         }
     }
 }
@@ -602,22 +623,26 @@ impl HydrationKind {
     /// was loaded/changed for the pool's cold-start report. A decode failure is
     /// surfaced (un-flattened) so the caller can fall the pool back to the
     /// multi-round cold-start.
-    fn apply(&self, cache: &mut EvmCache, output: &Bytes) -> Result<Hydrated, HydrationError> {
-        let entries: Vec<(Address, U256, U256)> = match self {
+    fn decode_entries(&self, output: &Bytes) -> Result<Vec<(Address, U256, U256)>, HydrationError> {
+        match self {
             #[cfg(feature = "uniswap-v3")]
             HydrationKind::V3 { pool, spec } => {
                 let snapshot = decode_full_sync(spec, output).map_err(HydrationError::V3)?;
-                snapshot
+                Ok(snapshot
                     .storage_entries(spec)
                     .into_iter()
                     .map(|(slot, value)| (*pool, slot, value))
-                    .collect()
+                    .collect())
             }
             HydrationKind::Flat { spec } => {
                 let snapshot = decode_storage_sync(spec, output).map_err(HydrationError::Flat)?;
-                snapshot.storage_entries()
+                Ok(snapshot.storage_entries())
             }
-        };
+        }
+    }
+
+    fn apply(&self, cache: &mut EvmCache, output: &Bytes) -> Result<Hydrated, HydrationError> {
+        let entries = self.decode_entries(output)?;
         Ok(inject_and_record(cache, entries))
     }
 }
@@ -703,18 +728,17 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
-    let (metadata, canonical_uniswap) = match &pool.metadata {
-        ProtocolMetadata::UniswapV3(metadata) => (metadata, true),
-        ProtocolMetadata::PancakeV3(metadata) | ProtocolMetadata::Slipstream(metadata) => {
-            (metadata, false)
-        }
+    let (metadata, family) = match &pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata) => (metadata, 0),
+        ProtocolMetadata::PancakeV3(metadata) => (metadata, 1),
+        ProtocolMetadata::Slipstream(metadata) => (metadata, 2),
         _ => return None,
     };
     let layout = metadata.storage_layout.filter(|l| l.tick_spacing > 0)?;
-    Some(if canonical_uniswap {
-        V3SyncSpec::uniswap(layout)
-    } else {
-        V3SyncSpec::core(layout)
+    Some(match family {
+        0 => V3SyncSpec::uniswap(layout),
+        1 => V3SyncSpec::pancake(layout),
+        _ => V3SyncSpec::core(layout),
     })
 }
 
@@ -786,6 +810,12 @@ fn fast_metadata_complete(pool: &PoolRegistration) -> bool {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HydrationError {
+    /// The registration cannot use the one-shot worker path.
+    Ineligible,
+    /// Fetched state cannot produce the same ready registration as planner fallback.
+    InvalidState(&'static str),
+    /// The exact-hash storage program fetch failed.
+    Fetch(Box<evm_fork_cache::StorageFetchError>),
     /// Decoding a V3 full-sync program's output failed.
     #[cfg(feature = "uniswap-v3")]
     V3(V3SyncError),
@@ -796,6 +826,11 @@ pub enum HydrationError {
 impl std::fmt::Display for HydrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Ineligible => write!(f, "pool is not eligible for one-shot hydration"),
+            Self::InvalidState(message) => {
+                write!(f, "one-shot state is not publishable: {message}")
+            }
+            Self::Fetch(_) => write!(f, "one-shot hydration provider fetch failed"),
             #[cfg(feature = "uniswap-v3")]
             Self::V3(_) => write!(f, "one-shot V3 hydration failed"),
             Self::Flat(_) => write!(f, "one-shot flat-slot hydration failed"),
@@ -806,11 +841,803 @@ impl std::fmt::Display for HydrationError {
 impl std::error::Error for HydrationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Ineligible | Self::InvalidState(_) => None,
+            Self::Fetch(err) => Some(err.as_ref()),
             #[cfg(feature = "uniswap-v3")]
             Self::V3(err) => Some(err as &(dyn std::error::Error + 'static)),
             Self::Flat(err) => Some(err as &(dyn std::error::Error + 'static)),
         }
     }
+}
+
+/// Fetch and decode one metadata-complete one-shot pool without mutating the actor cache.
+#[cfg(feature = "live-runtime")]
+#[allow(dead_code)]
+pub(crate) async fn prepare_one_shot_pool<P>(
+    registry: &AdapterRegistry,
+    pool: PoolRegistration,
+    baseline: AmmStatePoint,
+    policy: ColdStartPolicy,
+    provider: &P,
+) -> Result<AmmPreparedPoolState, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork> + Clone + Send + Sync + 'static,
+{
+    prepare_pool_from_view(
+        registry,
+        pool,
+        baseline,
+        policy,
+        Arc::new(EmptyPreparedState),
+        Arc::new(provider.clone()),
+        ResumableColdStartConfig::default(),
+    )
+    .await
+}
+
+/// Maximum work accepted from one resumable adapter planner.
+#[cfg(feature = "live-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResumableColdStartConfig {
+    max_rounds: usize,
+}
+
+#[cfg(feature = "live-runtime")]
+impl Default for ResumableColdStartConfig {
+    fn default() -> Self {
+        Self { max_rounds: 8 }
+    }
+}
+
+/// Planner phases that need worker-side facilities beyond exact slot/proof reads.
+#[cfg(feature = "live-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnsupportedPreparedPhase {
+    Accounts,
+    Discover,
+    ProbeRoots,
+}
+
+/// Failure to prepare one pool without mutating the canonical cache.
+#[cfg(feature = "live-runtime")]
+#[derive(Debug)]
+pub(crate) enum PreparedColdStartError {
+    Unsupported(UnsupportedReason),
+    UnsupportedPhase(UnsupportedPreparedPhase),
+    InvalidRoundBudget,
+    RoundBudgetExceeded { max_rounds: usize },
+    StorageFetch(evm_fork_cache::cold_start::StorageRoundFetchError),
+    CodeSeed(super::bytecode::BytecodeTemplateError),
+    CodeProofUnavailable,
+    CodeProofFetch(evm_fork_cache::cold_start::AccountProofRoundFetchError),
+    CodeProofMismatch { address: Address },
+    CodeProofFailed { address: Address, reason: String },
+    PlannerTranscriptDiverged,
+    NotReady(Box<ColdStartOutcome>),
+    Prepared(super::AmmPreparedStateError),
+}
+
+#[cfg(feature = "live-runtime")]
+impl std::fmt::Display for PreparedColdStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(reason) => write!(f, "adapter cold-start is unsupported: {reason:?}"),
+            Self::UnsupportedPhase(phase) => {
+                write!(
+                    f,
+                    "background cold-start does not support the {phase:?} phase"
+                )
+            }
+            Self::InvalidRoundBudget => {
+                write!(f, "background cold-start max_rounds must be non-zero")
+            }
+            Self::RoundBudgetExceeded { max_rounds } => {
+                write!(
+                    f,
+                    "background cold-start round budget exceeded ({max_rounds})"
+                )
+            }
+            Self::StorageFetch(error) => write!(f, "background storage round failed: {error}"),
+            Self::CodeSeed(error) => write!(f, "adapter code-seed rendering failed: {error}"),
+            Self::CodeProofUnavailable => write!(
+                f,
+                "background code verification needs an account-proof fetcher"
+            ),
+            Self::CodeProofFetch(error) => {
+                write!(f, "background account-proof round failed: {error}")
+            }
+            Self::CodeProofMismatch { address } => {
+                write!(f, "runtime-code proof mismatch for {address}")
+            }
+            Self::CodeProofFailed { address, reason } => {
+                write!(f, "runtime-code proof fetch failed for {address}: {reason}")
+            }
+            Self::PlannerTranscriptDiverged => {
+                write!(f, "adapter planner diverged while replaying a prior round")
+            }
+            Self::NotReady(outcome) => {
+                write!(
+                    f,
+                    "adapter cold-start did not produce a ready pool: {outcome:?}"
+                )
+            }
+            Self::Prepared(error) => write!(f, "prepared pool is invalid: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "live-runtime")]
+impl std::error::Error for PreparedColdStartError {}
+
+#[cfg(feature = "live-runtime")]
+struct WorkerStateView<'a> {
+    base: &'a dyn StateView,
+    storage: &'a BTreeMap<(Address, U256), U256>,
+}
+
+#[cfg(feature = "live-runtime")]
+struct EmptyPreparedState;
+
+#[cfg(feature = "live-runtime")]
+impl StateView for EmptyPreparedState {
+    fn storage(&self, _address: Address, _slot: U256) -> Option<U256> {
+        None
+    }
+}
+
+/// Adapter-facing immutable view over a queue-time EVM snapshot.
+#[cfg(feature = "live-runtime")]
+#[allow(dead_code)]
+pub(crate) struct PreparedSnapshotState {
+    snapshot: Arc<evm_fork_cache::EvmSnapshot>,
+}
+
+#[cfg(feature = "live-runtime")]
+impl PreparedSnapshotState {
+    #[allow(dead_code)]
+    pub(crate) const fn new(snapshot: Arc<evm_fork_cache::EvmSnapshot>) -> Self {
+        Self { snapshot }
+    }
+}
+
+#[cfg(feature = "live-runtime")]
+impl StateView for PreparedSnapshotState {
+    fn storage(&self, address: Address, slot: U256) -> Option<U256> {
+        self.snapshot.storage_value(address, slot)
+    }
+}
+
+/// Attempt the single-program fast path for one pool.
+///
+/// Ineligible pools and storage-program/decode failures return `Ok(None)` so a
+/// scheduler can construct a [`PreparedPoolJob`] and continue in bounded
+/// rounds. Exact-hash code-proof failures remain hard errors.
+#[cfg(feature = "live-runtime")]
+pub(crate) async fn prepare_fast_pool<P>(
+    registry: &AdapterRegistry,
+    mut pool: PoolRegistration,
+    baseline: AmmStatePoint,
+    provider: &P,
+    account_fetcher: Option<&AccountProofRoundFetcher>,
+) -> Result<Option<AmmPreparedPoolState>, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    if registry.adapter(pool.protocol()).is_none() || !fast_metadata_complete(&pool) {
+        return Ok(None);
+    }
+    let Some(kind) = hydration_kind(&pool) else {
+        return Ok(None);
+    };
+    let fast = async {
+        let output = run_storage_program(
+            provider,
+            BlockId::from((baseline.block_hash(), Some(true))),
+            &kind.program(),
+        )
+        .await
+        .map_err(|error| HydrationError::Fetch(Box::new(error)))?;
+        let entries = kind.decode_entries(&output)?;
+        finalize_prepared_registration(&mut pool, &entries)?;
+        Ok::<_, HydrationError>(entries)
+    }
+    .await;
+    let Ok(entries) = fast else {
+        return Ok(None);
+    };
+    record_v3_prepared_slots(&mut pool, &entries);
+    let adapter = registry.adapter(pool.protocol()).ok_or_else(|| {
+        PreparedColdStartError::Unsupported(UnsupportedReason::Protocol(pool.protocol()))
+    })?;
+    let accounts = prepare_code_seeds(
+        adapter.as_ref(),
+        &pool,
+        baseline,
+        registry.code_seeding,
+        account_fetcher,
+    )?;
+    let mut account_values = accounts.values().to_vec();
+    account_values
+        .extend(prepare_verified_code_targets(adapter.as_ref(), &pool, baseline, provider).await?);
+    let accounts = PreparedAccountPatch::new(
+        baseline.block_hash(),
+        baseline.block_number(),
+        account_values,
+    );
+    let storage = entries
+        .into_iter()
+        .map(|(address, slot, value)| AmmPreparedStorage::new(address, slot, value));
+    pool.status = PoolStatus::Ready;
+    let prepared = AmmPreparedPoolState::new(pool, baseline, storage)
+        .map_err(PreparedColdStartError::Prepared)?
+        .with_accounts(accounts);
+    Ok(Some(prepared))
+}
+
+/// Fetch the real runtime for V3-family forks that cannot use the embedded
+/// canonical Uniswap pool template. QuoterV2 calls the pool recursively, so an
+/// immutable snapshot needs these bytes in addition to the pool's hydrated
+/// storage. The proof and code are both pinned to the exact runtime baseline;
+/// the actor revalidates the hash before installing the prepared patch.
+#[cfg(feature = "live-runtime")]
+async fn prepare_verified_code_target<P>(
+    address: Address,
+    baseline: AmmStatePoint,
+    provider: &P,
+) -> Result<PreparedAccountValue, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    let block = BlockId::from((baseline.block_hash(), Some(true)));
+    let mut attempt = 0u32;
+    let (code, proof) = loop {
+        match tokio::try_join!(
+            provider.get_code_at(address).block_id(block),
+            provider.get_proof(address, Vec::new()).block_id(block),
+        ) {
+            Ok(result) => break result,
+            Err(_) if attempt < 2 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+            }
+            Err(error) => {
+                return Err(PreparedColdStartError::CodeProofFailed {
+                    address,
+                    reason: error.to_string(),
+                });
+            }
+        }
+    };
+    if code.is_empty() {
+        return Err(PreparedColdStartError::CodeProofFailed {
+            address,
+            reason: "pool account has no runtime code".to_owned(),
+        });
+    }
+    let actual = keccak256(&code);
+    if actual != proof.code_hash {
+        return Err(PreparedColdStartError::CodeProofMismatch { address });
+    }
+    Ok(PreparedAccountValue::new(
+        address,
+        evm_fork_cache::AccountProof {
+            storage_hash: proof.storage_hash,
+            balance: proof.balance,
+            nonce: proof.nonce,
+            code_hash: proof.code_hash,
+            slots: Vec::new(),
+        },
+        code,
+    ))
+}
+
+#[cfg(feature = "live-runtime")]
+pub(crate) async fn prepare_verified_code_targets<P>(
+    adapter: &dyn super::AmmAdapter,
+    pool: &PoolRegistration,
+    baseline: AmmStatePoint,
+    provider: &P,
+) -> Result<Vec<PreparedAccountValue>, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    let mut values = Vec::new();
+    for address in adapter.verified_code_targets(pool) {
+        values.push(prepare_verified_code_target(address, baseline, provider).await?);
+    }
+    Ok(values)
+}
+
+#[cfg(feature = "live-runtime")]
+fn record_v3_prepared_slots(pool: &mut PoolRegistration, entries: &[(Address, U256, U256)]) {
+    let Some(address) = pool.key.address() else {
+        return;
+    };
+    let mut slots = entries
+        .iter()
+        .filter_map(|(slot_address, slot, _)| (*slot_address == address).then_some(*slot))
+        .collect::<Vec<_>>();
+    slots.sort_unstable();
+    slots.dedup();
+    match &mut pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata)
+        | ProtocolMetadata::PancakeV3(metadata)
+        | ProtocolMetadata::Slipstream(metadata) => {
+            metadata.warmed_slots = slots;
+        }
+        _ => {}
+    }
+}
+
+/// Prepare a pool over an immutable snapshot view, preferring the one-shot
+/// storage-program path and falling back to resumable adapter rounds.
+#[cfg(feature = "live-runtime")]
+pub(crate) async fn prepare_pool_from_view<P>(
+    registry: &AdapterRegistry,
+    pool: PoolRegistration,
+    baseline: AmmStatePoint,
+    policy: ColdStartPolicy,
+    base: Arc<dyn StateView + Send + Sync>,
+    provider: Arc<P>,
+    config: ResumableColdStartConfig,
+) -> Result<AmmPreparedPoolState, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork> + Send + Sync + 'static,
+{
+    let storage_fetcher = StorageRoundFetcher::from_provider(
+        Arc::clone(&provider),
+        evm_fork_cache::StorageBatchConfig::default(),
+        evm_fork_cache::StorageFetchStrategy::default(),
+    );
+    let account_fetcher = AccountProofRoundFetcher::from_provider(Arc::clone(&provider), 8);
+
+    if let Some(prepared) = prepare_fast_pool(
+        registry,
+        pool.clone(),
+        baseline,
+        provider.as_ref(),
+        Some(&account_fetcher),
+    )
+    .await?
+    {
+        return Ok(prepared);
+    }
+
+    let adapter = registry.adapter(pool.protocol()).ok_or_else(|| {
+        PreparedColdStartError::Unsupported(UnsupportedReason::Protocol(pool.protocol()))
+    })?;
+    let verified_accounts =
+        prepare_verified_code_targets(adapter.as_ref(), &pool, baseline, provider.as_ref()).await?;
+    prepare_resumable_pool(
+        registry,
+        pool,
+        baseline,
+        policy,
+        base,
+        PreparedPoolFetchers::new(storage_fetcher, Some(account_fetcher))
+            .with_verified_accounts(verified_accounts),
+        config,
+    )
+}
+
+#[cfg(feature = "live-runtime")]
+impl StateView for WorkerStateView<'_> {
+    fn storage(&self, address: Address, slot: U256) -> Option<U256> {
+        self.storage
+            .get(&(address, slot))
+            .copied()
+            .or_else(|| self.base.storage(address, slot))
+    }
+}
+
+#[derive(Clone)]
+#[cfg(feature = "live-runtime")]
+struct PreparedRound {
+    plan: ColdStartPlan,
+    results: ColdStartResults,
+    storage: BTreeMap<(Address, U256), U256>,
+}
+
+/// Result of one bounded prepared cold-start quantum.
+#[cfg(feature = "live-runtime")]
+pub(crate) enum PreparedPoolStep {
+    Continue {
+        completed_rounds: usize,
+        max_rounds: usize,
+    },
+    Done(Box<AmmPreparedPoolState>),
+}
+
+/// Provider handles used by one resumable pool job.
+#[cfg(feature = "live-runtime")]
+pub(crate) struct PreparedPoolFetchers {
+    storage: StorageRoundFetcher,
+    accounts: Option<AccountProofRoundFetcher>,
+    verified_accounts: Vec<PreparedAccountValue>,
+}
+
+#[cfg(feature = "live-runtime")]
+impl PreparedPoolFetchers {
+    pub(crate) const fn new(
+        storage: StorageRoundFetcher,
+        accounts: Option<AccountProofRoundFetcher>,
+    ) -> Self {
+        Self {
+            storage,
+            accounts,
+            verified_accounts: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_verified_accounts(
+        mut self,
+        verified_accounts: Vec<PreparedAccountValue>,
+    ) -> Self {
+        self.verified_accounts = verified_accounts;
+        self
+    }
+}
+
+/// Worker-owned, `Send` resumable adapter cold-start state.
+///
+/// Adapter planners themselves are not `Send`. The job therefore persists a
+/// compact transcript and reconstructs/replays the pure planner during each
+/// synchronous [`step`](Self::step). No planner object crosses the scheduler's
+/// await boundary, while every replay sees the exact overlay that followed that
+/// historical round.
+#[cfg(feature = "live-runtime")]
+pub(crate) struct PreparedPoolJob {
+    adapter: Arc<dyn super::AmmAdapter>,
+    pool: PoolRegistration,
+    baseline: AmmStatePoint,
+    policy: ColdStartPolicy,
+    base: Arc<dyn StateView + Send + Sync>,
+    storage_fetcher: StorageRoundFetcher,
+    account_patch: PreparedAccountPatch,
+    config: ResumableColdStartConfig,
+    rounds: Vec<PreparedRound>,
+    report: ColdStartRunReport,
+    accumulated: BTreeMap<(Address, U256), U256>,
+}
+
+#[cfg(feature = "live-runtime")]
+impl PreparedPoolJob {
+    pub(crate) fn new(
+        registry: &AdapterRegistry,
+        pool: PoolRegistration,
+        baseline: AmmStatePoint,
+        policy: ColdStartPolicy,
+        base: Arc<dyn StateView + Send + Sync>,
+        fetchers: PreparedPoolFetchers,
+        config: ResumableColdStartConfig,
+    ) -> Result<Self, PreparedColdStartError> {
+        if config.max_rounds == 0 {
+            return Err(PreparedColdStartError::InvalidRoundBudget);
+        }
+        let adapter = registry
+            .adapter(pool.protocol())
+            .ok_or_else(|| {
+                PreparedColdStartError::Unsupported(UnsupportedReason::Protocol(pool.protocol()))
+            })?
+            .clone();
+        // Validate planner construction before accepting the job. The planner
+        // is intentionally dropped: a fresh instance is replayed per quantum.
+        adapter
+            .cold_start_planner(&pool, policy)
+            .map_err(PreparedColdStartError::Unsupported)?;
+        let account_patch = prepare_code_seeds(
+            adapter.as_ref(),
+            &pool,
+            baseline,
+            registry.code_seeding,
+            fetchers.accounts.as_ref(),
+        )?;
+        let mut account_values = account_patch.values().to_vec();
+        account_values.extend(fetchers.verified_accounts);
+        let account_patch = PreparedAccountPatch::new(
+            baseline.block_hash(),
+            baseline.block_number(),
+            account_values,
+        );
+        Ok(Self {
+            adapter,
+            pool,
+            baseline,
+            policy,
+            base,
+            storage_fetcher: fetchers.storage,
+            account_patch,
+            config,
+            rounds: Vec::new(),
+            report: ColdStartRunReport::default(),
+            accumulated: BTreeMap::new(),
+        })
+    }
+
+    /// Execute exactly one provider round and retain all continuation state.
+    pub(crate) fn step(&mut self) -> Result<PreparedPoolStep, PreparedColdStartError> {
+        if self.rounds.len() >= self.config.max_rounds {
+            return Err(PreparedColdStartError::RoundBudgetExceeded {
+                max_rounds: self.config.max_rounds,
+            });
+        }
+        let mut planner = self
+            .adapter
+            .cold_start_planner(&self.pool, self.policy)
+            .map_err(PreparedColdStartError::Unsupported)?;
+        let empty_storage = BTreeMap::new();
+        let empty = WorkerStateView {
+            base: self.base.as_ref(),
+            storage: &empty_storage,
+        };
+        let mut plan = planner.initial_plan(&empty);
+        for historical in &self.rounds {
+            if !same_prepared_plan(&plan, &historical.plan) {
+                return Err(PreparedColdStartError::PlannerTranscriptDiverged);
+            }
+            let view = WorkerStateView {
+                base: self.base.as_ref(),
+                storage: &historical.storage,
+            };
+            plan = match planner.on_results(&historical.results, &view) {
+                ColdStartStep::Continue(next) => next,
+                ColdStartStep::Done => {
+                    return Err(PreparedColdStartError::PlannerTranscriptDiverged);
+                }
+            };
+        }
+        reject_unsupported_phase(&plan)?;
+
+        let request = StorageRoundRequest::new(
+            self.baseline.block_hash(),
+            plan.verify.iter().copied(),
+            plan.probe.iter().copied(),
+        );
+        let (fetched, probed, patch) = self
+            .storage_fetcher
+            .fetch(&request)
+            .map_err(PreparedColdStartError::StorageFetch)?
+            .into_parts();
+        let mut storage = self
+            .rounds
+            .last()
+            .map(|round| round.storage.clone())
+            .unwrap_or_default();
+        let mut verified = Vec::new();
+        for value in patch.values() {
+            let address = value.address();
+            let slot = value.slot();
+            let new = value.value();
+            let old = storage
+                .get(&(address, slot))
+                .copied()
+                .or_else(|| self.base.storage(address, slot))
+                .unwrap_or(U256::ZERO);
+            if old != new {
+                verified.push(SlotChange::new(address, slot, old, new));
+            }
+            storage.insert((address, slot), new);
+            self.accumulated.insert((address, slot), new);
+        }
+        let results = ColdStartResults {
+            verified,
+            fetched: fetched.into_iter().map(Into::into).collect(),
+            probed: probed.into_iter().map(Into::into).collect(),
+            discovered: Vec::new(),
+        };
+        absorb_worker_round(&mut self.report, &plan, &results);
+        self.rounds.push(PreparedRound {
+            plan,
+            results: results.clone(),
+            storage: storage.clone(),
+        });
+        let view = WorkerStateView {
+            base: self.base.as_ref(),
+            storage: &storage,
+        };
+        match planner.on_results(&results, &view) {
+            ColdStartStep::Continue(_) => Ok(PreparedPoolStep::Continue {
+                completed_rounds: self.rounds.len(),
+                max_rounds: self.config.max_rounds,
+            }),
+            ColdStartStep::Done => {
+                let mut pool = self.pool.clone();
+                let outcome = planner.finish(&mut pool, &self.report);
+                let deferred = match outcome {
+                    ColdStartOutcome::Ready(_) => Vec::new(),
+                    ColdStartOutcome::ReadyWithDeferred(_, deferred) => deferred,
+                    outcome => return Err(PreparedColdStartError::NotReady(Box::new(outcome))),
+                };
+                let prepared = AmmPreparedPoolState::new(
+                    pool,
+                    self.baseline,
+                    self.accumulated.iter().map(|(&(address, slot), &value)| {
+                        AmmPreparedStorage::new(address, slot, value)
+                    }),
+                )
+                .map_err(PreparedColdStartError::Prepared)?
+                .with_accounts(self.account_patch.clone())
+                .with_deferred(deferred);
+                Ok(PreparedPoolStep::Done(Box::new(prepared)))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "live-runtime")]
+fn same_prepared_plan(left: &ColdStartPlan, right: &ColdStartPlan) -> bool {
+    left.verify == right.verify
+        && left.probe == right.probe
+        && left.probe_roots == right.probe_roots
+        && left.accounts == right.accounts
+        && left.discover.len() == right.discover.len()
+        && left
+            .discover
+            .iter()
+            .zip(&right.discover)
+            .all(|(left, right)| {
+                left.from == right.from
+                    && left.to == right.to
+                    && left.calldata == right.calldata
+                    && left.restrict_to == right.restrict_to
+            })
+}
+
+#[cfg(feature = "live-runtime")]
+fn reject_unsupported_phase(plan: &ColdStartPlan) -> Result<(), PreparedColdStartError> {
+    if !plan.accounts.is_empty() {
+        return Err(PreparedColdStartError::UnsupportedPhase(
+            UnsupportedPreparedPhase::Accounts,
+        ));
+    }
+    if !plan.discover.is_empty() {
+        return Err(PreparedColdStartError::UnsupportedPhase(
+            UnsupportedPreparedPhase::Discover,
+        ));
+    }
+    if !plan.probe_roots.is_empty() {
+        return Err(PreparedColdStartError::UnsupportedPhase(
+            UnsupportedPreparedPhase::ProbeRoots,
+        ));
+    }
+    Ok(())
+}
+
+/// Convenience driver used by the one-shot fallback and focused tests.
+/// Scheduler integrations should own [`PreparedPoolJob`] and call one step per
+/// scheduling quantum.
+#[cfg(feature = "live-runtime")]
+pub(crate) fn prepare_resumable_pool(
+    registry: &AdapterRegistry,
+    pool: PoolRegistration,
+    baseline: AmmStatePoint,
+    policy: ColdStartPolicy,
+    base: Arc<dyn StateView + Send + Sync>,
+    fetchers: PreparedPoolFetchers,
+    config: ResumableColdStartConfig,
+) -> Result<AmmPreparedPoolState, PreparedColdStartError> {
+    let mut job = PreparedPoolJob::new(registry, pool, baseline, policy, base, fetchers, config)?;
+    loop {
+        match job.step()? {
+            PreparedPoolStep::Continue {
+                completed_rounds,
+                max_rounds,
+            } => debug_assert!(completed_rounds <= max_rounds),
+            PreparedPoolStep::Done(prepared) => return Ok(*prepared),
+        }
+    }
+}
+
+#[cfg(feature = "live-runtime")]
+fn absorb_worker_round(
+    report: &mut ColdStartRunReport,
+    plan: &ColdStartPlan,
+    results: &ColdStartResults,
+) {
+    report.rounds += 1;
+    report.verified_slots += plan.verify.len();
+    report.changed_slots += results.verified.len();
+    report.failed_slots += results
+        .fetched
+        .iter()
+        .chain(&results.probed)
+        .filter(|outcome| matches!(outcome.fetch, SlotFetch::FetchFailed { .. }))
+        .count();
+}
+
+#[cfg(feature = "live-runtime")]
+fn prepare_code_seeds(
+    adapter: &dyn super::AmmAdapter,
+    pool: &PoolRegistration,
+    baseline: AmmStatePoint,
+    enabled: bool,
+    fetcher: Option<&AccountProofRoundFetcher>,
+) -> Result<PreparedAccountPatch, PreparedColdStartError> {
+    let seeds = if enabled {
+        adapter
+            .code_seeds(pool)
+            .map_err(PreparedColdStartError::CodeSeed)?
+    } else {
+        Vec::new()
+    };
+    if seeds.is_empty() {
+        return Ok(PreparedAccountPatch::new(
+            baseline.block_hash(),
+            baseline.block_number(),
+            std::iter::empty(),
+        ));
+    }
+    let fetcher = fetcher.ok_or(PreparedColdStartError::CodeProofUnavailable)?;
+    let request = AccountProofRoundRequest::new(
+        baseline.block_hash(),
+        seeds
+            .iter()
+            .map(|seed| AccountCodeClaim::new(seed.address, seed.code_hash)),
+    );
+    let outcomes = fetcher
+        .fetch(&request)
+        .map_err(PreparedColdStartError::CodeProofFetch)?
+        .into_outcomes();
+    let mut values = Vec::with_capacity(seeds.len());
+    for (seed, outcome) in seeds.into_iter().zip(outcomes) {
+        match outcome {
+            AccountProofOutcome::Verified { address, proof } => values.push(
+                PreparedAccountValue::new(address, proof, seed.runtime_bytecode),
+            ),
+            AccountProofOutcome::Mismatch { address, .. } => {
+                return Err(PreparedColdStartError::CodeProofMismatch { address });
+            }
+            AccountProofOutcome::FetchFailed { address, reason } => {
+                return Err(PreparedColdStartError::CodeProofFailed { address, reason });
+            }
+            other => {
+                return Err(PreparedColdStartError::CodeProofFailed {
+                    address: other.address(),
+                    reason: "unsupported account-proof outcome".to_string(),
+                });
+            }
+        }
+    }
+    Ok(PreparedAccountPatch::new(
+        baseline.block_hash(),
+        baseline.block_number(),
+        values,
+    ))
+}
+
+#[cfg(feature = "live-runtime")]
+fn finalize_prepared_registration(
+    pool: &mut PoolRegistration,
+    entries: &[(Address, U256, U256)],
+) -> Result<(), HydrationError> {
+    let ProtocolMetadata::UniswapV2(existing) = &pool.metadata else {
+        return Ok(());
+    };
+    let address = pool.key.address().ok_or(HydrationError::Ineligible)?;
+    let value = |slot| {
+        entries
+            .iter()
+            .find_map(|(entry_address, entry_slot, value)| {
+                (*entry_address == address && *entry_slot == slot).then_some(*value)
+            })
+            .ok_or(HydrationError::InvalidState("missing declared V2 slot"))
+    };
+    let token0 = decode_address_slot(value(V2_TOKEN0_SLOT)?);
+    let token1 = decode_address_slot(value(V2_TOKEN1_SLOT)?);
+    if token0.is_zero() || token1.is_zero() {
+        return Err(HydrationError::InvalidState("V2 token address is zero"));
+    }
+    if value(V2_RESERVES_SLOT)?.is_zero() {
+        return Err(HydrationError::InvalidState(
+            "V2 reserves are degenerate zero",
+        ));
+    }
+    pool.metadata = ProtocolMetadata::UniswapV2(UniswapV2Metadata {
+        token0: Some(token0),
+        token1: Some(token1),
+        fee_bps: existing.fee_bps,
+    });
+    Ok(())
 }
 
 impl AdapterRegistry {
@@ -902,9 +1729,11 @@ impl AdapterRegistry {
     ///    / Balancer vault each pool's [`quote_code_targets`] resolves against the
     ///    registry's [`sim_config`](Self::with_sim_config) — have their bytecode
     ///    fetched once so the first [`simulate_swap`] runs offline instead of a
-    ///    lazy `eth_getCode`. Best-effort (an offline backend leaves the lazy
-    ///    fetch in place) and typically a handful of fetches for the whole batch,
-    ///    since one quoter/router serves an entire protocol family.
+    ///    lazy `eth_getCode`. V3-family forks whose pool runtime cannot be
+    ///    reconstructed from the canonical Uniswap template (Pancake V3 and
+    ///    Slipstream) also warm the pool account itself because the quoter calls
+    ///    it recursively. Best-effort (an offline backend leaves the lazy fetch
+    ///    in place); shared entrypoints still collapse to one fetch per family.
     ///
     /// Returns one [`ColdStartOutcome`] per input pool, in **input order**. An
     /// empty slice returns `Ok(vec![])` without touching `provider`.
@@ -1046,10 +1875,11 @@ impl AdapterRegistry {
     /// first-seen order. Folds each pool's
     /// [`quote_code_targets`](PoolRegistration::quote_code_targets) (resolved
     /// against the registry's [`sim_config`](Self::with_sim_config)) and
-    /// de-duplicates — one QuoterV2 / Router02 / vault typically serves many
-    /// pools, so the returned set is a small constant regardless of pool count.
-    /// Pools with no registered adapter are skipped (they cannot be quoted, so
-    /// warming their target would be wasted).
+    /// de-duplicates. Pancake V3 and Slipstream additionally contribute their
+    /// own pool account because their real runtime cannot use the canonical
+    /// Uniswap V3 code seed and QuoterV2 calls the pool recursively. Pools with
+    /// no registered adapter are skipped (they cannot be quoted, so warming
+    /// their target would be wasted).
     fn collect_quote_code_targets(&self, pools: &[PoolRegistration]) -> Vec<Address> {
         let mut targets: Vec<Address> = Vec::new();
         for pool in pools {
@@ -1059,6 +1889,13 @@ impl AdapterRegistry {
             for target in pool.quote_code_targets(&self.sim_config) {
                 if !targets.contains(&target) {
                     targets.push(target);
+                }
+            }
+            if let Some(adapter) = self.adapter(pool.protocol()) {
+                for address in adapter.verified_code_targets(pool) {
+                    if !targets.contains(&address) {
+                        targets.push(address);
+                    }
                 }
             }
         }
@@ -1207,11 +2044,10 @@ mod tests {
         assert_eq!(v3_sync_spec(&pool), Some(V3SyncSpec::uniswap(layout)));
     }
 
-    /// PancakeSwap V3 and Slipstream use the layout-only `core` spec (slot0 +
-    /// liquidity + ticks) — their extra static/observation slots are not verified,
-    /// so hydration must not inject Uniswap's positions for them.
+    /// PancakeSwap V3 uses its verified shifted full layout; Slipstream remains
+    /// on the layout-only `core` spec until its extra slots are verified.
     #[test]
-    fn pancake_and_slipstream_use_the_core_spec_until_verified() {
+    fn pancake_uses_its_full_spec_while_slipstream_uses_core() {
         let pancake_layout = V3StorageLayout::pancake(10);
         let pancake = PoolRegistration::new(PoolKey::PancakeV3(Address::repeat_byte(0x22)))
             .with_metadata(ProtocolMetadata::PancakeV3(
@@ -1221,7 +2057,7 @@ mod tests {
             ));
         assert_eq!(
             v3_sync_spec(&pancake),
-            Some(V3SyncSpec::core(pancake_layout))
+            Some(V3SyncSpec::pancake(pancake_layout))
         );
 
         let slip_layout = V3StorageLayout::slipstream(100);
@@ -1252,12 +2088,13 @@ mod tests {
     /// The eager warm step's target collection: the distinct quote-code targets
     /// across the pools, resolved via each pool's metadata. A quoter shared by two
     /// V3 pools collapses to one entry, a distinct quoter adds a second
-    /// (order-stable), and a pool whose protocol has no registered adapter
+    /// (order-stable), a fork whose runtime cannot be reconstructed also adds
+    /// its pool account, and a pool whose protocol has no registered adapter
     /// contributes nothing (it cannot be quoted, so warming its target is wasted).
     #[test]
     fn collect_quote_code_targets_dedupes_and_skips_unadaptered_pools() {
         let (q1, q2) = (Address::repeat_byte(0xd1), Address::repeat_byte(0xd2));
-        let mut registry = AdapterRegistry::new();
+        let mut registry = AdapterRegistry::new().with_code_seeding(false);
         registry
             .register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))
             .expect("register the V3-family adapter");
@@ -1267,32 +2104,53 @@ mod tests {
                 ProtocolMetadata::UniswapV3(V3Metadata::default().with_quoter(quoter)),
             )
         };
+        let pancake_pool = Address::repeat_byte(0x05);
         let pools = vec![
             v3(0x01, q1),
             v3(0x02, q1), // same quoter -> deduped away
             v3(0x03, q2), // distinct quoter -> a second, later entry
+            PoolRegistration::new(PoolKey::PancakeV3(pancake_pool)).with_metadata(
+                ProtocolMetadata::PancakeV3(V3Metadata::default().with_quoter(q1)),
+            ),
             // A V2 pool with real metadata but NO registered V2 adapter: skipped.
             PoolRegistration::new(PoolKey::UniswapV2(Address::repeat_byte(0x04)))
                 .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata::default())),
         ];
 
-        assert_eq!(registry.collect_quote_code_targets(&pools), vec![q1, q2]);
+        assert_eq!(
+            registry.collect_quote_code_targets(&pools),
+            vec![q1, q2, pancake_pool]
+        );
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-runtime", feature = "uniswap-v2"))]
 mod hydration_tests {
     use super::*;
-    use alloy_primitives::Address;
+    use crate::adapters::{
+        AmmAdapter, CustomPoolKey, DeferredWork, PoolKey, ProtocolId, ProtocolMetadata,
+        UniswapV2Adapter, UniswapV2Metadata,
+    };
+    use alloy_primitives::{Address, B256};
     use alloy_provider::RootProvider;
     use alloy_provider::network::AnyNetwork;
     use alloy_rpc_client::RpcClient;
     use alloy_transport::mock::Asserter;
+    use evm_fork_cache::StorageFetchError;
+    use evm_fork_cache::cold_start::StorageRoundFetcher;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn mock_cache() -> EvmCache {
         let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
         EvmCache::new(Arc::new(provider)).await
+    }
+
+    #[test]
+    fn prepared_pool_job_can_cross_scheduler_await_boundaries() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PreparedPoolJob>();
     }
 
     /// `inject_and_record` (the fast `cold_start_many` hydration path) reports
@@ -1343,5 +2201,436 @@ mod hydration_tests {
             Some(U256::from(20_u64))
         );
         assert_eq!(cache.cached_storage_value(pool, fresh), Some(value));
+    }
+
+    struct EmptyState;
+
+    impl StateView for EmptyState {
+        fn storage(&self, _address: Address, _slot: U256) -> Option<U256> {
+            None
+        }
+    }
+
+    /// A registration that is deliberately ineligible for one-shot hydration
+    /// still becomes a hash-pinned prepared artifact through its adapter's
+    /// planner, without touching an `EvmCache`.
+    #[test]
+    fn resumable_fallback_prepares_an_incomplete_v2_registration() {
+        let pool_address = Address::repeat_byte(0x61);
+        let token0 = Address::repeat_byte(0xa0);
+        let token1 = Address::repeat_byte(0xa1);
+        let reserves = U256::from(7_u64) | (U256::from(11_u64) << 112);
+        let baseline = AmmStatePoint::post_block(1, 100, B256::repeat_byte(0x42));
+        let values = std::collections::HashMap::from([
+            (V2_TOKEN0_SLOT, U256::from_be_slice(token0.as_slice())),
+            (V2_TOKEN1_SLOT, U256::from_be_slice(token1.as_slice())),
+            (V2_RESERVES_SLOT, reserves),
+        ]);
+        let fetcher = StorageRoundFetcher::new(Arc::new(move |requests, block| {
+            assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+            requests
+                .into_iter()
+                .map(|(address, slot)| {
+                    (
+                        address,
+                        slot,
+                        Ok(*values.get(&slot).expect("planner requested a V2 slot")),
+                    )
+                })
+                .collect()
+        }));
+        let mut registry = AdapterRegistry::new().with_code_seeding(false);
+        registry
+            .register_adapter(Arc::new(UniswapV2Adapter::default()))
+            .unwrap();
+        let pool = PoolRegistration::new(PoolKey::UniswapV2(pool_address)).with_metadata(
+            ProtocolMetadata::UniswapV2(UniswapV2Metadata::default().with_fee_bps(30)),
+        );
+
+        let prepared = prepare_resumable_pool(
+            &registry,
+            pool,
+            baseline,
+            ColdStartPolicy::Eager,
+            Arc::new(EmptyState),
+            PreparedPoolFetchers::new(fetcher, None),
+            ResumableColdStartConfig::default(),
+        )
+        .expect("the slot-only fallback should prepare the pool");
+
+        assert_eq!(prepared.baseline(), baseline);
+        assert_eq!(prepared.registration().status, PoolStatus::Ready);
+        assert_eq!(prepared.registration().tokens(), Some(vec![token0, token1]));
+        assert_eq!(prepared.storage().len(), 3);
+        assert!(prepared.storage().iter().any(|entry| {
+            entry.address() == pool_address
+                && entry.slot() == V2_RESERVES_SLOT
+                && entry.value() == reserves
+        }));
+    }
+
+    #[test]
+    fn resumable_lazy_completion_preserves_deferred_work() {
+        let pool_address = Address::repeat_byte(0x64);
+        let baseline = AmmStatePoint::post_block(1, 102, B256::repeat_byte(0x44));
+        let reserves = U256::from(7_u64) | (U256::from(11_u64) << 112);
+        let fetcher = StorageRoundFetcher::new(Arc::new(move |requests, block| {
+            assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+            requests
+                .into_iter()
+                .map(|(address, slot)| {
+                    assert_eq!(slot, V2_RESERVES_SLOT);
+                    (address, slot, Ok(reserves))
+                })
+                .collect()
+        }));
+        let mut registry = AdapterRegistry::new().with_code_seeding(false);
+        registry
+            .register_adapter(Arc::new(UniswapV2Adapter::default()))
+            .unwrap();
+        let pool = PoolRegistration::new(PoolKey::UniswapV2(pool_address)).with_metadata(
+            ProtocolMetadata::UniswapV2(UniswapV2Metadata::default().with_fee_bps(30)),
+        );
+
+        let prepared = prepare_resumable_pool(
+            &registry,
+            pool,
+            baseline,
+            ColdStartPolicy::Lazy,
+            Arc::new(EmptyState),
+            PreparedPoolFetchers::new(fetcher, None),
+            ResumableColdStartConfig::default(),
+        )
+        .expect("the lazy fallback should prepare a searchable pool");
+
+        let expected = vec![DeferredWork::VerifySlots(vec![
+            (pool_address, V2_TOKEN0_SLOT),
+            (pool_address, V2_TOKEN1_SLOT),
+        ])];
+        assert_eq!(prepared.deferred(), expected);
+        let (_, _, _, _, deferred, _) = prepared.into_parts();
+        assert_eq!(deferred, expected);
+    }
+
+    /// Code seeds are not merely copied into a worker artifact: each one must
+    /// match an exact-hash account proof before the pool can finish.
+    #[test]
+    fn resumable_fallback_pairs_verified_code_with_its_exact_hash_proof() {
+        let pool_address = Address::repeat_byte(0x62);
+        let token0 = Address::repeat_byte(0xb0);
+        let token1 = Address::repeat_byte(0xb1);
+        let baseline = AmmStatePoint::post_block(1, 101, B256::repeat_byte(0x43));
+        let values = HashMap::from([
+            (V2_TOKEN0_SLOT, U256::from_be_slice(token0.as_slice())),
+            (V2_TOKEN1_SLOT, U256::from_be_slice(token1.as_slice())),
+            (V2_RESERVES_SLOT, U256::from(1) | (U256::from(2) << 112)),
+        ]);
+        let storage_fetcher = StorageRoundFetcher::new(Arc::new(move |requests, block| {
+            assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+            requests
+                .into_iter()
+                .map(|(address, slot)| (address, slot, Ok(values[&slot])))
+                .collect()
+        }));
+        let expected_code_hash = crate::adapters::bytecode::uniswap_v2_pair_runtime_code_hash();
+        let account_fetcher = AccountProofRoundFetcher::new(Arc::new(move |requests, block| {
+            assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+            requests
+                .into_iter()
+                .map(|(address, slots)| {
+                    assert!(slots.is_empty());
+                    (
+                        address,
+                        Ok(evm_fork_cache::AccountProof {
+                            storage_hash: B256::repeat_byte(0x91),
+                            balance: U256::ZERO,
+                            nonce: 1,
+                            code_hash: expected_code_hash,
+                            slots: Vec::new(),
+                        }),
+                    )
+                })
+                .collect()
+        }));
+        let mut registry = AdapterRegistry::new();
+        registry
+            .register_adapter(Arc::new(UniswapV2Adapter::default()))
+            .unwrap();
+        let pool = PoolRegistration::new(PoolKey::UniswapV2(pool_address))
+            .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata::default()));
+
+        let mut job = PreparedPoolJob::new(
+            &registry,
+            pool,
+            baseline,
+            ColdStartPolicy::Eager,
+            Arc::new(EmptyState),
+            PreparedPoolFetchers::new(storage_fetcher, Some(account_fetcher)),
+            ResumableColdStartConfig::default(),
+        )
+        .expect("the exact-hash proof should verify the adapter seed");
+        let prepared = match job.step().expect("the V2 planner is one round") {
+            PreparedPoolStep::Done(prepared) => prepared,
+            PreparedPoolStep::Continue { .. } => panic!("V2 should finish in one round"),
+        };
+        let accounts = prepared
+            .accounts()
+            .expect("verified code patch is attached");
+        assert_eq!(accounts.block_hash(), baseline.block_hash());
+        assert_eq!(accounts.verified_at_block(), baseline.block_number());
+        assert_eq!(accounts.values().len(), 1);
+        assert_eq!(accounts.values()[0].address(), pool_address);
+        assert_eq!(accounts.values()[0].proof().code_hash, expected_code_hash);
+        assert!(!accounts.values()[0].code().is_empty());
+    }
+
+    #[test]
+    fn prepared_round_rejects_unavailable_phases_explicitly() {
+        let address = Address::repeat_byte(0x63);
+        let cases = [
+            (
+                ColdStartPlan {
+                    accounts: vec![address],
+                    ..Default::default()
+                },
+                UnsupportedPreparedPhase::Accounts,
+            ),
+            (
+                ColdStartPlan {
+                    discover: vec![ColdStartCall::new(address, address, Bytes::new())],
+                    ..Default::default()
+                },
+                UnsupportedPreparedPhase::Discover,
+            ),
+            (
+                ColdStartPlan {
+                    probe_roots: vec![address],
+                    ..Default::default()
+                },
+                UnsupportedPreparedPhase::ProbeRoots,
+            ),
+        ];
+        for (plan, expected) in cases {
+            assert!(matches!(
+                reject_unsupported_phase(&plan),
+                Err(PreparedColdStartError::UnsupportedPhase(actual)) if actual == expected
+            ));
+        }
+    }
+
+    struct MapState(HashMap<(Address, U256), U256>);
+
+    impl StateView for MapState {
+        fn storage(&self, address: Address, slot: U256) -> Option<U256> {
+            self.0.get(&(address, slot)).copied()
+        }
+    }
+
+    struct TwoRoundAdapter {
+        address: Address,
+        first: U256,
+        second: U256,
+        probe: U256,
+    }
+
+    impl AmmAdapter for TwoRoundAdapter {
+        fn protocol(&self) -> ProtocolId {
+            ProtocolId::Custom("prepared-two-round")
+        }
+
+        fn cold_start_planner(
+            &self,
+            _pool: &PoolRegistration,
+            policy: ColdStartPolicy,
+        ) -> Result<Box<dyn AdapterColdStartPlanner>, UnsupportedReason> {
+            Ok(Box::new(TwoRoundPlanner {
+                address: self.address,
+                first: self.first,
+                second: self.second,
+                probe: self.probe,
+                policy,
+                phase: 0,
+                equivalent: true,
+            }))
+        }
+    }
+
+    struct TwoRoundPlanner {
+        address: Address,
+        first: U256,
+        second: U256,
+        probe: U256,
+        policy: ColdStartPolicy,
+        phase: u8,
+        equivalent: bool,
+    }
+
+    impl AdapterColdStartPlanner for TwoRoundPlanner {
+        fn initial_plan(&mut self, state: &dyn StateView) -> ColdStartPlan {
+            self.equivalent &= state.storage(self.address, U256::ZERO) == Some(U256::from(9));
+            ColdStartPlan {
+                verify: vec![(self.address, self.first)],
+                probe: vec![(self.address, self.probe)],
+                ..Default::default()
+            }
+        }
+
+        fn on_results(
+            &mut self,
+            results: &ColdStartResults,
+            state: &dyn StateView,
+        ) -> ColdStartStep {
+            self.phase += 1;
+            if self.phase == 1 {
+                self.equivalent &= matches!(
+                    results
+                        .probed
+                        .iter()
+                        .find(|outcome| outcome.slot == self.probe)
+                        .map(|outcome| &outcome.fetch),
+                    Some(SlotFetch::FetchFailed { .. })
+                );
+                self.equivalent &= state.storage(self.address, self.first) == Some(U256::from(5));
+                return ColdStartStep::Continue(ColdStartPlan {
+                    verify: vec![(self.address, self.second)],
+                    ..Default::default()
+                });
+            }
+            self.equivalent &= state.storage(self.address, self.first) == Some(U256::from(5));
+            self.equivalent &= state.storage(self.address, self.second) == Some(U256::from(7));
+            ColdStartStep::Done
+        }
+
+        fn finish(
+            &mut self,
+            pool: &mut PoolRegistration,
+            report: &ColdStartRunReport,
+        ) -> ColdStartOutcome {
+            if !self.equivalent || report.rounds != 2 || report.failed_slots != 1 {
+                return ColdStartOutcome::Unsupported(UnsupportedReason::Custom(
+                    "worker planner state diverged".to_string(),
+                ));
+            }
+            pool.status = PoolStatus::Ready;
+            let mut report = ColdStartReport::new(pool.key.clone(), self.policy);
+            report.status = PoolStatus::Ready;
+            ColdStartOutcome::Ready(report)
+        }
+    }
+
+    /// Verify values are layered between rounds while probe failures remain
+    /// observational, matching the canonical driver's planner contract.
+    #[test]
+    fn resumable_rounds_preserve_probe_outcomes_and_overlay_visibility() {
+        let address = Address::repeat_byte(0x71);
+        let first = U256::from(1);
+        let second = U256::from(2);
+        let probe = U256::from(3);
+        let baseline = AmmStatePoint::post_block(1, 200, B256::repeat_byte(0x52));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = Arc::clone(&calls);
+        let fetcher = StorageRoundFetcher::new(Arc::new(move |requests, block| {
+            assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+            fetch_calls.fetch_add(1, Ordering::SeqCst);
+            requests
+                .into_iter()
+                .map(|(request_address, slot)| {
+                    let result = if slot == first {
+                        Ok(U256::from(5))
+                    } else if slot == second {
+                        Ok(U256::from(7))
+                    } else {
+                        Err(StorageFetchError::custom("archive miss"))
+                    };
+                    (request_address, slot, result)
+                })
+                .collect()
+        }));
+        let mut registry = AdapterRegistry::new().with_code_seeding(false);
+        registry
+            .register_adapter(Arc::new(TwoRoundAdapter {
+                address,
+                first,
+                second,
+                probe,
+            }))
+            .unwrap();
+        let pool = PoolRegistration::new(PoolKey::Custom(CustomPoolKey::Address {
+            protocol: "prepared-two-round",
+            address,
+        }));
+        let base = MapState(HashMap::from([((address, U256::ZERO), U256::from(9))]));
+
+        let mut job = PreparedPoolJob::new(
+            &registry,
+            pool,
+            baseline,
+            ColdStartPolicy::Eager,
+            Arc::new(base),
+            PreparedPoolFetchers::new(fetcher, None),
+            ResumableColdStartConfig::default(),
+        )
+        .expect("the resumable job should be accepted");
+
+        let first_step = job.step().expect("first quantum should succeed");
+        assert!(matches!(
+            first_step,
+            PreparedPoolStep::Continue {
+                completed_rounds: 1,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let prepared = match job.step().expect("second quantum should succeed") {
+            PreparedPoolStep::Done(prepared) => prepared,
+            PreparedPoolStep::Continue { .. } => panic!("planner should finish after round two"),
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(prepared.storage().len(), 2);
+        assert!(prepared.storage().iter().any(|entry| entry.slot() == first));
+        assert!(
+            prepared
+                .storage()
+                .iter()
+                .any(|entry| entry.slot() == second)
+        );
+        assert!(!prepared.storage().iter().any(|entry| entry.slot() == probe));
+
+        let budget_calls = Arc::new(AtomicUsize::new(0));
+        let observed_budget_calls = Arc::clone(&budget_calls);
+        let bounded_fetcher = StorageRoundFetcher::new(Arc::new(move |requests, _block| {
+            observed_budget_calls.fetch_add(1, Ordering::SeqCst);
+            requests
+                .into_iter()
+                .map(|(request_address, slot)| (request_address, slot, Ok(U256::from(5))))
+                .collect()
+        }));
+        let bounded_pool = PoolRegistration::new(PoolKey::Custom(CustomPoolKey::Address {
+            protocol: "prepared-two-round",
+            address,
+        }));
+        let mut bounded = PreparedPoolJob::new(
+            &registry,
+            bounded_pool,
+            baseline,
+            ColdStartPolicy::Eager,
+            Arc::new(MapState(HashMap::from([(
+                (address, U256::ZERO),
+                U256::from(9),
+            )]))),
+            PreparedPoolFetchers::new(bounded_fetcher, None),
+            ResumableColdStartConfig { max_rounds: 1 },
+        )
+        .expect("the one-round budget is valid");
+        assert!(matches!(
+            bounded.step(),
+            Ok(PreparedPoolStep::Continue { .. })
+        ));
+        assert!(matches!(
+            bounded.step(),
+            Err(PreparedColdStartError::RoundBudgetExceeded { max_rounds: 1 })
+        ));
+        assert_eq!(budget_calls.load(Ordering::SeqCst), 1);
     }
 }

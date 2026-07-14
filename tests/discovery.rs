@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use anyhow::{Result, anyhow};
@@ -18,7 +19,8 @@ use evm_amm_state::adapters::{
     ConcentratedLiquidityAdapter, CreationLogContext, DiscoveredPool, DiscoveryError,
     DiscoverySource, EventSource, FactoryConfig, PoolDiscovery, PoolFactory, PoolKey, PoolQuery,
     PoolRegistration, ProtocolId, ProtocolMetadata, SlotChange, StateDiff, StateUpdate, StateView,
-    UniswapV2Adapter, UniswapV2FactoryConfig, UniswapV2Metadata,
+    TokenEdgeDiscoveryReport, TokenEdgeDiscoveryRequest, UniswapV2Adapter, UniswapV2FactoryConfig,
+    UniswapV2Metadata,
 };
 
 // --- counting cache ---
@@ -424,6 +426,128 @@ fn external_find_pools_only_factory_participates() -> Result<()> {
     Ok(())
 }
 
+/// A background discovery worker can prepare the exact factory reads, fetch
+/// them at its own block pin, and assemble registrations without mutating the
+/// canonical cache.
+#[test]
+fn prepared_discovery_reads_assemble_without_cache_access() -> Result<()> {
+    let factory = Address::repeat_byte(0xf2);
+    let token_a = Address::repeat_byte(0x0a);
+    let token_b = Address::repeat_byte(0x0b);
+    let pool = Address::repeat_byte(0x21);
+    let config = UniswapV2FactoryConfig::uniswap_v2(factory).with_fee_bps(30);
+    let (token0, token1) = derive::sort_tokens(token_a, token_b);
+    let expected_slot = derive::v2_get_pair_slot(config.get_pair_base_slot, token0, token1);
+    let discovery = Arc::new(PoolDiscovery::for_registry(
+        &registry_v2_v3(),
+        FactoryConfig::default().with_uniswap_v2(config),
+    ));
+
+    let prepared = discovery.prepare_reads([PoolQuery::pair(token_a, token_b)])?;
+    assert_eq!(prepared.reads(), &[(factory, expected_slot)]);
+
+    let found = discovery.assemble_prepared(&prepared, [((factory, expected_slot), word(pool))])?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].key, PoolKey::UniswapV2(pool));
+    Ok(())
+}
+
+#[test]
+fn prepared_discovery_requires_every_exact_candidate_value() -> Result<()> {
+    let factory = Address::repeat_byte(0xf2);
+    let token_a = Address::repeat_byte(0x0a);
+    let token_b = Address::repeat_byte(0x0b);
+    let discovery = PoolDiscovery::for_registry(
+        &registry_v2_v3(),
+        FactoryConfig::default().with_uniswap_v2(UniswapV2FactoryConfig::uniswap_v2(factory)),
+    );
+    let prepared = discovery.prepare_reads([PoolQuery::pair(token_a, token_b)])?;
+    let [(address, slot)] = prepared.reads() else {
+        panic!("V2 pair discovery should prepare exactly one read")
+    };
+
+    let error = discovery
+        .assemble_prepared(&prepared, std::iter::empty())
+        .expect_err("missing exact-hash result must not assemble as zero");
+    assert!(matches!(
+        error,
+        DiscoveryError::MissingPreparedValue {
+            address: missing_address,
+            slot: missing_slot,
+        } if missing_address == *address && missing_slot == *slot
+    ));
+    Ok(())
+}
+
+/// Provider-neutral prepared mode rejects a custom factory whose only query
+/// implementation requires a mutable `AdapterCache`.
+#[test]
+fn prepared_discovery_rejects_legacy_cache_factories() -> Result<()> {
+    let calls = Arc::new(LegacyFactoryCalls::default());
+    let factory = Address::repeat_byte(0xcf);
+    let discovery = PoolDiscovery::new([Box::new(CountingLegacyFactory {
+        factory,
+        pool: Address::repeat_byte(0x99),
+        calls,
+    }) as Box<dyn PoolFactory>]);
+
+    let error = discovery
+        .prepare_reads([PoolQuery::pair(
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+        )])
+        .expect_err("legacy factory must be explicit in prepared mode");
+    assert!(matches!(
+        error,
+        DiscoveryError::PreparedModeUnsupported {
+            protocol: ProtocolId::UniswapV2,
+            factory: rejected,
+        } if rejected == factory
+    ));
+    Ok(())
+}
+
+/// Synchronous fallback probes `candidate_reads` once and invokes the legacy
+/// factory once per pair. This guards against the old prepare/assemble path
+/// calling `candidate_reads` twice.
+#[test]
+fn synchronous_legacy_fallback_probes_candidate_reads_once() -> Result<()> {
+    let calls = Arc::new(LegacyFactoryCalls::default());
+    let discovery = PoolDiscovery::new([Box::new(CountingLegacyFactory {
+        factory: Address::repeat_byte(0xcf),
+        pool: Address::repeat_byte(0x99),
+        calls: Arc::clone(&calls),
+    }) as Box<dyn PoolFactory>]);
+    let mut cache = CountingCache::default();
+
+    let found = discovery.find(
+        &mut cache,
+        PoolQuery::pair(Address::repeat_byte(0x01), Address::repeat_byte(0x02)),
+    )?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(calls.candidate_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.find_pools.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+fn token_edge_request_normalizes_connectors_and_report_is_immutable() {
+    let token = Address::repeat_byte(0x0a);
+    let connector_a = Address::repeat_byte(0x01);
+    let connector_b = Address::repeat_byte(0x02);
+    let request =
+        TokenEdgeDiscoveryRequest::new(token, [connector_b, token, connector_a, connector_b])
+            .with_protocol(ProtocolId::UniswapV2);
+
+    assert_eq!(request.token(), token);
+    assert_eq!(request.connectors(), &[connector_a, connector_b]);
+    assert_eq!(request.protocol(), Some(ProtocolId::UniswapV2));
+
+    let report = TokenEdgeDiscoveryReport::new(request.clone(), Vec::new());
+    assert_eq!(report.request(), &request);
+    assert!(report.discovered().is_empty());
+}
+
 /// An empty query is a no-op.
 #[test]
 fn find_empty_query_is_empty() -> Result<()> {
@@ -615,6 +739,61 @@ fn topic(address: Address) -> B256 {
 struct StubFactory {
     factory: Address,
     pool: Address,
+}
+
+#[derive(Default)]
+struct LegacyFactoryCalls {
+    candidate_reads: AtomicUsize,
+    find_pools: AtomicUsize,
+}
+
+struct CountingLegacyFactory {
+    factory: Address,
+    pool: Address,
+    calls: Arc<LegacyFactoryCalls>,
+}
+
+impl PoolFactory for CountingLegacyFactory {
+    fn protocol(&self) -> ProtocolId {
+        ProtocolId::UniswapV2
+    }
+
+    fn factory_address(&self) -> Address {
+        self.factory
+    }
+
+    fn candidate_reads(&self, _pairs: &[(Address, Address)]) -> Vec<(Address, U256)> {
+        self.calls.candidate_reads.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    }
+
+    fn find_pools(
+        &self,
+        _cache: &mut dyn AdapterCache,
+        _pair: (Address, Address),
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        self.calls.find_pools.fetch_add(1, Ordering::SeqCst);
+        let registration = PoolRegistration::new(PoolKey::UniswapV2(self.pool))
+            .with_state_address(self.pool)
+            .with_metadata(ProtocolMetadata::UniswapV2(UniswapV2Metadata::default()));
+        Ok(vec![DiscoveredPool::new(
+            registration.key.clone(),
+            registration,
+            DiscoverySource::Query,
+        )])
+    }
+
+    fn creation_sources(&self) -> Vec<EventSource> {
+        Vec::new()
+    }
+
+    fn decode_creation(
+        &self,
+        _log: &Log,
+        _context: CreationLogContext,
+    ) -> Result<Option<DiscoveredPool>, DiscoveryError> {
+        Ok(None)
+    }
 }
 
 impl PoolFactory for StubFactory {

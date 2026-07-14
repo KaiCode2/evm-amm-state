@@ -9,8 +9,9 @@ use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_ad
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    StateDiff, StateUpdate, StateView, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
+    PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata,
+    RepairAction, SlotChange, StateDiff, StateSlot, StateUpdate, StateView, UniswapV2Metadata,
+    UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, Bytes, Log, U256};
 use alloy_sol_types::{SolCall, SolEvent};
@@ -40,6 +41,17 @@ impl AmmAdapter for UniswapV2Adapter {
             .map(|address| EventSource::direct(address, vec![Sync::SIGNATURE_HASH]))
             .into_iter()
             .collect()
+    }
+
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let Some(address) = pool.key.address() else {
+            return PoolStateDependencies::default();
+        };
+        PoolStateDependencies::default().with_slots([
+            StateSlot::new(address, V2_TOKEN0_SLOT),
+            StateSlot::new(address, V2_TOKEN1_SLOT),
+            StateSlot::new(address, V2_RESERVES_SLOT),
+        ])
     }
 
     fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {

@@ -8,18 +8,38 @@ pub mod bytecode;
 /// The [`AdapterCache`] facade over `evm-fork-cache` (reads, writes, raw calls).
 pub mod cache;
 pub mod cold_start;
+/// Progressive background cold-start scheduling.
+#[cfg(feature = "live-runtime")]
+pub mod cold_start_scheduler;
 /// [`AdapterDriver`], which applies decoded logs to a cache in caller order.
 pub mod driver;
 pub mod factory;
+/// Asynchronous single-writer cache runtime.
+#[cfg(feature = "live-runtime")]
+pub mod live_runtime;
+/// Generation-scoped runtime resource ownership indexes.
+pub mod ownership;
+/// Versioned warm-resume persistence for immutable pool registrations and hints.
+pub mod persistence;
+/// Hash-pinned state artifacts produced outside the cache actor.
+#[cfg(feature = "live-runtime")]
+pub mod prepared;
 /// The [`AmmReactiveHandler`] bridge onto the `evm-fork-cache` reactive runtime.
 pub mod reactive;
 /// The [`AdapterRegistry`] of tracked pools and protocol adapters.
 pub mod registry;
 pub mod repair;
+/// Live-runtime identity, lifecycle, version, and change vocabulary.
+pub mod runtime;
 pub mod sim;
+/// Immutable state and registry publications for concurrent readers.
+pub mod snapshot;
 pub mod state;
 pub mod storage;
 pub mod storage_sync;
+/// Alloy-specific complete-block and transactional interest driver.
+#[cfg(feature = "live-runtime")]
+pub mod subscriber_driver;
 pub mod sync_manager;
 /// The [`AmmAdapter`] protocol-adapter trait.
 pub mod traits;
@@ -59,6 +79,11 @@ pub use cold_start::{
     ColdStartError, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     HydrationError, SlotFetch, SlotOutcome, StorageAccessList, supports_one_shot_hydration,
 };
+#[cfg(feature = "live-runtime")]
+pub use cold_start_scheduler::{
+    AmmColdStartOptions, AmmColdStartWorkerConfig, AmmColdStartWorkerError,
+    AmmColdStartWorkerHandle, AmmColdStartWorkerState, AmmScheduledPool,
+};
 pub use driver::{AdapterDriver, DriverError};
 #[cfg(feature = "uniswap-v2")]
 pub use factory::UniswapV2FactoryConfig;
@@ -69,13 +94,53 @@ pub use factory::{
 };
 pub use factory::{
     CreationLogContext, DiscoveredPool, DiscoveryError, DiscoverySource, FactoryConfig,
-    PoolDiscovery, PoolFactory, PoolQuery,
+    PoolDiscovery, PoolFactory, PoolQuery, PreparedDiscoveryReads, TokenEdgeDiscoveryReport,
+    TokenEdgeDiscoveryRequest,
 };
 #[cfg(feature = "solidly-v2")]
 pub use factory::{SolidlyFactory, SolidlyFactoryConfig};
-pub use reactive::AmmReactiveHandler;
+#[cfg(feature = "live-runtime")]
+pub use live_runtime::{
+    AmmCanonicalBatch, AmmCanonicalBatchError, AmmChangeSubscription, AmmCommandId,
+    AmmCommandTicket, AmmDiscoveryOptions, AmmFactoryWatcherRegistration, AmmObserver,
+    AmmObserverError, AmmRuntime, AmmRuntimeBaseline, AmmRuntimeCommandError, AmmRuntimeConfig,
+    AmmRuntimeHandle, AmmRuntimeSpawnError, AmmRuntimeSubmitError, AmmScheduledDiscovery,
+    AmmScheduledFollowUp,
+};
+pub use ownership::{
+    AmmOwnershipError, AmmOwnershipIndex, DiscoveryOwnership, DiscoveryOwnershipRemoval,
+    PoolOwnership, PoolOwnershipRemoval, PoolStateDependencies, StateSlot,
+};
+pub use persistence::{AmmRegistrationArchive, AmmRegistrationPersistenceError};
+#[cfg(feature = "live-runtime")]
+pub use prepared::{AmmPreparedPoolState, AmmPreparedStateError, AmmPreparedStorage};
+pub use reactive::{
+    AmmPoolReactiveHandler, AmmPoolReactiveHandlerError, AmmReactiveHandler,
+    AmmReactiveRoutingContext, AmmReactiveSignal,
+};
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
+pub use runtime::{
+    AdapterGeneration, AdapterInstanceId, AdapterKey, AmmChangeImpact, AmmChangeSet,
+    AmmChangeSetError, AmmPoolChange, AmmPoolChangeKind, AmmRuntimeEvent, AmmRuntimeEventKind,
+    AmmRuntimeHealth, AmmRuntimeId, AmmRuntimeStatusSnapshot, AmmStateIncident, AmmStatePoint,
+    AmmStateQuality, AmmStateVersion, AmmWorkClass, AmmWorkKind, AmmWorkProgress,
+    DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey, InvalidPoolRuntimeTransition,
+    InvalidWorkProgress, OwnerRuntimeState, PoolGeneration, PoolInstanceId, PoolLifecycle,
+    PoolRuntimeState, PoolStateRef, PoolStateRevision, QueryEvidencePolicy, QueueDepths,
+    RegistrationEvidenceSet, RegistrationProvenance, RegistrationReorgAction,
+    RegistrationSourceKey, RuntimeLifecycleMap, RuntimeOwnerId, RuntimeSequenceOverflow,
+    RuntimeWorkId, StatePosition, WorkId,
+};
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
+pub use snapshot::{
+    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmStateCommit, AmmStateSnapshot,
+    PoolRevisionMap,
+};
+#[cfg(feature = "live-runtime")]
+pub use subscriber_driver::{
+    AmmSubscriberDriverConfig, AmmSubscriberDriverError, AmmSubscriberDriverHandle,
+    AmmSubscriberDriverState,
+};
 // Both layout types are always compiled (`storage` is feature-neutral); export
 // them unconditionally — `V3StorageLayout` is the field type of the
 // root-exported `V3Metadata.storage_layout`, and gating `SolidlyStorageLayout`
@@ -87,7 +152,12 @@ pub use storage_sync::{
     decode_storage_sync, run_and_inject_storage_sync, run_and_inject_storage_syncs,
     run_storage_sync, run_storage_syncs, slot_loader_calldata, storage_sync_spec_for_pool,
 };
-pub use sync_manager::{AmmSyncBatchReport, AmmSyncEngine, AmmSyncError};
+pub use sync_manager::{
+    AmmEvictionPolicy, AmmEvictionReport, AmmLifecycleReport, AmmPendingRepair,
+    AmmPoolGenerationReservation, AmmPoolRefreshReport, AmmPoolSubscriptionPlan,
+    AmmPreparedPoolRefresh, AmmRemovedPool, AmmSyncBatchReport, AmmSyncChangeSource, AmmSyncEngine,
+    AmmSyncError, AmmSyncIncident, AmmSyncPoolChange, AmmSyncPoolChangeKind,
+};
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,

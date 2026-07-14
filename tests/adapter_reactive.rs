@@ -14,11 +14,12 @@ use evm_amm_state::adapters::storage::{
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
 };
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, AmmReactiveHandler, BalancerTokenBalance, BalancerV2Adapter,
-    BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter,
-    CurveAdapter, CurveMetadata, CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus,
-    ProtocolMetadata, SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata,
-    V3Metadata, uniswap_v2_pair_runtime_code_hash,
+    AdapterEventError, AdapterEventKind, AdapterRegistry, AmmAdapter, AmmReactiveHandler,
+    AmmReactiveSignal, BalancerTokenBalance, BalancerV2Adapter, BalancerV2Metadata,
+    ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter, CurveAdapter, CurveMetadata,
+    CurveVariant, DeferredWork, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
+    SolidlyV2Adapter, SolidlyV2Metadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
+    uniswap_v2_pair_runtime_code_hash,
 };
 // The reactive-runtime seam these tests exercise (raw `EvmCache::apply_updates`
 // and the upstream `ResyncedReport`/`InvalidationRequest`) speaks the upstream
@@ -423,13 +424,21 @@ async fn v2_sync_applies_masked_update_through_reactive_runtime() -> Result<()> 
         StateEffectQuality::ExactFromInput
     );
     assert!(report.applied[0].resyncs.is_empty());
-    assert!(
-        report.applied[0]
-            .hook_signals
-            .iter()
-            .any(|signal| signal.namespace.as_ref() == "evm-amm-state"
-                && signal.kind.as_ref() == "amm.event")
-    );
+    let typed = report.applied[0]
+        .hook_signals
+        .iter()
+        .find_map(|signal| {
+            (signal.namespace.as_ref() == "evm-amm-state" && signal.kind.as_ref() == "amm.event")
+                .then_some(signal.payload.as_deref())
+                .flatten()?
+                .downcast_ref::<AmmReactiveSignal>()
+        })
+        .expect("AMM event hook carries a typed payload");
+    assert!(matches!(
+        typed,
+        AmmReactiveSignal::Event(event)
+            if event.pool == PoolKey::UniswapV2(pool) && event.kind == AdapterEventKind::Sync
+    ));
     Ok(())
 }
 
@@ -464,7 +473,7 @@ async fn malformed_log_does_not_abort_reactive_batch() -> Result<()> {
     runtime.register_handler(Arc::new(AmmReactiveHandler::new(v2_registry(pool, true))))?;
 
     // The whole batch must succeed (no HandlerError propagated by the malformed log).
-    runtime.ingest_batch(
+    let report = runtime.ingest_batch(
         &mut cache,
         batch(vec![
             (ReactiveInput::Log(malformed), included_context(12, 0)),
@@ -478,6 +487,23 @@ async fn malformed_log_does_not_abort_reactive_batch() -> Result<()> {
         .expect("valid Sync must have written the reserves slot");
     assert_eq!(raw & low_mask(112), reserve0);
     assert_eq!((raw >> 112) & low_mask(112), reserve1);
+    let decode_error = report
+        .applied
+        .iter()
+        .flat_map(|applied| &applied.hook_signals)
+        .filter_map(|signal| {
+            signal
+                .payload
+                .as_deref()?
+                .downcast_ref::<AmmReactiveSignal>()
+        })
+        .find(|signal| matches!(signal, AmmReactiveSignal::DecodeError { .. }))
+        .expect("malformed routed log carries a typed decode error");
+    let AmmReactiveSignal::DecodeError { pool: key, error } = decode_error else {
+        unreachable!("filtered to decode errors")
+    };
+    assert_eq!(key, &PoolKey::UniswapV2(pool));
+    assert!(matches!(error, AdapterEventError::MalformedLog(_)));
     Ok(())
 }
 

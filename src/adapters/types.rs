@@ -41,7 +41,7 @@ pub enum ProtocolId {
 
 /// Protocol-specific pool identity.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PoolKey {
     /// Uniswap V2 pair, keyed by pool address.
     UniswapV2(Address),
@@ -130,7 +130,7 @@ impl PoolKey {
 
 /// Extension point for protocol-specific pool key shapes.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CustomPoolKey {
     /// An address-keyed custom pool.
     Address {
@@ -538,6 +538,11 @@ pub struct V3Metadata {
     /// data so wider tick-crossing swaps stay fully offline, at higher
     /// cold-start cost.
     pub warm_word_radius: Option<i16>,
+    /// Exact pool storage slots verified by cold-start and owned by this
+    /// registration. Concentrated-liquidity tick/bitmap slots are dynamic, so
+    /// the runtime records the concrete warmed set here instead of claiming
+    /// unverifiable whole-account ownership.
+    pub warmed_slots: Vec<U256>,
 }
 
 impl V3Metadata {
@@ -586,6 +591,14 @@ impl V3Metadata {
     /// Set the cold-start tick-warm ± word radius (see field docs).
     pub fn with_warm_word_radius(mut self, warm_word_radius: i16) -> Self {
         self.warm_word_radius = Some(warm_word_radius);
+        self
+    }
+
+    /// Set the exact warmed pool storage slots.
+    pub fn with_warmed_slots(mut self, warmed_slots: impl IntoIterator<Item = U256>) -> Self {
+        self.warmed_slots = warmed_slots.into_iter().collect();
+        self.warmed_slots.sort_unstable();
+        self.warmed_slots.dedup();
         self
     }
 

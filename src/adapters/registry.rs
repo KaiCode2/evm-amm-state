@@ -133,10 +133,23 @@ impl AdapterRegistry {
                 pool: pool.key.clone(),
             });
         }
-        for id in served {
+        Ok(self.unregister_adapter_prevalidated(protocol))
+    }
+
+    /// Detach an adapter family after the caller has proved it owns no pools.
+    ///
+    /// This crate-private commit primitive deliberately performs no pool scan;
+    /// transactional lifecycle code preflights dependency ownership once, then
+    /// uses the same infallible detach in the primary and routing registries.
+    pub(crate) fn unregister_adapter_prevalidated(
+        &mut self,
+        protocol: ProtocolId,
+    ) -> Option<Arc<dyn AmmAdapter>> {
+        let adapter = self.adapters.get(&protocol).cloned()?;
+        for id in adapter.protocols() {
             self.adapters.remove(&id);
         }
-        Ok(Some(adapter))
+        Some(adapter)
     }
 
     /// The adapter registered for `protocol`, if any.

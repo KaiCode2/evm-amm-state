@@ -154,6 +154,25 @@ pub trait AdapterCache: StateView {
         calldata: Bytes,
         commit: bool,
     ) -> Result<CallOutcome, CacheError>;
+
+    /// Execute a raw EVM call with simulation-scoped runtime-code overrides.
+    ///
+    /// The default delegates to [`call_raw`](Self::call_raw), which is correct
+    /// for live-backed caches that can lazily resolve the callee state. Snapshot
+    /// adapters should override this when an execution helper needs to
+    /// neutralize a state-independent external side effect without mutating the
+    /// immutable base. Overrides must not survive the call.
+    fn call_raw_with_code_overrides(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        code_overrides: &[(Address, Bytes)],
+        commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        let _ = code_overrides;
+        self.call_raw(from, to, calldata, commit)
+    }
 }
 
 /// Read-only crate-owned [`StateView`] over the cache, delegating to the

@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
+### Added
+
+- Added the progressive live-runtime domain model: generation-scoped pool,
+  adapter, discovery-owner, and work identities; post-block state points;
+  checked lifecycle/version/revision/event sequences; registration provenance;
+  deterministic committed AMM change sets; and recoverable typed runtime
+  status/observer events.
+- Added deterministic `AmmSyncBatchReport::{affected_pools, pool_changes,
+  incidents, requires_full_refresh}` attribution after direct effects and
+  authoritative resync completion, including shared-state ownership,
+  degradation/recovery, coverage gaps, missed ranges, and reorgs.
+- Added typed `AmmReactiveSignal` hook payloads for decoded AMM events and
+  per-pool decode failures, avoiding debug-label parsing in integrations.
+- Added generation-scoped `AmmPoolReactiveHandler`s with exact direct,
+  shared-emitter, and adapter-defined local routing; pool-scoped hook payloads
+  (including actionable repairs) and repair IDs retain the exact
+  `PoolInstanceId` so stale generations cannot alias replacements. The public
+  compatibility handler retains its previous resync-ID format.
+- Added `AmmOwnershipIndex` and adapter-declared `PoolStateDependencies` for
+  pool/handler/adapter, associated-address, whole-account, exact-slot, emitter,
+  runtime-job, and resync ownership. Sync attribution, degradation/recovery,
+  purge handling, and explicit removal eviction now use these indexes instead
+  of registry-wide protocol-specific scans; resync ownership is registered from
+  real handler reports, consulted before shared-target fallback, and removed on
+  synchronous completion.
+- Added offline `pool_routing` coverage alongside the lifecycle benchmark and
+  documented the transactional lifecycle baselines.
+- Added transactional `AmmSyncEngine::{add_pools, remove_pools}` lifecycle APIs
+  with retained pool/adapter generations, checked successor allocation,
+  lifecycle tombstones, atomic batch rejection/rollback, typed
+  `AmmLifecycleReport`s, and incremental compatibility wrappers that preserve
+  runtime journals and pending work.
+- Added adapter-family add/remove and explicit cascade lifecycle. Default
+  removal rejects in-use adapters; cascade uses prevalidated no-scan detach
+  primitives and applies exclusive cache eviction only after the complete
+  adapter commit.
+- Added explicit `Retain`/`Exclusive` eviction reporting and exact
+  generation-owned resync cancellation. Shared-address pending requests and
+  cache slots belonging to remaining pools are preserved. Multi-pool teardown
+  batches every exact ID into one pending-queue pass, and explicit eviction is
+  fenced until the removed handler generation leaves the reorg journal so a
+  later rollback cannot rematerialize purged state.
+- Upgraded the lifecycle path to `evm-fork-cache 0.3.0`: direct/indexed pool
+  handlers declare exhaustive route indexes, indexed hit/miss dispatch skips
+  unrelated handlers, and ordered owner sets make handler churn logarithmic
+  without tombstone growth. Adapter-defined third-party routes retain the
+  compatible fallback path.
+- Added the opt-in `live-runtime` cache actor and Alloy subscriber driver:
+  sealed full-header baselines, immutable version/interest-revision snapshots,
+  complete zero-log block commits, typed reorg/degradation incidents,
+  transactional generation-owned interest add/remove, bounded reliable and
+  observer channels, recoverable snapshot/status watches, explicit
+  backpressure, bidirectional queue fairness, and prompt coordinated shutdown.
+- Added checked prepared-pool publication, non-mutating exact subscription
+  previews, hash-pinned/chunked complete-block log reconciliation, and the
+  `live_runtime_actor` creation benchmark.
+- Added progressive background cold-start: atomic exact-generation
+  reservations, bounded job admission and provider concurrency, priority/fair
+  resumable planner quanta, recoverable round progress and queue depths,
+  independent per-pool publication, cancellation-safe tombstones, and stale
+  work/baseline rejection. Worker artifacts now pair exact-hash storage with
+  root-only account/code proofs and commit verified runtime code without an
+  intermediate unverified cache state.
+- Added Stage 6 live orchestration: bounded connector and factory-event
+  discovery, background canonical repair and lazy deferred warming, exact
+  adapter/factory watcher generations, dynamic add/remove and cascade teardown,
+  capacity-one successor handoffs, stale-point retry for runtime-owned work,
+  and prompt cancellation that prevents old adapter work from escaping into a
+  replacement generation. Registration evidence is merged across independent
+  discovery owners, query revalidation is durable and owner-keyed, and
+  subscriber acknowledgement now fences interest-changing topology mutation.
+- Added incremental immutable AMM commits for search consumers, including exact
+  pool generations/revisions, state quality, complete state points, reliable
+  change subscriptions, and snapshot-safe worker overlays.
+- Added registration warm resume through the deterministic, bounded,
+  chain-scoped `AmmRegistrationArchive`. Built-in metadata and reusable read-set
+  hints restore as pending work and must pass current-baseline verification.
+- Added attached-subscriber reorg hardening: subscriber lifecycle controls are
+  serviced while canonical ingest is in flight, preventing factory-evidence
+  removal from deadlocking the same driver that delivered the reorg. Overtaking
+  multi-block replacements now walk exact parent hashes to the retained common
+  ancestor and publish every replacement block oldest-first. Dropped creation
+  hashes also prune pending and in-flight factory evidence, cancelling
+  factory-only hydration while retaining independently supported work.
+- Added indexed factory-watcher dispatch by emitter and creation topic, with
+  atomic add/remove/cascade/rollback maintenance and deterministic wildcard
+  handling. Unrelated logs no longer invoke unrelated factory decoders.
+- Added production cache-owner, lifecycle, routing, progressive cold-start, and
+  release-gate benchmark coverage with reproducible offline/live methodology.
+- Added configurable point-read batching and bulk storage strategy propagation
+  across cold start, discovery, repair, and deferred worker fetch paths.
+- Added fail-closed mainnet and Base live release runners covering swap parity,
+  discovery, liquidity event sourcing, WebSocket health, progressive first
+  routes, and chain-specific adapter gates. Curve activity can be made strict
+  with `E2E_REQUIRE_CURVE_ACTIVITY=1`; the default check reports inactive pools
+  and continues to deterministic post-soak quote parity.
+
+### Changed
+
+- Bumped the release candidate to `0.2.0` and the companion dependency to
+  `evm-fork-cache 0.3.0`; publish the companion minor release before packaging this
+  crate.
+- Canonical state quality now uses an incrementally maintained degraded-pool
+  count, and zero-change canonical commits reuse the immutable pool-revision
+  index instead of scanning or cloning it.
+- `AmmRuntimeHandle::shutdown` now resolves only after actor-owned resources,
+  including the persistent `EvmCache`, have been dropped and their final flush
+  has completed.
+- Prepared cold-start artifacts can now carry exact-block proof-verified runtime
+  code for quote dependencies whose bytecode has no embedded template. The V3
+  family uses this for PancakeSwap and Slipstream pool runtimes.
+- Pancake V3 full sync now hydrates its verified shifted storage layout: the
+  second `slot0` word containing `feeProtocol`/`unlocked`, fee-growth and
+  protocol-fee slots, and the observation ring.
+- Connector discovery accepts an optional deterministic per-request candidate
+  limit, allowing consumers to enforce a global startup pool budget.
+
+### Fixed
+
+- Immutable-snapshot V3 quotes no longer require arbitrary ERC-20 balance state:
+  a call-scoped transfer-success runtime neutralizes only the output transfer
+  before QuoterV2's intentional revert and is restored immediately afterward.
+- Background prepared-state validation now accepts self-hash-consistent,
+  exact-proof code targets declared by an adapter while continuing to require
+  predeclared hashes for embedded code seeds.
+
 ## [0.1.0] - 2026-07-07
 
 First public release.
@@ -295,5 +423,6 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0

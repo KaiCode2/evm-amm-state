@@ -22,7 +22,8 @@
 //! tick-crossing and Balancer's refresh-on-event are not "events-only" by
 //! construction, so they are out of scope for this specific claim.)
 //!
-//! Run (derives `wss://` from `E2E_RPC_URL`; default 300s, override
+//! Run (`ETH_WS_URL` takes precedence; otherwise derives `wss://` from
+//! `E2E_RPC_URL`; default 300s, override
 //! `E2E_WS_SECONDS`):
 //! ```text
 //! E2E_RPC_URL=<https-archive> cargo test --test reactive_ws_e2e -- --ignored --nocapture
@@ -129,9 +130,10 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         eprintln!("E2E_RPC_URL unset; skipping");
         return Ok(());
     };
-    let ws_url = rpc
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    let ws_url = std::env::var("ETH_WS_URL").unwrap_or_else(|_| {
+        rpc.replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    });
     let secs: u64 = std::env::var("E2E_WS_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -140,7 +142,7 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
     let provider = Arc::new(
         RootProvider::<AnyNetwork>::connect(&ws_url)
             .await
-            .context("connect wss:// (derived from E2E_RPC_URL)")?,
+            .context("connect WebSocket provider")?,
     );
 
     let b0 = provider.get_block_number().await.context("latest block")?;
@@ -282,7 +284,7 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
     Ok(())
 }
 
-/// Fast (~45s) subscription health probe: does the derived `wss://` actually
+/// Fast (~45s) subscription health probe: does the configured `wss://` actually
 /// PUSH logs? Subscribes to ALL Uniswap-V2-style `Sync` events (topic-only, no
 /// address filter — hundreds per minute on mainnet) and asserts it receives
 /// some. Isolates "subscription transport works" from "the target pool was
@@ -294,9 +296,10 @@ async fn ws_subscription_health_probe() -> Result<()> {
         eprintln!("E2E_RPC_URL unset; skipping");
         return Ok(());
     };
-    let ws_url = rpc
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    let ws_url = std::env::var("ETH_WS_URL").unwrap_or_else(|_| {
+        rpc.replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    });
     let provider = Arc::new(
         RootProvider::<AnyNetwork>::connect(&ws_url)
             .await

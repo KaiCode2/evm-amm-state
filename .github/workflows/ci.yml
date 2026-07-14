@@ -8,12 +8,26 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  checks: write
+
+defaults:
+  run:
+    working-directory: evm-amm-state
+
 jobs:
   check:
     name: test / clippy / fmt / docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: evm-amm-state
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-fork-cache
+          path: evm-fork-cache
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +70,9 @@ jobs:
       - name: Tests (no default features)
         run: cargo test --no-default-features
 
+      - name: Check (live runtime only)
+        run: cargo check --all-targets --no-default-features --features live-runtime
+
       - name: Docs
         run: cargo doc --all-features --no-deps
         env:
@@ -68,6 +85,16 @@ jobs:
         run: cargo check --features experimental-protocols
       - name: Check (experimental protocols, no default features)
         run: cargo check --no-default-features --features experimental-protocols
+
+      - name: Security audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: evm-amm-state
+          # ark-relations records tracing-subscriber 0.2.25 as an optional
+          # dependency, but it is absent from the active all-target/all-feature
+          # graph (`cargo tree -i tracing-subscriber@0.2.25 --target all`).
+          ignore: RUSTSEC-2025-0055
 
   # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
   # together, which can mask a protocol whose code/imports are not correctly
@@ -97,6 +124,12 @@ jobs:
           - curve
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: evm-amm-state
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-fork-cache
+          path: evm-fork-cache
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -118,6 +151,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: evm-amm-state
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-fork-cache
+          path: evm-fork-cache
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88

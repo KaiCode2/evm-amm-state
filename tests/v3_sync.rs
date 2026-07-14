@@ -288,7 +288,7 @@ async fn full_sync_of_an_empty_pool_is_statics_only() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pancake_layout_core_spec_uses_its_own_slot_bases() -> Result<()> {
+async fn core_spec_can_use_pancake_tick_slot_bases() -> Result<()> {
     // Pancake V3: slot0 @ 0, liquidity @ 5, ticks base @ 6, bitmap base @ 7.
     let layout = V3StorageLayout::pancake(60);
     let spec = V3SyncSpec::core(layout);

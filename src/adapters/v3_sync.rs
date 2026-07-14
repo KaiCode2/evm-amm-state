@@ -81,6 +81,14 @@ const UNISWAP_PROTOCOL_FEES_SLOT: u64 = 3;
 /// `observationCardinality` inside `slot0`.
 const UNISWAP_OBSERVATIONS_SLOT: u64 = 8;
 const UNISWAP_CARDINALITY_SHIFT: u32 = 200;
+/// PancakeSwap V3's wider `feeProtocol` makes `slot0` span two storage
+/// words. The second word holds `feeProtocol` and the `unlocked` reentrancy
+/// flag; all following canonical V3 fields are shifted by one slot.
+const PANCAKE_SLOT0_EXTENSION_SLOT: u64 = 1;
+const PANCAKE_FEE_GROWTH_0_SLOT: u64 = 2;
+const PANCAKE_FEE_GROWTH_1_SLOT: u64 = 3;
+const PANCAKE_PROTOCOL_FEES_SLOT: u64 = 4;
+const PANCAKE_OBSERVATIONS_SLOT: u64 = 9;
 
 // ---------------------------------------------------------------------------
 // Sync spec
@@ -112,7 +120,7 @@ impl V3ObservationsSpec {
 /// the storage layout (slots + tick spacing), which static slots to emit,
 /// the bitmap word range, and (optionally) the observation ring.
 ///
-/// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::core`], or
+/// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::pancake`], [`V3SyncSpec::core`], or
 /// [`V3SyncSpec::new`] — the struct is `#[non_exhaustive]` so fields can be
 /// added for further V3-family variants without a breaking release.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +203,35 @@ impl V3SyncSpec {
             ],
             observations: Some(V3ObservationsSpec {
                 array_slot: U256::from(UNISWAP_OBSERVATIONS_SLOT),
+                cardinality_shift: UNISWAP_CARDINALITY_SHIFT,
+            }),
+            min_word,
+            max_word,
+            layout,
+        }
+    }
+
+    /// PancakeSwap V3 full spec.
+    ///
+    /// Pancake's `Slot0` uses a 32-bit protocol-fee field, so Solidity spills
+    /// `feeProtocol` plus `unlocked` into slot 1. Fee growth, protocol fees,
+    /// liquidity, mappings, and the observation ring consequently sit one slot
+    /// later than canonical Uniswap V3. Warming slot 1 is correctness-critical:
+    /// leaving it at snapshot-default zero makes every offline swap revert with
+    /// `LOK` even though the price/tick word at slot 0 is present.
+    pub fn pancake(layout: V3StorageLayout) -> Self {
+        let (min_word, max_word) = full_word_range(layout.tick_spacing);
+        Self {
+            static_slots: vec![
+                layout.slot0_slot,
+                U256::from(PANCAKE_SLOT0_EXTENSION_SLOT),
+                U256::from(PANCAKE_FEE_GROWTH_0_SLOT),
+                U256::from(PANCAKE_FEE_GROWTH_1_SLOT),
+                U256::from(PANCAKE_PROTOCOL_FEES_SLOT),
+                layout.liquidity_slot,
+            ],
+            observations: Some(V3ObservationsSpec {
+                array_slot: U256::from(PANCAKE_OBSERVATIONS_SLOT),
                 cardinality_shift: UNISWAP_CARDINALITY_SHIFT,
             }),
             min_word,

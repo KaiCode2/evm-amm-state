@@ -194,10 +194,33 @@ pub fn quote_via_call_from(
     target: Address,
     calldata: Bytes,
 ) -> Result<Bytes, SimError> {
-    match cache
-        .call_raw(from, target, calldata, false)
-        .map_err(|e| SimError::Execution(Box::new(e)))?
-    {
+    classify_quote_outcome(
+        cache
+            .call_raw(from, target, calldata, false)
+            .map_err(|e| SimError::Execution(Box::new(e)))?,
+    )
+}
+
+/// Internal quote helper for a call that needs temporary runtime-code
+/// overrides on snapshot-backed execution. Live-backed caches may ignore the
+/// overrides and resolve the real callee state lazily.
+#[cfg(feature = "uniswap-v3")]
+pub(crate) fn quote_via_call_with_code_overrides_from(
+    cache: &mut dyn AdapterCache,
+    from: Address,
+    target: Address,
+    calldata: Bytes,
+    code_overrides: &[(Address, Bytes)],
+) -> Result<Bytes, SimError> {
+    classify_quote_outcome(
+        cache
+            .call_raw_with_code_overrides(from, target, calldata, code_overrides, false)
+            .map_err(|e| SimError::Execution(Box::new(e)))?,
+    )
+}
+
+fn classify_quote_outcome(outcome: CallOutcome) -> Result<Bytes, SimError> {
+    match outcome {
         CallOutcome::Success { output, .. } => Ok(output),
         CallOutcome::Revert { .. } | CallOutcome::Halt { .. } => Err(SimError::Reverted),
     }

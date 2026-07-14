@@ -9,8 +9,9 @@ use super::sim::{
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
-    ColdStartReport, EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata,
-    RepairAction, SlotChange, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
+    ColdStartReport, EventSource, PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId,
+    ProtocolMetadata, RepairAction, SlotChange, StateSlot, StateUpdate, StateView,
+    UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
 use alloy_sol_types::{SolCall, SolEvent};
@@ -339,6 +340,34 @@ impl AmmAdapter for BalancerV2Adapter {
             })
             .into_iter()
             .collect()
+    }
+
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let mut associated = pool.state_addresses.clone();
+        let mut whole_accounts = Vec::new();
+        let mut slots = Vec::new();
+        if let ProtocolMetadata::BalancerV2(metadata) = &pool.metadata {
+            if let Some(vault) = metadata
+                .vault
+                .or_else(|| pool.state_addresses.first().copied())
+            {
+                associated.push(vault);
+                slots.extend(
+                    metadata
+                        .balance_slots
+                        .iter()
+                        .copied()
+                        .map(|slot| StateSlot::new(vault, slot)),
+                );
+            }
+            if let Some(pool_address) = metadata.pool_address {
+                whole_accounts.push(pool_address);
+            }
+        }
+        PoolStateDependencies::default()
+            .with_associated_addresses(associated)
+            .with_whole_accounts(whole_accounts)
+            .with_slots(slots)
     }
 
     fn cold_start_planner(

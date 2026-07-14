@@ -453,6 +453,102 @@ impl PoolQuery {
     }
 }
 
+/// Immutable connector-focused discovery request for one token.
+///
+/// Connectors are sorted, de-duplicated, and never include `token` itself. The
+/// request deliberately contains no provider or runtime policy: it can be
+/// converted into a [`PoolQuery`] and scheduled at any exact block pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenEdgeDiscoveryRequest {
+    token: Address,
+    connectors: Vec<Address>,
+    protocol: Option<ProtocolId>,
+}
+
+impl TokenEdgeDiscoveryRequest {
+    /// Discover pools joining `token` to each configured connector.
+    pub fn new(token: Address, connectors: impl IntoIterator<Item = Address>) -> Self {
+        let mut connectors: Vec<_> = connectors
+            .into_iter()
+            .filter(|connector| *connector != token)
+            .collect();
+        connectors.sort_unstable();
+        connectors.dedup();
+        Self {
+            token,
+            connectors,
+            protocol: None,
+        }
+    }
+
+    /// Restrict the connector query to one protocol.
+    pub const fn with_protocol(mut self, protocol: ProtocolId) -> Self {
+        self.protocol = Some(protocol);
+        self
+    }
+
+    /// Token whose edges are being discovered.
+    pub const fn token(&self) -> Address {
+        self.token
+    }
+
+    /// Canonically ordered connector set.
+    pub fn connectors(&self) -> &[Address] {
+        &self.connectors
+    }
+
+    /// Optional protocol restriction.
+    pub const fn protocol(&self) -> Option<ProtocolId> {
+        self.protocol
+    }
+
+    /// Convert this request into the existing declarative query vocabulary.
+    pub fn query(&self) -> PoolQuery {
+        let query = PoolQuery::pairs(
+            self.connectors
+                .iter()
+                .copied()
+                .map(|connector| (self.token, connector)),
+        );
+        match self.protocol {
+            Some(protocol) => query.on(protocol),
+            None => query,
+        }
+    }
+}
+
+/// Completed connector-focused discovery result.
+#[derive(Clone, Debug)]
+pub struct TokenEdgeDiscoveryReport {
+    request: TokenEdgeDiscoveryRequest,
+    discovered: Vec<DiscoveredPool>,
+}
+
+impl TokenEdgeDiscoveryReport {
+    /// Pair one immutable request with its assembled discovered pools.
+    pub fn new(request: TokenEdgeDiscoveryRequest, discovered: Vec<DiscoveredPool>) -> Self {
+        Self {
+            request,
+            discovered,
+        }
+    }
+
+    /// Request that produced this report.
+    pub const fn request(&self) -> &TokenEdgeDiscoveryRequest {
+        &self.request
+    }
+
+    /// De-duplicated pools found for the connector set.
+    pub fn discovered(&self) -> &[DiscoveredPool] {
+        &self.discovered
+    }
+
+    /// Consume the report into its request and pools.
+    pub fn into_parts(self) -> (TokenEdgeDiscoveryRequest, Vec<DiscoveredPool>) {
+        (self.request, self.discovered)
+    }
+}
+
 /// Factory configuration. Defaults are intentionally empty; callers must opt in
 /// to concrete factory addresses or explicit presets. Each protocol accepts
 /// multiple factory configs (e.g. Uniswap plus a same-protocol fork), which are
@@ -1150,6 +1246,35 @@ pub enum DiscoveryError {
         /// The pool address derived from CREATE2 (init-code hash + salt).
         derived: Address,
     },
+    /// Provider-neutral prepared mode cannot execute a legacy factory whose
+    /// only query path requires a mutable [`AdapterCache`].
+    PreparedModeUnsupported {
+        /// Protocol served by the legacy factory.
+        protocol: ProtocolId,
+        /// Address identifying the legacy factory.
+        factory: Address,
+    },
+    /// A worker omitted one exact candidate value requested by its prepared plan.
+    MissingPreparedValue {
+        /// Contract whose storage was requested.
+        address: Address,
+        /// Requested storage slot.
+        slot: U256,
+    },
+    /// A worker supplied the same prepared value more than once.
+    DuplicatePreparedValue {
+        /// Contract whose storage value was duplicated.
+        address: Address,
+        /// Duplicated storage slot.
+        slot: U256,
+    },
+    /// A prepared plan was assembled against a different discovery registry.
+    PreparedFactoryMismatch {
+        /// Factory protocol recorded by the prepared plan.
+        protocol: ProtocolId,
+        /// Factory address recorded by the prepared plan.
+        factory: Address,
+    },
 }
 
 impl fmt::Display for DiscoveryError {
@@ -1161,6 +1286,22 @@ impl fmt::Display for DiscoveryError {
             Self::DerivationMismatch { mapping, derived } => write!(
                 f,
                 "factory mapping answer {mapping:?} disagrees with CREATE2 derivation {derived:?}"
+            ),
+            Self::PreparedModeUnsupported { protocol, factory } => write!(
+                f,
+                "factory {factory:?} for {protocol:?} requires mutable-cache discovery and cannot run in prepared mode"
+            ),
+            Self::MissingPreparedValue { address, slot } => write!(
+                f,
+                "prepared discovery omitted storage value {address:?}[{slot}]"
+            ),
+            Self::DuplicatePreparedValue { address, slot } => write!(
+                f,
+                "prepared discovery supplied storage value {address:?}[{slot}] more than once"
+            ),
+            Self::PreparedFactoryMismatch { protocol, factory } => write!(
+                f,
+                "prepared discovery factory {protocol:?}@{factory:?} is absent or moved"
             ),
         }
     }
@@ -1254,6 +1395,41 @@ pub trait PoolFactory: Send + Sync {
     ) -> Result<Option<DiscoveredPool>, DiscoveryError>;
 }
 
+#[derive(Clone, Debug)]
+struct PreparedFactoryQuery {
+    factory_index: usize,
+    protocol: ProtocolId,
+    factory: Address,
+    pairs: Vec<(Address, Address)>,
+    reads: Vec<(Address, U256)>,
+    legacy: bool,
+}
+
+/// Immutable provider-neutral plan for one or more discovery queries.
+///
+/// A background worker fetches [`reads`](Self::reads) at its exact block/hash
+/// pin, then returns those values to [`PoolDiscovery::assemble_prepared`]. The
+/// plan contains no cache or provider handle and is safe to retain alongside an
+/// `Arc<PoolDiscovery>`.
+#[derive(Clone, Debug)]
+pub struct PreparedDiscoveryReads {
+    reads: Vec<(Address, U256)>,
+    factories: Vec<PreparedFactoryQuery>,
+}
+
+impl PreparedDiscoveryReads {
+    /// Canonically sorted and de-duplicated `(address, slot)` values to fetch.
+    pub fn reads(&self) -> &[(Address, U256)] {
+        &self.reads
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyFactoryMode {
+    Allow,
+    Reject,
+}
+
 /// Front-end that fans discovery across registered adapter factory drivers.
 ///
 /// Factories are held in insertion order, so iteration (and thus the order of
@@ -1315,6 +1491,141 @@ impl PoolDiscovery {
         self.factories.push(factory);
     }
 
+    /// Prepare provider-neutral candidate reads for several queries.
+    ///
+    /// `candidate_reads` is evaluated exactly once for every matching
+    /// `(query, factory)` pair. The returned read set is globally sorted and
+    /// de-duplicated so a worker can fetch it in one exact-hash batch. Factories
+    /// that only implement [`PoolFactory::find_pools`] are rejected explicitly:
+    /// that legacy path requires a mutable [`AdapterCache`] and remains available
+    /// through synchronous [`find`](Self::find) / [`find_many`](Self::find_many).
+    pub fn prepare_reads(
+        &self,
+        queries: impl IntoIterator<Item = PoolQuery>,
+    ) -> Result<PreparedDiscoveryReads, DiscoveryError> {
+        self.prepare_reads_with_mode(queries, LegacyFactoryMode::Reject)
+    }
+
+    /// Assemble a prepared plan from externally fetched `(address, slot)` values.
+    ///
+    /// This method performs no cache or provider access. Every requested value
+    /// must appear exactly once; the caller remains responsible for fetching all
+    /// values at the block/hash pin associated with its work item.
+    pub fn assemble_prepared(
+        &self,
+        prepared: &PreparedDiscoveryReads,
+        values: impl IntoIterator<Item = ((Address, U256), U256)>,
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        let mut resolved = HashMap::new();
+        for ((address, slot), value) in values {
+            if resolved.insert((address, slot), value).is_some() {
+                return Err(DiscoveryError::DuplicatePreparedValue { address, slot });
+            }
+        }
+        for &(address, slot) in prepared.reads() {
+            if !resolved.contains_key(&(address, slot)) {
+                return Err(DiscoveryError::MissingPreparedValue { address, slot });
+            }
+        }
+        self.assemble_plan(prepared, &resolved, None)
+    }
+
+    fn prepare_reads_with_mode(
+        &self,
+        queries: impl IntoIterator<Item = PoolQuery>,
+        legacy_mode: LegacyFactoryMode,
+    ) -> Result<PreparedDiscoveryReads, DiscoveryError> {
+        let queries: Vec<_> = queries.into_iter().collect();
+        for query in &queries {
+            if let Some(protocol) = query.protocol
+                && !self
+                    .factories
+                    .iter()
+                    .any(|factory| factory.protocol() == protocol)
+            {
+                return Err(DiscoveryError::MissingFactory(protocol));
+            }
+        }
+
+        let mut reads = Vec::new();
+        let mut factories = Vec::new();
+        for query in queries {
+            for (factory_index, factory) in
+                self.factories.iter().enumerate().filter(|(_, factory)| {
+                    query
+                        .protocol
+                        .is_none_or(|protocol| factory.protocol() == protocol)
+                })
+            {
+                let mut factory_reads = factory.candidate_reads(&query.pairs);
+                factory_reads.sort_unstable();
+                factory_reads.dedup();
+                let legacy = !query.pairs.is_empty() && factory_reads.is_empty();
+                if legacy && legacy_mode == LegacyFactoryMode::Reject {
+                    return Err(DiscoveryError::PreparedModeUnsupported {
+                        protocol: factory.protocol(),
+                        factory: factory.factory_address(),
+                    });
+                }
+                reads.extend(factory_reads.iter().copied());
+                factories.push(PreparedFactoryQuery {
+                    factory_index,
+                    protocol: factory.protocol(),
+                    factory: factory.factory_address(),
+                    pairs: query.pairs.clone(),
+                    reads: factory_reads,
+                    legacy,
+                });
+            }
+        }
+        reads.sort_unstable();
+        reads.dedup();
+        Ok(PreparedDiscoveryReads { reads, factories })
+    }
+
+    fn assemble_plan(
+        &self,
+        prepared: &PreparedDiscoveryReads,
+        resolved: &HashMap<(Address, U256), U256>,
+        mut cache: Option<&mut dyn AdapterCache>,
+    ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for plan in &prepared.factories {
+            let factory = self.factories.get(plan.factory_index).ok_or(
+                DiscoveryError::PreparedFactoryMismatch {
+                    protocol: plan.protocol,
+                    factory: plan.factory,
+                },
+            )?;
+            if factory.protocol() != plan.protocol || factory.factory_address() != plan.factory {
+                return Err(DiscoveryError::PreparedFactoryMismatch {
+                    protocol: plan.protocol,
+                    factory: plan.factory,
+                });
+            }
+            debug_assert!(plan.reads.iter().all(|read| prepared.reads.contains(read)));
+            let pools = if plan.legacy {
+                let cache = cache
+                    .as_deref_mut()
+                    .expect("legacy plans are never exposed by prepare_reads");
+                let mut pools = Vec::new();
+                for pair in &plan.pairs {
+                    pools.extend(factory.find_pools(cache, *pair)?);
+                }
+                pools
+            } else {
+                factory.assemble_pairs(&plan.pairs, resolved)?
+            };
+            for pool in pools {
+                if seen.insert(pool.key.clone()) {
+                    found.push(pool);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Discover pools for several [`PoolQuery`]s at once, resolving the candidate
     /// slots of *all* of them in a single batched read and returning the
     /// de-duplicated union. This is the shared resolution core behind
@@ -1338,70 +1649,14 @@ impl PoolDiscovery {
         cache: &mut dyn AdapterCache,
         queries: impl IntoIterator<Item = PoolQuery>,
     ) -> Result<Vec<DiscoveredPool>, DiscoveryError> {
-        let queries: Vec<PoolQuery> = queries.into_iter().collect();
-
-        // An explicit `.on(protocol)` naming an unregistered protocol is an error.
-        for query in &queries {
-            if let Some(protocol) = query.protocol
-                && !self
-                    .factories
-                    .iter()
-                    .any(|factory| factory.protocol() == protocol)
-            {
-                return Err(DiscoveryError::MissingFactory(protocol));
-            }
-        }
-
-        // Gather the candidate slots of every (query, matching batchable factory)
-        // into one set, then resolve them all in a single batched read.
-        let mut slots: Vec<(Address, U256)> = Vec::new();
-        for query in &queries {
-            for factory in self
-                .factories
-                .iter()
-                .filter(|factory| query.protocol.is_none_or(|p| factory.protocol() == p))
-            {
-                slots.extend(factory.candidate_reads(&query.pairs));
-            }
-        }
-        slots.sort_unstable();
-        slots.dedup();
-
-        let resolved: HashMap<(Address, U256), U256> = if slots.is_empty() {
+        let prepared = self.prepare_reads_with_mode(queries, LegacyFactoryMode::Allow)?;
+        let resolved: HashMap<(Address, U256), U256> = if prepared.reads.is_empty() {
             HashMap::new()
         } else {
-            let values = cache.read_storage_slots(&slots)?;
-            slots.into_iter().zip(values).collect()
+            let values = cache.read_storage_slots(&prepared.reads)?;
+            prepared.reads.iter().copied().zip(values).collect()
         };
-
-        // Assemble, de-duplicating by pool key across (possibly overlapping) queries.
-        let mut found = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for query in &queries {
-            for factory in self
-                .factories
-                .iter()
-                .filter(|factory| query.protocol.is_none_or(|p| factory.protocol() == p))
-            {
-                let pools = if factory.candidate_reads(&query.pairs).is_empty() {
-                    // Legacy factory (no `candidate_reads`): per-pair fallback.
-                    let mut out = Vec::new();
-                    for pair in &query.pairs {
-                        out.extend(factory.find_pools(cache, *pair)?);
-                    }
-                    out
-                } else {
-                    factory.assemble_pairs(&query.pairs, &resolved)?
-                };
-                for pool in pools {
-                    if seen.insert(pool.key.clone()) {
-                        found.push(pool);
-                    }
-                }
-            }
-        }
-
-        Ok(found)
+        self.assemble_plan(&prepared, &resolved, Some(cache))
     }
 
     /// Resolve a [`PoolQuery`] into discovered pools in a single batched read.

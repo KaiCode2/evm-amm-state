@@ -5,14 +5,15 @@ use super::cold_start::{
 };
 use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote, quote_via_call_from,
-    quoteExactInputSingleCall,
+    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote,
+    quote_via_call_with_code_overrides_from, quoteExactInputSingleCall,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    StateDiff, StateUpdate, StateView, UnsupportedReason, UpdateQuality, V3Metadata,
+    PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata,
+    RepairAction, SlotChange, StateDiff, StateSlot, StateUpdate, StateView, UnsupportedReason,
+    UpdateQuality, V3Metadata,
 };
 use crate::adapters::storage::{
     V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
@@ -49,6 +50,25 @@ use pancake_v3::Swap as PancakeV3Swap;
 
 const SLOT0_PRICE_TICK_BITS: usize = 184;
 const SLOT0_TICK_SHIFT: usize = 160;
+
+/// Minimal runtime that ABI-returns `true` for any call.
+///
+/// QuoterV2 obtains its answer by executing `pool.swap`; the pool transfers the
+/// output token, then the quoter callback deliberately reverts with quote data.
+/// An immutable AMM snapshot intentionally does not carry arbitrary ERC20
+/// balance mappings, so snapshot-backed quote execution temporarily substitutes
+/// this runtime for both path tokens. Pool math and tick traversal remain real;
+/// only the transfer side effect that precedes the intentional revert is
+/// neutralized. Live-backed caches ignore the override and execute real token
+/// code/state through their lazy backend.
+const ERC20_TRANSFER_SUCCESS_RUNTIME: &[u8] = &[
+    0x60, 0x01, // PUSH1 1
+    0x60, 0x00, // PUSH1 0
+    0x52, // MSTORE
+    0x60, 0x20, // PUSH1 32
+    0x60, 0x00, // PUSH1 0
+    0xf3, // RETURN
+];
 
 /// The minimum/maximum tick a Uniswap V3 pool can reach (`±887272`). Ticks (and
 /// the tick-bitmap words derived from them) outside this range never exist, so
@@ -108,6 +128,23 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             .collect()
     }
 
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let Some(address) = pool.key.address() else {
+            return PoolStateDependencies::default();
+        };
+        let mut slots = v3_metadata(pool)
+            .map(|metadata| metadata.warmed_slots.clone())
+            .unwrap_or_default();
+        if slots.is_empty()
+            && let Some(layout) = layout_for(pool)
+        {
+            slots.extend([layout.slot0_slot, layout.liquidity_slot]);
+        }
+        PoolStateDependencies::default()
+            .with_associated_addresses([address])
+            .with_slots(slots.into_iter().map(|slot| StateSlot::new(address, slot)))
+    }
+
     fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
         config
             .concentrated_liquidity
@@ -154,6 +191,12 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         &self,
         pool: &PoolRegistration,
     ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
+        if matches!(
+            pool.protocol(),
+            ProtocolId::PancakeV3 | ProtocolId::Slipstream
+        ) {
+            return Ok(Vec::new());
+        }
         let Some(address) = pool.key.address() else {
             return Ok(Vec::new());
         };
@@ -161,6 +204,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             return Ok(Vec::new());
         };
         v3_code_seed_from_metadata(address, metadata).map(|opt| opt.into_iter().collect())
+    }
+
+    fn verified_code_targets(&self, pool: &PoolRegistration) -> Vec<Address> {
+        if matches!(
+            pool.protocol(),
+            ProtocolId::PancakeV3 | ProtocolId::Slipstream
+        ) {
+            pool.key.address().into_iter().collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn decode_event(
@@ -249,7 +303,18 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         };
         let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
-        let output = quote_via_call_from(cache, config.from, quoter, calldata)?;
+        let transfer_success = Bytes::from_static(ERC20_TRANSFER_SUCCESS_RUNTIME);
+        let code_overrides = [
+            (token_in, transfer_success.clone()),
+            (token_out, transfer_success),
+        ];
+        let output = quote_via_call_with_code_overrides_from(
+            cache,
+            config.from,
+            quoter,
+            calldata,
+            &code_overrides,
+        )?;
         let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
             .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
 
@@ -851,6 +916,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
         // Preserve the config-supplied V3 metadata (token0/token1/fee/
         // tick_spacing/layout are not at predictable storage slots and are not
         // re-fetched here).
+        record_v3_warmed_slots(pool, self.address, &self.verified_slots);
         pool.status = PoolStatus::Ready;
         report.status = PoolStatus::Ready;
 
@@ -860,6 +926,27 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
             report.deferred = self.deferred.clone();
             ColdStartOutcome::ReadyWithDeferred(report, self.deferred.clone())
         }
+    }
+}
+
+fn record_v3_warmed_slots(
+    pool: &mut PoolRegistration,
+    address: Address,
+    verified_slots: &[(Address, U256)],
+) {
+    let mut slots = verified_slots
+        .iter()
+        .filter_map(|(slot_address, slot)| (*slot_address == address).then_some(*slot))
+        .collect::<Vec<_>>();
+    slots.sort_unstable();
+    slots.dedup();
+    match &mut pool.metadata {
+        ProtocolMetadata::UniswapV3(metadata)
+        | ProtocolMetadata::PancakeV3(metadata)
+        | ProtocolMetadata::Slipstream(metadata) => {
+            metadata.warmed_slots = slots;
+        }
+        _ => {}
     }
 }
 
@@ -953,6 +1040,7 @@ fn apply_liquidity_delta(
 
 #[cfg(test)]
 mod tests {
+    use super::super::PoolKey;
     use super::*;
 
     fn gross(word0: U256) -> u128 {
@@ -975,6 +1063,55 @@ mod tests {
             assert_eq!(gross(w), g);
             assert_eq!(net(w), n);
         }
+    }
+
+    #[test]
+    fn record_warmed_slots_keeps_pool_slots_only() {
+        let address = Address::repeat_byte(0x42);
+        let other = Address::repeat_byte(0x43);
+        let mut pool = PoolRegistration::new(PoolKey::UniswapV3(address)).with_metadata(
+            ProtocolMetadata::UniswapV3(V3Metadata::default().with_tick_spacing(60)),
+        );
+
+        record_v3_warmed_slots(
+            &mut pool,
+            address,
+            &[
+                (address, U256::from(4)),
+                (other, U256::from(9)),
+                (address, U256::ZERO),
+                (address, U256::from(4)),
+            ],
+        );
+
+        let ProtocolMetadata::UniswapV3(metadata) = &pool.metadata else {
+            panic!("metadata changed protocol");
+        };
+        assert_eq!(metadata.warmed_slots, vec![U256::ZERO, U256::from(4)]);
+    }
+
+    #[test]
+    fn v3_dependencies_use_warmed_slots_not_whole_account() {
+        let address = Address::repeat_byte(0x44);
+        let pool = PoolRegistration::new(PoolKey::UniswapV3(address)).with_metadata(
+            ProtocolMetadata::UniswapV3(
+                V3Metadata::default()
+                    .with_tick_spacing(60)
+                    .with_warmed_slots([U256::from(4), U256::ZERO, U256::from(4)]),
+            ),
+        );
+
+        let dependencies = ConcentratedLiquidityAdapter::default().state_dependencies(&pool);
+
+        assert_eq!(dependencies.associated_addresses(), &[address]);
+        assert!(dependencies.whole_accounts().is_empty());
+        assert_eq!(
+            dependencies.slots(),
+            &[
+                StateSlot::new(address, U256::ZERO),
+                StateSlot::new(address, U256::from(4)),
+            ]
+        );
     }
 
     #[test]

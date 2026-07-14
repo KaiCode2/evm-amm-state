@@ -1,0 +1,45 @@
+name: Stage 10 live gates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: stage10-live
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: evm-amm-state
+
+jobs:
+  paid-rpc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: evm-amm-state
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-amm-search
+          path: evm-amm-search
+      - uses: actions/checkout@v4
+        with:
+          repository: KaiCode2/evm-fork-cache
+          path: evm-fork-cache
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            evm-amm-state
+            evm-amm-search
+
+      - name: Mainnet parity, WS health, and progressive route bootstrap
+        env:
+          E2E_RPC_URL: ${{ secrets.E2E_RPC_URL }}
+          ETH_WS_URL: ${{ secrets.ETH_WS_URL }}
+        run: ./scripts/stage10-live-gates.sh

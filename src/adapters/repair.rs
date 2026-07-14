@@ -18,7 +18,7 @@ use super::storage::{
     V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
     v3_tick_info_storage_keys_with_base, v3_word_position,
 };
-use super::{AdapterEvent, PoolRegistration, PurgeScope};
+use super::{AdapterEvent, PoolInstanceId, PoolRegistration, PurgeScope};
 
 /// Lower a `RepairAction::V3TickRange` for `pool` into executable effects:
 /// a hash-pinned [`ResyncRequest`] over the boundary tick slots, plus the
@@ -30,6 +30,7 @@ pub(crate) fn v3_tick_range_effects(
     tick_lower: i32,
     tick_upper: i32,
     ctx: &ReactiveContext,
+    instance: Option<&PoolInstanceId>,
 ) -> Vec<ReactiveEffect> {
     let Some(address) = pool.key.address() else {
         // V3 pools are address-keyed; an address-less key cannot be targeted.
@@ -49,7 +50,9 @@ pub(crate) fn v3_tick_range_effects(
     let slots = v3_tick_range_slots(&layout, tick_lower, tick_upper);
     let block = super::reactive::resync_block(ctx);
     vec![ReactiveEffect::Resync(ResyncRequest {
-        id: ResyncId::new(super::reactive::resync_id(event, address, &slots, &block)),
+        id: ResyncId::new(super::reactive::resync_id(
+            instance, event, address, &slots, &block, ctx,
+        )),
         reason: ResyncReason::HandlerRequested,
         block,
         targets: vec![ResyncTarget::StorageSlots { address, slots }],

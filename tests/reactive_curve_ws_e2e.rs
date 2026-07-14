@@ -5,8 +5,10 @@
 //!   1. **Liquidity signatures are real + flowing**: subscribe TOPIC-ONLY to the
 //!      union of every Curve event signature this adapter derives (swap +
 //!      liquidity, StableSwap + CryptoSwap, arities 2/3) and confirm liquidity
-//!      events actually arrive — i.e. the hand-derived topic hashes match live
-//!      on-chain logs (the live analog of the on-chain signature probe).
+//!      events when the network produces them. Set
+//!      `E2E_REQUIRE_CURVE_ACTIVITY=1` for a strict activity soak; the default
+//!      release check does not confuse an inactive market window with a broken
+//!      subscription or adapter.
 //!   2. **Live routing**: register 3pool (StableSwap) + tricrypto2 (CryptoSwap),
 //!      route each delivered log through the real reactive runtime, and confirm
 //!      registered-pool events apply (resync) live. Liquidity events on a given
@@ -16,7 +18,8 @@
 //!   3. **Live accuracy**: at the post-soak head `M`, a fresh pinned cache +
 //!      cold-start + `simulate_swap` == `eth_call get_dy` at `M` for BOTH variants.
 //!
-//! Run (derives `wss://` from `E2E_RPC_URL`; default 180s, override `E2E_WS_SECONDS`):
+//! Run (`ETH_WS_URL` takes precedence; otherwise derives `wss://` from
+//! `E2E_RPC_URL`; default 180s, override `E2E_WS_SECONDS`):
 //! ```text
 //! E2E_RPC_URL=<https-archive> cargo test --test reactive_curve_ws_e2e -- --ignored --nocapture
 //! ```
@@ -281,9 +284,10 @@ async fn ws_curve_liquidity_events_flow_route_and_stay_accurate() -> Result<()> 
         eprintln!("E2E_RPC_URL unset; skipping");
         return Ok(());
     };
-    let ws_url = rpc
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    let ws_url = std::env::var("ETH_WS_URL").unwrap_or_else(|_| {
+        rpc.replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    });
     let secs: u64 = std::env::var("E2E_WS_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -339,14 +343,20 @@ async fn ws_curve_liquidity_events_flow_route_and_stay_accurate() -> Result<()> 
         .into_stream();
 
     let mut liquidity_seen: HashMap<&'static str, u64> = HashMap::new();
+    let mut ecosystem_events = 0u64;
     let mut routed = 0u64;
     let mut routed_liquidity = 0u64;
+    let mut stream_ended = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
             maybe = stream.next() => {
-                let Some(log) = maybe else { break };
+                let Some(log) = maybe else {
+                    stream_ended = true;
+                    break;
+                };
+                ecosystem_events += 1;
                 // (1) ecosystem-wide liquidity-signature delivery.
                 if let Some(label) = log.topics().first().and_then(|t| liquidity_topics.get(t)) {
                     *liquidity_seen.entry(label).or_default() += 1;
@@ -368,21 +378,38 @@ async fn ws_curve_liquidity_events_flow_route_and_stay_accurate() -> Result<()> 
     }
     let total_liq: u64 = liquidity_seen.values().sum();
     eprintln!(
-        "[curve-ws] window done: routed {routed} registered-pool events ({routed_liquidity} liquidity); {total_liq} liquidity events seen ecosystem-wide: {liquidity_seen:?}"
+        "[curve-ws] window done: {ecosystem_events} matching events seen ecosystem-wide; routed {routed} registered-pool events ({routed_liquidity} liquidity); {total_liq} liquidity events: {liquidity_seen:?}"
     );
 
-    // (1) The derived liquidity-event signatures are real and flow on the live
-    // wire — the live analog of the on-chain probe. (Liquidity events are far
-    // rarer than swaps but ecosystem-wide there are plenty.)
     assert!(
-        total_liq > 0,
-        "no liquidity events matched our derived topics in {secs}s — signatures may be wrong or the window too short"
+        !stream_ended,
+        "Curve WebSocket subscription ended during soak"
     );
-    // (2) Registered pools received + applied events live.
     assert!(
-        routed > 0,
-        "no events routed to the registered pools in {secs}s (3pool/tricrypto2 inactive?)"
+        ecosystem_events > 0,
+        "no Curve events matched the derived topics in {secs}s"
     );
+
+    // Market activity is not deterministic. Strict manual soaks can require a
+    // matching ecosystem event and an event from one of the registered pools;
+    // the release matrix separately proves WebSocket delivery with its broad
+    // V2 health probe and proves Curve routing/resync with offline fixtures.
+    let require_activity = std::env::var("E2E_REQUIRE_CURVE_ACTIVITY")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+    if require_activity {
+        assert!(
+            total_liq > 0,
+            "no liquidity events matched our derived topics in {secs}s"
+        );
+        assert!(
+            routed > 0,
+            "no events routed to the registered pools in {secs}s"
+        );
+    } else if routed == 0 {
+        eprintln!(
+            "[curve-ws] registered pools were inactive; continuing with post-soak live parity"
+        );
+    }
 
     // (3) Live accuracy for ALL THREE variants at the post-soak head.
     let m = provider.get_block_number().await?;
@@ -415,7 +442,7 @@ async fn ws_curve_liquidity_events_flow_route_and_stay_accurate() -> Result<()> 
     .await?;
 
     eprintln!(
-        "[curve-ws] PASS: liquidity signatures flow live, registered-pool events route, and sim is accurate at head for all three variants (StableSwap/CryptoSwap/CryptoSwapNG)."
+        "[curve-ws] PASS: subscription stayed healthy, observed activity is reported above, and sim is accurate at head for all three variants (StableSwap/CryptoSwap/CryptoSwapNG)."
     );
     Ok(())
 }

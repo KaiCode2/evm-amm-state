@@ -41,8 +41,8 @@ use super::sim::{SimConfig, SimError, SwapQuote, get_dyCall, quote_via_call_from
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant,
-    EventSource, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
-    SlotChange, StateView, UnsupportedReason, UpdateQuality,
+    EventSource, PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata,
+    RepairAction, SlotChange, StateSlot, StateView, UnsupportedReason, UpdateQuality,
 };
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -275,6 +275,23 @@ impl AmmAdapter for CurveAdapter {
             .map(|address| EventSource::direct(address, curve_event_topics(n_coins, variant)))
             .into_iter()
             .collect()
+    }
+
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let mut associated: Vec<_> = pool.key.address().into_iter().collect();
+        associated.extend(pool.state_addresses.iter().copied());
+        let slots = match (&pool.metadata, pool.key.address()) {
+            (ProtocolMetadata::Curve(metadata), Some(address)) => metadata
+                .discovered_slots
+                .iter()
+                .copied()
+                .map(|slot| StateSlot::new(address, slot))
+                .collect(),
+            _ => Vec::new(),
+        };
+        PoolStateDependencies::default()
+            .with_associated_addresses(associated)
+            .with_slots(slots)
     }
 
     fn cold_start_planner(

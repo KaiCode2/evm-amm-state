@@ -40,6 +40,7 @@ feature flags:
 evm-amm-state = { version = "0.1", default-features = false, features = [
     "uniswap-v3",
     "curve",
+    "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
 ] }
 ```
 
@@ -300,12 +301,28 @@ requests without executing the trace/storage resync phase. The boundary and
 fallback policy are documented in
 [`docs/trace-backed-sync.md`](docs/trace-backed-sync.md).
 
-The tracked working set can change mid-lifecycle: `AmmSyncEngine::register_pools`
-adds pools (cold-start them first) and `unregister_pools` /
-`unregister_pools_evicting` remove them — the evicting variant also purges cache
-state owned exclusively by the removed pools, sparing shared-emitter state such
-as the Balancer vault. Each call rebuilds the runtime between batches, so batch
-changes rather than looping.
+The tracked working set changes transactionally without rebuilding the runtime.
+`AmmSyncEngine::add_pools` / `remove_pools` return generation-scoped
+`AmmLifecycleReport`s while preserving journals and unrelated pending work;
+`register_pools` / `unregister_pools` remain compatibility projections. Pool
+handlers use an exact upstream route index, so direct/indexed dispatch does not
+scan unrelated pools. `remove_pools_evicting` is explicit and ownership-aware:
+it purges only state exclusive to removed pools, sparing co-tenants such as the
+Balancer vault, and fences retained rollback history so a late reorg cannot
+restore an explicitly evicted generation. Teardown batches exact resync-ID
+cancellation into one pending-queue pass. Adapter families have matching add,
+default-rejecting remove, and explicit cascade APIs. See
+[`docs/live-runtime-lifecycle.md`](docs/live-runtime-lifecycle.md).
+
+With the opt-in `live-runtime` feature, `AmmRuntime` owns the thread-local cache
+inside a Tokio `LocalSet` and publishes immutable `Send + Sync` snapshots to
+search workers. Startup is anchored by a sealed full header; zero-log blocks,
+degradation, and reorg replacements remain version-coherent. The attached Alloy
+driver stages generation-owned subscriptions before topology publication and
+hash-pins a bounded union of `eth_getLogs` filters at every header. Reliable
+changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
+typed backpressure, and prompt shutdown are described in
+[`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
 
 ```mermaid
 flowchart LR
@@ -390,6 +407,41 @@ one-shot storage programs around 75–76 ms once their read-set metadata is know
 The same run measured Uniswap V3 full-pool loading at 124.8 ms, while loading
 7,670 slots. See
 [`docs/benchmarks.md`](docs/benchmarks.md) for the full table and caveats.
+
+The progressive live-runtime roadmap, including lifecycle/version/backfill
+semantics and the stage-by-stage implementation gates, is documented in
+[`docs/live-runtime-master-plan.md`](docs/live-runtime-master-plan.md). The
+corresponding reproducible measurement contract and commands live in
+[`docs/live-runtime-baselines.md`](docs/live-runtime-baselines.md). The public
+identity, lifecycle, state-point, change-set, observer-event, and typed
+compatibility-report contract is summarized in
+[`docs/live-runtime-domain.md`](docs/live-runtime-domain.md). Stage 2's
+generation-scoped pool handlers, shared-emitter routing, state/job/resync
+ownership indexes, isolation guarantees, and routing benchmarks are documented
+in [`docs/live-runtime-ownership.md`](docs/live-runtime-ownership.md).
+Stage 4's cache actor, complete-block envelope, subscriber transactions,
+publication channels, and responsiveness gates are documented in
+[`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
+Stage 5's non-blocking cold-start worker, exact-hash prepared artifacts,
+generation-safe cancellation, resumable round progress, priority scheduling,
+independent pool publication, and Stage 6's background discovery/repair,
+capacity-one handoffs, deferred warming, and dynamic adapter/factory ownership
+are documented in
+[`docs/live-runtime-progressive-cold-start.md`](docs/live-runtime-progressive-cold-start.md).
+
+Stage 9 adds `AmmRegistrationArchive`, a versioned chain-scoped sidecar for
+built-in pool registrations and reusable Curve/Balancer read-set hints. Restored
+queueable records are always `Pending` and must pass the current runtime's
+hash-pinned cold-start verification before publication; generic EVM state stays
+in `evm-fork-cache`. The deterministic, bounded file is written by same-directory
+temporary file plus atomic rename. See
+[`docs/warm-resume.md`](docs/warm-resume.md).
+
+The archive's atomic rename protects that file alone. Applications that resume
+ready pools from a persisted `EvmCache` must commit cache files, registration
+archive, and hash-certified checkpoint as one application-level generation.
+Publish a small manifest only after every generation file is flushed and synced;
+otherwise a crash can pair a newer cache with an older valid checkpoint.
 
 For event-time repair specifically, [`examples/trace_resync_latency.rs`](examples/trace_resync_latency.rs)
 compares a real Curve event through `AmmSyncEngine` with trace-only resync versus

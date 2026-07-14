@@ -6,7 +6,8 @@ use super::factory::{FactoryConfig, PoolFactory};
 use super::sim::{SimConfig, SimError, SwapQuote};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource,
-    PoolKey, PoolRegistration, ProtocolId, RepairAction, StateDiff, StateView, UnsupportedReason,
+    PoolKey, PoolRegistration, PoolStateDependencies, ProtocolId, RepairAction, StateDiff,
+    StateView, UnsupportedReason,
 };
 
 /// Protocol adapter contract for AMM-specific routing, cold-start, and decoding.
@@ -35,6 +36,18 @@ pub trait AmmAdapter: Send + Sync {
     /// generic emitter/topic routing; override for adapter-defined routing.
     fn route_log(&self, log: &Log, registry: &AdapterRegistry) -> Option<PoolKey> {
         registry.route_log_generic(log).map(|pool| pool.key.clone())
+    }
+
+    /// Declare the pool's state-associated addresses and storage ownership.
+    ///
+    /// The conservative default treats the pool key address and every explicit
+    /// `state_address` as whole-account storage. Shared-address adapters should
+    /// override this and declare exact slots so unrelated co-tenants are not
+    /// attributed every write at the shared contract.
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let mut addresses: Vec<Address> = pool.key.address().into_iter().collect();
+        addresses.extend(pool.state_addresses.iter().copied());
+        PoolStateDependencies::default().with_whole_accounts(addresses)
     }
 
     /// Build factory drivers backed by `config`, if this adapter supports
@@ -92,6 +105,18 @@ pub trait AmmAdapter: Send + Sync {
         _pool: &PoolRegistration,
     ) -> Result<Vec<AdapterCodeSeed>, BytecodeTemplateError> {
         Ok(Vec::new())
+    }
+
+    /// Runtime-code accounts that must be fetched and exact-hash verified for
+    /// snapshot-only quote execution, but whose bytecode cannot be derived from
+    /// an embedded template.
+    ///
+    /// Unlike [`code_seeds`](Self::code_seeds), these addresses carry no
+    /// predeclared hash: the background worker fetches both `eth_getCode` and an
+    /// exact-block account proof, and the cache owner accepts the prepared bytes
+    /// only when they hash to the proof's `codeHash`. The default is empty.
+    fn verified_code_targets(&self, _pool: &PoolRegistration) -> Vec<Address> {
+        Vec::new()
     }
 
     /// Decode a routed log into a semantic event with its cache updates.
