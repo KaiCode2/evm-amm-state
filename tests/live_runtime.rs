@@ -40,8 +40,9 @@ use evm_fork_cache::StateUpdate as ForkStateUpdate;
 use evm_fork_cache::bulk_storage::pack_slots_calldata;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay};
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockRef, ChainStatus, InputSource, ReactiveContext, ReactiveInput,
-    ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig, SubscriberMode,
+    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockRef, InputSource, ProviderRef,
+    ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig,
+    SubscriberMode,
 };
 use revm::Database;
 use tower::Service;
@@ -394,10 +395,10 @@ fn canonical_log_batch(
                         chain_id: Some(1),
                         source: InputSource::Synthetic,
                         chain_status: ChainStatus::Included {
-                            block: block.clone(),
+                            block,
                             confirmations: 0,
                         },
-                        block: Some(block.clone()),
+                        block: Some(block),
                         transaction_index: Some(0),
                         log_index: Some(log_index),
                     },
@@ -434,7 +435,7 @@ fn canonical_primitive_log_batch(
             chain_id: Some(1),
             source: InputSource::Synthetic,
             chain_status: ChainStatus::Included {
-                block: block.clone(),
+                block,
                 confirmations: 0,
             },
             block: Some(block),
@@ -504,7 +505,7 @@ fn raw_canonical_batch(block_number: u64) -> ReactiveInputBatch<Ethereum> {
             chain_id: Some(1),
             source: InputSource::Synthetic,
             chain_status: ChainStatus::Included {
-                block: block.clone(),
+                block,
                 confirmations: 0,
             },
             block: Some(block),
@@ -512,6 +513,43 @@ fn raw_canonical_batch(block_number: u64) -> ReactiveInputBatch<Ethereum> {
             log_index: Some(0),
         },
     )])
+}
+
+fn flashblock_batch(block_number: u64, generation: u64) -> ReactiveInputBatch<Ethereum> {
+    let flashblock = FlashblockRef {
+        provider: ProviderRef::new("base-flashblocks", generation),
+        payload_id: None,
+        index: Some(1),
+        block_number,
+        block_hash: block_hash(block_number),
+        parent_hash: Some(block_hash(block_number.saturating_sub(1))),
+        state_root: None,
+        timestamp: Some(1_700_000_000 + block_number),
+    };
+    let block = flashblock.block_ref();
+    let provider = flashblock.provider.clone();
+    ReactiveInputBatch::new(vec![
+        ReactiveInputRecord::new(
+            ReactiveInput::Log(RpcLog {
+                block_hash: Some(block.hash),
+                block_number: Some(block.number),
+                transaction_hash: Some(B256::repeat_byte(0xf1)),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                ..RpcLog::default()
+            }),
+            ReactiveContext {
+                chain_id: Some(1),
+                source: InputSource::Flashblocks,
+                chain_status: ChainStatus::Preconfirmed { flashblock },
+                block: Some(block),
+                transaction_index: Some(0),
+                log_index: Some(0),
+            },
+        )
+        .with_provider(provider),
+    ])
+    .with_delivery_scope(DeliveryScope::Preconfirmed)
 }
 
 fn empty_canonical_batch(block_number: u64) -> AmmCanonicalBatch {
@@ -533,6 +571,49 @@ fn alternate_empty_canonical_batch(block_number: u64) -> AmmCanonicalBatch {
         ReactiveInputBatch::new(Vec::new()),
     )
     .expect("alternate test header is sealed")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_is_published_then_invalidated_by_canonical_progress() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let mut previews = runtime.subscribe_preconfirmations();
+
+            let preview = runtime
+                .ingest_preconfirmation(flashblock_batch(501, 9))
+                .await?;
+            assert_eq!(preview.base_version(), AmmStateVersion::initial());
+            assert_eq!(
+                preview.base_point(),
+                AmmStatePoint::post_block(1, 500, block_hash(500))
+            );
+            assert_eq!(
+                preview.flashblock().provider,
+                ProviderRef::new("base-flashblocks", 9)
+            );
+            assert!(preview.pool_changes().is_empty());
+            assert!(runtime.latest_preconfirmation().is_some());
+            previews.changed().await?;
+            assert!(previews.borrow().is_some());
+
+            runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            previews.changed().await?;
+            assert!(previews.borrow().is_none());
+            assert!(runtime.latest_preconfirmation().is_none());
+            assert_eq!(runtime.latest_snapshot().point().block_number(), 501);
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,7 +673,9 @@ async fn alloy_driver_attaches_paused_then_stops_without_stranding_the_actor() -
                 runtime_baseline(500),
                 AmmRuntimeConfig::default(),
             )?;
-            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let asserter = Asserter::new();
+            asserter.push_success(&U256::from(1));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let subscriber =
                 AlloySubscriber::new(provider, SubscriberMode::Auto, SubscriberConfig::default());
             let driver = runtime

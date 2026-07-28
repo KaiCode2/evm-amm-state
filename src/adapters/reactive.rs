@@ -868,6 +868,12 @@ fn verify_slot_resyncs(
 }
 
 pub(crate) fn resync_block(ctx: &ReactiveContext) -> ResyncBlock {
+    if matches!(
+        &ctx.chain_status,
+        evm_fork_cache::reactive::ChainStatus::Preconfirmed { .. }
+    ) {
+        return ResyncBlock::Pending;
+    }
     if let Some(block) = context_block(ctx) {
         return ResyncBlock::Hash {
             number: block.number,
@@ -885,7 +891,9 @@ fn context_block(ctx: &ReactiveContext) -> Option<&evm_fork_cache::reactive::Blo
         | evm_fork_cache::reactive::ChainStatus::Safe { block }
         | evm_fork_cache::reactive::ChainStatus::Finalized { block } => Some(block),
         evm_fork_cache::reactive::ChainStatus::Reorged { dropped_from } => Some(dropped_from),
-        evm_fork_cache::reactive::ChainStatus::Pending => None,
+        evm_fork_cache::reactive::ChainStatus::Pending
+        | evm_fork_cache::reactive::ChainStatus::Preconfirmed { .. }
+        | _ => None,
     })
 }
 

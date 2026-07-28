@@ -17,9 +17,9 @@ use alloy_network::Ethereum;
 use alloy_primitives::{Address, U256};
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
-    HandlerId, ReactiveBatchReport, ReactiveConfig, ReactiveError, ReactiveInputBatch,
-    ReactiveInterest, ReactiveReport, ReactiveRuntime, RegisterError, ResyncFailure, ResyncId,
-    ResyncRequest, ResyncTarget,
+    ChainStatus, FlashblockRef, HandlerId, ReactiveBatchReport, ReactiveConfig, ReactiveError,
+    ReactiveInputBatch, ReactiveInterest, ReactiveReport, ReactiveRuntime, RegisterError,
+    ResyncFailure, ResyncId, ResyncRequest, ResyncTarget,
 };
 
 use super::{
@@ -607,6 +607,12 @@ pub struct AmmSyncBatchReport {
     /// Full upstream reactive report, including applied effects and resync
     /// details.
     pub reactive: ReactiveBatchReport<Ethereum>,
+    /// Flashblock represented by this disposable preview, or `None` for a
+    /// canonical ingest.
+    ///
+    /// Preconfirmed reports expose fast quote-relevant pool changes but never
+    /// mutate canonical pool health, repair ownership, or lifecycle state.
+    pub preconfirmation: Option<FlashblockRef>,
     /// Canonically ordered pools whose state or search eligibility changed.
     ///
     /// Attribution is derived after direct effects, authoritative resyncs, and
@@ -647,6 +653,11 @@ pub struct AmmSyncBatchReport {
 }
 
 impl AmmSyncBatchReport {
+    /// Flashblock provenance when this report describes speculative state.
+    pub const fn preconfirmation(&self) -> Option<&FlashblockRef> {
+        self.preconfirmation.as_ref()
+    }
+
     /// Typed adapter repair signals available to higher-level orchestration.
     ///
     /// This is additive observability: repair effects already lowered into the
@@ -729,6 +740,11 @@ impl AmmSyncEngine {
     /// Number of active registrations whose current status is degraded.
     pub const fn degraded_pool_count(&self) -> usize {
         self.degraded_pool_count
+    }
+
+    /// Discard the active Flashblock preview and restore canonical cache state.
+    pub fn discard_preconfirmation(&mut self, cache: &mut EvmCache) {
+        self.runtime.discard_preconfirmation(cache);
     }
 
     /// Whether an active degraded registration exists other than `excluded`.
@@ -1898,6 +1914,26 @@ impl AmmSyncEngine {
         reactive: ReactiveBatchReport<Ethereum>,
         defer_repairs: bool,
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
+        if let Some(flashblock) = report_preconfirmation(&reactive) {
+            let pool_changes = sync_pool_changes(&self.ownership, &reactive, &[], &[], &[]);
+            let affected_pools = pool_changes
+                .iter()
+                .map(|change| change.pool.clone())
+                .collect();
+            return Ok(AmmSyncBatchReport {
+                resync_state_updates: resync_state_update_count(&reactive),
+                resync_failures: resync_failure_count(&reactive),
+                pending_repairs: collect_pending_repairs(&reactive),
+                reactive,
+                preconfirmation: Some(flashblock),
+                affected_pools,
+                pool_changes,
+                incidents: Vec::new(),
+                requires_full_refresh: false,
+                degraded_pools: Vec::new(),
+                recovered_pools: Vec::new(),
+            });
+        }
         if reactive
             .reports
             .iter()
@@ -1989,6 +2025,7 @@ impl AmmSyncEngine {
 
         Ok(AmmSyncBatchReport {
             reactive,
+            preconfirmation: None,
             affected_pools,
             pool_changes,
             incidents,
@@ -2471,6 +2508,33 @@ fn sync_pool_changes(
     }
 
     changes.into_values().collect()
+}
+
+fn report_preconfirmation(report: &ReactiveBatchReport<Ethereum>) -> Option<FlashblockRef> {
+    let mut flashblock = None;
+    for input in report
+        .reports
+        .iter()
+        .filter_map(|report| match report.as_ref() {
+            ReactiveReport::Input(input) => Some(input),
+            _ => None,
+        })
+    {
+        let ChainStatus::Preconfirmed {
+            flashblock: current,
+        } = &input.context.chain_status
+        else {
+            continue;
+        };
+        debug_assert!(
+            flashblock
+                .as_ref()
+                .is_none_or(|existing: &FlashblockRef| existing == current),
+            "one reactive batch must represent exactly one Flashblock snapshot"
+        );
+        flashblock.get_or_insert_with(|| current.clone());
+    }
+    flashblock
 }
 
 fn collect_pending_repairs(report: &ReactiveBatchReport<Ethereum>) -> Vec<AmmPendingRepair> {
@@ -3490,7 +3554,7 @@ mod tests {
                 chain_id: Some(1),
                 source: InputSource::Synthetic,
                 chain_status: ChainStatus::Included {
-                    block: block.clone(),
+                    block,
                     confirmations: 0,
                 },
                 block: Some(block),
@@ -3609,10 +3673,10 @@ mod tests {
                     chain_id: Some(1),
                     source: InputSource::Synthetic,
                     chain_status: ChainStatus::Included {
-                        block: canonical_block.clone(),
+                        block: canonical_block,
                         confirmations: 0,
                     },
-                    block: Some(canonical_block.clone()),
+                    block: Some(canonical_block),
                     transaction_index: Some(0),
                     log_index: Some(0),
                 },
@@ -3637,7 +3701,7 @@ mod tests {
         let mut removed_log = canonical_log;
         removed_log.removed = true;
         let conflict_block = BlockRef {
-            number: 2,
+            number: 1,
             hash: B256::repeat_byte(2),
             parent_hash: Some(B256::ZERO),
             timestamp: Some(2),
@@ -3665,7 +3729,7 @@ mod tests {
                             chain_id: Some(1),
                             source: InputSource::Synthetic,
                             chain_status: ChainStatus::Reorged {
-                                dropped_from: canonical_block.clone(),
+                                dropped_from: canonical_block,
                             },
                             block: Some(canonical_block),
                             transaction_index: Some(0),
@@ -3678,7 +3742,7 @@ mod tests {
                             chain_id: Some(1),
                             source: InputSource::Synthetic,
                             chain_status: ChainStatus::Included {
-                                block: conflict_block.clone(),
+                                block: conflict_block,
                                 confirmations: 0,
                             },
                             block: Some(conflict_block),
@@ -3690,10 +3754,13 @@ mod tests {
             )
             .expect_err("the later input must fail after reorg recovery mutates the cache");
 
-        assert!(matches!(
-            error,
-            AmmSyncError::Reactive(ReactiveError::ConflictingEffects { .. })
-        ));
+        assert!(
+            matches!(
+                &error,
+                AmmSyncError::Reactive(ReactiveError::ConflictingEffects { .. })
+            ),
+            "unexpected ingest error: {error:?}"
+        );
         assert_eq!(
             cache.cached_storage_value(pool, slot),
             None,

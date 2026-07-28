@@ -5,10 +5,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use evm_fork_cache::cache::EvmSnapshot;
+use evm_fork_cache::reactive::FlashblockRef;
 
 use super::{
     AdapterInstanceId, AdapterKey, AdapterRegistry, AmmChangeSet, AmmOwnershipIndex, AmmRuntimeId,
-    AmmStatePoint, AmmStateVersion, PoolInstanceId, PoolKey, PoolRegistration, PoolStateRevision,
+    AmmStatePoint, AmmStateVersion, AmmSyncPoolChange, PoolInstanceId, PoolKey, PoolRegistration,
+    PoolStateRevision,
 };
 
 /// Registry/ownership divergence rejected before publishing a topology snapshot.
@@ -208,6 +210,94 @@ pub struct AmmStateSnapshot {
     cache: Arc<EvmSnapshot>,
     registry: Arc<AdapterRegistrySnapshot>,
     pool_revisions: Arc<PoolRevisionMap>,
+}
+
+/// Disposable AMM state preview derived from one Flashblock snapshot.
+///
+/// A preview is anchored to a canonical state version but is not itself a
+/// canonical commit. It may be replaced by a newer Flashblock or cleared when
+/// canonical progress arrives. Consumers should clone the outer `Arc`, perform
+/// simulations promptly, and never persist it as confirmed state.
+pub struct AmmPreconfirmedSnapshot {
+    runtime_id: AmmRuntimeId,
+    base_version: AmmStateVersion,
+    base_point: AmmStatePoint,
+    interest_revision: u64,
+    flashblock: FlashblockRef,
+    cache: Arc<EvmSnapshot>,
+    registry: Arc<AdapterRegistrySnapshot>,
+    pool_changes: Vec<AmmSyncPoolChange>,
+}
+
+impl AmmPreconfirmedSnapshot {
+    #[cfg_attr(not(feature = "live-runtime"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        runtime_id: AmmRuntimeId,
+        base_version: AmmStateVersion,
+        base_point: AmmStatePoint,
+        interest_revision: u64,
+        flashblock: FlashblockRef,
+        cache: Arc<EvmSnapshot>,
+        registry: Arc<AdapterRegistrySnapshot>,
+        pool_changes: Vec<AmmSyncPoolChange>,
+    ) -> Self {
+        Self {
+            runtime_id,
+            base_version,
+            base_point,
+            interest_revision,
+            flashblock,
+            cache,
+            registry,
+            pool_changes,
+        }
+    }
+
+    /// Process-unique lineage of the runtime that published this preview.
+    pub const fn runtime_id(&self) -> AmmRuntimeId {
+        self.runtime_id
+    }
+
+    /// Canonical state version from which this preview was derived.
+    pub const fn base_version(&self) -> AmmStateVersion {
+        self.base_version
+    }
+
+    /// Canonical point from which this preview was derived.
+    pub const fn base_point(&self) -> AmmStatePoint {
+        self.base_point
+    }
+
+    /// Subscriber interest revision used to route this preview.
+    pub const fn interest_revision(&self) -> u64 {
+        self.interest_revision
+    }
+
+    /// Flashblock identity and announcing-provider provenance.
+    pub const fn flashblock(&self) -> &FlashblockRef {
+        &self.flashblock
+    }
+
+    /// Immutable speculative cache state for isolated simulation overlays.
+    pub fn cache(&self) -> &EvmSnapshot {
+        &self.cache
+    }
+
+    /// Clone the immutable speculative cache snapshot.
+    pub fn cache_snapshot(&self) -> Arc<EvmSnapshot> {
+        Arc::clone(&self.cache)
+    }
+
+    /// Canonical registry topology shared with the base state version.
+    pub fn registry(&self) -> &AdapterRegistrySnapshot {
+        &self.registry
+    }
+
+    /// Pools whose quote-relevant state changed in this preview.
+    pub fn pool_changes(&self) -> &[AmmSyncPoolChange] {
+        &self.pool_changes
+    }
 }
 
 impl AmmStateSnapshot {

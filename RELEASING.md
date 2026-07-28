@@ -1,16 +1,20 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.2.0`. Publish in this order:
+The current release candidate is `0.3.0-alpha.1`. Publish in this order:
 
-1. `alloy-transport-balancer 0.2.0`;
-2. `evm-fork-cache 0.3.0`;
-3. `evm-amm-state 0.2.0`;
-4. `evm-amm-search 0.1.0`.
+1. `alloy-transport-balancer 0.3.0-alpha.1`;
+2. `evm-fork-cache 0.4.0-alpha.1`;
+3. `evm-amm-state 0.3.0-alpha.1`.
 
 The state crate intentionally keeps a versioned sibling path during development.
-Packaging removes the path and resolves `evm-fork-cache 0.3.0` from crates.io.
-Until that version is published, state packaging is expected to stop at
+Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.1` from
+crates.io. Until that version is published, state packaging is expected to stop at
 dependency resolution.
+
+The alpha accepts the documented preconfirmed-overlay lazy-read cost. A
+production rollout or stable release is blocked until the read-set retention
+gate in `docs/flashblocks-latency.md` is complete and the paid-provider
+benchmark has been repeated.
 
 ## Offline release matrix
 
@@ -90,9 +94,10 @@ cargo publish --dry-run
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.3.0` is not waived; publish and verify
-the companion crate first. Do not tag or publish until packaged-source builds,
-live gates, downstream compatibility, changelog, and benchmark evidence pass.
+resolution failure for `evm-fork-cache 0.4.0-alpha.1` is not waived; publish and
+verify the companion crate first. Do not tag or publish until packaged-source
+builds, live gates, downstream compatibility, changelog, and benchmark evidence
+pass.
 
 Publishing and tag creation are external state changes and are never performed
 as part of an ordinary validation run.

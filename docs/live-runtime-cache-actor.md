@@ -47,6 +47,32 @@ During a lifecycle handshake the actor continues servicing the driver's
 already-in-flight canonical delivery until the driver acknowledges its pause;
 that acknowledgement is the topology transaction's delivery fence.
 
+## Flashblock previews
+
+`AmmRuntimeHandle::ingest_preconfirmation` accepts only batches whose records
+carry `ChainStatus::Preconfirmed` and `DeliveryScope::Preconfirmed`. An attached
+`AlloySubscriber` forwards those batches through the same owner driver and AMM
+handlers used for canonical logs. The runtime publishes the result separately as
+`AmmPreconfirmedSnapshot` via `latest_preconfirmation()` and
+`subscribe_preconfirmations()`.
+
+A preview names its canonical base version/point, subscriber interest revision,
+exact `FlashblockRef` (including provider provenance), immutable cache state,
+registry topology, and quote-relevant pool changes. It is deliberately not an
+`AmmStateCommit`: canonical version, pool revisions, lifecycle, health, repair
+ownership, and the reliable canonical change stream do not advance. Consumers
+must treat the outer `Arc` as short-lived simulation input rather than confirmed
+state.
+
+Each cumulative Flashblock replaces the previous overlay. Canonical progress
+first restores the saved canonical cache and clears the preview watch; subscriber
+trust loss and shutdown do the same. Speculative decode/repair failures are
+reported on the preview path but cannot degrade canonical registrations. The
+actor continues to defer provider I/O, so exact and event-sourced AMM updates are
+immediately simulation-ready while a pending-tag repair should be executed by a
+caller using the synchronous `AmmSyncEngine` path or a dedicated background
+repair integration.
+
 ## Complete canonical blocks
 
 `AmmCanonicalBatch` is not an arbitrary event vector. It owns a sealed full

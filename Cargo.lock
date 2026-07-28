@@ -602,6 +602,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-transport-balancer"
+version = "0.3.0-alpha.1"
+dependencies = [
+ "alloy-json-rpc",
+ "alloy-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "alloy-transport-http"
 version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1889,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "evm-amm-state"
-version = "0.2.0"
+version = "0.3.0-alpha.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1916,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.3.0"
+version = "0.4.0-alpha.1"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
@@ -1928,6 +1941,7 @@ dependencies = [
  "alloy-rpc-client",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
+ "alloy-transport-balancer",
  "bincode",
  "foundry-fork-db",
  "futures",

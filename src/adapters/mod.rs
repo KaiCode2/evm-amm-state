@@ -133,8 +133,8 @@ pub use runtime::{
 };
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 pub use snapshot::{
-    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmStateCommit, AmmStateSnapshot,
-    PoolRevisionMap,
+    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmPreconfirmedSnapshot, AmmStateCommit,
+    AmmStateSnapshot, PoolRevisionMap,
 };
 #[cfg(feature = "live-runtime")]
 pub use subscriber_driver::{

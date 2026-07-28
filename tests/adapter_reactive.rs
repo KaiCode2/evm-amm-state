@@ -83,7 +83,7 @@ fn included_context(
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -98,7 +98,7 @@ fn reorged_context(block_number: u64, log_index: u64) -> evm_fork_cache::reactiv
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Reorged {
-            dropped_from: block.clone(),
+            dropped_from: block,
         },
         block: Some(block),
         transaction_index: Some(0),

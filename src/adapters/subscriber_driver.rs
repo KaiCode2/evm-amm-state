@@ -500,7 +500,7 @@ impl PendingSubscriberTransaction {
 
 pub(crate) fn spawn_alloy_subscriber<P>(
     runtime: AmmRuntimeHandle,
-    mut subscriber: AlloySubscriber<P, Ethereum>,
+    subscriber: AlloySubscriber<P, Ethereum>,
     config: AmmSubscriberDriverConfig,
 ) -> Result<(AmmSubscriberControl, AmmSubscriberDriverHandle), AmmSubscriberDriverError>
 where
@@ -519,8 +519,6 @@ where
     {
         base_interests.push(ReactiveInterest::Blocks(BlockInterest::default()));
     }
-    subscriber.register_interests(&base_interests)?;
-
     let (command_tx, command_rx) = mpsc::channel(config.control_capacity);
     let (state_tx, state_rx) = watch::channel(AmmSubscriberDriverState::Paused);
     let canonical_lineage = initial_canonical_lineage(runtime.latest_snapshot().point());
@@ -530,6 +528,7 @@ where
     let actor = AlloyAmmSubscriberDriver {
         runtime,
         subscriber,
+        initial_interests: base_interests,
         commands: command_rx,
         state: state_tx,
         paused: true,
@@ -555,6 +554,7 @@ where
 struct AlloyAmmSubscriberDriver<P> {
     runtime: AmmRuntimeHandle,
     subscriber: AlloySubscriber<P, Ethereum>,
+    initial_interests: Vec<ReactiveInterest<Ethereum>>,
     commands: mpsc::Receiver<SubscriberControlCommand>,
     state: watch::Sender<AmmSubscriberDriverState>,
     paused: bool,
@@ -579,7 +579,14 @@ where
     P: Provider<Ethereum> + Clone + Send + Sync + 'static,
 {
     async fn run(mut self) {
-        let result = self.run_inner().await;
+        let result = match self
+            .subscriber
+            .register_interests(&self.initial_interests)
+            .await
+        {
+            Ok(()) => self.run_inner().await,
+            Err(error) => Err(error.into()),
+        };
         let message = match result {
             Err(error) => {
                 let message = error.to_string();
@@ -820,7 +827,7 @@ where
         let replacement = match self.subscriber.stage_interest_owner_replacement(
             plan.owner().clone(),
             plan.interests(),
-            SubscriberOwnerStart::PostBlock(block.clone()),
+            SubscriberOwnerStart::PostBlock(block),
         ) {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -963,7 +970,7 @@ where
             let epoch = match self.subscriber.stage_interest_owner(
                 plan.owner().clone(),
                 plan.interests(),
-                SubscriberOwnerStart::PostBlock(block.clone()),
+                SubscriberOwnerStart::PostBlock(block),
             ) {
                 Ok(epoch) => epoch,
                 Err(error) => {
@@ -1002,6 +1009,17 @@ where
         &mut self,
         batch: evm_fork_cache::reactive::SubscriberInputBatch<Ethereum>,
     ) -> Result<(), AmmSubscriberDriverError> {
+        if !batch.records().is_empty()
+            && batch
+                .records()
+                .iter()
+                .all(|record| record.scope().is_preconfirmed())
+        {
+            self.runtime
+                .ingest_preconfirmation(batch.into_reactive_batch())
+                .await?;
+            return Ok(());
+        }
         let mut headers = Vec::new();
         for scoped in batch.into_records() {
             if !scoped.scope().is_canonical() {
@@ -1154,10 +1172,10 @@ where
                     chain_id: Some(point.chain_id()),
                     source: InputSource::Batch,
                     chain_status: ChainStatus::Included {
-                        block: block.clone(),
+                        block,
                         confirmations: 0,
                     },
-                    block: Some(block.clone()),
+                    block: Some(block),
                     transaction_index: log.transaction_index,
                     log_index: log.log_index,
                 };
@@ -1410,7 +1428,7 @@ mod tests {
                 chain_id: Some(1),
                 source: InputSource::Synthetic,
                 chain_status: ChainStatus::Included {
-                    block: block.clone(),
+                    block,
                     confirmations: 0,
                 },
                 block: Some(block),
@@ -1828,7 +1846,9 @@ mod tests {
                 worker.shutdown();
 
                 let reconciliation = Asserter::new();
-                reconciliation.push_success(&U256::from(1));
+                reconciliation.push_success(&U256::from(1)); // eth_chainId
+                reconciliation.push_success(&U256::from(1)); // eth_newFilter
+                reconciliation.push_success(&U256::from(2)); // eth_newFilter
                 let canonical_block: Block = Block::empty(header(501, baseline_header.hash));
                 reconciliation.push_success(&Some(canonical_block.clone()));
                 reconciliation.push_success(&Some(canonical_block));
@@ -1847,6 +1867,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: true,
@@ -1927,6 +1948,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: true,
@@ -2009,6 +2031,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: false,

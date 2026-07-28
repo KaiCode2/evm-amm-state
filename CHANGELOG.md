@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.1] - 2026-07-28
+
+### Added
+
+- Added immutable `AmmPreconfirmedSnapshot` publication and observation APIs,
+  including exact Flashblock/provider provenance and quote-relevant pool
+  changes over a disposable cache view.
+- Added direct and attached-subscriber preconfirmation ingestion. Canonical
+  progress, topology changes, trust loss, shutdown, or an explicit discard
+  invalidate the speculative view without incrementing the canonical AMM state
+  version.
+
+### Changed
+
+- Upgraded the live runtime to `evm-fork-cache 0.4.0-alpha.1` and its
+  asynchronous subscriber registration contract.
+- Canonical full-header ingestion now preserves the complete verified EVM block
+  environment while exact-hash pinning provider reads.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added
@@ -423,6 +442,7 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...HEAD
+[0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0

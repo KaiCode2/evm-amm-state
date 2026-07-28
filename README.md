@@ -37,7 +37,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.1", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.1", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -324,6 +324,20 @@ changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
 
+The same attached subscriber can opt into Base or OP Flashblocks through
+`evm-fork-cache`. Preconfirmed logs pass through the existing AMM handlers—there
+is no second protocol adapter path—and publish an `AmmPreconfirmedSnapshot`
+through `latest_preconfirmation` / `subscribe_preconfirmations`. Each preview is
+anchored to the current canonical version, carries its `FlashblockRef` and
+announcing provider ID, and exposes an immutable cache snapshot plus the affected
+pool changes for immediate simulation. A newer Flashblock replaces it; canonical
+progress, subscriber trust loss, explicit discard, or shutdown invalidates it.
+Speculative decode/resync failures never degrade canonical pool health or create
+canonical repair ownership. Direct `AmmSyncEngine::ingest_batch` still executes
+pending-tag resyncs; the cache-owner runtime keeps provider I/O deferred, so its
+fast preview path is strongest for the exact/event-sourced swap updates listed in
+the protocol table above.
+
 ```mermaid
 flowchart LR
     A["AMM log"] --> B["Adapter decode"]
@@ -487,6 +501,7 @@ Everything else is env-gated and prints a skip message when unset:
 | --- | --- | --- |
 | [`custom_adapter`](examples/custom_adapter.rs) | third-party adapter, register → quote | — |
 | [`adapter_pipeline`](examples/adapter_pipeline.rs) | register → cold-start → WS react → quote | `ETH_WS_URL` or `E2E_RPC_URL` |
+| [`flashblocks_latency_live`](examples/flashblocks_latency_live.rs) | Base Flashblocks vs canonical cache/quote latency | `BASE_HTTP_URL` and `BASE_WS_URL` |
 | [`factory_discovery_live`](examples/factory_discovery_live.rs) | discovery → cold-start → reactive | `E2E_RPC_URL` |
 | [`declarative_discovery`](examples/declarative_discovery.rs) | token-basket `PoolQuery` → `cold_start_many` | `E2E_RPC_URL` |
 | [`token_basket_bench`](examples/token_basket_bench.rs) | batched vs per-pair discovery timing | `E2E_RPC_URL` |
