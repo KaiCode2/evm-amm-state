@@ -2,7 +2,10 @@
 
 //! Offline acceptance tests for representative AMM quote read-set warming.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use alloy_primitives::{Address, Bytes, U256, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
@@ -10,11 +13,12 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
 use evm_amm_state::adapters::{
-    AdapterRegistry, PoolKey, PoolRegistration, ProtocolMetadata, QuoteReadSetLimits, QuoteWarmup,
-    QuoteWarmupError, SimConfig, UniswapV2Adapter, UniswapV2Metadata,
+    AdapterCache, AdapterRegistry, AmmAdapter, CustomPoolKey, PoolKey, PoolRegistration,
+    ProtocolId, ProtocolMetadata, QuoteReadSetLimits, QuoteWarmup, QuoteWarmupError, SimConfig,
+    SimError, SwapQuote, UniswapV2Adapter, UniswapV2Metadata,
 };
-use evm_fork_cache::AccountProof;
 use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::{AccountProof, ReadSetHydrationFailure};
 use revm::state::{AccountInfo, Bytecode};
 
 async fn setup_cache() -> EvmCache {
@@ -38,6 +42,68 @@ fn install_runtime(cache: &mut EvmCache, address: Address, runtime: &str) {
             account_id: None,
         },
     );
+}
+
+struct DivergentQuoteAdapter {
+    calls: AtomicU64,
+}
+
+impl AmmAdapter for DivergentQuoteAdapter {
+    fn protocol(&self) -> ProtocolId {
+        ProtocolId::Custom("divergent-quote")
+    }
+
+    fn simulate_swap(
+        &self,
+        _pool: &PoolRegistration,
+        _cache: &mut dyn AdapterCache,
+        _token_in: Address,
+        _token_out: Address,
+        _amount_in: U256,
+        _config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        Ok(SwapQuote::new(U256::from(
+            self.calls.fetch_add(1, Ordering::Relaxed) + 1,
+        )))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warmup_rejects_an_offline_quote_that_differs_from_canonical() -> Result<()> {
+    let pool_address = Address::repeat_byte(0x10);
+    let key = PoolKey::Custom(CustomPoolKey::Address {
+        protocol: "divergent-quote",
+        address: pool_address,
+    });
+    let request = QuoteWarmup::exact_input(
+        key.clone(),
+        Address::repeat_byte(0x01),
+        Address::repeat_byte(0x02),
+        U256::from(1_000),
+    );
+    let mut cache = setup_cache().await;
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(Arc::new(DivergentQuoteAdapter {
+        calls: AtomicU64::new(0),
+    }))?;
+    registry.register_pool(PoolRegistration::new(key))?;
+
+    let error = registry
+        .warm_quote_read_sets(&mut cache, [request.clone()])
+        .expect_err("offline replay returned a different quote");
+
+    assert!(matches!(
+        error,
+        QuoteWarmupError::ReplayMismatch {
+            request: failed,
+            canonical,
+            offline,
+        } if *failed == request
+            && canonical.amount_out == U256::from(1)
+            && offline.amount_out == U256::from(2)
+    ));
+    assert!(registry.quote_read_set(&request).is_none());
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -181,6 +247,58 @@ async fn learned_quotes_refresh_at_the_exact_cache_pin_and_revalidate_offline() 
         Some(U256::from(9_999))
     );
     registry.validate_quote_read_sets(cache.snapshot(), [&key])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quote_hydration_preserves_typed_upstream_failure_causes() -> Result<()> {
+    let pool = Address::repeat_byte(0x26);
+    let router = Address::repeat_byte(0x27);
+    let token0 = Address::repeat_byte(0x28);
+    let token1 = Address::repeat_byte(0x29);
+    let mut cache = setup_cache().await;
+    cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    install_runtime(
+        &mut cache,
+        router,
+        include_str!("fixtures/mock_v2_router_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(router, U256::ZERO, U256::from(1))?;
+
+    let key = PoolKey::UniswapV2(pool);
+    let mut registry =
+        AdapterRegistry::new().with_sim_config(SimConfig::default().with_v2_router(router));
+    registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
+    registry.register_pool(
+        PoolRegistration::new(key.clone()).with_metadata(ProtocolMetadata::UniswapV2(
+            UniswapV2Metadata::default()
+                .with_token0(token0)
+                .with_token1(token1)
+                .with_fee_bps(30),
+        )),
+    )?;
+    registry.warm_quote_read_sets(
+        &mut cache,
+        [QuoteWarmup::exact_input(
+            key,
+            token0,
+            token1,
+            U256::from(1_000_u64),
+        )],
+    )?;
+    cache.set_account_proof_fetcher(Arc::new(|_requests, _block| Vec::new()));
+
+    let report = registry.hydrate_quote_read_sets(&mut cache);
+
+    assert!(!report.is_complete());
+    assert!(report.failures.iter().any(|failure| matches!(
+        failure,
+        ReadSetHydrationFailure::ProofResultMissing { address } if *address == router
+    )));
     Ok(())
 }
 

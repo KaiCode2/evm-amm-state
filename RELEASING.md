@@ -12,32 +12,38 @@ crates.io. Until that version is published, state packaging is expected to stop 
 dependency resolution.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
-hydration, provider-read-free preview replay, and retention of generation-local
-lazy fills across cumulative overlay replacement. Historical paid QuickNode
-and Alchemy Base results, plus the current provider-specific revalidation
-status, are recorded in `docs/flashblocks-latency.md`; every release candidate
-must still repeat the documented paid-provider gate.
+hydration, exact equality between the canonical warm-up quote and its immediate
+provider-read-free replay, and retention of generation-local lazy fills across
+cumulative overlay replacement. Historical paid QuickNode and Alchemy Base
+results, plus the current provider-specific revalidation status, are recorded
+in `docs/flashblocks-latency.md`; every release candidate must still repeat the
+documented paid-provider gate.
 
 ## Offline release matrix
 
 ```bash
 cargo fmt --all -- --check
-cargo test --all-features
-cargo test
-cargo test --no-default-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo clippy --all-targets --no-default-features -- -D warnings
-cargo check --all-targets --no-default-features --features live-runtime
+cargo test --locked --all-features
+cargo test --locked
+cargo test --locked --no-default-features
+cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --no-deps -- -D warnings
+cargo check --locked --all-targets --no-default-features --features live-runtime
 for f in uniswap-v2 uniswap-v3 pancake-v3 slipstream balancer-v2 solidly-v2 curve; do
-  cargo clippy --all-targets --no-default-features --features "adapters,$f" -- -D warnings
+  cargo clippy --locked --all-targets --no-default-features --features "adapters,$f" --no-deps -- -D warnings
 done
-RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
-cargo +1.90.0 check --all-features
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
+cargo +1.90.0 check --locked --all-features
+bash scripts/check-authoring-hygiene.sh
 bash scripts/check-security-exceptions.sh
 cargo audit --ignore RUSTSEC-2025-0055
 cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' &&
   exit 1 || true
 ```
+
+Confirm every third-party workflow action and sibling checkout matches the full
+commit recorded in `SECURITY.md`. A tag, branch, or unresolved candidate
+placeholder is a release blocker.
 
 `RUSTSEC-2025-0055` is narrowly ignored because `ark-relations` records
 `tracing-subscriber 0.2.25` only through an inactive optional proof-system
@@ -48,9 +54,9 @@ entry disappears without the exception being removed.
 Run the offline performance gates:
 
 ```bash
-cargo bench --bench runtime_lifecycle
-cargo bench --bench pool_routing
-cargo bench --all-features --bench live_runtime_actor
+cargo bench --locked --bench runtime_lifecycle
+cargo bench --locked --bench pool_routing
+cargo bench --locked --all-features --bench live_runtime_actor
 ```
 
 ## Live gates
@@ -98,8 +104,8 @@ in-flight V3 work could become stale after subscriber attachment.
 ## Packaging
 
 ```bash
-cargo package --list
-cargo publish --dry-run
+cargo package --list --locked
+cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency

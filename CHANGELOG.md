@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added representative AMM quote read-set learning, exact-canonical hydration,
-  offline preview-readiness replay, bounded manifest growth, and runtime-code
-  identity invalidation.
+  exact canonical-to-offline quote equality, offline preview-readiness replay,
+  bounded manifest growth, typed hydration failures, and runtime-code identity
+  invalidation.
 - Added automatic next-canonical background hydration for quote-only slots that
   an unexpected speculative path discovered, keeping provider I/O off the
   preview actor.
@@ -39,9 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Raised the minimum supported Rust version to 1.90 and updated the locked
   `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+- CI and live gates now use the checked-in lockfile, immutable third-party
+  action revisions, exact sibling candidate commits, and a release-delta
+  authoring-hygiene check.
 
 ### Fixed
 
+- Representative warm-up now rejects and atomically withholds manifests when
+  the immediate RPC-disconnected replay returns a different `SwapQuote` from
+  the canonical execution.
 - Flashblock previews now fail closed when ingest requires a full refresh,
   schedules or fails a repair/resync, reports unknown pool impact, or applies a
   non-ready update quality. Rejected speculative work restores canonical cache

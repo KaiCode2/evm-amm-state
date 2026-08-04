@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
+use evm_fork_cache::ReadSetHydrationFailure;
 use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay, EvmSnapshot, MissingState};
 use revm::database_interface::Database;
@@ -138,8 +139,8 @@ pub struct QuoteReadSetHydrationReport {
     pub accounts_refreshed: usize,
     /// Storage slots refreshed at the same pin.
     pub slots_refreshed: usize,
-    /// Account proof/fetch failures.
-    pub account_failures: Vec<(Address, String)>,
+    /// Typed proof, provider, code-residency, or proof-shape failures.
+    pub failures: Vec<ReadSetHydrationFailure>,
     /// Code identity changes that invalidated learned manifests.
     pub code_changes: Vec<(Address, B256, B256)>,
     /// Manifests invalidated by a code/layout change.
@@ -151,7 +152,7 @@ pub struct QuoteReadSetHydrationReport {
 impl QuoteReadSetHydrationReport {
     /// Whether every manifest remains valid and fully resident.
     pub fn is_complete(&self) -> bool {
-        self.account_failures.is_empty()
+        self.failures.is_empty()
             && self.code_changes.is_empty()
             && self.invalidated.is_empty()
             && self.missing_after.accounts.is_empty()
@@ -194,6 +195,16 @@ pub enum QuoteWarmupError {
         /// Exact unresolved account/code/storage/block-hash reads.
         missing: Box<MissingState>,
     },
+    /// Immediate RPC-disconnected replay over the warmed canonical snapshot
+    /// produced a different quote.
+    ReplayMismatch {
+        /// Request whose replay diverged.
+        request: Box<QuoteWarmup>,
+        /// Quote returned by the canonical warmup execution.
+        canonical: SwapQuote,
+        /// Quote returned by immediate offline replay of the same state.
+        offline: SwapQuote,
+    },
     /// A learned or newly observed dependency set exceeded its configured
     /// memory/cost bound.
     ReadSetLimit {
@@ -231,6 +242,15 @@ impl fmt::Display for QuoteWarmupError {
                 missing.code_hashes.len(),
                 missing.storage.len(),
                 missing.block_hashes.len()
+            ),
+            Self::ReplayMismatch {
+                request,
+                canonical,
+                offline,
+            } => write!(
+                f,
+                "offline quote replay diverged for {:?}: canonical amount_out {}, offline amount_out {}",
+                request.pool, canonical.amount_out, offline.amount_out
             ),
             Self::ReadSetLimit {
                 request,
@@ -289,13 +309,20 @@ impl AdapterRegistry {
             let (accesses, provider_reads) = recording.into_parts();
             ensure_within_limits(self.quote_read_set_limits, &request, &accesses)?;
 
-            validate_one(
+            let offline = validate_one(
                 &pool,
                 adapter.as_ref(),
                 &self.sim_config,
                 cache.snapshot(),
                 &request,
             )?;
+            if offline != quote {
+                return Err(QuoteWarmupError::ReplayMismatch {
+                    request: Box::new(request),
+                    canonical: quote,
+                    offline,
+                });
+            }
 
             entries.push(QuoteWarmupEntry {
                 request: request.clone(),
@@ -385,7 +412,7 @@ impl AdapterRegistry {
             warmups,
             accounts_refreshed: hydrated.accounts_refreshed,
             slots_refreshed: hydrated.slots_refreshed,
-            account_failures: hydrated.account_failures,
+            failures: hydrated.failures,
             code_changes: hydrated.code_changes,
             invalidated,
             missing_after: hydrated.missing_after.into(),
@@ -485,9 +512,9 @@ fn validate_one(
     config: &super::SimConfig,
     snapshot: Arc<EvmSnapshot>,
     request: &QuoteWarmup,
-) -> Result<(), QuoteWarmupError> {
+) -> Result<SwapQuote, QuoteWarmupError> {
     let mut offline = OfflineSnapshotCache::new(snapshot);
-    adapter
+    let quote = adapter
         .simulate_swap(
             pool,
             &mut offline,
@@ -498,7 +525,7 @@ fn validate_one(
         )
         .map_err(|error| simulation_error(request, error))?;
     if offline.missing_state().is_empty() {
-        Ok(())
+        Ok(quote)
     } else {
         Err(QuoteWarmupError::IncompleteSnapshot {
             request: Box::new(request.clone()),

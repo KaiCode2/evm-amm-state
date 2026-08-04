@@ -133,4 +133,70 @@ if [[ -n "$inactive_graph" ]]; then
   exit 1
 fi
 
-echo "Security advisory exception remains confined to an inactive lock entry."
+# bincode 1 is inherited only through evm-fork-cache's versioned on-disk cache
+# formats. Pin the immediate reverse dependency so no additional consumer can
+# inherit that compatibility decision unnoticed.
+bincode_graph="$({
+  cargo tree --locked -i bincode@1.3.3 --target all --prefix depth --depth 1
+} | sed -E 's# \(/[^)]*\)$##; s# \(\*\)$##')"
+expected_bincode_graph="$(printf '%s\n' \
+  '0bincode v1.3.3' \
+  '1evm-fork-cache v0.4.0-alpha.2')"
+if [[ "$bincode_graph" != "$expected_bincode_graph" ]]; then
+  echo "The accepted bincode 1 compatibility scope changed." >&2
+  echo "Expected:" >&2
+  echo "$expected_bincode_graph" >&2
+  echo "Observed:" >&2
+  echo "$bincode_graph" >&2
+  exit 1
+fi
+
+# derivative is tolerated only as an unreachable lockfile entry.
+inactive_derivative="$({
+  cargo tree --locked -i derivative@2.2.0 --target all --prefix none 2>/dev/null
+} || true)"
+if [[ -n "$inactive_derivative" ]]; then
+  echo "Unmaintained derivative 2.2.0 became reachable." >&2
+  echo "$inactive_derivative" >&2
+  exit 1
+fi
+
+# paste is an active transitive procedural macro. Keep its immediate reverse
+# dependency set pinned so a new path cannot inherit this release decision.
+paste_graph="$({
+  cargo tree --locked -i paste@1.0.15 --target all --prefix depth --depth 1
+} | sed -E 's# \(/[^)]*\)$##; s# \(\*\)$##')"
+expected_paste_graph="$(printf '%s\n' \
+  '0paste v1.0.15 (proc-macro)' \
+  '1alloy-primitives v1.6.0' \
+  '1ark-ff v0.5.0' \
+  '1syn-solidity v1.6.0')"
+if [[ "$paste_graph" != "$expected_paste_graph" ]]; then
+  echo "The accepted paste dependency scope changed." >&2
+  echo "Expected:" >&2
+  echo "$expected_paste_graph" >&2
+  echo "Observed:" >&2
+  echo "$paste_graph" >&2
+  exit 1
+fi
+
+# proc-macro-error2 is reachable only while expanding the pinned Alloy Solidity
+# macros. Pin its immediate reverse dependency set for the same reason.
+proc_macro_error_graph="$({
+  cargo tree --locked -i proc-macro-error2@2.0.1 \
+    --target all --prefix depth --depth 1
+} | sed -E 's# \(/[^)]*\)$##; s# \(\*\)$##')"
+expected_proc_macro_error_graph="$(printf '%s\n' \
+  '0proc-macro-error2 v2.0.1' \
+  '1alloy-sol-macro v1.6.0 (proc-macro)' \
+  '1alloy-sol-macro-expander v1.6.0')"
+if [[ "$proc_macro_error_graph" != "$expected_proc_macro_error_graph" ]]; then
+  echo "The accepted proc-macro-error2 dependency scope changed." >&2
+  echo "Expected:" >&2
+  echo "$expected_proc_macro_error_graph" >&2
+  echo "Observed:" >&2
+  echo "$proc_macro_error_graph" >&2
+  exit 1
+fi
+
+echo "Security advisory and unmaintained-dependency scopes match policy."

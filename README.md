@@ -351,12 +351,16 @@ Before attaching a Flashblocks subscriber, call
 `AdapterRegistry::warm_quote_read_sets` with the representative pool,
 direction, and size classes the strategy will simulate. Each successful warmup
 records account, code, storage, and block-hash dependencies, verifies the quote
-again against an RPC-disconnected snapshot, and enables fail-closed readiness
-for every affected pool. The live runtime replays those representative quotes
-offline before publishing each preview. An unexpected cold dependency rejects
-that preview, grows the bounded manifest, and is fetched only after the next
-exact canonical point by the hash-pinned background worker. Code identity
-changes invalidate dependent manifests and require re-warming.
+again against an RPC-disconnected snapshot, requires the complete `SwapQuote`
+to equal the canonical warmup result, and enables fail-closed readiness for
+every affected pool. A mismatch returns `QuoteWarmupError::ReplayMismatch` and
+installs none of the batch's manifests. The live runtime replays those
+representative quotes offline before publishing each preview. An unexpected
+cold dependency rejects that preview, grows the bounded manifest, and is fetched
+only after the next exact canonical point by the hash-pinned background worker.
+Typed proof/code-residency failures remain visible in
+`QuoteReadSetHydrationReport::failures`; code identity changes invalidate
+dependent manifests and require re-warming.
 
 ```mermaid
 flowchart LR

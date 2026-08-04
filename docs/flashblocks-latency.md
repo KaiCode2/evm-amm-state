@@ -229,11 +229,13 @@ independently eligible for ordinary canonical OP traffic.
 
 The crate implementation now learns representative account/code/storage/block
 read sets, hydrates them at the exact canonical pin, replays affected quotes
-against an RPC-disconnected preview, bounds unexpected dependency growth, and
+against an RPC-disconnected preview, requires the immediate offline warm-up
+quote to equal its canonical result, bounds unexpected dependency growth, and
 invalidates manifests on runtime-code changes. Same-payload cumulative previews
 retain generation-local fills; every invalidation boundary restores canonical
 state. An unexpected speculative cold slot rejects publication and is hydrated
-by the hash-pinned worker only after the next canonical point.
+by the hash-pinned worker only after the next canonical point. Proof-shape,
+provider, and bytecode-residency failures remain typed in the hydration report.
 
 Each release candidate must still run this benchmark against the selected paid
 Base and Optimism endpoints intended for deployment. A timed window must observe

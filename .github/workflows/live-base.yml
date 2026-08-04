@@ -3,6 +3,13 @@ name: Stage 10 Base live gates
 on:
   workflow_dispatch:
 
+env:
+  TRANSPORT_REF: 5d012b8b848cd061c9aa909a17597cd4c303f4b7
+  CACHE_REF: 010caa7b82ca60e12f6f9d87090b5279d14238ca
+
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: evm-amm-state
@@ -12,19 +19,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - uses: actions/checkout@v4
+      - name: Check out exact cache candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-fork-cache
+          ref: ${{ env.CACHE_REF }}
           path: evm-fork-cache
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          workspaces: evm-amm-state
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-amm-state -> target
 
       - name: Solidly and Slipstream parity
         env:
