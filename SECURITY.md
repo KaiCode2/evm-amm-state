@@ -25,8 +25,8 @@ Every third-party workflow action is pinned to an immutable full commit:
 
 Sibling repositories are checked out at exact candidate commits in every CI and
 live workflow. The transport candidate is
-`b84a24823286313cf6ab19e2da4b38724e925dba`; the cache candidate is
-`e51aaf2e17275c73af0809073c5bcba8ddf23805`; and the live search gate uses
+`7868bea593dec5748ad7475d1909fc3a2de0d4ad`; the cache candidate is
+`2be88d15fa15b5c44188b318463aa4705bb75aef`; and the live search gate uses
 `2a1bdacb8e91143278570d01d3a06ccfa59acef2`. Any revision change requires
 rerunning the applicable locked release or paid-provider matrix.
 
