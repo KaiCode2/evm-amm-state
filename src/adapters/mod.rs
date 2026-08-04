@@ -24,6 +24,8 @@ pub mod persistence;
 /// Hash-pinned state artifacts produced outside the cache actor.
 #[cfg(feature = "live-runtime")]
 pub mod prepared;
+/// Representative quote read-set warming and offline readiness validation.
+pub mod quote_warmup;
 /// The [`AmmReactiveHandler`] bridge onto the `evm-fork-cache` reactive runtime.
 pub mod reactive;
 /// The [`AdapterRegistry`] of tracked pools and protocol adapters.
@@ -114,6 +116,10 @@ pub use ownership::{
 pub use persistence::{AmmRegistrationArchive, AmmRegistrationPersistenceError};
 #[cfg(feature = "live-runtime")]
 pub use prepared::{AmmPreparedPoolState, AmmPreparedStateError, AmmPreparedStorage};
+pub use quote_warmup::{
+    QuoteReadSetHydrationReport, QuoteReadSetLimits, QuoteReadinessReport, QuoteWarmup,
+    QuoteWarmupEntry, QuoteWarmupError, QuoteWarmupReport,
+};
 pub use reactive::{
     AmmPoolReactiveHandler, AmmPoolReactiveHandlerError, AmmReactiveHandler,
     AmmReactiveRoutingContext, AmmReactiveSignal,
@@ -121,15 +127,15 @@ pub use reactive::{
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use runtime::{
     AdapterGeneration, AdapterInstanceId, AdapterKey, AmmChangeImpact, AmmChangeSet,
-    AmmChangeSetError, AmmPoolChange, AmmPoolChangeKind, AmmRuntimeEvent, AmmRuntimeEventKind,
-    AmmRuntimeHealth, AmmRuntimeId, AmmRuntimeStatusSnapshot, AmmStateIncident, AmmStatePoint,
-    AmmStateQuality, AmmStateVersion, AmmWorkClass, AmmWorkKind, AmmWorkProgress,
-    DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey, InvalidPoolRuntimeTransition,
-    InvalidWorkProgress, OwnerRuntimeState, PoolGeneration, PoolInstanceId, PoolLifecycle,
-    PoolRuntimeState, PoolStateRef, PoolStateRevision, QueryEvidencePolicy, QueueDepths,
-    RegistrationEvidenceSet, RegistrationProvenance, RegistrationReorgAction,
-    RegistrationSourceKey, RuntimeLifecycleMap, RuntimeOwnerId, RuntimeSequenceOverflow,
-    RuntimeWorkId, StatePosition, WorkId,
+    AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind, AmmRuntimeEvent,
+    AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeId, AmmRuntimeStatusSnapshot,
+    AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateVersion, AmmWorkClass, AmmWorkKind,
+    AmmWorkProgress, DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey,
+    InvalidPoolRuntimeTransition, InvalidWorkProgress, OwnerRuntimeState, PoolGeneration,
+    PoolInstanceId, PoolLifecycle, PoolRuntimeState, PoolStateRef, PoolStateRevision,
+    QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet, RegistrationProvenance,
+    RegistrationReorgAction, RegistrationSourceKey, RuntimeLifecycleMap, RuntimeOwnerId,
+    RuntimeSequenceOverflow, RuntimeWorkId, StatePosition, WorkId,
 };
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 pub use snapshot::{

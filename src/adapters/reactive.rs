@@ -15,8 +15,8 @@ use evm_fork_cache::reactive::{
 use super::state::UpstreamStateView;
 use super::{
     AdapterEvent, AdapterEventError, AdapterRegistry, AmmAdapter, EventRoute, EventSource,
-    PoolInstanceId, PoolKey, PoolRegistration, PurgeScope, RepairAction, SkippedDelta, SkippedMask,
-    StateDiff, StateUpdate, StateView, UpdateQuality,
+    PoolInstanceId, PoolKey, PoolRegistration, PoolStatus, PurgeScope, RepairAction, SkippedDelta,
+    SkippedMask, StateDiff, StateUpdate, StateView, UpdateQuality,
 };
 
 const HANDLER_ID: &str = "evm-amm-state.adapters";
@@ -154,6 +154,16 @@ impl AmmReactiveRoutingContext {
         };
         *existing = pool;
         true
+    }
+
+    pub(crate) fn update_pool_status(&self, pool: &PoolKey, status: PoolStatus) -> bool {
+        let mut current = self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::make_mut(&mut current)
+            .update_pool_status(pool, status)
+            .is_some()
     }
 
     pub(crate) fn register_adapter(

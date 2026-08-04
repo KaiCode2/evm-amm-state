@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/evm-amm-state)](https://docs.rs/evm-amm-state)
 [![CI](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml/badge.svg)](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
 
 `evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
 cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
@@ -37,14 +37,14 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.1", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.2", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
 ] }
 ```
 
-Requires Rust **1.88+** (the declared MSRV, checked in CI). The two public
+Requires Rust **1.90+** (the declared MSRV, checked in CI). The two public
 dependencies whose types appear in this crate's API are re-exported at the
 crate root — import `evm_amm_state::evm_fork_cache` and
 `evm_amm_state::alloy_primitives` instead of pinning them yourself, and the
@@ -324,19 +324,39 @@ changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
 
-The same attached subscriber can opt into Base or OP Flashblocks through
-`evm-fork-cache`. Preconfirmed logs pass through the existing AMM handlers—there
-is no second protocol adapter path—and publish an `AmmPreconfirmedSnapshot`
+The same attached subscriber can opt into Base or Optimism Flashblocks through
+`evm-fork-cache`. Base consumes native `newFlashblocks` plus `pendingLogs`;
+Optimism uses the cache crate's bounded, generation-pinned pending-state
+sampler. Applications that do not want recurring OP request usage can keep
+`PreconfirmationMode::Disabled` and use the ordinary canonical subscriber.
+Preconfirmed logs pass through the existing AMM handlers—there is no second
+protocol adapter path—and publish an `AmmPreconfirmedSnapshot`
 through `latest_preconfirmation` / `subscribe_preconfirmations`. Each preview is
 anchored to the current canonical version, carries its `FlashblockRef` and
 announcing provider ID, and exposes an immutable cache snapshot plus the affected
-pool changes for immediate simulation. A newer Flashblock replaces it; canonical
+pool changes for immediate simulation. `AmmPreconfirmedSnapshot::event_refs`
+and `AmmChangeSet::event_refs` expose the same sorted, deduplicated transaction
+hash/log-index identity across pending and canonical delivery; placeholder zero
+transaction hashes are omitted. A newer Flashblock replaces it; canonical
 progress, subscriber trust loss, explicit discard, or shutdown invalidates it.
 Speculative decode/resync failures never degrade canonical pool health or create
-canonical repair ownership. Direct `AmmSyncEngine::ingest_batch` still executes
-pending-tag resyncs; the cache-owner runtime keeps provider I/O deferred, so its
-fast preview path is strongest for the exact/event-sourced swap updates listed in
-the protocol table above.
+canonical repair ownership. The cache-owner runtime publishes only a fully
+simulation-ready preview: pending repairs, unresolved resyncs, unknown pool
+impact, degraded update quality, or a required full refresh reject the complete
+speculative branch and restore canonical state. Direct
+`AmmSyncEngine::ingest_batch` can still execute pending-tag resyncs for callers
+that deliberately use the synchronous path.
+
+Before attaching a Flashblocks subscriber, call
+`AdapterRegistry::warm_quote_read_sets` with the representative pool,
+direction, and size classes the strategy will simulate. Each successful warmup
+records account, code, storage, and block-hash dependencies, verifies the quote
+again against an RPC-disconnected snapshot, and enables fail-closed readiness
+for every affected pool. The live runtime replays those representative quotes
+offline before publishing each preview. An unexpected cold dependency rejects
+that preview, grows the bounded manifest, and is fetched only after the next
+exact canonical point by the hash-pinned background worker. Code identity
+changes invalidate dependent manifests and require re-warming.
 
 ```mermaid
 flowchart LR
@@ -501,7 +521,7 @@ Everything else is env-gated and prints a skip message when unset:
 | --- | --- | --- |
 | [`custom_adapter`](examples/custom_adapter.rs) | third-party adapter, register → quote | — |
 | [`adapter_pipeline`](examples/adapter_pipeline.rs) | register → cold-start → WS react → quote | `ETH_WS_URL` or `E2E_RPC_URL` |
-| [`flashblocks_latency_live`](examples/flashblocks_latency_live.rs) | Base Flashblocks vs canonical cache/quote latency | `BASE_HTTP_URL` and `BASE_WS_URL` |
+| [`flashblocks_latency_live`](examples/flashblocks_latency_live.rs) | Base Flashblocks vs canonical cache/quote latency | matching paid HTTP and WS endpoints |
 | [`factory_discovery_live`](examples/factory_discovery_live.rs) | discovery → cold-start → reactive | `E2E_RPC_URL` |
 | [`declarative_discovery`](examples/declarative_discovery.rs) | token-basket `PoolQuery` → `cold_start_many` | `E2E_RPC_URL` |
 | [`token_basket_bench`](examples/token_basket_bench.rs) | batched vs per-pair discovery timing | `E2E_RPC_URL` |

@@ -14,7 +14,7 @@ use evm_fork_cache::BlockContextError;
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, DeliveryScope, FlashblockRef, HandlerId, ReactiveInput,
-    ReactiveInputBatch, ReactiveReport,
+    ReactiveInputBatch, ReactiveReport, StateEffectQuality,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -26,7 +26,7 @@ use super::cold_start_scheduler::{
 use super::subscriber_driver::{AmmSubscriberControl, AmmSubscriberOwnerPlan};
 use super::{
     AdapterRegistry, AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmChangeSet,
-    AmmChangeSetError, AmmPoolChange, AmmPoolChangeKind, AmmPoolGenerationReservation,
+    AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind, AmmPoolGenerationReservation,
     AmmPreconfirmedSnapshot, AmmPreparedPoolState, AmmPreparedStorage, AmmRuntimeEvent,
     AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeStatusSnapshot, AmmStateCommit,
     AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateSnapshot, AmmStateVersion,
@@ -1327,6 +1327,17 @@ impl AmmRuntimeHandle {
         result.await.map_err(|_| AmmRuntimeCommandError::Closed)?
     }
 
+    /// Discard the active speculative branch after provider-generation or
+    /// subscription continuity is lost.
+    pub async fn invalidate_preconfirmation(&self) -> Result<(), AmmRuntimeCommandError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(AmmRuntimeCommand::InvalidatePreconfirmation { response })
+            .await
+            .map_err(|_| AmmRuntimeCommandError::Closed)?;
+        result.await.map_err(|_| AmmRuntimeCommandError::Closed)?
+    }
+
     /// Non-blockingly enqueue one input batch and return its independent ticket.
     pub fn try_ingest_batch(
         &self,
@@ -1942,6 +1953,9 @@ enum AmmRuntimeCommand {
         batch: Box<ReactiveInputBatch<Ethereum>>,
         response: oneshot::Sender<Result<Arc<AmmPreconfirmedSnapshot>, AmmRuntimeCommandError>>,
     },
+    InvalidatePreconfirmation {
+        response: oneshot::Sender<Result<(), AmmRuntimeCommandError>>,
+    },
     AddAdapter {
         adapter: Arc<dyn super::AmmAdapter>,
         response: oneshot::Sender<Result<super::AdapterInstanceId, AmmRuntimeCommandError>>,
@@ -2282,6 +2296,26 @@ enum AmmActorInput {
     Canonical(Option<AmmCanonicalCommand>),
 }
 
+fn amm_event_refs(batch: &ReactiveInputBatch<Ethereum>) -> Vec<AmmEventRef> {
+    let mut event_refs = batch
+        .records()
+        .iter()
+        .filter_map(|record| {
+            let ReactiveInput::Log(log) = &record.input else {
+                return None;
+            };
+            let transaction_hash = log.transaction_hash?;
+            if transaction_hash.is_zero() {
+                return None;
+            }
+            Some(AmmEventRef::new(transaction_hash, log.log_index?))
+        })
+        .collect::<Vec<_>>();
+    event_refs.sort_unstable();
+    event_refs.dedup();
+    event_refs
+}
+
 fn validate_preconfirmation_batch(
     batch: &ReactiveInputBatch<Ethereum>,
 ) -> Result<FlashblockRef, AmmRuntimeCommandError> {
@@ -2298,11 +2332,11 @@ fn validate_preconfirmation_batch(
         };
         if expected
             .as_ref()
-            .is_some_and(|current: &FlashblockRef| current != flashblock)
+            .is_some_and(|current: &FlashblockRef| current != flashblock.as_ref())
         {
             return Err(AmmRuntimeCommandError::ExpectedPreconfirmation);
         }
-        expected.get_or_insert_with(|| flashblock.clone());
+        expected.get_or_insert_with(|| flashblock.as_ref().clone());
     }
     expected.ok_or(AmmRuntimeCommandError::ExpectedPreconfirmation)
 }
@@ -2394,6 +2428,11 @@ impl AmmRuntimeActor {
         match command {
             AmmRuntimeCommand::IngestPreconfirmation { batch, response } => {
                 let _ = response.send(self.ingest_preconfirmation(*batch));
+            }
+            AmmRuntimeCommand::InvalidatePreconfirmation { response } => {
+                self.engine.discard_preconfirmation(&mut self.cache);
+                self.preconfirmations.send_replace(None);
+                let _ = response.send(Ok(()));
             }
             AmmRuntimeCommand::AddAdapter { adapter, response } => {
                 let _ = response.send(self.add_adapter(adapter).await);
@@ -5010,12 +5049,18 @@ impl AmmRuntimeActor {
             .registry()
             .adapter(registration.protocol())
             .ok_or_else(|| AmmRuntimeCommandError::StaleWork(work.clone()))?;
-        let declared = adapter
+        let mut declared = adapter
             .state_dependencies(&registration)
             .slots()
             .iter()
             .map(|slot| (slot.address(), slot.slot()))
             .collect::<BTreeSet<_>>();
+        declared.extend(
+            self.engine
+                .registry()
+                .quote_read_set_upstream_for_pool(pool.key())
+                .slots,
+        );
         if !provided.is_subset(&declared) {
             return Err(AmmRuntimeCommandError::ColdStartWorker(
                 "scheduled slot patch escaped the active adapter read set".to_owned(),
@@ -6398,6 +6443,7 @@ impl AmmRuntimeActor {
     ) -> Result<Arc<AmmPreconfirmedSnapshot>, AmmRuntimeCommandError> {
         self.require_trusted()?;
         let expected = validate_preconfirmation_batch(&batch)?;
+        let event_refs = amm_event_refs(&batch);
         if batch
             .chain_id()
             .is_some_and(|chain_id| chain_id != self.point.chain_id())
@@ -6435,6 +6481,23 @@ impl AmmRuntimeActor {
             self.engine.discard_preconfirmation(&mut self.cache);
             return Err(AmmRuntimeCommandError::PreconfirmationBatch(message));
         }
+        if let Some(reason) = preconfirmation_readiness_error(&report) {
+            self.engine.discard_preconfirmation(&mut self.cache);
+            return Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                reason.to_owned(),
+            ));
+        }
+
+        let snapshot = self.cache.snapshot();
+        if let Err(error) = self
+            .engine
+            .validate_quote_read_sets(Arc::clone(&snapshot), report.affected_pools.iter())
+        {
+            self.engine.discard_preconfirmation(&mut self.cache);
+            return Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                error.to_string(),
+            ));
+        }
 
         let preview = Arc::new(AmmPreconfirmedSnapshot::new(
             self.runtime_id,
@@ -6442,9 +6505,10 @@ impl AmmRuntimeActor {
             self.point,
             self.interest_revision,
             flashblock,
-            self.cache.snapshot(),
+            snapshot,
             Arc::clone(&self.registry_snapshot),
             report.pool_changes,
+            event_refs,
         ));
         self.preconfirmations
             .send_replace(Some(Arc::clone(&preview)));
@@ -6479,6 +6543,7 @@ impl AmmRuntimeActor {
         let expected_cache_block = batch.block().number;
         let permit = self.reserve_critical().await?;
         let (next_version, _) = self.next_commit_identity(1)?;
+        let event_refs = amm_event_refs(&batch.records);
         let (header, records) = batch.into_parts();
         let factory_candidates = self.factory_candidates(&records);
         let block = BlockRef {
@@ -6602,14 +6667,17 @@ impl AmmRuntimeActor {
                 .iter()
                 .map(|incident| committed_incident(self.point.chain_id(), incident))
                 .collect::<Vec<_>>();
-            let changes = Arc::new(AmmChangeSet::new(
-                next_version,
-                next_point,
-                quality,
-                pool_changes,
-                incidents,
-                report.requires_full_refresh,
-            )?);
+            let changes = Arc::new(
+                AmmChangeSet::new(
+                    next_version,
+                    next_point,
+                    quality,
+                    pool_changes,
+                    incidents,
+                    report.requires_full_refresh,
+                )?
+                .with_event_refs(event_refs),
+            );
             let registry_changed = report.requires_full_refresh
                 || !report.degraded_pools.is_empty()
                 || !report.recovered_pools.is_empty();
@@ -6717,6 +6785,45 @@ impl AmmRuntimeActor {
             );
         }
         self.drain_followup_intents();
+        // Unexpected speculative reads extend learned manifests without
+        // touching the provider. At the next exact canonical point, feed only
+        // unresolved learned slots through the existing hash-pinned worker.
+        // Required repair work remains higher priority; the deferred intent is
+        // retained until that repair completes.
+        let quote_hydrations = if self.engine.registry().has_quote_read_sets() {
+            // `publish_commit` already produced the exact immutable snapshot
+            // for this canonical point. Reuse it: taking a second cache
+            // snapshot here adds actor latency and is unnecessary.
+            let snapshot = self.snapshots.borrow().cache_snapshot();
+            self.engine
+                .registry()
+                .pools()
+                .filter_map(|registration| {
+                    let missing = self
+                        .engine
+                        .registry()
+                        .missing_quote_read_set(snapshot.as_ref(), &registration.key);
+                    if missing.slots.is_empty() {
+                        return None;
+                    }
+                    let pool = self
+                        .engine
+                        .ownership()
+                        .active_pool(&registration.key)?
+                        .clone();
+                    Some((pool, missing.slots))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for (pool, slots) in quote_hydrations {
+            self.retain_followup_intent(
+                pool,
+                AmmPendingFollowUpIntent::Deferred(vec![DeferredWork::VerifySlots(slots)]),
+            );
+        }
+        self.drain_followup_intents();
         Ok(published)
     }
 
@@ -6806,6 +6913,37 @@ impl AmmRuntimeActor {
             },
         ));
     }
+}
+
+fn preconfirmation_readiness_error(report: &super::AmmSyncBatchReport) -> Option<&'static str> {
+    if report.requires_full_refresh {
+        return Some("the speculative batch requires a full authoritative refresh");
+    }
+    if report.resync_failures != 0 {
+        return Some("the speculative batch contains failed resync targets");
+    }
+    if !report.pending_repairs().is_empty() {
+        return Some("the speculative batch contains unresolved adapter repairs");
+    }
+    if !report.reactive.resyncs.is_empty() {
+        return Some("the speculative batch contains unresolved resync requests");
+    }
+    if report.reactive.applied.iter().any(|applied| {
+        matches!(
+            applied.quality,
+            StateEffectQuality::AppliedWithPendingResync | StateEffectQuality::RequiresRepair
+        )
+    }) {
+        return Some("the speculative batch contains non-exact state effects");
+    }
+    if report
+        .pool_changes
+        .iter()
+        .any(|change| change.kind() == AmmSyncPoolChangeKind::UnknownImpact)
+    {
+        return Some("the speculative batch has unknown pool impact");
+    }
+    None
 }
 
 const fn runtime_health(quality: AmmStateQuality) -> AmmRuntimeHealth {

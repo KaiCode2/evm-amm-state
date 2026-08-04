@@ -8,9 +8,9 @@ use evm_fork_cache::cache::EvmSnapshot;
 use evm_fork_cache::reactive::FlashblockRef;
 
 use super::{
-    AdapterInstanceId, AdapterKey, AdapterRegistry, AmmChangeSet, AmmOwnershipIndex, AmmRuntimeId,
-    AmmStatePoint, AmmStateVersion, AmmSyncPoolChange, PoolInstanceId, PoolKey, PoolRegistration,
-    PoolStateRevision,
+    AdapterInstanceId, AdapterKey, AdapterRegistry, AmmChangeSet, AmmEventRef, AmmOwnershipIndex,
+    AmmRuntimeId, AmmStatePoint, AmmStateVersion, AmmSyncPoolChange, PoolInstanceId, PoolKey,
+    PoolRegistration, PoolStateRevision,
 };
 
 /// Registry/ownership divergence rejected before publishing a topology snapshot.
@@ -227,6 +227,7 @@ pub struct AmmPreconfirmedSnapshot {
     cache: Arc<EvmSnapshot>,
     registry: Arc<AdapterRegistrySnapshot>,
     pool_changes: Vec<AmmSyncPoolChange>,
+    event_refs: Vec<AmmEventRef>,
 }
 
 impl AmmPreconfirmedSnapshot {
@@ -241,6 +242,7 @@ impl AmmPreconfirmedSnapshot {
         cache: Arc<EvmSnapshot>,
         registry: Arc<AdapterRegistrySnapshot>,
         pool_changes: Vec<AmmSyncPoolChange>,
+        event_refs: Vec<AmmEventRef>,
     ) -> Self {
         Self {
             runtime_id,
@@ -251,6 +253,7 @@ impl AmmPreconfirmedSnapshot {
             cache,
             registry,
             pool_changes,
+            event_refs,
         }
     }
 
@@ -297,6 +300,11 @@ impl AmmPreconfirmedSnapshot {
     /// Pools whose quote-relevant state changed in this preview.
     pub fn pool_changes(&self) -> &[AmmSyncPoolChange] {
         &self.pool_changes
+    }
+
+    /// Source AMM logs represented by this speculative preview.
+    pub fn event_refs(&self) -> &[AmmEventRef] {
+        &self.event_refs
     }
 }
 

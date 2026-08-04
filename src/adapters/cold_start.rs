@@ -305,15 +305,56 @@ impl From<evm_fork_cache::cold_start::ColdStartCallResult> for ColdStartCallResu
 pub struct StorageAccessList {
     /// Accounts the call touched.
     pub accounts: Vec<Address>,
+    /// Runtime-code hashes the call executed or inspected.
+    pub code_hashes: Vec<B256>,
     /// Storage `(address, slot)` pairs the call touched.
     pub slots: Vec<(Address, U256)>,
+    /// Historical block numbers read through `BLOCKHASH`.
+    pub block_numbers: Vec<u64>,
+}
+
+impl StorageAccessList {
+    /// Whether the access list contains no account, code, storage, or block-hash
+    /// dependencies.
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+            && self.code_hashes.is_empty()
+            && self.slots.is_empty()
+            && self.block_numbers.is_empty()
+    }
+
+    /// Union another access list into this one without duplicate dependencies.
+    pub fn extend(&mut self, other: &Self) {
+        for account in &other.accounts {
+            if !self.accounts.contains(account) {
+                self.accounts.push(*account);
+            }
+        }
+        for code_hash in &other.code_hashes {
+            if !self.code_hashes.contains(code_hash) {
+                self.code_hashes.push(*code_hash);
+            }
+        }
+        for slot in &other.slots {
+            if !self.slots.contains(slot) {
+                self.slots.push(*slot);
+            }
+        }
+        for block_number in &other.block_numbers {
+            if !self.block_numbers.contains(block_number) {
+                self.block_numbers.push(*block_number);
+            }
+        }
+    }
 }
 
 impl From<evm_fork_cache::access_set::StorageAccessList> for StorageAccessList {
     fn from(access: evm_fork_cache::access_set::StorageAccessList) -> Self {
         Self {
             accounts: access.accounts.into_iter().collect(),
+            code_hashes: access.code_hashes.into_iter().collect(),
             slots: access.slots.into_iter().collect(),
+            block_numbers: access.block_numbers.into_iter().collect(),
         }
     }
 }

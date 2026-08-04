@@ -1,20 +1,22 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.1`. Publish in this order:
+The current release candidate is `0.3.0-alpha.2`. Publish in this order:
 
-1. `alloy-transport-balancer 0.3.0-alpha.1`;
-2. `evm-fork-cache 0.4.0-alpha.1`;
-3. `evm-amm-state 0.3.0-alpha.1`.
+1. `alloy-transport-balancer 0.3.0-alpha.2`;
+2. `evm-fork-cache 0.4.0-alpha.2`;
+3. `evm-amm-state 0.3.0-alpha.2`.
 
 The state crate intentionally keeps a versioned sibling path during development.
-Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.1` from
+Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.2` from
 crates.io. Until that version is published, state packaging is expected to stop at
 dependency resolution.
 
-The alpha accepts the documented preconfirmed-overlay lazy-read cost. A
-production rollout or stable release is blocked until the read-set retention
-gate in `docs/flashblocks-latency.md` is complete and the paid-provider
-benchmark has been repeated.
+Alpha.2 includes representative quote read-set learning, exact-canonical
+hydration, provider-read-free preview replay, and retention of generation-local
+lazy fills across cumulative overlay replacement. Historical paid QuickNode
+and Alchemy Base results, plus the current provider-specific revalidation
+status, are recorded in `docs/flashblocks-latency.md`; every release candidate
+must still repeat the documented paid-provider gate.
 
 ## Offline release matrix
 
@@ -30,11 +32,18 @@ for f in uniswap-v2 uniswap-v3 pancake-v3 slipstream balancer-v2 solidly-v2 curv
   cargo clippy --all-targets --no-default-features --features "adapters,$f" -- -D warnings
 done
 RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
-cargo +1.88 check --all-features
-cargo audit
+cargo +1.90.0 check --all-features
+bash scripts/check-security-exceptions.sh
+cargo audit --ignore RUSTSEC-2025-0055
 cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' &&
   exit 1 || true
 ```
+
+`RUSTSEC-2025-0055` is narrowly ignored because `ark-relations` records
+`tracing-subscriber 0.2.25` only through an inactive optional proof-system
+dependency. The scope script fails if that version enters any active target or
+feature graph, if another vulnerable version appears, or if the inactive lock
+entry disappears without the exception being removed.
 
 Run the offline performance gates:
 
@@ -94,7 +103,7 @@ cargo publish --dry-run
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0-alpha.1` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.0-alpha.2` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, live gates, downstream compatibility, changelog, and benchmark evidence
 pass.

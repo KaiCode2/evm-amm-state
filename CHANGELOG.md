@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.2] - 2026-07-30
+
+### Added
+
+- Added representative AMM quote read-set learning, exact-canonical hydration,
+  offline preview-readiness replay, bounded manifest growth, and runtime-code
+  identity invalidation.
+- Added automatic next-canonical background hydration for quote-only slots that
+  an unexpected speculative path discovered, keeping provider I/O off the
+  preview actor.
+- Added provider-read-free repeated-warmup and cache-to-quote acceptance gates
+  to the live Base benchmark, with recent-activity pool selection.
+- Added explicit preconfirmation invalidation on the runtime handle and attached
+  subscriber bridge, allowing a lost/replaced provider generation to revoke
+  signing and simulation authority before reconnect work begins.
+- Added sorted, deduplicated `AmmEventRef` source identities to speculative
+  snapshots and canonical change sets. Applications can reconcile a pending
+  and canonical AMM log by transaction hash and log index without relying on a
+  pending block hash; placeholder zero transaction hashes are omitted.
+- Added the preview's pending EVM block environment to immutable AMM snapshots.
+- Extended the live latency acceptance example to run the 100-swap or
+  five-minute gate against Base's native streams or Optimism's bounded pending
+  sampler, with a bounded connection timeout, exact RPC/failure metrics, and
+  documented paid-provider results.
+- OP acceptance now uses the cache adapter's 250 ms exact pending-parent fence
+  and exact transaction-receipt recovery, and reports completed/null
+  receipt and raced-sample counts alongside the total RPC-method rate.
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.90 and updated the locked
+  `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+
+### Fixed
+
+- Flashblock previews now fail closed when ingest requires a full refresh,
+  schedules or fails a repair/resync, reports unknown pool impact, or applies a
+  non-ready update quality. Rejected speculative work restores canonical cache
+  and AMM state and is never published to observers.
+- Pool readiness transitions now preserve learned quote manifests in both the
+  registry and routing views, so canonical status changes cannot silently
+  disable offline Flashblock quote validation.
+
 ## [0.3.0-alpha.1] - 2026-07-28
 
 ### Added
@@ -442,7 +485,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...HEAD
+[0.3.0-alpha.2]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0

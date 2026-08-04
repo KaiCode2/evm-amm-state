@@ -96,6 +96,9 @@ jobs:
           # graph (`cargo tree -i tracing-subscriber@0.2.25 --target all`).
           ignore: RUSTSEC-2025-0055
 
+      - name: Verify security-exception scope
+        run: bash scripts/check-security-exceptions.sh
+
   # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
   # together, which can mask a protocol whose code/imports are not correctly
   # `#[cfg]`-gated on its own feature (a `--features <one-protocol>` build then
@@ -143,11 +146,11 @@ jobs:
         run: cargo clippy --no-default-features --features adapters,${{ matrix.feature }} --all-targets --no-deps -- -D warnings
 
   # Guard the declared MSRV (Cargo.toml `rust-version`). The `stable` jobs above
-  # use whatever stable is current, so without this a >1.88 API or a dep MSRV
-  # bump would pass CI yet break downstream consumers pinned to 1.88. `check`
+  # use whatever stable is current, so without this a >1.90 API or a dep MSRV
+  # bump would pass CI yet break downstream consumers pinned to 1.90. `check`
   # (not test) keeps it cheap; it is the build that the MSRV claim is about.
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.90)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -158,8 +161,8 @@ jobs:
           repository: KaiCode2/evm-fork-cache
           path: evm-fork-cache
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90.0
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2

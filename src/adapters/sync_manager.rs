@@ -30,6 +30,7 @@ use super::{
     PoolStateDependencies, PoolStatus, RegistryError, RepairAction, RuntimeLifecycleMap,
     RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StateSlot, UpdateQuality,
 };
+use super::{QuoteReadSetHydrationReport, QuoteReadinessReport, QuoteWarmupError};
 
 /// Error constructing or running [`AmmSyncEngine`].
 ///
@@ -735,6 +736,22 @@ impl AmmSyncEngine {
     /// Current pool registry.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
+    }
+
+    /// Replay learned representative quotes against one RPC-disconnected cache
+    /// snapshot before publishing speculative state.
+    pub fn validate_quote_read_sets<'a>(
+        &mut self,
+        snapshot: Arc<evm_fork_cache::cache::EvmSnapshot>,
+        pools: impl IntoIterator<Item = &'a PoolKey>,
+    ) -> Result<QuoteReadinessReport, QuoteWarmupError> {
+        self.registry.validate_quote_read_sets(snapshot, pools)
+    }
+
+    /// Refresh every learned representative quote dependency at the cache's
+    /// exact canonical block pin.
+    pub fn hydrate_quote_read_sets(&mut self, cache: &mut EvmCache) -> QuoteReadSetHydrationReport {
+        self.registry.hydrate_quote_read_sets(cache)
     }
 
     /// Number of active registrations whose current status is degraded.
@@ -2313,27 +2330,30 @@ impl AmmSyncEngine {
     }
 
     fn set_pool_status(&mut self, key: &PoolKey, status: PoolStatus) -> bool {
-        let Some(registration) = self.registry.pool_mut(key) else {
+        let Some(previous_status) = self.registry.pool(key).map(|pool| pool.status) else {
             return false;
         };
         match (
-            registration.status == PoolStatus::Degraded,
+            previous_status == PoolStatus::Degraded,
             status == PoolStatus::Degraded,
         ) {
             (false, true) => self.degraded_pool_count = self.degraded_pool_count.saturating_add(1),
             (true, false) => self.degraded_pool_count = self.degraded_pool_count.saturating_sub(1),
             _ => {}
         }
-        registration.status = status;
-        let routing_registration = registration.clone();
+        let registration = self
+            .registry
+            .update_pool_status(key, status)
+            .expect("pool existence was checked before its status update");
         debug_assert!(
-            self.routing.update_pool(routing_registration),
+            self.routing.update_pool_status(key, status),
             "active pool status must exist in the routing registry"
         );
         if let Some(instance) = self.ownership.active_pool(key).cloned() {
             self.lifecycles
                 .set_pool(instance, pool_runtime_state(status));
         }
+        debug_assert_eq!(registration.status, status);
         true
     }
 }
@@ -2529,10 +2549,10 @@ fn report_preconfirmation(report: &ReactiveBatchReport<Ethereum>) -> Option<Flas
         debug_assert!(
             flashblock
                 .as_ref()
-                .is_none_or(|existing: &FlashblockRef| existing == current),
+                .is_none_or(|existing: &FlashblockRef| existing == current.as_ref()),
             "one reactive batch must represent exactly one Flashblock snapshot"
         );
-        flashblock.get_or_insert_with(|| current.clone());
+        flashblock.get_or_insert_with(|| current.as_ref().clone());
     }
     flashblock
 }
@@ -3067,7 +3087,7 @@ mod tests {
     use super::super::{
         AdapterEvent, AdapterEventKind, AdapterEventResult, AdapterGeneration, AdapterInstanceId,
         AdapterKey, AdapterRegistry, AmmAdapter, CustomPoolKey, EventSource, PoolStatus,
-        ProtocolId, RepairAction, StateUpdate, StateView, UpdateQuality,
+        ProtocolId, QuoteWarmup, RepairAction, StateUpdate, StateView, UpdateQuality,
     };
     use super::*;
 
@@ -3140,6 +3160,54 @@ mod tests {
             vec![work]
         );
         assert_eq!(ownership.resync_owner(&resync), Some(&instance));
+    }
+
+    #[test]
+    fn status_transition_preserves_quote_read_sets_in_both_registries() {
+        let address = Address::repeat_byte(0x70);
+        let key = PoolKey::Custom(CustomPoolKey::Address {
+            protocol: FENCE_PROTOCOL,
+            address,
+        });
+        let warmup = QuoteWarmup::exact_input(
+            key.clone(),
+            Address::repeat_byte(0x71),
+            Address::repeat_byte(0x72),
+            U256::from(1_000_u64),
+        );
+        let mut registry = AdapterRegistry::new();
+        registry
+            .register_adapter(Arc::new(FenceAdapter {
+                topic: B256::repeat_byte(0x73),
+                slot: U256::from(3),
+            }))
+            .unwrap();
+        registry
+            .register_pool(
+                PoolRegistration::new(key.clone())
+                    .with_state_address(address)
+                    .with_status(PoolStatus::Ready),
+            )
+            .unwrap();
+        registry.quote_read_sets.insert(
+            warmup,
+            evm_fork_cache::access_set::StorageAccessList::default(),
+        );
+
+        let mut engine = AmmSyncEngine::new(registry).unwrap();
+        assert!(engine.set_pool_status(&key, PoolStatus::Degraded));
+
+        assert!(engine.registry.has_quote_read_set(&key));
+        assert_eq!(
+            engine.registry.pool(&key).map(|pool| pool.status),
+            Some(PoolStatus::Degraded)
+        );
+        let routing = engine.routing.registry();
+        assert!(routing.has_quote_read_set(&key));
+        assert_eq!(
+            routing.pool(&key).map(|pool| pool.status),
+            Some(PoolStatus::Degraded)
+        );
     }
 
     #[test]

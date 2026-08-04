@@ -80,7 +80,9 @@ fn preconfirmed_batch(log: RpcLog, flashblock: FlashblockRef) -> ReactiveInputBa
             ReactiveContext {
                 chain_id: Some(1),
                 source: InputSource::Flashblocks,
-                chain_status: ChainStatus::Preconfirmed { flashblock },
+                chain_status: ChainStatus::Preconfirmed {
+                    flashblock: Arc::new(flashblock),
+                },
                 block: Some(block),
                 transaction_index: log.transaction_index,
                 log_index: log.log_index,
@@ -2278,10 +2280,17 @@ async fn flashblock_preview_is_attributed_and_discard_restores_canonical_pool_st
         payload_id: None,
         index: Some(2),
         block_number: 91,
-        block_hash: block_hash(91),
+        content_hash: block_hash(91),
+        partial_block_hash: Some(block_hash(91)),
         parent_hash: Some(block_hash(90)),
         state_root: None,
+        transactions_root: None,
+        transaction_hashes: vec![B256::repeat_byte(0x22)],
         timestamp: Some(1_700_000_091),
+        base_fee_per_gas: Some(7),
+        beneficiary: Some(Address::repeat_byte(0xcb)),
+        prevrandao: Some(B256::repeat_byte(0x77)),
+        gas_limit: Some(30_000_000),
     };
     let log = rpc_log(
         pool,
@@ -2338,10 +2347,17 @@ async fn malformed_flashblock_event_does_not_degrade_canonical_pool_health() -> 
         payload_id: None,
         index: None,
         block_number: 91,
-        block_hash: block_hash(91),
+        content_hash: block_hash(91),
+        partial_block_hash: Some(block_hash(91)),
         parent_hash: Some(block_hash(90)),
         state_root: None,
+        transactions_root: None,
+        transaction_hashes: vec![B256::repeat_byte(0x22)],
         timestamp: Some(1_700_000_091),
+        base_fee_per_gas: Some(7),
+        beneficiary: Some(Address::repeat_byte(0xcb)),
+        prevrandao: Some(B256::repeat_byte(0x77)),
+        gas_limit: Some(30_000_000),
     };
     let malformed = rpc_log(
         pool,

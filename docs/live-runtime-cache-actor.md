@@ -66,12 +66,26 @@ state.
 
 Each cumulative Flashblock replaces the previous overlay. Canonical progress
 first restores the saved canonical cache and clears the preview watch; subscriber
-trust loss and shutdown do the same. Speculative decode/repair failures are
-reported on the preview path but cannot degrade canonical registrations. The
-actor continues to defer provider I/O, so exact and event-sourced AMM updates are
-immediately simulation-ready while a pending-tag repair should be executed by a
-caller using the synchronous `AmmSyncEngine` path or a dedicated background
-repair integration.
+trust loss, coupled-stream termination, explicit invalidation, and shutdown do
+the same. The actor continues to defer provider I/O, so it publishes a preview
+only when the existing event-sourced handlers leave every affected pool ready
+for immediate simulation. A required full refresh, pending or failed repair,
+unresolved reactive resync, unknown pool impact, or non-ready applied quality
+rejects the complete speculative branch. Rejection restores canonical state,
+clears the preview watch, and cannot degrade canonical registrations or acquire
+canonical repair ownership. Callers that need pending-tag repair may use the
+synchronous `AmmSyncEngine` path, but that repaired state is not silently mixed
+into the actor's no-I/O fast path.
+
+Representative quote manifests add a second readiness gate. They are learned
+and proven offline against the canonical cache before subscriber attachment.
+Every preview replays affected manifests against its immutable snapshot; a
+missing account, code body, slot, or block hash rejects the branch and extends
+the bounded manifest. The actor performs no provider read. At the next exact
+canonical state point, missing quote-only slots are queued through the existing
+hash-pinned cold-start worker and installed only if the pool generation and
+baseline still match. A runtime-code hash change invalidates every dependent
+manifest instead of assuming the old storage layout remains valid.
 
 ## Complete canonical blocks
 

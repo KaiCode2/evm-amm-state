@@ -1009,6 +1009,12 @@ where
         &mut self,
         batch: evm_fork_cache::reactive::SubscriberInputBatch<Ethereum>,
     ) -> Result<(), AmmSubscriberDriverError> {
+        if batch.preconfirmation_invalidated() {
+            self.runtime.invalidate_preconfirmation().await?;
+            if batch.records().is_empty() && batch.chain_controls().is_empty() {
+                return Ok(());
+            }
+        }
         if !batch.records().is_empty()
             && batch
                 .records()
