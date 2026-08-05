@@ -5,8 +5,9 @@ use super::cold_start::{
 };
 use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote,
-    quote_via_call_with_code_overrides_from, quoteExactInputSingleCall,
+    ISlipstreamQuoter, QuoteExactInputSingleParams, SimConfig, SimError,
+    SlipstreamQuoteExactInputSingleParams, SwapQuote, quote_via_call_with_code_overrides_from,
+    quoteExactInputSingleCall,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
@@ -19,7 +20,10 @@ use crate::adapters::storage::{
     V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
     v3_tick_info_storage_keys_with_base, v3_word_position,
 };
-use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
+use alloy_primitives::{
+    Address, B256, Bytes, Log, U256,
+    aliases::{I24, U24},
+};
 use alloy_sol_types::{SolCall, SolEvent};
 
 /// `sol!`-generated pool event bindings (crate-internal, not public API).
@@ -270,16 +274,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     ///
     /// The Quoter executes a real V3 swap against the warmed pool slots and
     /// returns the encoded `amountOut` (chain code, not reimplemented math). The
-    /// pool `fee` is taken from the V3-family metadata; tick-crossing swaps stay
-    /// correct because the cache lazily fetches any cold tick/bitmap slot from
-    /// the backend.
+    /// Fee-keyed pools take `fee` from metadata; Slipstream instead takes the
+    /// signed `tick_spacing` used by its native quoter ABI. Tick-crossing swaps
+    /// stay correct because the cache lazily fetches any cold tick/bitmap slot
+    /// from the backend.
     ///
     /// The quote target is the pool's own [`V3Metadata::quoter`] when set (a
     /// fork's QuoterV2, e.g. PancakeSwap's, filled in by factory discovery),
-    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The quote
-    /// ABI is unchanged (the `fee`-param struct variant) — forks whose quoter
-    /// takes a different struct (e.g. Slipstream's `tickSpacing`-keyed quoter)
-    /// leave `quoter` unset and ride the caller's Uniswap-compatible quoter.
+    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The
+    /// adapter selects the fee-keyed struct for Uniswap/Pancake and the native
+    /// signed-tick-spacing struct for Slipstream. A discovered Slipstream pool
+    /// must therefore be paired with a compatible Slipstream quote target.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -289,19 +294,44 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         amount_in: U256,
         config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
-        let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
         // Same resolver `ProtocolMetadata::quote_code_targets` uses, so the quoter
         // we call is always the one an eager cold-start pre-warmed.
         let quoter = v3_metadata(pool).map_or(config.v3_quoter, |m| m.quote_target(config));
-
-        let params = QuoteExactInputSingleParams {
-            tokenIn: token_in,
-            tokenOut: token_out,
-            amountIn: amount_in,
-            fee: U24::from(fee),
-            sqrtPriceLimitX96: U256::ZERO.to(),
+        let slipstream = pool.protocol() == ProtocolId::Slipstream;
+        let calldata = if slipstream {
+            let tick_spacing = v3_metadata(pool)
+                .and_then(|metadata| metadata.tick_spacing)
+                .ok_or(SimError::MissingMetadata("Slipstream tick spacing"))?;
+            let tick_spacing = I24::try_from(tick_spacing).map_err(|_| {
+                SimError::Custom("Slipstream tick spacing exceeds signed int24".to_owned())
+            })?;
+            Bytes::from(
+                ISlipstreamQuoter::quoteExactInputSingleCall {
+                    params: SlipstreamQuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: amount_in,
+                        tickSpacing: tick_spacing,
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    },
+                }
+                .abi_encode(),
+            )
+        } else {
+            let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
+            Bytes::from(
+                quoteExactInputSingleCall {
+                    params: QuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: amount_in,
+                        fee: U24::from(fee),
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    },
+                }
+                .abi_encode(),
+            )
         };
-        let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
         let transfer_success = Bytes::from_static(ERC20_TRANSFER_SUCCESS_RUNTIME);
         let code_overrides = [
@@ -315,10 +345,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             calldata,
             &code_overrides,
         )?;
-        let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
-            .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
+        let amount_out = if slipstream {
+            ISlipstreamQuoter::quoteExactInputSingleCall::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?
+                .amountOut
+        } else {
+            quoteExactInputSingleCall::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?
+                .amountOut
+        };
 
-        Ok(SwapQuote::new(decoded.amountOut))
+        Ok(SwapQuote::new(amount_out))
     }
 }
 

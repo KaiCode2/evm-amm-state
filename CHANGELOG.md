@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.3] - 2026-08-05
+
+### Fixed
+
+- Slipstream/Aerodrome CL quotes now encode the protocol's native QuoterV2
+  `int24 tickSpacing` parameter instead of the Uniswap V3 `uint24 fee`
+  parameter. Discovered pools no longer require synthetic fee metadata, and
+  one-shot cold-start accepts complete tick-spacing metadata while preserving
+  provider-disconnected quote execution.
+
 ## [0.3.0-alpha.2] - 2026-08-05
 
 ### Added
@@ -492,7 +502,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...HEAD
+[0.3.0-alpha.3]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...v0.3.0-alpha.3
 [0.3.0-alpha.2]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0

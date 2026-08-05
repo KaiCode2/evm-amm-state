@@ -37,7 +37,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.2", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.3", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -90,11 +90,12 @@ per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
 discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
 
-> **Slipstream quoting caveat.** Slipstream / Aerodrome CL ships as
-> discovery + cold-start: its own quoter ABI differs (int24 tickSpacing), so
-> discovered registrations leave `fee` unset and `simulate_swap` returns
-> `MissingMetadata` until you supply a Uniswap-compatible quoter + fee — see
-> the [support matrix](docs/protocol-support-matrix.md).
+> **Slipstream quoting configuration.** Slipstream / Aerodrome CL uses its
+> native `int24 tickSpacing` QuoterV2 struct; `fee` is intentionally unset and
+> is not used. Factory discovery supplies the tick spacing but does not pin a
+> chain-specific quoter address, so configure a compatible Slipstream quoter on
+> the factory/pool metadata (or in `SimConfig`) before cold-start. See the
+> [support matrix](docs/protocol-support-matrix.md).
 
 > **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
 > reserves its cold-start warms — the pool's `stable` flag and token `decimals`,

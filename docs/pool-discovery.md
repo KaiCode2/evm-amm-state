@@ -80,7 +80,7 @@ the protocol boundary below.)
 | Protocol | Mechanism | Notes |
 | --- | --- | --- |
 | Uniswap V3 / Sushi V3 / Pancake V3 | DerivedSlot (fee-keyed `getPool[t0][t1][fee]`) via [`ClFactorySpec`] | per-fork base slots / fee tiers / quoter; fork presets (`uniswap_v3`, `sushi_v3`, `pancake_v3`) |
-| Slipstream / Aerodrome CL | DerivedSlot (tickSpacing-keyed `getPool[t0][t1][tickSpacing]`) via [`ClFactorySpec`] | discovery only — its quoter ABI differs (int24 tickSpacing), so quoting rides a Uniswap-compatible quoter |
+| Slipstream / Aerodrome CL | DerivedSlot (tickSpacing-keyed `getPool[t0][t1][tickSpacing]`) via [`ClFactorySpec`] | native signed-tick-spacing quoting; configure the chain-specific compatible quoter with `with_quoter` or `SimConfig` |
 | Uniswap V2 | DerivedSlot (`getPair[t0][t1]`) | one pool per pair |
 | Solidly V2 (Aerodrome / Velodrome) | DerivedSlot (`getPool[t0][t1][bool stable]`) | stable **and** volatile — a pair yields up to two pools |
 

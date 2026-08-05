@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "evm-amm-state"
-version = "0.3.0-alpha.2"
+version = "0.3.0-alpha.3"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

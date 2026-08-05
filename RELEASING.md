@@ -1,10 +1,11 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.2`. Publish in this order:
+The current release candidate is `0.3.0-alpha.3`. Its prerequisites are already
+published:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
 2. `evm-fork-cache 0.4.0-alpha.2`;
-3. `evm-amm-state 0.3.0-alpha.2`.
+3. publish `evm-amm-state 0.3.0-alpha.3` after the gates below pass.
 
 The state crate intentionally keeps a versioned sibling path during development.
 Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.2` from
@@ -18,6 +19,11 @@ cumulative overlay replacement. Historical paid QuickNode and Alchemy Base
 results, plus the current provider-specific revalidation status, are recorded
 in `docs/flashblocks-latency.md`; every release candidate must still repeat the
 documented paid-provider gate.
+
+Alpha.3 is a targeted Slipstream correction: native quote calldata uses the
+protocol's signed `int24 tickSpacing` field rather than Uniswap V3's `uint24
+fee`, and the fast cold-start path accepts complete Slipstream tick-spacing
+metadata without inventing a fee.
 
 ## Offline release matrix
 

@@ -511,7 +511,8 @@ pub struct V3Metadata {
     /// The pool's `token1`.
     pub token1: Option<Address>,
     /// The pool fee in hundredths of a bip (e.g. `500` = 0.05%). Required for
-    /// `simulate_swap` (the QuoterV2 fee argument).
+    /// fee-keyed Uniswap/Pancake `simulate_swap` calls. Slipstream uses
+    /// [`Self::tick_spacing`] instead and intentionally leaves this unset.
     pub fee: Option<u32>,
     /// The pool's tick spacing (drives the derived storage layout when no
     /// explicit `storage_layout` is set).
@@ -523,9 +524,10 @@ pub struct V3Metadata {
     /// Per-pool swap-quote target (a fork's own QuoterV2). When set, swap
     /// simulation quotes against this address instead of the caller's
     /// [`SimConfig::v3_quoter`](super::SimConfig::v3_quoter) — so a discovered
-    /// PancakeSwap pool quotes against Pancake's quoter. `None` falls back to the
-    /// caller's configured quoter. Factory discovery fills this from the
-    /// fork's [`ClFactorySpec`](super::factory::ClFactorySpec) quoter.
+    /// PancakeSwap or configured Slipstream pool quotes against its own quoter.
+    /// `None` falls back to the caller's configured quoter. Factory discovery
+    /// fills this from the fork's [`ClFactorySpec`](super::factory::ClFactorySpec)
+    /// quoter when one was configured.
     pub quoter: Option<Address>,
     /// Explicit V3 storage layout (slot bases + tick spacing). When unset it is
     /// derived from `tick_spacing` per the pool's family.

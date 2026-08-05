@@ -810,20 +810,23 @@ pub fn supports_one_shot_hydration(pool: &PoolRegistration) -> bool {
 /// the fast path.
 ///
 /// For a V3-family pool `finish` *preserves* (never merges) metadata, so
-/// completeness here means the fields a later `simulate_swap` needs (`fee`) plus
-/// the layout the fast path already requires. A V3 fork with no fee tier (e.g. a
-/// discovered Slipstream pool, whose `fee` is deliberately unset) therefore
-/// forgoes the fast path and takes the normal `cold_start` — acceptable, since it
-/// is discovery-only for quoting anyway. Balancer/Curve flat hydration only
-/// applies once a discovered read-set exists, which itself is produced by a
-/// prior discover→verify `cold_start` that already ran `finish`.
+/// completeness here means the fields its quote ABI needs plus the layout the
+/// fast path already requires. Fee-keyed V3 pools require `fee`; Slipstream
+/// instead requires a valid signed tick spacing that agrees with its storage
+/// layout. Balancer/Curve flat hydration only applies once a discovered read-set
+/// exists, which itself is produced by a prior discover→verify `cold_start` that
+/// already ran `finish`.
 fn fast_metadata_complete(pool: &PoolRegistration) -> bool {
     use super::ProtocolMetadata;
     match &pool.metadata {
         ProtocolMetadata::UniswapV2(m) => m.token0.is_some() && m.token1.is_some(),
-        ProtocolMetadata::UniswapV3(m)
-        | ProtocolMetadata::PancakeV3(m)
-        | ProtocolMetadata::Slipstream(m) => m.fee.is_some() && m.storage_layout.is_some(),
+        ProtocolMetadata::UniswapV3(m) | ProtocolMetadata::PancakeV3(m) => {
+            m.fee.is_some() && m.storage_layout.is_some()
+        }
+        ProtocolMetadata::Slipstream(m) => m.storage_layout.is_some_and(|layout| {
+            m.tick_spacing == Some(layout.tick_spacing)
+                && (-8_388_608..=8_388_607).contains(&layout.tick_spacing)
+        }),
         // Solidly `finish` decodes+merges token0/token1 like V2, so require them
         // here too — otherwise the fast path would leave metadata tokens `None`
         // while the fallback populates them (an inconsistency for consumers that
@@ -2104,9 +2107,15 @@ mod tests {
         let slip_layout = V3StorageLayout::slipstream(100);
         let slip = PoolRegistration::new(PoolKey::Slipstream(Address::repeat_byte(0x33)))
             .with_metadata(ProtocolMetadata::Slipstream(
-                V3Metadata::default().with_storage_layout(slip_layout),
+                V3Metadata::default()
+                    .with_tick_spacing(100)
+                    .with_storage_layout(slip_layout),
             ));
         assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+        assert!(
+            fast_metadata_complete(&slip),
+            "tick-spacing-keyed Slipstream does not require fee metadata"
+        );
     }
 
     /// A non-positive tick spacing would panic in `full_word_range` /

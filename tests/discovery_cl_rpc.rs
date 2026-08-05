@@ -28,9 +28,9 @@
 //!   against the live factory getter and `pancake_create2_matches_getter`
 //!   confirms the CREATE2 derivation; a regression there means the constants in
 //!   `ClFactorySpec::pancake_v3` are wrong.
-//! - **Slipstream**: the preset is discovery-only (no `create2`, no `quoter` — its
-//!   quoter takes a different, tickSpacing-keyed ABI, so quoting rides a
-//!   caller-supplied compatible quoter). `slipstream_get_pool_base_slot_matches_getter`
+//! - **Slipstream**: the preset has no `create2` or chain-specific `quoter`;
+//!   native tickSpacing-keyed quoting uses a caller-supplied compatible target.
+//!   `slipstream_get_pool_base_slot_matches_getter`
 //!   confirms the `getPool` base slot + the tickSpacing salt encoding against
 //!   Aerodrome's live CLFactory on Base.
 
