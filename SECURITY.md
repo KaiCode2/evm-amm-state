@@ -27,7 +27,7 @@ Sibling repositories are checked out at exact candidate commits in every CI and
 live workflow. The transport candidate is
 `7868bea593dec5748ad7475d1909fc3a2de0d4ad`; the cache candidate is
 `2be88d15fa15b5c44188b318463aa4705bb75aef`; and the live search gate uses
-`566bde7949e828cd82c0d864576ee10f7044cc88`. Any revision change requires
+`564d3d9ccbe260fd4d6606359ea0ddb639350acf`. Any revision change requires
 rerunning the applicable locked release or paid-provider matrix.
 
 The accepted advisory and unmaintained-dependency scopes are documented and
