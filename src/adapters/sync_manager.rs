@@ -837,6 +837,16 @@ impl AmmSyncEngine {
         &self.runtime
     }
 
+    /// Install the verified canonical starting point owned by the asynchronous
+    /// runtime before any speculative input can be accepted.
+    #[cfg(feature = "live-runtime")]
+    pub(crate) fn adopt_canonical_baseline(
+        &mut self,
+        baseline: evm_fork_cache::reactive::BlockRef,
+    ) -> Result<(), evm_fork_cache::reactive::ReactiveBaselineError> {
+        self.runtime.adopt_canonical_baseline(baseline)
+    }
+
     /// Replace the registry and rebuild the underlying handler registration.
     ///
     /// Pool-scoped handlers own immutable registration/dependency snapshots, so

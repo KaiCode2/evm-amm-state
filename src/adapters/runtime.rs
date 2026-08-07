@@ -1423,6 +1423,28 @@ impl AmmRuntimeStatusSnapshot {
     }
 }
 
+/// Bounded reason for rejecting one disposable preconfirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmmPreconfirmationRejectionReason {
+    /// A routed speculative log decoded or applied with an error.
+    ReactiveBatch,
+    /// The speculative batch was not exact and repair-free.
+    StateReadiness,
+    /// A representative offline quote was incomplete or failed.
+    QuoteReadiness,
+}
+
+impl AmmPreconfirmationRejectionReason {
+    /// Stable telemetry label for this rejection class.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReactiveBatch => "reactive_batch",
+            Self::StateReadiness => "state_readiness",
+            Self::QuoteReadiness => "quote_readiness",
+        }
+    }
+}
+
 /// Observer-facing runtime event payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1558,6 +1580,11 @@ pub enum AmmRuntimeEventKind {
         address: Address,
         /// Block at which the gap was detected.
         block: u64,
+    },
+    /// One speculative preview was discarded without changing canonical state.
+    PreconfirmationRejected {
+        /// Stable, low-cardinality rejection class.
+        reason: AmmPreconfirmationRejectionReason,
     },
     /// Runtime health changed.
     HealthChanged {

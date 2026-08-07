@@ -62,7 +62,10 @@ registry topology, and quote-relevant pool changes. It is deliberately not an
 `AmmStateCommit`: canonical version, pool revisions, lifecycle, health, repair
 ownership, and the reliable canonical change stream do not advance. Consumers
 must treat the outer `Arc` as short-lived simulation input rather than confirmed
-state.
+state. The runtime installs its verified full-header startup point as the
+reactive canonical baseline, and accepts only a preview whose block number and
+parent hash identify that baseline's exact child. Canonical advancement moves
+the baseline before another preview can be accepted.
 
 Each cumulative Flashblock replaces the previous overlay. Canonical progress
 first restores the saved canonical cache and clears the preview watch; subscriber

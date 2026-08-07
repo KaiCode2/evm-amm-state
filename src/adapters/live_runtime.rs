@@ -13,8 +13,8 @@ use alloy_rpc_types_eth::Header as RpcHeader;
 use evm_fork_cache::BlockContextError;
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
-    BlockRef, ChainStatus, DeliveryScope, FlashblockRef, HandlerId, ReactiveInput,
-    ReactiveInputBatch, ReactiveReport, StateEffectQuality,
+    BlockRef, ChainStatus, DeliveryScope, FlashblockRef, HandlerId, ReactiveBaselineError,
+    ReactiveInput, ReactiveInputBatch, ReactiveReport, StateEffectQuality,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -27,16 +27,17 @@ use super::subscriber_driver::{AmmSubscriberControl, AmmSubscriberOwnerPlan};
 use super::{
     AdapterRegistry, AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmChangeSet,
     AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind, AmmPoolGenerationReservation,
-    AmmPreconfirmedSnapshot, AmmPreparedPoolState, AmmPreparedStorage, AmmRuntimeEvent,
-    AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeStatusSnapshot, AmmStateCommit,
-    AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateSnapshot, AmmStateVersion,
-    AmmSyncEngine, AmmSyncError, AmmSyncIncident, AmmSyncPoolChangeKind, AmmWorkClass, AmmWorkKind,
-    AmmWorkProgress, DeferredWork, DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey,
-    DiscoveryOwnership, PoolDiscovery, PoolKey, PoolRegistration, PoolRevisionMap,
-    PoolRuntimeState, PoolStateRevision, QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet,
-    RegistrationProvenance, RegistrationReorgAction, RegistrationSourceKey, RepairAction,
-    RuntimeLifecycleMap, RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId,
-    TokenEdgeDiscoveryReport, TokenEdgeDiscoveryRequest, WorkId,
+    AmmPreconfirmationRejectionReason, AmmPreconfirmedSnapshot, AmmPreparedPoolState,
+    AmmPreparedStorage, AmmRuntimeEvent, AmmRuntimeEventKind, AmmRuntimeHealth,
+    AmmRuntimeStatusSnapshot, AmmStateCommit, AmmStateIncident, AmmStatePoint, AmmStateQuality,
+    AmmStateSnapshot, AmmStateVersion, AmmSyncEngine, AmmSyncError, AmmSyncIncident,
+    AmmSyncPoolChangeKind, AmmWorkClass, AmmWorkKind, AmmWorkProgress, DeferredWork,
+    DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey, DiscoveryOwnership, PoolDiscovery,
+    PoolKey, PoolRegistration, PoolRevisionMap, PoolRuntimeState, PoolStateRevision,
+    QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet, RegistrationProvenance,
+    RegistrationReorgAction, RegistrationSourceKey, RepairAction, RuntimeLifecycleMap,
+    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, TokenEdgeDiscoveryReport,
+    TokenEdgeDiscoveryRequest, WorkId,
 };
 
 /// Hash-pinned, source-reconciled complete canonical block delivery.
@@ -386,6 +387,8 @@ pub enum AmmRuntimeSpawnError {
     MissingLocalExecutor,
     /// The synchronous lifecycle engine could not be initialized.
     Sync(AmmSyncError),
+    /// The verified canonical point could not initialize speculative lineage.
+    ReactiveBaseline(ReactiveBaselineError),
     /// The initial registry and generation-ownership snapshot diverged.
     RegistrySnapshot(Box<AdapterRegistrySnapshotError>),
     /// The cache and advertised baseline use different chain identities.
@@ -417,6 +420,9 @@ impl fmt::Display for AmmRuntimeSpawnError {
                 write!(f, "AMM runtime requires an active Tokio LocalSet")
             }
             Self::Sync(error) => write!(f, "failed to initialize AMM runtime: {error}"),
+            Self::ReactiveBaseline(error) => {
+                write!(f, "failed to initialize AMM speculative lineage: {error}")
+            }
             Self::RegistrySnapshot(error) => write!(f, "failed to snapshot AMM topology: {error}"),
             Self::BaselineChainMismatch { expected, actual } => write!(
                 f,
@@ -438,6 +444,7 @@ impl std::error::Error for AmmRuntimeSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sync(error) => Some(error),
+            Self::ReactiveBaseline(error) => Some(error),
             Self::RegistrySnapshot(error) => Some(error),
             Self::ZeroChannelCapacity
             | Self::MissingTokioRuntime
@@ -452,6 +459,12 @@ impl std::error::Error for AmmRuntimeSpawnError {
 impl From<AmmSyncError> for AmmRuntimeSpawnError {
     fn from(error: AmmSyncError) -> Self {
         Self::Sync(error)
+    }
+}
+
+impl From<ReactiveBaselineError> for AmmRuntimeSpawnError {
+    fn from(error: ReactiveBaselineError) -> Self {
+        Self::ReactiveBaseline(error)
     }
 }
 
@@ -1020,7 +1033,13 @@ impl AmmRuntime {
         cache.set_block_gas_limit(Some(baseline.header.inner.gas_limit));
         cache.set_timestamp(Some(baseline.header.inner.timestamp));
 
-        let engine = AmmSyncEngine::new(registry)?;
+        let mut engine = AmmSyncEngine::new(registry)?;
+        engine.adopt_canonical_baseline(BlockRef {
+            number: point.block_number(),
+            hash: point.block_hash(),
+            parent_hash: Some(baseline.header.inner.parent_hash),
+            timestamp: Some(baseline.header.inner.timestamp),
+        })?;
         let registry_snapshot = Arc::new(AdapterRegistrySnapshot::try_new(
             engine.registry(),
             engine.ownership(),
@@ -6437,6 +6456,20 @@ impl AmmRuntimeActor {
         changes
     }
 
+    fn reject_preconfirmation(
+        &mut self,
+        reason: AmmPreconfirmationRejectionReason,
+        message: String,
+    ) -> AmmRuntimeCommandError {
+        self.engine.discard_preconfirmation(&mut self.cache);
+        self.preconfirmations.send_replace(None);
+        self.publish_runtime_events(vec![AmmRuntimeEventKind::PreconfirmationRejected {
+            reason,
+        }])
+        .err()
+        .unwrap_or(AmmRuntimeCommandError::PreconfirmationBatch(message))
+    }
+
     fn ingest_preconfirmation(
         &mut self,
         batch: ReactiveInputBatch<Ethereum>,
@@ -6478,12 +6511,14 @@ impl AmmRuntimeActor {
                 None
             }
         }) {
-            self.engine.discard_preconfirmation(&mut self.cache);
-            return Err(AmmRuntimeCommandError::PreconfirmationBatch(message));
+            return Err(self.reject_preconfirmation(
+                AmmPreconfirmationRejectionReason::ReactiveBatch,
+                message,
+            ));
         }
         if let Some(reason) = preconfirmation_readiness_error(&report) {
-            self.engine.discard_preconfirmation(&mut self.cache);
-            return Err(AmmRuntimeCommandError::PreconfirmationBatch(
+            return Err(self.reject_preconfirmation(
+                AmmPreconfirmationRejectionReason::StateReadiness,
                 reason.to_owned(),
             ));
         }
@@ -6493,8 +6528,8 @@ impl AmmRuntimeActor {
             .engine
             .validate_quote_read_sets(Arc::clone(&snapshot), report.affected_pools.iter())
         {
-            self.engine.discard_preconfirmation(&mut self.cache);
-            return Err(AmmRuntimeCommandError::PreconfirmationBatch(
+            return Err(self.reject_preconfirmation(
+                AmmPreconfirmationRejectionReason::QuoteReadiness,
                 error.to_string(),
             ));
         }

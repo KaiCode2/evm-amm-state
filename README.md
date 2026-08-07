@@ -37,7 +37,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.3", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.4", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -333,9 +333,10 @@ sampler. Applications that do not want recurring OP request usage can keep
 Preconfirmed logs pass through the existing AMM handlers—there is no second
 protocol adapter path—and publish an `AmmPreconfirmedSnapshot`
 through `latest_preconfirmation` / `subscribe_preconfirmations`. Each preview is
-anchored to the current canonical version, carries its `FlashblockRef` and
-announcing provider ID, and exposes an immutable cache snapshot plus the affected
-pool changes for immediate simulation. `AmmPreconfirmedSnapshot::event_refs`
+anchored to the current canonical version and must identify the exact next block
+by number and parent hash. It carries its `FlashblockRef` and announcing provider
+ID, and exposes an immutable cache snapshot plus the affected pool changes for
+immediate simulation. `AmmPreconfirmedSnapshot::event_refs`
 and `AmmChangeSet::event_refs` expose the same sorted, deduplicated transaction
 hash/log-index identity across pending and canonical delivery; placeholder zero
 transaction hashes are omitted. A newer Flashblock replaces it; canonical

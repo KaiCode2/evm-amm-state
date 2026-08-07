@@ -127,15 +127,15 @@ pub use reactive::{
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use runtime::{
     AdapterGeneration, AdapterInstanceId, AdapterKey, AmmChangeImpact, AmmChangeSet,
-    AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind, AmmRuntimeEvent,
-    AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeId, AmmRuntimeStatusSnapshot,
-    AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateVersion, AmmWorkClass, AmmWorkKind,
-    AmmWorkProgress, DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey,
-    InvalidPoolRuntimeTransition, InvalidWorkProgress, OwnerRuntimeState, PoolGeneration,
-    PoolInstanceId, PoolLifecycle, PoolRuntimeState, PoolStateRef, PoolStateRevision,
-    QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet, RegistrationProvenance,
-    RegistrationReorgAction, RegistrationSourceKey, RuntimeLifecycleMap, RuntimeOwnerId,
-    RuntimeSequenceOverflow, RuntimeWorkId, StatePosition, WorkId,
+    AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind,
+    AmmPreconfirmationRejectionReason, AmmRuntimeEvent, AmmRuntimeEventKind, AmmRuntimeHealth,
+    AmmRuntimeId, AmmRuntimeStatusSnapshot, AmmStateIncident, AmmStatePoint, AmmStateQuality,
+    AmmStateVersion, AmmWorkClass, AmmWorkKind, AmmWorkProgress, DiscoveryGeneration,
+    DiscoveryOwnerId, DiscoveryOwnerKey, InvalidPoolRuntimeTransition, InvalidWorkProgress,
+    OwnerRuntimeState, PoolGeneration, PoolInstanceId, PoolLifecycle, PoolRuntimeState,
+    PoolStateRef, PoolStateRevision, QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet,
+    RegistrationProvenance, RegistrationReorgAction, RegistrationSourceKey, RuntimeLifecycleMap,
+    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StatePosition, WorkId,
 };
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 pub use snapshot::{
@@ -144,8 +144,8 @@ pub use snapshot::{
 };
 #[cfg(feature = "live-runtime")]
 pub use subscriber_driver::{
-    AmmSubscriberDriverConfig, AmmSubscriberDriverError, AmmSubscriberDriverHandle,
-    AmmSubscriberDriverState,
+    AmmPreconfirmationRejectionPolicy, AmmSubscriberDriverConfig, AmmSubscriberDriverError,
+    AmmSubscriberDriverHandle, AmmSubscriberDriverState,
 };
 // Both layout types are always compiled (`storage` is feature-neutral); export
 // them unconditionally — `V3StorageLayout` is the field type of the

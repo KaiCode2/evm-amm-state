@@ -19,7 +19,8 @@ use evm_amm_state::adapters::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AdapterRegistry,
     AmmAdapter, AmmCanonicalBatch, AmmCanonicalBatchError, AmmColdStartOptions,
     AmmColdStartWorkerConfig, AmmDiscoveryOptions, AmmEventRef, AmmEvictionPolicy,
-    AmmFactoryWatcherRegistration, AmmObserverError, AmmPoolChangeKind, AmmPreparedPoolState,
+    AmmFactoryWatcherRegistration, AmmObserverError, AmmPoolChangeKind,
+    AmmPreconfirmationRejectionPolicy, AmmPreconfirmationRejectionReason, AmmPreparedPoolState,
     AmmPreparedStorage, AmmRuntime, AmmRuntimeBaseline, AmmRuntimeCommandError, AmmRuntimeConfig,
     AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeSubmitError, AmmStatePoint, AmmStateVersion,
     AmmSubscriberDriverConfig, AmmSubscriberDriverError, AmmSubscriberDriverState, ColdStartPolicy,
@@ -40,9 +41,9 @@ use evm_fork_cache::StateUpdate as ForkStateUpdate;
 use evm_fork_cache::bulk_storage::pack_slots_calldata;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay};
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockRef, InputSource, ProviderRef,
-    ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig,
-    SubscriberMode,
+    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockRef, InputSource,
+    PreconfirmationMode, ProviderRef, ReactiveContext, ReactiveInput, ReactiveInputBatch,
+    ReactiveInputRecord, SubscriberConfig, SubscriberMode,
 };
 use revm::{
     Database,
@@ -615,6 +616,7 @@ async fn flashblock_preview_with_pending_repair_is_rejected_and_restored() -> Re
                 runtime_baseline(500),
                 AmmRuntimeConfig::default(),
             )?;
+            let mut observer = runtime.subscribe_events();
 
             let error = match runtime
                 .ingest_preconfirmation(flashblock_primitive_log_batch(
@@ -641,6 +643,12 @@ async fn flashblock_preview_with_pending_repair_is_rejected_and_restored() -> Re
                     .storage_value(address, slot),
                 Some(canonical_value)
             );
+            assert!(matches!(
+                observer.next_event().await?.kind(),
+                AmmRuntimeEventKind::PreconfirmationRejected {
+                    reason: AmmPreconfirmationRejectionReason::StateReadiness,
+                }
+            ));
 
             runtime.shutdown().await?;
             Ok(())
@@ -715,6 +723,7 @@ async fn flashblock_preview_with_an_incomplete_learned_quote_is_rejected() -> Re
                 runtime_baseline(500),
                 AmmRuntimeConfig::default(),
             )?;
+            let mut observer = runtime.subscribe_events();
             let error = match runtime
                 .ingest_preconfirmation(flashblock_primitive_log_batch(
                     501,
@@ -737,6 +746,12 @@ async fn flashblock_preview_with_an_incomplete_learned_quote_is_rejected() -> Re
                     if message.contains("incomplete")
             ));
             assert!(runtime.latest_preconfirmation().is_none());
+            assert!(matches!(
+                observer.next_event().await?.kind(),
+                AmmRuntimeEventKind::PreconfirmationRejected {
+                    reason: AmmPreconfirmationRejectionReason::QuoteReadiness,
+                }
+            ));
 
             runtime.shutdown().await?;
             Ok(())
@@ -1177,6 +1192,42 @@ async fn alloy_driver_rejects_polling_before_mutating_runtime_attachment() -> Re
                     .attach_alloy_subscriber(subscriber, AmmSubscriberDriverConfig::default())
                     .await,
                 Err(AmmSubscriberDriverError::UnsupportedMode)
+            ));
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_continuation_policy_rejects_required_preconfirmations() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let subscriber = AlloySubscriber::new(
+                provider,
+                SubscriberMode::PubSub,
+                SubscriberConfig {
+                    preconfirmations: PreconfirmationMode::Required,
+                    ..SubscriberConfig::default()
+                },
+            );
+            let config = AmmSubscriberDriverConfig::default()
+                .with_preconfirmation_rejection_policy(
+                    AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+                );
+
+            assert!(matches!(
+                runtime.attach_alloy_subscriber(subscriber, config).await,
+                Err(AmmSubscriberDriverError::IncompatiblePreconfirmationPolicy)
             ));
             runtime.shutdown().await?;
             Ok(())
@@ -3747,6 +3798,7 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                 )
                 .await?;
 
+            let mut snapshots = runtime.subscribe_snapshots();
             let log = PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new());
             let degraded = runtime
                 .ingest_batch(canonical_primitive_log_batch(
@@ -3762,18 +3814,22 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     .any(|change| change.pool() == &instance
                         && change.kind() == AmmPoolChangeKind::Degraded)
             );
-            assert_eq!(
-                runtime
-                    .latest_snapshot()
-                    .registry()
-                    .pool(&instance)
-                    .expect("degraded generation remains registered")
-                    .status,
-                PoolStatus::Degraded
-            );
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                loop {
+                    let is_degraded = snapshots
+                        .borrow()
+                        .registry()
+                        .pool(&instance)
+                        .is_some_and(|pool| pool.status == PoolStatus::Degraded);
+                    if is_degraded {
+                        break;
+                    }
+                    snapshots.changed().await.expect("runtime remains alive");
+                }
+            })
+            .await?;
             transport.release_one();
 
-            let mut snapshots = runtime.subscribe_snapshots();
             tokio::time::timeout(std::time::Duration::from_millis(250), async {
                 while snapshots
                     .borrow()

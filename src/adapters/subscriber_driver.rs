@@ -8,9 +8,9 @@ use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, Header as RpcHeader, Log as RpcLog};
 use evm_fork_cache::reactive::{
     AlloySubscriber, BlockInterest, BlockRef, ChainStatus, EventSubscriber, HandlerId, InputSource,
-    ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest,
-    SubscriberDriverPoll, SubscriberMode, SubscriberOwnerEpoch, SubscriberOwnerError,
-    SubscriberOwnerStart, SubscriberOwnerState,
+    PreconfirmationMode, ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
+    ReactiveInterest, SubscriberDriverPoll, SubscriberMode, SubscriberOwnerEpoch,
+    SubscriberOwnerError, SubscriberOwnerStart, SubscriberOwnerState,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -19,11 +19,31 @@ use super::{
     AmmRuntimeHandle, AmmStatePoint,
 };
 
+/// Policy for a data-quality rejection of one disposable preconfirmation.
+///
+/// Canonical invariants, subscriber transport errors, and runtime lifecycle
+/// failures are unaffected by this policy and always remain fatal. Only the
+/// typed [`AmmRuntimeCommandError::PreconfirmationBatch`] rejection may be
+/// discarded so a `Preferred` preview stream cannot tear down canonical
+/// delivery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AmmPreconfirmationRejectionPolicy {
+    /// Preserve the historical fail-closed behavior for required previews.
+    #[default]
+    FailDriver,
+    /// Discard the rejected preview and continue canonical delivery.
+    ///
+    /// Attachment rejects this policy unless the subscriber explicitly uses
+    /// [`PreconfirmationMode::Preferred`].
+    ContinueCanonical,
+}
+
 /// Configuration for the Alloy subscriber driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmmSubscriberDriverConfig {
     control_capacity: usize,
     max_addresses_per_get_logs: usize,
+    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
 }
 
 impl Default for AmmSubscriberDriverConfig {
@@ -31,6 +51,7 @@ impl Default for AmmSubscriberDriverConfig {
         Self {
             control_capacity: 32,
             max_addresses_per_get_logs: 256,
+            preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
         }
     }
 }
@@ -56,6 +77,20 @@ impl AmmSubscriberDriverConfig {
     /// Maximum addresses placed in one hash-pinned `eth_getLogs` request.
     pub const fn max_addresses_per_get_logs(&self) -> usize {
         self.max_addresses_per_get_logs
+    }
+
+    /// Select whether a rejected disposable preview terminates this driver.
+    pub const fn with_preconfirmation_rejection_policy(
+        mut self,
+        policy: AmmPreconfirmationRejectionPolicy,
+    ) -> Self {
+        self.preconfirmation_rejection_policy = policy;
+        self
+    }
+
+    /// Active rejected-preview policy.
+    pub const fn preconfirmation_rejection_policy(&self) -> AmmPreconfirmationRejectionPolicy {
+        self.preconfirmation_rejection_policy
     }
 }
 
@@ -86,6 +121,9 @@ pub enum AmmSubscriberDriverError {
     ZeroControlCapacity,
     /// Stage 4 complete-block delivery requires header-capable pubsub mode.
     UnsupportedMode,
+    /// Canonical continuation was paired with a subscriber mode that does not
+    /// permit disposable previews.
+    IncompatiblePreconfirmationPolicy,
     /// The driver task or its control channel is closed.
     Closed,
     /// The upstream subscriber rejected or failed an operation.
@@ -128,6 +166,10 @@ impl fmt::Display for AmmSubscriberDriverError {
             Self::UnsupportedMode => write!(
                 f,
                 "AMM subscriber driver requires Auto or PubSub header delivery"
+            ),
+            Self::IncompatiblePreconfirmationPolicy => write!(
+                f,
+                "canonical continuation requires Preferred preconfirmations"
             ),
             Self::Closed => write!(f, "AMM subscriber driver is closed"),
             Self::Subscriber(error) => write!(f, "AMM subscriber failed: {error}"),
@@ -512,6 +554,12 @@ where
     if subscriber.mode() == SubscriberMode::Polling {
         return Err(AmmSubscriberDriverError::UnsupportedMode);
     }
+    if config.preconfirmation_rejection_policy
+        == AmmPreconfirmationRejectionPolicy::ContinueCanonical
+        && subscriber.config().preconfirmations != PreconfirmationMode::Preferred
+    {
+        return Err(AmmSubscriberDriverError::IncompatiblePreconfirmationPolicy);
+    }
     let mut base_interests = subscriber.registered_interests().to_vec();
     if !base_interests
         .iter()
@@ -537,6 +585,7 @@ where
         pending: None,
         next_transaction: 0,
         max_addresses_per_get_logs: config.max_addresses_per_get_logs,
+        preconfirmation_rejection_policy: config.preconfirmation_rejection_policy,
         report_stop: true,
         stop_requested: false,
         canonical_lineage,
@@ -563,6 +612,7 @@ struct AlloyAmmSubscriberDriver<P> {
     pending: Option<PendingSubscriberTransaction>,
     next_transaction: u64,
     max_addresses_per_get_logs: usize,
+    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
     report_stop: bool,
     stop_requested: bool,
     canonical_lineage: BTreeMap<u64, alloy_primitives::B256>,
@@ -572,6 +622,21 @@ const RETAINED_CANONICAL_LINEAGE: usize = 65;
 
 fn initial_canonical_lineage(point: AmmStatePoint) -> BTreeMap<u64, alloy_primitives::B256> {
     BTreeMap::from([(point.block_number(), point.block_hash())])
+}
+
+fn handle_preconfirmation_result<T>(
+    policy: AmmPreconfirmationRejectionPolicy,
+    result: Result<T, AmmRuntimeCommandError>,
+) -> Result<(), AmmSubscriberDriverError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(AmmRuntimeCommandError::PreconfirmationBatch(_))
+            if policy == AmmPreconfirmationRejectionPolicy::ContinueCanonical =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl<P> AlloyAmmSubscriberDriver<P>
@@ -1021,9 +1086,12 @@ where
                 .iter()
                 .all(|record| record.scope().is_preconfirmed())
         {
-            self.runtime
-                .ingest_preconfirmation(batch.into_reactive_batch())
-                .await?;
+            handle_preconfirmation_result(
+                self.preconfirmation_rejection_policy,
+                self.runtime
+                    .ingest_preconfirmation(batch.into_reactive_batch())
+                    .await,
+            )?;
             return Ok(());
         }
         let mut headers = Vec::new();
@@ -1329,8 +1397,9 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        AlloyAmmSubscriberDriver, AmmSubscriberControl, AmmSubscriberDriverState,
-        AmmSubscriberOwnerPlan, SubscriberControlCommand, SubscriberTransaction,
+        AlloyAmmSubscriberDriver, AmmPreconfirmationRejectionPolicy, AmmSubscriberControl,
+        AmmSubscriberDriverConfig, AmmSubscriberDriverState, AmmSubscriberOwnerPlan,
+        SubscriberControlCommand, SubscriberTransaction, handle_preconfirmation_result,
         initial_canonical_lineage, reconciliation_filters,
     };
     use crate::adapters::{
@@ -1341,6 +1410,44 @@ mod tests {
         PoolStateDependencies, PoolStatus, ProtocolId, UniswapV2Adapter,
         uniswap_v2_pair_runtime_code_hash,
     };
+
+    #[test]
+    fn preferred_preview_rejection_continues_canonical_delivery() {
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+            Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                "quote call reverted or halted".to_owned(),
+            )),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preferred_preview_policy_keeps_runtime_failures_fatal() {
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+            Err(AmmRuntimeCommandError::Closed),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn preview_rejections_remain_fatal_by_default() {
+        assert_eq!(
+            AmmSubscriberDriverConfig::default().preconfirmation_rejection_policy(),
+            AmmPreconfirmationRejectionPolicy::FailDriver
+        );
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::FailDriver,
+            Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                "quote call reverted or halted".to_owned(),
+            )),
+        );
+
+        assert!(result.is_err());
+    }
 
     struct EmptyAdapter;
 
@@ -1882,6 +1989,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
@@ -1963,6 +2071,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
@@ -2046,6 +2155,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),

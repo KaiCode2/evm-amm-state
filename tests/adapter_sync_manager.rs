@@ -2274,6 +2274,10 @@ async fn flashblock_preview_is_attributed_and_discard_restores_canonical_pool_st
         StateUpdate::slot(pool, r1_slot, canonical_reserve1),
     ]);
     let mut engine = AmmSyncEngine::new(solidly_registry(pool, r0_slot, r1_slot)?)?;
+    engine.ingest_batch(
+        &mut cache,
+        batch(rpc_log(Address::ZERO, Vec::new(), Vec::new(), 90), 90),
+    )?;
     let provider = ProviderRef::new("base-flashblocks", 7);
     let flashblock = FlashblockRef {
         provider: provider.clone(),
@@ -2342,6 +2346,10 @@ async fn malformed_flashblock_event_does_not_degrade_canonical_pool_health() -> 
     let (r0_slot, r1_slot) = (U256::from(10_u64), U256::from(11_u64));
     let mut cache = setup_cache().await?;
     let mut engine = AmmSyncEngine::new(solidly_registry(pool, r0_slot, r1_slot)?)?;
+    engine.ingest_batch(
+        &mut cache,
+        batch(rpc_log(Address::ZERO, Vec::new(), Vec::new(), 90), 90),
+    )?;
     let flashblock = FlashblockRef {
         provider: ProviderRef::new("op-flashblocks", 3),
         payload_id: None,

@@ -1,16 +1,16 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.3`. Its prerequisites are already
-published:
+The current release candidate is `0.3.0-alpha.4`. Publish its prerequisites in
+this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
-2. `evm-fork-cache 0.4.0-alpha.2`;
-3. publish `evm-amm-state 0.3.0-alpha.3` after the gates below pass.
+2. `evm-fork-cache 0.4.0-alpha.3`;
+3. publish `evm-amm-state 0.3.0-alpha.4` after the gates below pass.
 
 The state crate intentionally keeps a versioned sibling path during development.
-Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.2` from
-crates.io. Until that version is published, state packaging is expected to stop at
-dependency resolution.
+Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.3` from
+crates.io. Treat any failure to resolve that published version as a release
+blocker rather than bypassing registry verification.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
 hydration, exact equality between the canonical warm-up quote and its immediate
@@ -24,6 +24,16 @@ Alpha.3 is a targeted Slipstream correction: native quote calldata uses the
 protocol's signed `int24 tickSpacing` field rather than Uniswap V3's `uint24
 fee`, and the fast cold-start path accepts complete Slipstream tick-spacing
 metadata without inventing a fee.
+
+Alpha.4 combines explicit containment for rejected speculative batches with
+canonical baseline lineage initialization for external preview sources. The
+subscriber driver remains fail-closed by default, while a `Preferred`
+application can discard only `PreconfirmationBatch` data-quality failures and
+continue canonical delivery; incompatible `Required` or `Disabled` pairings are
+rejected during attachment. The runtime rejects stale, missing-parent, and
+wrong-parent previews before they can alter canonical state. Typed rejection
+events preserve bounded observability without making raw error text a metric
+label.
 
 ## Offline release matrix
 
@@ -115,7 +125,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0-alpha.2` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.0-alpha.3` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, live gates, downstream compatibility, changelog, and benchmark evidence
 pass.

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.4] - 2026-08-07
+
+### Added
+
+- Added a typed, low-cardinality observer event for rejected speculative AMM
+  batches so applications can alert on reactive, state-readiness, and offline
+  quote-readiness failures without using raw error strings as labels.
+- Added an explicit subscriber-driver rejection policy. Required/default
+  previews remain fail-closed, while applications using `Preferred` mode may
+  discard only a typed preconfirmation-batch rejection and continue canonical
+  delivery. Attachment rejects a continuation policy paired with `Required` or
+  `Disabled` preconfirmations.
+
+### Fixed
+
+- The asynchronous runtime now installs its already-verified canonical
+  full-header baseline into the embedded reactive engine before accepting a
+  speculative preview. A preview must identify that baseline's exact child by
+  block number and parent hash; stale, missing-parent, and wrong-parent inputs
+  fail closed without altering canonical state.
+- A failed disposable preview no longer has to terminate the shared canonical
+  subscriber driver when the application explicitly selects canonical
+  continuation. Canonical transport, lifecycle, chain, and trust errors remain
+  fatal under either policy.
+
 ## [0.3.0-alpha.3] - 2026-08-05
 
 ### Fixed
@@ -502,7 +527,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...HEAD
+[0.3.0-alpha.4]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...v0.3.0-alpha.4
 [0.3.0-alpha.3]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...v0.3.0-alpha.3
 [0.3.0-alpha.2]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
