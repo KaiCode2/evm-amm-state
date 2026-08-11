@@ -14,14 +14,32 @@ use evm_fork_cache::reactive::{
 
 use super::state::UpstreamStateView;
 use super::{
-    AdapterEvent, AdapterEventError, AdapterRegistry, AmmAdapter, EventRoute, EventSource,
-    PoolInstanceId, PoolKey, PoolRegistration, PoolStatus, PurgeScope, RepairAction, SkippedDelta,
-    SkippedMask, StateDiff, StateUpdate, StateView, UpdateQuality,
+    AdapterEvent, AdapterEventContext, AdapterEventError, AdapterRegistry, AmmAdapter, EventRoute,
+    EventSource, PoolInstanceId, PoolKey, PoolRegistration, PoolStatus, PurgeScope, RepairAction,
+    SkippedDelta, SkippedMask, SlipstreamFeeEvidenceError, SlipstreamSwapFeeEvidence, StateDiff,
+    StateUpdate, StateView, UpdateQuality,
 };
 
 const HANDLER_ID: &str = "evm-amm-state.adapters";
 const HOOK_NAMESPACE: &str = "evm-amm-state";
 const POOL_HANDLER_NAMESPACE: &str = "evm-amm-state.pool";
+const MAX_SLIPSTREAM_FEE_EVIDENCE_PER_CHAIN: usize = 2_048;
+
+/// Result of inserting one effective Slipstream fee-evidence record.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlipstreamFeeEvidenceInsertOutcome {
+    /// A new event identity was inserted.
+    Inserted,
+    /// Existing evidence for the same exact event identity was replaced.
+    Replaced(SlipstreamSwapFeeEvidence),
+    /// The per-chain bound was reached; the oldest retained event was evicted.
+    InsertedAndEvicted(SlipstreamSwapFeeEvidence),
+    /// The evidence did not pass its public constructor-equivalent validation.
+    RejectedInvalid(SlipstreamFeeEvidenceError),
+    /// A stale event was not retained because the per-chain store was full.
+    RejectedStaleAtCapacity(SlipstreamSwapFeeEvidence),
+}
 
 /// Typed in-process payload carried by AMM reactive hook signals.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,12 +110,62 @@ impl std::error::Error for AmmPoolReactiveHandlerError {}
 #[derive(Clone)]
 pub struct AmmReactiveRoutingContext {
     registry: Arc<RwLock<Arc<AdapterRegistry>>>,
+    slipstream_fee_evidence:
+        Arc<RwLock<BTreeMap<SlipstreamFeeEvidenceKey, SlipstreamSwapFeeEvidence>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SlipstreamFeeEvidenceKey {
+    chain_id: u64,
+    pool: Address,
+    block_number: u64,
+    block_hash: B256,
+    parent_hash: B256,
+    transaction_hash: B256,
+    transaction_index: u64,
+    log_index: u64,
+}
+
+impl SlipstreamFeeEvidenceKey {
+    fn from_evidence(evidence: SlipstreamSwapFeeEvidence) -> Self {
+        Self {
+            chain_id: evidence.chain_id,
+            pool: evidence.pool,
+            block_number: evidence.block_number,
+            block_hash: evidence.block_hash,
+            parent_hash: evidence.parent_hash,
+            transaction_hash: evidence.transaction_hash,
+            transaction_index: evidence.transaction_index,
+            log_index: evidence.log_index,
+        }
+    }
+
+    fn from_context(pool: Address, context: &AdapterEventContext) -> Option<Self> {
+        Some(Self {
+            chain_id: context.chain_id?,
+            pool,
+            block_number: context.block_number?,
+            block_hash: context.block_hash?,
+            parent_hash: context.parent_hash?,
+            transaction_hash: context.transaction_hash?,
+            transaction_index: context.transaction_index?,
+            log_index: context.log_index?,
+        })
+    }
 }
 
 impl std::fmt::Debug for AmmReactiveRoutingContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AmmReactiveRoutingContext")
             .field("registry", &self.registry())
+            .field(
+                "slipstream_fee_evidence_count",
+                &self
+                    .slipstream_fee_evidence
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len(),
+            )
             .finish()
     }
 }
@@ -107,7 +175,124 @@ impl AmmReactiveRoutingContext {
     pub fn new(registry: Arc<AdapterRegistry>) -> Self {
         Self {
             registry: Arc::new(RwLock::new(registry)),
+            slipstream_fee_evidence: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Inject effective dynamic-fee evidence for one exact Slipstream event.
+    ///
+    /// This is the production seam from a canonical transaction/state pipeline
+    /// into provider-free adapter replay. Insertion performs no network I/O.
+    pub fn inject_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> SlipstreamFeeEvidenceInsertOutcome {
+        if let Err(error) = evidence.validate() {
+            return SlipstreamFeeEvidenceInsertOutcome::RejectedInvalid(error);
+        }
+        let key = SlipstreamFeeEvidenceKey::from_evidence(evidence);
+        let mut retained = self
+            .slipstream_fee_evidence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = retained.get(&key).copied() {
+            retained.insert(key, evidence);
+            return SlipstreamFeeEvidenceInsertOutcome::Replaced(previous);
+        }
+        let count = retained
+            .keys()
+            .filter(|candidate| candidate.chain_id == evidence.chain_id)
+            .count();
+        if count < MAX_SLIPSTREAM_FEE_EVIDENCE_PER_CHAIN {
+            retained.insert(key, evidence);
+            return SlipstreamFeeEvidenceInsertOutcome::Inserted;
+        }
+        let oldest = retained
+            .keys()
+            .filter(|candidate| candidate.chain_id == evidence.chain_id)
+            .min_by_key(|candidate| {
+                (
+                    candidate.block_number,
+                    candidate.transaction_index,
+                    candidate.log_index,
+                    candidate.pool,
+                    candidate.block_hash,
+                )
+            })
+            .copied()
+            .expect("per-chain evidence count reached the nonzero bound");
+        let order = |candidate: SlipstreamFeeEvidenceKey| {
+            (
+                candidate.block_number,
+                candidate.transaction_index,
+                candidate.log_index,
+                candidate.pool,
+                candidate.block_hash,
+            )
+        };
+        if order(key) <= order(oldest) {
+            return SlipstreamFeeEvidenceInsertOutcome::RejectedStaleAtCapacity(evidence);
+        }
+        let evicted = retained
+            .remove(&oldest)
+            .expect("selected evidence key is retained");
+        retained.insert(key, evidence);
+        SlipstreamFeeEvidenceInsertOutcome::InsertedAndEvicted(evicted)
+    }
+
+    /// Remove exact Slipstream fee evidence after it is no longer needed.
+    pub fn remove_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> Option<SlipstreamSwapFeeEvidence> {
+        self.slipstream_fee_evidence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&SlipstreamFeeEvidenceKey::from_evidence(evidence))
+    }
+
+    /// Drop evidence older than `minimum_block` on `chain_id`.
+    pub fn prune_slipstream_fee_evidence(&self, chain_id: u64, minimum_block: u64) -> usize {
+        let mut evidence = self
+            .slipstream_fee_evidence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = evidence.len();
+        evidence.retain(|key, _| key.chain_id != chain_id || key.block_number >= minimum_block);
+        before - evidence.len()
+    }
+
+    /// At one reorged height, retain only evidence for the canonical block hash.
+    pub fn retain_slipstream_fee_evidence_for_block(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        canonical_hash: B256,
+    ) -> usize {
+        let mut evidence = self
+            .slipstream_fee_evidence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = evidence.len();
+        evidence.retain(|key, _| {
+            key.chain_id != chain_id
+                || key.block_number != block_number
+                || key.block_hash == canonical_hash
+        });
+        before - evidence.len()
+    }
+
+    fn slipstream_fee_evidence(
+        &self,
+        pool: Address,
+        context: &AdapterEventContext,
+    ) -> Option<SlipstreamSwapFeeEvidence> {
+        let key = SlipstreamFeeEvidenceKey::from_context(pool, context)?;
+        self.slipstream_fee_evidence
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .copied()
     }
 
     /// Return the current immutable registry snapshot.
@@ -379,7 +564,16 @@ impl ReactiveHandler<Ethereum> for AmmReactiveHandler {
             HandlerError::new(format!("no adapter registered for protocol {protocol:?}"))
         })?;
 
-        handle_routed_log(ctx, &rpc_log.inner, state, pool, adapter.as_ref(), None)
+        handle_routed_log(
+            ctx,
+            &rpc_log.inner,
+            rpc_log.transaction_hash,
+            state,
+            pool,
+            adapter.as_ref(),
+            None,
+            None,
+        )
     }
 }
 
@@ -447,10 +641,12 @@ impl ReactiveHandler<Ethereum> for AmmPoolReactiveHandler {
         handle_routed_log(
             ctx,
             &rpc_log.inner,
+            rpc_log.transaction_hash,
             state,
             &self.pool,
             self.adapter.as_ref(),
             Some(&self.instance),
+            Some(&self.routing),
         )
     }
 }
@@ -461,13 +657,16 @@ fn indexed_address_topic(address: Address) -> B256 {
     B256::from(topic)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_routed_log(
     ctx: &ReactiveContext,
     log: &alloy_primitives::Log,
+    transaction_hash: Option<B256>,
     state: &dyn evm_fork_cache::StateView,
     pool: &PoolRegistration,
     adapter: &dyn AmmAdapter,
     instance: Option<&PoolInstanceId>,
+    routing: Option<&AmmReactiveRoutingContext>,
 ) -> Result<HandlerOutcome, HandlerError> {
     // Wrap the upstream state view once; adapter code (`decode_event`,
     // `predict_cold_skips`) speaks the crate-owned `StateView`.
@@ -475,8 +674,27 @@ fn handle_routed_log(
     let state: &dyn StateView = &state;
     let protocol = pool.protocol();
 
-    let result = adapter.decode_event(pool, log, state);
-    if let Some(error) = result.error {
+    let mut event_context = AdapterEventContext {
+        chain_id: ctx.chain_id,
+        block_number: ctx.block.as_ref().map(|block| block.number),
+        block_hash: ctx.block.as_ref().map(|block| block.hash),
+        parent_hash: ctx.block.as_ref().and_then(|block| block.parent_hash),
+        block_timestamp: ctx.block.as_ref().and_then(|block| block.timestamp),
+        transaction_hash,
+        transaction_index: ctx.transaction_index,
+        log_index: ctx.log_index,
+        slipstream_fee_evidence: None,
+    };
+    if let (Some(routing), Some(address)) = (routing, pool.key.address())
+        && let Some(evidence) = routing.slipstream_fee_evidence(address, &event_context)
+    {
+        event_context.slipstream_fee_evidence = Some(evidence);
+    }
+    let result = adapter.decode_event_with_context(pool, log, state, &event_context);
+    let decode_error = result.error;
+    if result.event.is_none()
+        && let Some(error) = decode_error
+    {
         // A malformed / undecodable log for a watched topic must NOT abort
         // the batch: other pools' events in the same `ingest_batch` still
         // need to apply. Skip this log with a `NoStateEffect` outcome and
@@ -484,8 +702,7 @@ fn handle_routed_log(
         // `HandlerError`.
         let labels = vec![
             ReportTag::new("protocol", format!("{protocol:?}")),
-            ReportTag::new("emitter", format!("{:?}", log.address)),
-            ReportTag::new("error", format!("{error:?}")),
+            ReportTag::new("error_class", adapter_error_class(&error)),
         ];
         let signal = match instance {
             Some(instance) => AmmReactiveSignal::PoolDecodeError {
@@ -522,6 +739,27 @@ fn handle_routed_log(
         .combine(predicted_verify);
 
     let mut effects = Vec::new();
+    if let Some(error) = decode_error {
+        let labels = vec![
+            ReportTag::new("protocol", format!("{protocol:?}")),
+            ReportTag::new("error_class", adapter_error_class(&error)),
+        ];
+        let signal = match instance {
+            Some(instance) => AmmReactiveSignal::PoolDecodeError {
+                instance: instance.clone(),
+                error,
+            },
+            None => AmmReactiveSignal::DecodeError {
+                pool: pool.key.clone(),
+                error,
+            },
+        };
+        effects.push(ReactiveEffect::Hook(hook_signal_with_payload(
+            "amm.decode_error",
+            labels,
+            Arc::new(signal),
+        )));
+    }
     effects.extend(
         event
             .updates
@@ -568,6 +806,32 @@ fn handle_routed_log(
         quality,
         tags,
     })
+}
+
+fn adapter_error_class(error: &AdapterEventError) -> &'static str {
+    match error {
+        AdapterEventError::MalformedLog(_) => "malformed_log",
+        AdapterEventError::MissingState { .. } => "missing_state",
+        AdapterEventError::Unsupported(_) => "unsupported",
+        AdapterEventError::V3Transition(error) => match error {
+            super::V3TransitionError::MissingContext(_) => "v3_missing_context",
+            super::V3TransitionError::MissingSlipstreamFeeEvidence => {
+                "v3_missing_slipstream_fee_evidence"
+            }
+            super::V3TransitionError::SlipstreamFeeEvidence(_) => "v3_slipstream_fee_evidence",
+            super::V3TransitionError::SlipstreamFeeInferenceNoMatch => "v3_slipstream_fee_no_match",
+            super::V3TransitionError::SlipstreamFeeInferenceAmbiguous { .. } => {
+                "v3_slipstream_fee_ambiguous"
+            }
+            super::V3TransitionError::ContradictoryEvent(_) => "v3_contradictory_event",
+            super::V3TransitionError::FinalStateMismatch { .. } => "v3_final_state_mismatch",
+            super::V3TransitionError::Observation(_) => "v3_observation",
+            super::V3TransitionError::InitializedTick { .. } => "v3_initialized_tick",
+            super::V3TransitionError::Arithmetic(_) => "v3_arithmetic",
+            super::V3TransitionError::WorkLimitExceeded { .. } => "v3_work_limit",
+        },
+        AdapterEventError::Custom(_) => "custom",
+    }
 }
 
 fn log_interest(source: EventSource) -> LogInterest {
@@ -990,10 +1254,63 @@ fn hook_signal_with_payload(
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::B256;
+    use alloy_primitives::{B256, U256, address, b256};
 
     use super::super::AdapterEventKind;
     use super::*;
+
+    fn hash(value: u64) -> B256 {
+        B256::from(U256::from(value).to_be_bytes::<32>())
+    }
+
+    fn base_fee_evidence(block_number: u64) -> SlipstreamSwapFeeEvidence {
+        base_fee_evidence_with_identity(
+            block_number,
+            hash(block_number),
+            hash(block_number.saturating_add(10_000)),
+            hash(block_number.saturating_add(20_000)),
+        )
+    }
+
+    fn base_fee_evidence_with_identity(
+        block_number: u64,
+        block_hash: B256,
+        parent_hash: B256,
+        transaction_hash: B256,
+    ) -> SlipstreamSwapFeeEvidence {
+        let family = super::super::SlipstreamRuntimeFamily::AerodromeBaseBifi;
+        let identity = super::super::SlipstreamSnapshotIdentity::new(
+            8_453,
+            block_number,
+            block_hash,
+            parent_hash,
+            1_700_000_000 + block_number,
+            transaction_hash,
+            0,
+            0,
+        )
+        .expect("complete test identity");
+        SlipstreamSwapFeeEvidence::new(
+            family,
+            8_453,
+            address!("b378137c90444bbcecd44a1f766851fbf53d2a9e"),
+            address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"),
+            b256!("acd6710f7037ad095b1e4d5f8ee5b2681069cb4dd316e77e4e0cb8f85716a2a1"),
+            address!("ec8e5342b19977b4ef8892e02d8daecfa1315831"),
+            b256!("772fb5c610b40a122036f544e5b9b5bce6becb19db9524331289d1aaed2d5888"),
+            10_000,
+            0,
+            super::super::SlipstreamUnstakedFeeProof::unused_all_liquidity_staked(family, identity),
+            block_number,
+            block_hash,
+            parent_hash,
+            1_700_000_000 + block_number,
+            transaction_hash,
+            0,
+            0,
+        )
+        .expect("reviewed Base evidence")
+    }
 
     #[test]
     fn compatibility_resync_id_retains_the_pre_pool_handler_format() {
@@ -1025,5 +1342,82 @@ mod tests {
             )
         );
         assert!(!id.contains("None"));
+    }
+
+    #[test]
+    fn slipstream_fee_evidence_store_retains_the_newest_bounded_set() {
+        let context = AmmReactiveRoutingContext::new(Arc::new(AdapterRegistry::default()));
+        for block in 1..=MAX_SLIPSTREAM_FEE_EVIDENCE_PER_CHAIN as u64 {
+            assert_eq!(
+                context.inject_slipstream_fee_evidence(base_fee_evidence(block)),
+                SlipstreamFeeEvidenceInsertOutcome::Inserted
+            );
+        }
+
+        let oldest = base_fee_evidence(1);
+        let stale_replacement = base_fee_evidence_with_identity(
+            oldest.block_number,
+            oldest.block_hash,
+            oldest.parent_hash,
+            hash(99_999),
+        );
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(stale_replacement),
+            SlipstreamFeeEvidenceInsertOutcome::RejectedStaleAtCapacity(stale_replacement)
+        );
+        assert_eq!(
+            context.remove_slipstream_fee_evidence(oldest),
+            Some(oldest),
+            "a stale injection must not displace newer retained evidence"
+        );
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(oldest),
+            SlipstreamFeeEvidenceInsertOutcome::Inserted
+        );
+        let newest = base_fee_evidence(MAX_SLIPSTREAM_FEE_EVIDENCE_PER_CHAIN as u64 + 1);
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(newest),
+            SlipstreamFeeEvidenceInsertOutcome::InsertedAndEvicted(oldest)
+        );
+        assert_eq!(context.remove_slipstream_fee_evidence(oldest), None);
+        assert_eq!(context.remove_slipstream_fee_evidence(newest), Some(newest));
+    }
+
+    #[test]
+    fn slipstream_fee_evidence_replacement_and_reorg_pruning_are_explicit() {
+        let context = AmmReactiveRoutingContext::new(Arc::new(AdapterRegistry::default()));
+        let canonical = base_fee_evidence(4_000);
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(canonical),
+            SlipstreamFeeEvidenceInsertOutcome::Inserted
+        );
+        let replacement = canonical
+            .with_effective_swap_fee(9_999)
+            .expect("replacement fee remains valid");
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(replacement),
+            SlipstreamFeeEvidenceInsertOutcome::Replaced(canonical)
+        );
+
+        let reorged =
+            base_fee_evidence_with_identity(4_000, hash(4_001), hash(13_999), hash(23_999));
+        reorged.validate().expect("alternate lineage remains valid");
+        assert_eq!(
+            context.inject_slipstream_fee_evidence(reorged),
+            SlipstreamFeeEvidenceInsertOutcome::Inserted
+        );
+        assert_eq!(
+            context.retain_slipstream_fee_evidence_for_block(
+                canonical.chain_id,
+                canonical.block_number,
+                canonical.block_hash,
+            ),
+            1
+        );
+        assert_eq!(context.remove_slipstream_fee_evidence(reorged), None);
+        assert_eq!(
+            context.remove_slipstream_fee_evidence(replacement),
+            Some(replacement)
+        );
     }
 }

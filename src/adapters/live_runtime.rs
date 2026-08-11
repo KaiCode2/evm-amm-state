@@ -6,6 +6,7 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use alloy_eips::BlockId;
 use alloy_network::Ethereum;
@@ -26,18 +27,18 @@ use super::cold_start_scheduler::{
 use super::subscriber_driver::{AmmSubscriberControl, AmmSubscriberOwnerPlan};
 use super::{
     AdapterRegistry, AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmChangeSet,
-    AmmChangeSetError, AmmEventRef, AmmPoolChange, AmmPoolChangeKind, AmmPoolGenerationReservation,
-    AmmPreconfirmationRejectionReason, AmmPreconfirmedSnapshot, AmmPreparedPoolState,
-    AmmPreparedStorage, AmmRuntimeEvent, AmmRuntimeEventKind, AmmRuntimeHealth,
-    AmmRuntimeStatusSnapshot, AmmStateCommit, AmmStateIncident, AmmStatePoint, AmmStateQuality,
-    AmmStateSnapshot, AmmStateVersion, AmmSyncEngine, AmmSyncError, AmmSyncIncident,
-    AmmSyncPoolChangeKind, AmmWorkClass, AmmWorkKind, AmmWorkProgress, DeferredWork,
-    DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey, DiscoveryOwnership, PoolDiscovery,
-    PoolKey, PoolRegistration, PoolRevisionMap, PoolRuntimeState, PoolStateRevision,
-    QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet, RegistrationProvenance,
-    RegistrationReorgAction, RegistrationSourceKey, RepairAction, RuntimeLifecycleMap,
-    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, TokenEdgeDiscoveryReport,
-    TokenEdgeDiscoveryRequest, WorkId,
+    AmmChangeSetError, AmmCommitTiming, AmmEventRef, AmmPoolChange, AmmPoolChangeKind,
+    AmmPoolGenerationReservation, AmmPreconfirmationRejectionReason, AmmPreconfirmationTiming,
+    AmmPreconfirmedSnapshot, AmmPreparedPoolState, AmmPreparedStorage, AmmRuntimeEvent,
+    AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeStatusSnapshot, AmmStateCommit,
+    AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateSnapshot, AmmStateVersion,
+    AmmSyncEngine, AmmSyncError, AmmSyncIncident, AmmSyncPoolChangeKind, AmmWorkClass, AmmWorkKind,
+    AmmWorkProgress, DeferredWork, DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey,
+    DiscoveryOwnership, PoolDiscovery, PoolKey, PoolRegistration, PoolRevisionMap,
+    PoolRuntimeState, PoolStateRevision, QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet,
+    RegistrationProvenance, RegistrationReorgAction, RegistrationSourceKey, RepairAction,
+    RuntimeLifecycleMap, RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId,
+    TokenEdgeDiscoveryReport, TokenEdgeDiscoveryRequest, WorkId,
 };
 
 /// Hash-pinned, source-reconciled complete canonical block delivery.
@@ -52,15 +53,81 @@ pub struct AmmCanonicalBatch {
     block: BlockRef,
     interest_revision: u64,
     records: ReactiveInputBatch<Ethereum>,
+    timing: AmmCanonicalBatchTiming,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AmmCanonicalBatchTiming {
+    source_ingress: Instant,
+    decoded_after_ingress: Duration,
+    ordered_after_ingress: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AmmCanonicalTransitionTiming {
+    source_ingress: Instant,
+    decoded_after_ingress: Duration,
+    ordered_after_ingress: Duration,
+    transitioned_after_ingress: Duration,
+}
+
+impl AmmCanonicalBatchTiming {
+    fn transitioned(self) -> AmmCanonicalTransitionTiming {
+        let transitioned_after_ingress =
+            Instant::now().saturating_duration_since(self.source_ingress);
+        assert!(self.ordered_after_ingress <= transitioned_after_ingress);
+        AmmCanonicalTransitionTiming {
+            source_ingress: self.source_ingress,
+            decoded_after_ingress: self.decoded_after_ingress,
+            ordered_after_ingress: self.ordered_after_ingress,
+            transitioned_after_ingress,
+        }
+    }
+}
+
+impl AmmCanonicalTransitionTiming {
+    fn committed(self) -> AmmCommitTiming {
+        let committed_after_ingress = Instant::now().saturating_duration_since(self.source_ingress);
+        AmmCommitTiming::new(
+            self.source_ingress,
+            self.decoded_after_ingress,
+            self.ordered_after_ingress,
+            self.transitioned_after_ingress,
+            committed_after_ingress,
+        )
+    }
 }
 
 impl AmmCanonicalBatch {
     /// Construct a complete canonical block after source-level reconciliation.
+    ///
+    /// This typed boundary is the source-ingress stage for direct callers. The
+    /// payload is already decoded, so its decode offset is zero; deterministic
+    /// record validation and ordering are measured by this constructor.
     pub fn from_verified_block(
         chain_id: u64,
         header: RpcHeader,
         interest_revision: u64,
         records: ReactiveInputBatch<Ethereum>,
+    ) -> Result<Self, AmmCanonicalBatchError> {
+        let source_ingress = Instant::now();
+        Self::from_verified_block_with_timing(
+            chain_id,
+            header,
+            interest_revision,
+            records,
+            source_ingress,
+            Duration::ZERO,
+        )
+    }
+
+    pub(crate) fn from_verified_block_with_timing(
+        chain_id: u64,
+        header: RpcHeader,
+        interest_revision: u64,
+        records: ReactiveInputBatch<Ethereum>,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
     ) -> Result<Self, AmmCanonicalBatchError> {
         let computed_hash = header.inner.hash_slow();
         if header.hash != computed_hash {
@@ -77,6 +144,7 @@ impl AmmCanonicalBatch {
         };
         let mut identities = BTreeSet::new();
         let mut positions = BTreeSet::new();
+        let mut previous_position = None;
         for (index, record) in records.records().iter().enumerate() {
             let ReactiveInput::Log(log) = &record.input else {
                 return Err(AmmCanonicalBatchError::UnsupportedRecord { index });
@@ -144,13 +212,29 @@ impl AmmCanonicalBatch {
             if !identities.insert((transaction_hash, log_index)) || !positions.insert(log_index) {
                 return Err(AmmCanonicalBatchError::DuplicateRecord { index });
             }
+            let position = (transaction_index, log_index);
+            if previous_position.is_some_and(|previous| position <= previous) {
+                return Err(AmmCanonicalBatchError::OutOfOrderRecord {
+                    index,
+                    previous: previous_position.expect("checked Some"),
+                    actual: position,
+                });
+            }
+            previous_position = Some(position);
         }
+        let ordered_after_ingress = Instant::now().saturating_duration_since(source_ingress);
+        assert!(decoded_after_ingress <= ordered_after_ingress);
         Ok(Self {
             chain_id,
             header,
             block,
             interest_revision,
             records,
+            timing: AmmCanonicalBatchTiming {
+                source_ingress,
+                decoded_after_ingress,
+                ordered_after_ingress,
+            },
         })
     }
 
@@ -169,8 +253,14 @@ impl AmmCanonicalBatch {
         self.interest_revision
     }
 
-    fn into_parts(self) -> (RpcHeader, ReactiveInputBatch<Ethereum>) {
-        (self.header, self.records)
+    fn into_parts(
+        self,
+    ) -> (
+        RpcHeader,
+        ReactiveInputBatch<Ethereum>,
+        AmmCanonicalBatchTiming,
+    ) {
+        (self.header, self.records, self.timing)
     }
 }
 
@@ -201,6 +291,15 @@ pub enum AmmCanonicalBatchError {
     DuplicateRecord {
         /// Zero-based duplicate record index.
         index: usize,
+    },
+    /// Canonical records were not strictly increasing by transaction/log position.
+    OutOfOrderRecord {
+        /// Zero-based out-of-order record index.
+        index: usize,
+        /// Immediately preceding canonical position.
+        previous: (u64, u64),
+        /// Regressed or equal position.
+        actual: (u64, u64),
     },
     /// A record lacked a chain identity.
     MissingChainId {
@@ -252,6 +351,14 @@ impl fmt::Display for AmmCanonicalBatchError {
             Self::DuplicateRecord { index } => {
                 write!(f, "canonical record {index} duplicates an earlier log")
             }
+            Self::OutOfOrderRecord {
+                index,
+                previous,
+                actual,
+            } => write!(
+                f,
+                "canonical record {index} position {actual:?} does not follow {previous:?}"
+            ),
             Self::MissingChainId { index } => {
                 write!(f, "canonical record {index} has no chain id")
             }
@@ -597,6 +704,11 @@ pub enum AmmRuntimeCommandError {
         /// Submitted block.
         next: Box<BlockRef>,
     },
+    /// The exact current canonical block was submitted a second time.
+    DuplicateCanonicalBlock {
+        /// Already committed canonical point.
+        current: AmmStatePoint,
+    },
     /// Canonical delivery was reconciled against a stale subscriber interest set.
     InterestRevisionMismatch {
         /// Actor's current interest revision.
@@ -732,6 +844,9 @@ impl fmt::Display for AmmRuntimeCommandError {
                 f,
                 "canonical block {next:?} does not extend AMM point {current:?}"
             ),
+            Self::DuplicateCanonicalBlock { current } => {
+                write!(f, "canonical block at {current:?} was already applied")
+            }
             Self::InterestRevisionMismatch { expected, actual } => write!(
                 f,
                 "canonical interest revision mismatch: expected {expected}, received {actual}"
@@ -2753,6 +2868,7 @@ impl AmmRuntimeActor {
                     point: self.point,
                 },
             ],
+            None,
         );
         Ok(instance)
     }
@@ -2840,6 +2956,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
         );
         Ok(())
     }
@@ -3171,6 +3288,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             observer_events,
+            None,
         ))
     }
 
@@ -3327,6 +3445,7 @@ impl AmmRuntimeActor {
                     point: self.point,
                 },
             ],
+            None,
         );
         Ok(owner)
     }
@@ -3578,6 +3697,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
         );
         Ok(())
     }
@@ -5006,6 +5126,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
         );
         if let AmmFollowUpTask::Refresh { after_slots, .. } = &scheduled.task
             && !after_slots.is_empty()
@@ -5171,6 +5292,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
         );
         self.finish_followup(&work, &scheduled)?;
         Ok(published)
@@ -5825,6 +5947,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             observer_events,
+            None,
         ))
     }
 
@@ -6223,6 +6346,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             observer_events,
+            None,
         ))
     }
 
@@ -6419,6 +6543,7 @@ impl AmmRuntimeActor {
         candidates
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_commit(
         &mut self,
         changes: Arc<AmmChangeSet>,
@@ -6427,6 +6552,7 @@ impl AmmRuntimeActor {
         permit: Option<mpsc::OwnedPermit<Arc<AmmStateCommit>>>,
         first_sequence: u64,
         observer_events: Vec<AmmRuntimeEventKind>,
+        timing: Option<AmmCanonicalTransitionTiming>,
     ) -> Arc<AmmChangeSet> {
         let version = changes.version();
         let point = changes.point();
@@ -6440,9 +6566,11 @@ impl AmmRuntimeActor {
             Arc::clone(&registry_snapshot),
             Arc::clone(&revisions),
         ));
+        let timing = timing.map(AmmCanonicalTransitionTiming::committed);
         let commit = Arc::new(AmmStateCommit::new(
             Arc::clone(&snapshot),
             Arc::clone(&changes),
+            timing,
         ));
         self.version = version;
         self.point = point;
@@ -6475,6 +6603,9 @@ impl AmmRuntimeActor {
         batch: ReactiveInputBatch<Ethereum>,
     ) -> Result<Arc<AmmPreconfirmedSnapshot>, AmmRuntimeCommandError> {
         self.require_trusted()?;
+        let source_ingress = batch
+            .preconfirmation_timing()
+            .map(|timing| timing.source_ingress());
         let expected = validate_preconfirmation_batch(&batch)?;
         let event_refs = amm_event_refs(&batch);
         if batch
@@ -6544,6 +6675,7 @@ impl AmmRuntimeActor {
             Arc::clone(&self.registry_snapshot),
             report.pool_changes,
             event_refs,
+            source_ingress.map(AmmPreconfirmationTiming::published),
         ));
         self.preconfirmations
             .send_replace(Some(Arc::clone(&preview)));
@@ -6571,6 +6703,13 @@ impl AmmRuntimeActor {
                 actual: batch.interest_revision(),
             });
         }
+        if batch.block().number == self.point.block_number()
+            && batch.block().hash == self.point.block_hash()
+        {
+            return Err(AmmRuntimeCommandError::DuplicateCanonicalBlock {
+                current: self.point,
+            });
+        }
         self.engine.discard_preconfirmation(&mut self.cache);
         self.preconfirmations.send_replace(None);
         let next_point =
@@ -6579,7 +6718,7 @@ impl AmmRuntimeActor {
         let permit = self.reserve_critical().await?;
         let (next_version, _) = self.next_commit_identity(1)?;
         let event_refs = amm_event_refs(&batch.records);
-        let (header, records) = batch.into_parts();
+        let (header, records, batch_timing) = batch.into_parts();
         let factory_candidates = self.factory_candidates(&records);
         let block = BlockRef {
             number: header.inner.number,
@@ -6630,6 +6769,7 @@ impl AmmRuntimeActor {
                 actual: self.cache.block_number(),
             });
         }
+        let transition_timing = batch_timing.transitioned();
         // The reactive engine installed the verified full header and then
         // exact-hash pinned the cache while preserving that environment. Do
         // not repin here: `set_block` intentionally clears header-derived EVM
@@ -6764,6 +6904,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             observer_events,
+            Some(transition_timing),
         );
         for (pool, action, revalidation) in reorg_actions {
             if self.engine.ownership().active_pool(pool.key()) != Some(&pool) {

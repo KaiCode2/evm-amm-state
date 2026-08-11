@@ -1,8 +1,8 @@
 use alloy_primitives::Log;
 
 use super::{
-    AdapterCache, AdapterEventError, AdapterEventReport, AdapterRegistry, PoolRegistration,
-    ProtocolId,
+    AdapterCache, AdapterEventContext, AdapterEventError, AdapterEventReport, AdapterRegistry,
+    PoolRegistration, ProtocolId,
 };
 
 /// Error from applying an adapter event via [`AdapterDriver`].
@@ -78,7 +78,27 @@ impl AdapterDriver {
         let Some(pool) = self.registry.route_log(log) else {
             return Ok(None);
         };
-        self.apply_routed_log(cache, pool, log)
+        self.apply_routed_log(cache, pool, log, None)
+    }
+
+    /// Route and atomically apply one log with exact block/order context.
+    ///
+    /// Time-dependent adapters such as Uniswap V3 require this path to derive
+    /// an exact event-only transition. The context-free [`apply_log`](Self::apply_log)
+    /// remains available for adapters whose event payload is self-contained.
+    pub fn apply_log_with_context<C>(
+        &self,
+        cache: &mut C,
+        log: &Log,
+        context: &AdapterEventContext,
+    ) -> Result<Option<AdapterEventReport>, DriverError>
+    where
+        C: AdapterCache,
+    {
+        let Some(pool) = self.registry.route_log(log) else {
+            return Ok(None);
+        };
+        self.apply_routed_log(cache, pool, log, Some(context))
     }
 
     /// Apply a batch of logs in order, returning a report per routed-and-decoded
@@ -118,6 +138,7 @@ impl AdapterDriver {
         cache: &mut C,
         pool: &PoolRegistration,
         log: &Log,
+        context: Option<&AdapterEventContext>,
     ) -> Result<Option<AdapterEventReport>, DriverError>
     where
         C: AdapterCache,
@@ -128,8 +149,14 @@ impl AdapterDriver {
             .adapter(protocol)
             .ok_or(DriverError::NoAdapter(protocol))?;
 
-        let result = adapter.decode_event(pool, log, cache);
-        if let Some(error) = result.error {
+        let result = match context {
+            Some(context) => adapter.decode_event_with_context(pool, log, cache, context),
+            None => adapter.decode_event(pool, log, cache),
+        };
+        let decode_error = result.error;
+        if result.event.is_none()
+            && let Some(error) = decode_error
+        {
             return Err(DriverError::Decode { protocol, error });
         }
 
@@ -141,11 +168,15 @@ impl AdapterDriver {
         let post_apply_repair = adapter.after_apply(pool, &event, &applied);
         let repair = event.repair.clone().combine(post_apply_repair);
 
-        Ok(Some(AdapterEventReport {
+        let report = AdapterEventReport {
             pool: pool.key.clone(),
             event,
             applied,
             repair,
-        }))
+        };
+        if let Some(error) = decode_error {
+            return Err(DriverError::Decode { protocol, error });
+        }
+        Ok(Some(report))
     }
 }

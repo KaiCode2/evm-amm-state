@@ -28,7 +28,8 @@ use super::{
     AmmPoolReactiveHandlerError, AmmReactiveRoutingContext, AmmReactiveSignal, OwnerRuntimeState,
     PoolGeneration, PoolInstanceId, PoolKey, PoolOwnership, PoolRegistration, PoolRuntimeState,
     PoolStateDependencies, PoolStatus, RegistryError, RepairAction, RuntimeLifecycleMap,
-    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StateSlot, UpdateQuality,
+    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, SlipstreamFeeEvidenceInsertOutcome,
+    SlipstreamSwapFeeEvidence, StateSlot, UpdateQuality,
 };
 use super::{QuoteReadSetHydrationReport, QuoteReadinessReport, QuoteWarmupError};
 
@@ -736,6 +737,46 @@ impl AmmSyncEngine {
     /// Current pool registry.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
+    }
+
+    /// Inject effective dynamic-fee evidence for one exact Slipstream event.
+    ///
+    /// Callers derive this from their canonical transaction/state pipeline
+    /// before ingesting the corresponding log. The event callback performs no
+    /// provider read or local EVM execution.
+    pub fn inject_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> SlipstreamFeeEvidenceInsertOutcome {
+        self.routing.inject_slipstream_fee_evidence(evidence)
+    }
+
+    /// Remove one exact Slipstream fee-evidence record.
+    pub fn remove_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> Option<SlipstreamSwapFeeEvidence> {
+        self.routing.remove_slipstream_fee_evidence(evidence)
+    }
+
+    /// Drop retained Slipstream fee evidence older than `minimum_block`.
+    pub fn prune_slipstream_fee_evidence(&self, chain_id: u64, minimum_block: u64) -> usize {
+        self.routing
+            .prune_slipstream_fee_evidence(chain_id, minimum_block)
+    }
+
+    /// At one reorged height, retain only evidence for the canonical block hash.
+    pub fn retain_slipstream_fee_evidence_for_block(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        canonical_hash: alloy_primitives::B256,
+    ) -> usize {
+        self.routing.retain_slipstream_fee_evidence_for_block(
+            chain_id,
+            block_number,
+            canonical_hash,
+        )
     }
 
     /// Replay learned representative quotes against one RPC-disconnected cache

@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
@@ -14,7 +15,9 @@ use alloy_rpc_types_eth::{EIP1186AccountProofResponse, Header as RpcHeader, Log 
 use alloy_transport::mock::{Asserter, MockTransport};
 use alloy_transport::{TransportError, TransportFut};
 use anyhow::Result;
-use evm_amm_state::adapters::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT};
+use evm_amm_state::adapters::storage::{
+    V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, v3_tick_bitmap_storage_key,
+};
 use evm_amm_state::adapters::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AdapterRegistry,
     AmmAdapter, AmmCanonicalBatch, AmmCanonicalBatchError, AmmColdStartOptions,
@@ -24,12 +27,13 @@ use evm_amm_state::adapters::{
     AmmPreparedStorage, AmmRuntime, AmmRuntimeBaseline, AmmRuntimeCommandError, AmmRuntimeConfig,
     AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeSubmitError, AmmStatePoint, AmmStateVersion,
     AmmSubscriberDriverConfig, AmmSubscriberDriverError, AmmSubscriberDriverState, ColdStartPolicy,
-    CreationLogContext, CustomPoolKey, DeferredWork, DiscoveredPool, DiscoveryError,
-    DiscoveryOwnerKey, EventSource, FactoryConfig, OwnerRuntimeState, PoolDiscovery, PoolFactory,
-    PoolGeneration, PoolInstanceId, PoolKey, PoolRegistration, PoolStateDependencies, PoolStatus,
-    ProtocolId, ProtocolMetadata, QuoteWarmup, RepairAction, RuntimeOwnerId, SimConfig, StateSlot,
-    StateUpdate as AdapterStateUpdate, StateView, TokenEdgeDiscoveryRequest, UniswapV2Adapter,
-    UniswapV2Metadata, UpdateQuality, uniswap_v2_pair_runtime_code_hash,
+    ConcentratedLiquidityAdapter, CreationLogContext, CustomPoolKey, DeferredWork, DiscoveredPool,
+    DiscoveryError, DiscoveryOwnerKey, EventSource, FactoryConfig, OwnerRuntimeState,
+    PoolDiscovery, PoolFactory, PoolGeneration, PoolInstanceId, PoolKey, PoolRegistration,
+    PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata, QuoteWarmup, RepairAction,
+    RuntimeOwnerId, SimConfig, StateSlot, StateUpdate as AdapterStateUpdate, StateView,
+    TokenEdgeDiscoveryRequest, UniswapV2Adapter, UniswapV2Metadata, UpdateQuality, V3Metadata,
+    V3StorageLayout, uniswap_v2_pair_runtime_code_hash,
 };
 
 #[test]
@@ -41,9 +45,9 @@ use evm_fork_cache::StateUpdate as ForkStateUpdate;
 use evm_fork_cache::bulk_storage::pack_slots_calldata;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay};
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockRef, InputSource,
-    PreconfirmationMode, ProviderRef, ReactiveContext, ReactiveInput, ReactiveInputBatch,
-    ReactiveInputRecord, SubscriberConfig, SubscriberMode,
+    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockIngressTiming, FlashblockRef,
+    InputSource, PreconfirmationMode, ProviderRef, ReactiveContext, ReactiveInput,
+    ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig, SubscriberMode,
 };
 use revm::{
     Database,
@@ -412,6 +416,29 @@ fn canonical_log_batch(
     );
     AmmCanonicalBatch::from_verified_block(1, canonical_header(block_number), 0, records)
         .expect("test batch is block coherent")
+}
+
+fn canonical_record_at(
+    block_number: u64,
+    transaction_index: u64,
+    log_index: u64,
+) -> ReactiveInputRecord<Ethereum> {
+    let mut record = raw_canonical_batch(block_number)
+        .into_records()
+        .into_iter()
+        .next()
+        .expect("raw canonical fixture contains one log");
+    let ReactiveInput::Log(log) = &mut record.input else {
+        unreachable!("raw canonical fixture is a log")
+    };
+    log.transaction_hash = Some(B256::from(
+        U256::from(transaction_index + 1).to_be_bytes::<32>(),
+    ));
+    log.transaction_index = Some(transaction_index);
+    log.log_index = Some(log_index);
+    record.context.transaction_index = Some(transaction_index);
+    record.context.log_index = Some(log_index);
+    record
 }
 
 fn canonical_primitive_log_batch(
@@ -989,6 +1016,7 @@ async fn flashblock_preview_is_published_then_invalidated_by_canonical_progress(
             assert_eq!(preview.cache().timestamp(), Some(1_700_000_000 + 501));
             assert!(preview.pool_changes().is_empty());
             assert_eq!(preview.event_refs().len(), 1);
+            assert_eq!(preview.timing(), None);
             assert_eq!(
                 preview.event_refs()[0],
                 AmmEventRef::new(B256::repeat_byte(0xf1), 0)
@@ -1013,6 +1041,35 @@ async fn flashblock_preview_is_published_then_invalidated_by_canonical_progress(
             assert!(previews.borrow().is_none());
             assert!(runtime.latest_preconfirmation().is_none());
             assert_eq!(runtime.latest_snapshot().point().block_number(), 501);
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_retains_typed_source_ingress_through_publication() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let source_ingress = Instant::now() - Duration::from_millis(25);
+            let batch = flashblock_batch(501, 9)
+                .with_preconfirmation_timing(FlashblockIngressTiming::new(source_ingress));
+
+            let preview = runtime.ingest_preconfirmation(batch).await?;
+            let timing = preview
+                .timing()
+                .expect("typed Flashblock ingress must survive runtime publication");
+            assert_eq!(timing.source_ingress(), source_ingress);
+            assert!(timing.elapsed_to_publication() >= Duration::from_millis(25));
 
             runtime.shutdown().await?;
             Ok(())
@@ -1279,6 +1336,117 @@ async fn published_chain_reorg_rolls_forward_to_the_replacement_hash() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn canonical_actor_rejects_an_exact_duplicate_block_before_reapply() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            let committed = runtime.latest_snapshot();
+            assert!(matches!(
+                runtime.ingest_batch(empty_canonical_batch(501)).await,
+                Err(AmmRuntimeCommandError::DuplicateCanonicalBlock { current })
+                    if current == committed.point()
+            ));
+            assert_eq!(runtime.latest_snapshot().version(), committed.version());
+            assert_eq!(runtime.latest_snapshot().point(), committed.point());
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_actor_duplicate_guard_prevents_tiny_fee_only_double_accrual() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let pool = Address::repeat_byte(0xd3);
+            let q96 = U256::from(1) << 96_usize;
+            let liquidity = U256::from(1_000_000_000_000_000_000_u128);
+            let slot0 = q96
+                | (U256::from(1) << 200_usize)
+                | (U256::from(1) << 216_usize)
+                | (U256::from(1) << 240_usize);
+            let observation = U256::from(1_700_000_500_u64) | (U256::from(1) << 248_usize);
+            cache.apply_updates(&[
+                ForkStateUpdate::slot(pool, U256::ZERO, slot0),
+                ForkStateUpdate::slot(pool, U256::from(1), U256::from(5)),
+                ForkStateUpdate::slot(pool, U256::from(2), U256::from(7)),
+                ForkStateUpdate::slot(pool, U256::from(3), U256::ZERO),
+                ForkStateUpdate::slot(pool, U256::from(4), liquidity),
+                ForkStateUpdate::slot(pool, U256::from(8), observation),
+                ForkStateUpdate::slot(pool, v3_tick_bitmap_storage_key(0), U256::ZERO),
+            ]);
+
+            let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
+            let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+                .with_state_address(pool)
+                .with_metadata(ProtocolMetadata::UniswapV3(
+                    V3Metadata::default()
+                        .with_fee(3_000)
+                        .with_tick_spacing(1)
+                        .with_storage_layout(V3StorageLayout::uniswap(1)),
+                ))
+                .with_status(PoolStatus::Ready);
+            let sources = adapter.event_sources(&registration);
+            let registration = registration.with_event_sources(sources);
+            let mut registry = AdapterRegistry::new();
+            registry.register_adapter(adapter)?;
+            registry.register_pool(registration)?;
+
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let swap = PrimitiveLog::new_unchecked(
+                pool,
+                vec![
+                    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+                    B256::ZERO,
+                    B256::ZERO,
+                ],
+                encoded_words([U256::from(1), U256::ZERO, q96, liquidity, U256::MAX]),
+            );
+            let make_batch =
+                || canonical_primitive_log_batch(501, runtime.interest_revision(), swap.clone());
+
+            runtime.ingest_batch(make_batch()).await?;
+            let committed = runtime.latest_snapshot();
+            let fee_growth_after_first = committed
+                .cache()
+                .storage_value(pool, U256::from(1))
+                .expect("fee-growth slot remains resident");
+            assert!(fee_growth_after_first > U256::from(5));
+
+            assert!(matches!(
+                runtime.ingest_batch(make_batch()).await,
+                Err(AmmRuntimeCommandError::DuplicateCanonicalBlock { current })
+                    if current == committed.point()
+            ));
+            let after_duplicate = runtime.latest_snapshot();
+            assert_eq!(after_duplicate.version(), committed.version());
+            assert_eq!(
+                after_duplicate.cache().storage_value(pool, U256::from(1)),
+                Some(fee_growth_after_first),
+                "the rejected duplicate must not accrue the fee a second time",
+            );
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn change_subscription_starts_after_its_snapshot_and_observes_publication_order() -> Result<()>
 {
     tokio::task::LocalSet::new()
@@ -1299,7 +1467,10 @@ async fn change_subscription_starts_after_its_snapshot_and_observes_publication_
                 AmmStateVersion::initial()
             );
 
-            let committed = runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            let constructor_started = std::time::Instant::now();
+            let batch = empty_canonical_batch(501);
+            let constructor_finished = std::time::Instant::now();
+            let committed = runtime.ingest_batch(batch).await?;
             snapshots.changed().await?;
             statuses.changed().await?;
             let delivered = subscription.next_commit().await.expect("change delivery");
@@ -1311,6 +1482,20 @@ async fn change_subscription_starts_after_its_snapshot_and_observes_publication_
                 delivered.changes().version()
             );
             assert_eq!(delivered.changes().point().block_number(), 501);
+            let timing = delivered
+                .timing()
+                .expect("canonical event commit carries monotonic provenance");
+            assert!(timing.source_ingress() >= constructor_started);
+            assert!(timing.source_ingress() <= constructor_finished);
+            assert_eq!(
+                timing.decoded_after_ingress(),
+                std::time::Duration::ZERO,
+                "the public constructor receives an already typed payload",
+            );
+            assert!(timing.decoded_after_ingress() <= timing.ordered_after_ingress());
+            assert!(timing.ordered_after_ingress() <= timing.transitioned_after_ingress());
+            assert!(timing.transitioned_after_ingress() <= timing.committed_after_ingress());
+            assert_eq!(timing.elapsed_to_commit(), timing.committed_after_ingress());
             let delivered_overlay = EvmOverlay::new(delivered.snapshot().cache_snapshot(), None);
             assert_eq!(delivered_overlay.block_number(), Some(501));
             assert_eq!(delivered_overlay.basefee(), Some(601));
@@ -1529,6 +1714,7 @@ async fn adapter_lifecycle_is_dynamic_generation_fenced_and_published() -> Resul
                 AmmRuntimeConfig::default(),
             )?;
             let mut observer = runtime.subscribe_events();
+            let mut commits = runtime.subscribe_changes().await?;
             let adapter = Arc::new(TestWriteAdapter {
                 protocol: "runtime-dynamic-adapter",
                 emitter: Address::repeat_byte(0xa1),
@@ -1537,6 +1723,11 @@ async fn adapter_lifecycle_is_dynamic_generation_fenced_and_published() -> Resul
             });
 
             let first = runtime.add_adapter(adapter.clone()).await?;
+            let topology_commit = commits.next_commit().await.expect("adapter-add commit");
+            assert!(
+                topology_commit.timing().is_none(),
+                "command-only topology work must not fabricate event timing",
+            );
             assert_eq!(first.generation().get(), 0);
             assert_eq!(runtime.latest_snapshot().version(), AmmStateVersion::new(1));
             assert_eq!(runtime.latest_snapshot().registry().adapter_count(), 1);
@@ -4327,6 +4518,34 @@ fn canonical_envelope_rejects_intrinsic_log_mismatch_and_duplicates() {
             ReactiveInputBatch::new(records)
         ),
         Err(AmmCanonicalBatchError::MalformedRecord { index: 0, .. })
+    ));
+}
+
+#[test]
+fn canonical_envelope_requires_strict_transaction_and_log_order() {
+    let valid = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 0, 1),
+        canonical_record_at(501, 0, 2),
+        canonical_record_at(501, 1, 3),
+    ]);
+    assert!(AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, valid).is_ok());
+
+    let lower_log = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 0, 2),
+        canonical_record_at(501, 0, 1),
+    ]);
+    assert!(matches!(
+        AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, lower_log),
+        Err(AmmCanonicalBatchError::OutOfOrderRecord { index: 1, .. })
+    ));
+
+    let lower_transaction = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 1, 2),
+        canonical_record_at(501, 0, 3),
+    ]);
+    assert!(matches!(
+        AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, lower_transaction),
+        Err(AmmCanonicalBatchError::OutOfOrderRecord { index: 1, .. })
     ));
 }
 

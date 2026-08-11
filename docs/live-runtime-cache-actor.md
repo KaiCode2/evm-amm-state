@@ -32,7 +32,12 @@ revisions, and an `Arc<EvmSnapshot>` suitable for independent worker overlays.
 
 - `subscribe_changes()` atomically returns a current snapshot plus the one
   correctness-critical bounded commit receiver. Every first commit is strictly
-  newer than that baseline and pairs the exact snapshot/change set.
+  newer than that baseline and pairs the exact snapshot/change set. Canonical
+  event commits also expose `AmmCommitTiming`: process-local monotonic source
+  ingress plus decode, order, transition, and commit offsets. These are not
+  wall-clock timestamps. Subscriber ingress survives provider-backed
+  reconciliation, while topology/cold-start/repair commits return `None`
+  instead of inventing event provenance.
 - `subscribe_snapshots()` and `subscribe_status()` are recoverable latest-value
   watches for late consumers.
 - `subscribe_events()` is a lossy observer stream. Lag is explicit; actor exit
@@ -66,6 +71,13 @@ state. The runtime installs its verified full-header startup point as the
 reactive canonical baseline, and accepts only a preview whose block number and
 parent hash identify that baseline's exact child. Canonical advancement moves
 the baseline before another preview can be accepted.
+
+When the subscriber batch carries typed source provenance, the published
+snapshot also exposes `AmmPreconfirmationTiming`: the exact process-local
+monotonic ingress and elapsed time through preview publication. This is
+optional, provider-free metadata. Missing timing remains `None` rather than
+being inferred at the runtime watch boundary, and the value has no ordering,
+identity, canonical-state, or execution authority.
 
 Each cumulative Flashblock replaces the previous overlay. Canonical progress
 first restores the saved canonical cache and clears the preview watch; subscriber

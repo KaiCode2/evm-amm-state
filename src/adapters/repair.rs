@@ -1,11 +1,13 @@
 //! Lowering of state-affecting [`RepairAction`](super::RepairAction)s into
 //! executable [`ReactiveEffect`]s.
 //!
-//! A1 emits repair *intentions*; this module turns the V3 liquidity-event
-//! intention (`RepairAction::V3TickRange`) into a targeted, hash-pinned
-//! [`ResyncRequest`] over exactly the storage slots a `Mint`/`Burn` can dirty,
-//! while preserving the observability `Hook` the A1 path already emits. When the
-//! pool has no resolvable [`V3StorageLayout`] the repair degrades to a
+//! This module retains the generic `RepairAction::V3TickRange` lowering used by
+//! custom/legacy callers: it produces a targeted, hash-pinned [`ResyncRequest`]
+//! over the quote-facing boundary-tick surface while preserving the
+//! observability `Hook`. It is not a complete canonical `Mint`/`Burn` parent
+//! rebuild and the built-in V3-family adapter does not use it to authorize exact
+//! Swap replay; built-in non-Swap mutations whole-storage purge instead. When a
+//! pool has no resolvable [`V3StorageLayout`], lowering also degrades to a
 //! conservative whole-storage invalidation rather than being silently dropped.
 
 use alloy_primitives::U256;
@@ -60,15 +62,17 @@ pub(crate) fn v3_tick_range_effects(
     })]
 }
 
-/// Compute the sorted, deduped slot set a V3 liquidity event over
-/// `[tick_lower, tick_upper]` must resync: all four `Tick.Info` slots for each
-/// boundary tick, the containing `tickBitmap` word(s) (deduped when the boundary
-/// ticks share a word), and the global `liquidity` slot.
+/// Compute the sorted, deduped quote-facing slot set for a V3 liquidity range:
+/// all four `Tick.Info` slots for each boundary tick, the containing
+/// `tickBitmap` word(s) (deduped when the boundary ticks share a word), and the
+/// global `liquidity` slot.
 ///
 /// All four info words are refreshed (not just `{0, 3}`): a `Mint`/`Burn` that
 /// flips a tick's initialized state sets/clears its `feeGrowthOutside{0,1}X128`
 /// (words 1/2), which a later tick-crossing quote reads — so the resync must
-/// cover them, matching what the cold-start planner warms.
+/// cover them, matching what the cold-start planner warms. This set omits the
+/// position/accounting surface and therefore cannot by itself re-establish an
+/// exact canonical Swap parent after `Mint`/`Burn`.
 pub(crate) fn v3_tick_range_slots(
     layout: &V3StorageLayout,
     tick_lower: i32,

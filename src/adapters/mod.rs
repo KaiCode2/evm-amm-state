@@ -60,11 +60,15 @@ pub mod solidly_v2;
 /// Uniswap V2 adapter (constant-product pairs).
 #[cfg(feature = "uniswap-v2")]
 pub mod uniswap_v2;
-/// Uniswap V3-family adapter (Uniswap V3 / PancakeSwap V3 / Slipstream).
+/// Concentrated-liquidity adapter routing Uniswap V3, PancakeSwap V3, and
+/// Slipstream. Exact event-only `Swap` transitions are currently supported
+/// only for canonical Uniswap V3 semantics; fork families fail closed.
 #[cfg(feature = "uniswap-v3")]
 pub mod uniswap_v3;
 #[cfg(feature = "uniswap-v3")]
 pub mod v3_sync;
+#[cfg(feature = "uniswap-v3")]
+mod v3_transition;
 
 pub use bytecode::{
     AdapterCodeSeed, BytecodePatch, BytecodeTemplateError, V3ImmutablePatchValues,
@@ -122,7 +126,7 @@ pub use quote_warmup::{
 };
 pub use reactive::{
     AmmPoolReactiveHandler, AmmPoolReactiveHandlerError, AmmReactiveHandler,
-    AmmReactiveRoutingContext, AmmReactiveSignal,
+    AmmReactiveRoutingContext, AmmReactiveSignal, SlipstreamFeeEvidenceInsertOutcome,
 };
 pub use registry::{AdapterRegistry, RegistryError, SubscriptionSpec};
 pub use runtime::{
@@ -139,8 +143,9 @@ pub use runtime::{
 };
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
 pub use snapshot::{
-    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmPreconfirmedSnapshot, AmmStateCommit,
-    AmmStateSnapshot, PoolRevisionMap,
+    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmCommitTiming,
+    AmmPreconfirmationTiming, AmmPreconfirmedSnapshot, AmmStateCommit, AmmStateSnapshot,
+    PoolRevisionMap,
 };
 #[cfg(feature = "live-runtime")]
 pub use subscriber_driver::{
@@ -166,11 +171,15 @@ pub use sync_manager::{
 };
 pub use traits::AmmAdapter;
 pub use types::{
-    AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventReport, AdapterEventResult,
-    BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
-    CurveMetadata, CurveVariant, CustomPoolKey, DeferredOutcome, DeferredWork, EventRoute,
-    EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction,
-    SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3Metadata,
+    AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind, AdapterEventReport,
+    AdapterEventResult, BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome,
+    ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant, CustomPoolKey, DeferredOutcome,
+    DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId,
+    ProtocolMetadata, RepairAction, SlipstreamFeeEvidenceError, SlipstreamRuntimeFamily,
+    SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence, SlipstreamUnstakedFeeEvaluation,
+    SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof,
+    SlipstreamUnstakedFeeProofKind, SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason,
+    UpdateQuality, V3Metadata, V3SwapTransitionCapability, V3TransitionError,
 };
 
 #[cfg(feature = "balancer-v2")]

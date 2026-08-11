@@ -2,11 +2,516 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, address, b256};
 
 use super::cache::{SlotChange, StateDiff, StateUpdate};
 use super::sim::SimConfig;
 use super::storage::{SolidlyStorageLayout, V3StorageLayout};
+
+/// Independently reviewed deployed Slipstream runtime family.
+///
+/// This is deliberately narrower than [`ProtocolId::Slipstream`]. Exact
+/// event-only replay is granted only to the concrete deployed implementations
+/// whose storage and swap semantics have been checked against their runtime
+/// bytecode.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SlipstreamRuntimeFamily {
+    /// Aerodrome Slipstream implementation deployed by the Base mooBIFI pool.
+    AerodromeBaseBifi,
+    /// Velodrome Slipstream implementation deployed by the Optimism mooBIFI pool.
+    VelodromeOptimismBifi,
+}
+
+/// Proof of how the event-scoped unstaked-liquidity fee was obtained.
+///
+/// The pool does not call the factory when every swap step has all active
+/// liquidity staked. Mixed-liquidity swaps instead require a provider-free
+/// execution of the reviewed factory/voter/module path against the exact
+/// transaction parent snapshot.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SlipstreamUnstakedFeeProofKind {
+    /// Pool runtime identity was proven and every swap step later proved that
+    /// the unstaked fee branch was unreachable.
+    UnusedAllLiquidityStaked,
+    /// Pool/factory/voter/module runtimes and exact effective fee were executed
+    /// against the transaction-parent snapshot with no unresolved reads.
+    ReviewedRuntimeEvaluation,
+}
+
+/// Opaque attestation returned only by the provider-free runtime evaluator.
+///
+/// Fields are private so external callers cannot turn static fixture values
+/// into an Exact mixed-liquidity claim. Inspect the attestation through its
+/// accessors and pass it back to [`SlipstreamSwapFeeEvidence::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlipstreamUnstakedFeeProof {
+    runtime_family: SlipstreamRuntimeFamily,
+    kind: SlipstreamUnstakedFeeProofKind,
+    gauge_alive: Option<bool>,
+    effective_fee: Option<u32>,
+    snapshot_identity: Option<SlipstreamSnapshotIdentity>,
+}
+
+impl SlipstreamUnstakedFeeProof {
+    #[cfg_attr(not(feature = "uniswap-v3"), allow(dead_code))]
+    pub(crate) const fn reviewed_runtime_evaluation(
+        runtime_family: SlipstreamRuntimeFamily,
+        gauge_alive: bool,
+        effective_fee: u32,
+        snapshot_identity: SlipstreamSnapshotIdentity,
+    ) -> Self {
+        Self {
+            runtime_family,
+            kind: SlipstreamUnstakedFeeProofKind::ReviewedRuntimeEvaluation,
+            gauge_alive: Some(gauge_alive),
+            effective_fee: Some(effective_fee),
+            snapshot_identity: Some(snapshot_identity),
+        }
+    }
+
+    #[cfg_attr(not(feature = "uniswap-v3"), allow(dead_code))]
+    pub(crate) const fn unused_all_liquidity_staked(
+        runtime_family: SlipstreamRuntimeFamily,
+        snapshot_identity: SlipstreamSnapshotIdentity,
+    ) -> Self {
+        Self {
+            runtime_family,
+            kind: SlipstreamUnstakedFeeProofKind::UnusedAllLiquidityStaked,
+            gauge_alive: None,
+            effective_fee: None,
+            snapshot_identity: Some(snapshot_identity),
+        }
+    }
+
+    /// Reviewed runtime family whose state produced this attestation.
+    pub const fn runtime_family(self) -> SlipstreamRuntimeFamily {
+        self.runtime_family
+    }
+
+    /// Kind of provider-free proof represented by this attestation.
+    pub const fn kind(self) -> SlipstreamUnstakedFeeProofKind {
+        self.kind
+    }
+
+    /// Exact voter liveness result, when the external fee path was evaluated.
+    pub const fn gauge_alive(self) -> Option<bool> {
+        self.gauge_alive
+    }
+
+    /// Effective unstaked fee produced by the reviewed runtime evaluation.
+    ///
+    /// The all-staked candidate returns `None` because replay proves the fee
+    /// branch is unreachable and requires the evidence value to remain zero.
+    pub const fn effective_fee(self) -> Option<u32> {
+        self.effective_fee
+    }
+
+    /// Exact snapshot/event identity bound by a runtime evaluation.
+    ///
+    /// The all-staked candidate remains bound to the exact snapshot whose pool
+    /// and implementation runtimes were attested; replay separately proves its
+    /// fee branch is unreachable.
+    pub const fn snapshot_identity(self) -> Option<SlipstreamSnapshotIdentity> {
+        self.snapshot_identity
+    }
+}
+
+/// Independently validated identity of the immutable transaction-parent
+/// snapshot supplied to the offline Slipstream fee evaluator.
+///
+/// The canonical/raw transaction pipeline constructs this token only after it
+/// has matched the state snapshot to the announced block lineage and full
+/// transaction event. The evaluator then compares every field to the routed
+/// event context, including block and parent hashes, before executing bytecode.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlipstreamSnapshotIdentity {
+    chain_id: u64,
+    block_number: u64,
+    block_hash: B256,
+    parent_hash: B256,
+    block_timestamp: u64,
+    transaction_hash: B256,
+    transaction_index: u64,
+    log_index: u64,
+}
+
+impl SlipstreamSnapshotIdentity {
+    /// Construct a complete lineage token after the caller has independently
+    /// validated that its immutable snapshot represents this event parent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        chain_id: u64,
+        block_number: u64,
+        block_hash: B256,
+        parent_hash: B256,
+        block_timestamp: u64,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    ) -> Result<Self, SlipstreamUnstakedFeeEvaluationError> {
+        if chain_id == 0
+            || block_number == 0
+            || block_hash == B256::ZERO
+            || parent_hash == B256::ZERO
+            || block_timestamp == 0
+            || transaction_hash == B256::ZERO
+        {
+            return Err(SlipstreamUnstakedFeeEvaluationError::SnapshotIdentity);
+        }
+        Ok(Self {
+            chain_id,
+            block_number,
+            block_hash,
+            parent_hash,
+            block_timestamp,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        })
+    }
+
+    #[cfg_attr(not(feature = "uniswap-v3"), allow(dead_code))]
+    pub(crate) fn matches_context(self, context: &AdapterEventContext) -> bool {
+        context.chain_id == Some(self.chain_id)
+            && context.block_number == Some(self.block_number)
+            && context.block_hash == Some(self.block_hash)
+            && context.parent_hash == Some(self.parent_hash)
+            && context.block_timestamp == Some(self.block_timestamp)
+            && context.transaction_hash == Some(self.transaction_hash)
+            && context.transaction_index == Some(self.transaction_index)
+            && context.log_index == Some(self.log_index)
+    }
+
+    /// Chain containing the target event.
+    pub const fn chain_id(self) -> u64 {
+        self.chain_id
+    }
+
+    /// Block number containing the target event.
+    pub const fn block_number(self) -> u64 {
+        self.block_number
+    }
+
+    /// Exact block hash containing the target event.
+    pub const fn block_hash(self) -> B256 {
+        self.block_hash
+    }
+
+    /// Exact parent block hash underlying the transaction state.
+    pub const fn parent_hash(self) -> B256 {
+        self.parent_hash
+    }
+
+    /// Block timestamp installed in the snapshot EVM.
+    pub const fn block_timestamp(self) -> u64 {
+        self.block_timestamp
+    }
+
+    /// Exact transaction hash containing the event.
+    pub const fn transaction_hash(self) -> B256 {
+        self.transaction_hash
+    }
+
+    /// Transaction index within the block.
+    pub const fn transaction_index(self) -> u64 {
+        self.transaction_index
+    }
+
+    /// Log index within the block.
+    pub const fn log_index(self) -> u64 {
+        self.log_index
+    }
+}
+
+/// Provider-free result of evaluating `CLFactory.getUnstakedFee(pool)`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlipstreamUnstakedFeeEvaluation {
+    effective_fee: u32,
+    proof: SlipstreamUnstakedFeeProof,
+}
+
+impl SlipstreamUnstakedFeeEvaluation {
+    #[cfg_attr(not(feature = "uniswap-v3"), allow(dead_code))]
+    pub(crate) const fn new(effective_fee: u32, proof: SlipstreamUnstakedFeeProof) -> Self {
+        Self {
+            effective_fee,
+            proof,
+        }
+    }
+
+    /// Effective unstaked-liquidity fee in millionths.
+    pub const fn effective_fee(self) -> u32 {
+        self.effective_fee
+    }
+
+    /// Reviewed runtime proof attached to the evaluation.
+    pub const fn proof(self) -> SlipstreamUnstakedFeeProof {
+        self.proof
+    }
+}
+
+/// Failure producing exact unstaked-fee evidence without a provider read.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlipstreamUnstakedFeeEvaluationError {
+    /// Snapshot chain/block/timestamp did not match the target event context.
+    SnapshotIdentity,
+    /// A pool/factory/voter/module address was not the reviewed deployment.
+    RuntimeAddressIdentity,
+    /// An expected executed pool/factory/voter/module runtime hash was absent.
+    RuntimeCodeIdentity {
+        /// Reviewed runtime hash missing from the execution trace.
+        missing: B256,
+    },
+    /// The offline factory/voter/module evaluation observed unresolved state.
+    MissingState,
+    /// The reviewed factory call reverted, halted, or failed to execute.
+    ExecutionFailed,
+    /// The factory returned malformed ABI data.
+    MalformedOutput,
+    /// The factory returned a fee outside its deployed accepted range.
+    FeeRange,
+    /// Factory, voter liveness, and module results did not describe one state.
+    FeePathMismatch,
+}
+
+impl fmt::Display for SlipstreamUnstakedFeeEvaluationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SnapshotIdentity => write!(f, "Slipstream fee snapshot identity mismatch"),
+            Self::RuntimeAddressIdentity => {
+                write!(f, "Slipstream fee runtime address mismatch")
+            }
+            Self::RuntimeCodeIdentity { missing } => {
+                write!(f, "Slipstream fee runtime code mismatch: missing {missing}")
+            }
+            Self::MissingState => write!(f, "missing offline Slipstream fee state"),
+            Self::ExecutionFailed => write!(f, "offline Slipstream fee call failed"),
+            Self::MalformedOutput => write!(f, "malformed offline Slipstream fee output"),
+            Self::FeeRange => write!(f, "offline Slipstream unstaked fee is out of range"),
+            Self::FeePathMismatch => write!(f, "inconsistent Slipstream fee-path result"),
+        }
+    }
+}
+
+impl std::error::Error for SlipstreamUnstakedFeeEvaluationError {}
+
+/// Provider-free effective fee evidence for one concrete Slipstream swap.
+///
+/// Slipstream swap fees may depend on current observations, block timestamp,
+/// and `tx.origin` discount status. Consequently the effective swap fee is
+/// inferred from this exact event and replay-validated instead of trusting
+/// static pool metadata. The separately evaluated unstaked-fee path is limited
+/// to reviewed runtimes whose reachable calls are caller-independent.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlipstreamSwapFeeEvidence {
+    /// Reviewed runtime family whose semantics produced this evidence.
+    pub runtime_family: SlipstreamRuntimeFamily,
+    /// Chain containing the pool and event.
+    pub chain_id: u64,
+    /// Pool whose dynamic fee calls were evaluated.
+    pub pool: Address,
+    /// Factory read from the pool's exact parent storage.
+    pub factory: Address,
+    /// Runtime-code hash of the pool proxy.
+    pub proxy_runtime_code_hash: B256,
+    /// Implementation selected by the reviewed proxy runtime.
+    pub implementation: Address,
+    /// Runtime-code hash of the reviewed implementation.
+    pub implementation_runtime_code_hash: B256,
+    /// Effective swap fee for this transaction, denominated in millionths.
+    pub effective_swap_fee: u32,
+    /// Effective unstaked-liquidity fee for this transaction, in millionths.
+    pub effective_unstaked_fee: u32,
+    /// Provider-free proof for the effective unstaked-liquidity fee.
+    pub unstaked_fee_proof: SlipstreamUnstakedFeeProof,
+    /// Exact block containing the event.
+    pub block_number: u64,
+    /// Exact block identity containing the event.
+    pub block_hash: B256,
+    /// Exact parent state on which the fee evaluation and transition are based.
+    pub parent_hash: B256,
+    /// Timestamp used by the fee module and pool transition.
+    pub block_timestamp: u64,
+    /// Transaction containing the exact swap event.
+    pub transaction_hash: B256,
+    /// Transaction position within the block.
+    pub transaction_index: u64,
+    /// Log position within the block.
+    pub log_index: u64,
+}
+
+/// Validation failure constructing effective Slipstream fee evidence.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlipstreamFeeEvidenceError {
+    /// Runtime, pool, factory, or chain identity is not the reviewed deployment.
+    RuntimeIdentity,
+    /// Effective fee is outside the deployed factory's accepted range.
+    FeeRange,
+    /// Exact block/transaction lineage is incomplete.
+    IncompleteLineage,
+    /// Effective unstaked fee does not match the opaque evaluator attestation.
+    UnstakedFeeProofMismatch,
+}
+
+impl fmt::Display for SlipstreamFeeEvidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeIdentity => write!(f, "unreviewed Slipstream runtime identity"),
+            Self::FeeRange => write!(f, "Slipstream effective fee is outside accepted bounds"),
+            Self::IncompleteLineage => write!(f, "Slipstream event lineage is incomplete"),
+            Self::UnstakedFeeProofMismatch => {
+                write!(f, "Slipstream unstaked fee does not match its proof")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SlipstreamFeeEvidenceError {}
+
+impl SlipstreamSwapFeeEvidence {
+    /// Construct and validate evidence for one exact reviewed-runtime event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        runtime_family: SlipstreamRuntimeFamily,
+        chain_id: u64,
+        pool: Address,
+        factory: Address,
+        proxy_runtime_code_hash: B256,
+        implementation: Address,
+        implementation_runtime_code_hash: B256,
+        effective_swap_fee: u32,
+        effective_unstaked_fee: u32,
+        unstaked_fee_proof: SlipstreamUnstakedFeeProof,
+        block_number: u64,
+        block_hash: B256,
+        parent_hash: B256,
+        block_timestamp: u64,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    ) -> Result<Self, SlipstreamFeeEvidenceError> {
+        let evidence = Self {
+            runtime_family,
+            chain_id,
+            pool,
+            factory,
+            proxy_runtime_code_hash,
+            implementation,
+            implementation_runtime_code_hash,
+            effective_swap_fee,
+            effective_unstaked_fee,
+            unstaked_fee_proof,
+            block_number,
+            block_hash,
+            parent_hash,
+            block_timestamp,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Revalidate a retained or deserialized evidence value.
+    pub fn validate(self) -> Result<(), SlipstreamFeeEvidenceError> {
+        let identity_matches = match self.runtime_family {
+            SlipstreamRuntimeFamily::AerodromeBaseBifi => {
+                self.chain_id == 8_453
+                    && self.pool == address!("b378137c90444bbcecd44a1f766851fbf53d2a9e")
+                    && self.factory == address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a")
+                    && self.proxy_runtime_code_hash
+                        == b256!("acd6710f7037ad095b1e4d5f8ee5b2681069cb4dd316e77e4e0cb8f85716a2a1")
+                    && self.implementation == address!("ec8e5342b19977b4ef8892e02d8daecfa1315831")
+                    && self.implementation_runtime_code_hash
+                        == b256!("772fb5c610b40a122036f544e5b9b5bce6becb19db9524331289d1aaed2d5888")
+            }
+            SlipstreamRuntimeFamily::VelodromeOptimismBifi => {
+                self.chain_id == 10
+                    && self.pool == address!("173cdc71e29d5cffa6d090ad99f555a24b8831f9")
+                    && self.factory == address!("cc0bddb707055e04e497ab22a59c2af4391cd12f")
+                    && self.proxy_runtime_code_hash
+                        == b256!("063ca35333cb7f2463f087d40ff9485475550abf4858a2f63c387d4d102b0f4f")
+                    && self.implementation == address!("c28ad28853a547556780bebf7847628501a3bcbb")
+                    && self.implementation_runtime_code_hash
+                        == b256!("36c3da904ca0b58544254cd0d978fe4801c32dc1f9e3b3e644487ef541299794")
+            }
+        };
+        if !identity_matches {
+            return Err(SlipstreamFeeEvidenceError::RuntimeIdentity);
+        }
+        if self.effective_swap_fee > 100_000 || self.effective_unstaked_fee > 1_000_000 {
+            return Err(SlipstreamFeeEvidenceError::FeeRange);
+        }
+        let evidence_identity = SlipstreamSnapshotIdentity {
+            chain_id: self.chain_id,
+            block_number: self.block_number,
+            block_hash: self.block_hash,
+            parent_hash: self.parent_hash,
+            block_timestamp: self.block_timestamp,
+            transaction_hash: self.transaction_hash,
+            transaction_index: self.transaction_index,
+            log_index: self.log_index,
+        };
+        if self.unstaked_fee_proof.runtime_family() != self.runtime_family {
+            return Err(SlipstreamFeeEvidenceError::RuntimeIdentity);
+        }
+        match self.unstaked_fee_proof.kind() {
+            SlipstreamUnstakedFeeProofKind::ReviewedRuntimeEvaluation => {
+                if self.unstaked_fee_proof.snapshot_identity() != Some(evidence_identity) {
+                    return Err(SlipstreamFeeEvidenceError::RuntimeIdentity);
+                }
+                if self.unstaked_fee_proof.effective_fee() != Some(self.effective_unstaked_fee) {
+                    return Err(SlipstreamFeeEvidenceError::UnstakedFeeProofMismatch);
+                }
+            }
+            SlipstreamUnstakedFeeProofKind::UnusedAllLiquidityStaked => {
+                if self.unstaked_fee_proof.snapshot_identity() != Some(evidence_identity)
+                    || self.effective_unstaked_fee != 0
+                {
+                    return Err(SlipstreamFeeEvidenceError::UnstakedFeeProofMismatch);
+                }
+            }
+        }
+        if self.block_number == 0
+            || self.block_hash == B256::ZERO
+            || self.parent_hash == B256::ZERO
+            || self.block_timestamp == 0
+            || self.transaction_hash == B256::ZERO
+        {
+            return Err(SlipstreamFeeEvidenceError::IncompleteLineage);
+        }
+        Ok(())
+    }
+
+    /// Replace the event-derived effective swap fee and revalidate the record.
+    pub fn with_effective_swap_fee(
+        mut self,
+        effective_swap_fee: u32,
+    ) -> Result<Self, SlipstreamFeeEvidenceError> {
+        self.effective_swap_fee = effective_swap_fee;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Replace the event-scoped unstaked-fee evaluation and revalidate it.
+    pub fn with_unstaked_fee_evaluation(
+        mut self,
+        evaluation: SlipstreamUnstakedFeeEvaluation,
+    ) -> Result<Self, SlipstreamFeeEvidenceError> {
+        self.effective_unstaked_fee = evaluation.effective_fee();
+        self.unstaked_fee_proof = evaluation.proof();
+        self.validate()?;
+        Ok(self)
+    }
+}
 
 /// Protocol family identifier for adapter registrations.
 #[non_exhaustive]
@@ -547,6 +1052,20 @@ pub struct V3Metadata {
     pub warmed_slots: Vec<U256>,
 }
 
+/// Evidence-backed event-only swap-transition capability for a V3-family pool.
+///
+/// This is deliberately pool-specific: protocol identity alone is insufficient
+/// when a registration supplies a non-canonical storage layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum V3SwapTransitionCapability {
+    /// Exact parent state plus ordered event context can reproduce the complete
+    /// declared swap-induced storage surface without provider reads.
+    Exact,
+    /// This release has no independent parity proof for the registered family
+    /// or layout, so callers must hold/rebuild rather than claim exactness.
+    Unsupported,
+}
+
 impl V3Metadata {
     /// Set the pool's `token0` address.
     pub fn with_token0(mut self, token0: Address) -> Self {
@@ -904,6 +1423,88 @@ pub struct AdapterEvent {
     pub repair: RepairAction,
 }
 
+/// Immutable chain and ordering context for one adapter event transition.
+///
+/// Event payloads do not carry the block timestamp or their complete ordering
+/// identity. Adapters which derive time- or sequence-dependent state use this
+/// context instead of performing a provider read. Supplying positions does not
+/// itself enforce sequencing or deduplication: the runtime/driver must apply
+/// events in canonical `(block, transaction_index, log_index)` order and reject
+/// gaps, duplicates, and reordering before invoking the adapter.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterEventContext {
+    /// Chain which produced the event, when known.
+    pub chain_id: Option<u64>,
+    /// Block number containing the event, when known.
+    pub block_number: Option<u64>,
+    /// Exact block identity containing the event, when known.
+    pub block_hash: Option<B256>,
+    /// Exact parent identity on which the transition is based, when known.
+    pub parent_hash: Option<B256>,
+    /// Block timestamp used by time-dependent state transitions, when known.
+    pub block_timestamp: Option<u64>,
+    /// Exact transaction identity containing the event, when known.
+    pub transaction_hash: Option<B256>,
+    /// Transaction position within the block, when known.
+    pub transaction_index: Option<u64>,
+    /// Log position within the block, when known.
+    pub log_index: Option<u64>,
+    /// Exact effective fee evidence for a reviewed Slipstream runtime/event.
+    pub slipstream_fee_evidence: Option<SlipstreamSwapFeeEvidence>,
+}
+
+impl AdapterEventContext {
+    /// Construct context for an exact block and timestamp.
+    pub const fn for_block(block_number: u64, block_hash: B256, block_timestamp: u64) -> Self {
+        Self {
+            chain_id: None,
+            block_number: Some(block_number),
+            block_hash: Some(block_hash),
+            parent_hash: None,
+            block_timestamp: Some(block_timestamp),
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            slipstream_fee_evidence: None,
+        }
+    }
+
+    /// Bind the context to a chain id.
+    pub const fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
+    /// Bind the exact parent block identity.
+    pub const fn with_parent_hash(mut self, parent_hash: B256) -> Self {
+        self.parent_hash = Some(parent_hash);
+        self
+    }
+
+    /// Bind the event's transaction and log positions.
+    pub const fn with_event_order(mut self, transaction_index: u64, log_index: u64) -> Self {
+        self.transaction_index = Some(transaction_index);
+        self.log_index = Some(log_index);
+        self
+    }
+
+    /// Bind the exact transaction identity containing this event.
+    pub const fn with_transaction_hash(mut self, transaction_hash: B256) -> Self {
+        self.transaction_hash = Some(transaction_hash);
+        self
+    }
+
+    /// Attach effective dynamic-fee evidence for this exact Slipstream event.
+    pub const fn with_slipstream_fee_evidence(
+        mut self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> Self {
+        self.slipstream_fee_evidence = Some(evidence);
+        self
+    }
+}
+
 impl AdapterEvent {
     /// Construct an event with no state updates and no repair; chain
     /// [`with_updates`](Self::with_updates) / [`with_repair`](Self::with_repair)
@@ -1004,6 +1605,15 @@ impl AdapterEventResult {
             error: Some(error),
         }
     }
+
+    /// A recognized event whose exact transition failed, carrying both the
+    /// typed cause and a conservative event effect (normally invalidation).
+    pub fn event_with_error(event: AdapterEvent, error: AdapterEventError) -> Self {
+        Self {
+            event: Some(event),
+            error: Some(error),
+        }
+    }
 }
 
 /// Decode-time adapter error vocabulary.
@@ -1021,6 +1631,9 @@ pub enum AdapterEventError {
     },
     /// The event or its routing is unsupported for this adapter.
     Unsupported(UnsupportedReason),
+    /// A concentrated-liquidity swap could not be proven as one exact,
+    /// provider-free transition from the supplied parent state.
+    V3Transition(V3TransitionError),
     /// A protocol-specific decode failure.
     Custom(String),
 }
@@ -1033,12 +1646,98 @@ impl fmt::Display for AdapterEventError {
                 write!(f, "missing state at {address}:{slot}")
             }
             Self::Unsupported(reason) => write!(f, "unsupported: {reason:?}"),
+            Self::V3Transition(error) => write!(f, "V3 transition: {error}"),
             Self::Custom(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for AdapterEventError {}
+
+/// Exact V3 event-transition failure vocabulary.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum V3TransitionError {
+    /// Exact replay requires a context field that the caller omitted.
+    MissingContext(&'static str),
+    /// A reviewed Slipstream runtime was missing exact effective fee evidence.
+    MissingSlipstreamFeeEvidence,
+    /// Supplied Slipstream fee/runtime evidence did not match the exact event.
+    SlipstreamFeeEvidence(&'static str),
+    /// No effective fee in the deployed range can explain the event amounts.
+    SlipstreamFeeInferenceNoMatch,
+    /// More than one fee can explain the event because of integer rounding.
+    SlipstreamFeeInferenceAmbiguous {
+        /// Lowest fee consistent with the event.
+        first: u32,
+        /// Highest fee consistent with the event.
+        last: u32,
+    },
+    /// Event fields contradict each other or the parent direction/state.
+    ContradictoryEvent(&'static str),
+    /// A locally derived final field did not match the event postcondition.
+    FinalStateMismatch {
+        /// Postcondition being compared.
+        field: &'static str,
+        /// Value derived from the parent transition.
+        derived: U256,
+        /// Value carried by the event.
+        event: U256,
+    },
+    /// The parent observation ring cannot support an exact oracle transition.
+    Observation(&'static str),
+    /// Tick bitmap and `Tick.Info` evidence is inconsistent.
+    InitializedTick {
+        /// Initialized tick being validated.
+        tick: i32,
+        /// Static reason suitable for low-cardinality classification.
+        reason: &'static str,
+    },
+    /// Checked local arithmetic rejected invalid or overflowing state.
+    Arithmetic(&'static str),
+    /// The transition exceeded its deterministic hot-path step budget.
+    WorkLimitExceeded {
+        /// Maximum canonical swap steps evaluated before failing closed.
+        limit: u32,
+    },
+}
+
+impl fmt::Display for V3TransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingContext(field) => write!(f, "missing event context field {field}"),
+            Self::MissingSlipstreamFeeEvidence => {
+                write!(f, "missing effective Slipstream fee evidence")
+            }
+            Self::SlipstreamFeeEvidence(reason) => {
+                write!(f, "invalid Slipstream fee evidence: {reason}")
+            }
+            Self::SlipstreamFeeInferenceNoMatch => {
+                write!(f, "no Slipstream fee explains the event amounts")
+            }
+            Self::SlipstreamFeeInferenceAmbiguous { first, last } => write!(
+                f,
+                "Slipstream event fee is ambiguous across [{first}, {last}]",
+            ),
+            Self::ContradictoryEvent(reason) => write!(f, "contradictory event: {reason}"),
+            Self::FinalStateMismatch {
+                field,
+                derived,
+                event,
+            } => write!(f, "{field} mismatch: derived {derived}, event {event}"),
+            Self::Observation(reason) => write!(f, "observation mismatch: {reason}"),
+            Self::InitializedTick { tick, reason } => {
+                write!(f, "initialized tick {tick} mismatch: {reason}")
+            }
+            Self::Arithmetic(reason) => write!(f, "arithmetic failure: {reason}"),
+            Self::WorkLimitExceeded { limit } => {
+                write!(f, "swap transition exceeded the {limit}-step work limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for V3TransitionError {}
 
 /// Quality of the cache update emitted for an adapter event.
 ///
@@ -1085,8 +1784,10 @@ pub enum RepairAction {
         /// The policy to cold-start it under.
         policy: ColdStartPolicy,
     },
-    /// Resync the storage a V3 liquidity event over `[tick_lower, tick_upper]`
-    /// can dirty (boundary tick info, bitmap words, global liquidity).
+    /// Resync the quote-facing V3 liquidity-range surface (boundary tick info,
+    /// bitmap words, global liquidity). This is not a complete canonical
+    /// `Mint`/`Burn` accounting rebuild and cannot alone authorize exact Swap
+    /// replay.
     V3TickRange {
         /// The V3 pool.
         pool: PoolKey,

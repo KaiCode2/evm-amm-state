@@ -58,8 +58,9 @@ flowchart TD
 ```
 
 Plain `ReactiveRuntime::ingest_batch` is still valid for callers that only want
-to collect repair requests. It is not sufficient for live Balancer, Curve, or V3
-liquidity sync because it does not execute the resync phase.
+to collect repair requests. It is not sufficient for live Balancer/Curve slot
+resync or canonical V3 non-`Swap` recovery because it does not execute the
+authoritative repair/rebuild phase.
 
 ## Protocol Policy
 
@@ -67,8 +68,8 @@ liquidity sync because it does not execute the resync phase.
 | --- | --- |
 | Uniswap V2 `Sync` | exact masked reserve write |
 | Solidly V2 `Sync` | exact reserve writes when layout is configured |
-| V3 `Swap` | exact slot0/liquidity write |
-| V3 `Mint`/`Burn` | exact packed `liquidityGross`/`liquidityNet`, bitmap-bit, and in-range global-liquidity writes for warm (in-window) ticks; resync the computed tick/bitmap/liquidity slots only for cold ticks |
+| Canonical V3 `Swap` | exact provider-free replay of the complete swap-mutated fee/oracle/tick/liquidity surface from an exact parent and ordered context; Pancake/Slipstream remain unsupported and purge |
+| V3 non-`Swap` mutations | route the complete standard topic set and purge the whole pool with `RequiresRepair`; partial warm `Mint`/`Burn` tick writes cannot establish an exact later-Swap parent |
 | Balancer V2 `Swap` | exact 112-bit `cash`-field writes when both tokens' probed cash locations are warm; resync known Vault balance slots otherwise |
 | Balancer V2 `PoolBalanceChanged` | resync known Vault balance slots |
 | Curve swap/liquidity events | resync known pool read-set slots |

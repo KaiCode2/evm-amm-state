@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use evm_fork_cache::cache::EvmSnapshot;
 use evm_fork_cache::reactive::FlashblockRef;
@@ -228,6 +229,41 @@ pub struct AmmPreconfirmedSnapshot {
     registry: Arc<AdapterRegistrySnapshot>,
     pool_changes: Vec<AmmSyncPoolChange>,
     event_refs: Vec<AmmEventRef>,
+    timing: Option<AmmPreconfirmationTiming>,
+}
+
+/// Provider-free monotonic timing for one published preconfirmation snapshot.
+///
+/// The source instant originates at the Flashblock subscriber boundary and is
+/// retained without wall-clock conversion. Direct or legacy batches that do
+/// not carry source provenance expose no timing rather than fabricating a
+/// later ingress. This metadata affects neither preview identity nor canonical
+/// or execution authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmmPreconfirmationTiming {
+    source_ingress: Instant,
+    published_after_ingress: Duration,
+}
+
+impl AmmPreconfirmationTiming {
+    #[cfg_attr(not(feature = "live-runtime"), allow(dead_code))]
+    pub(crate) fn published(source_ingress: Instant) -> Self {
+        Self {
+            source_ingress,
+            published_after_ingress: Instant::now().saturating_duration_since(source_ingress),
+        }
+    }
+
+    /// Process-local monotonic instant at which the earliest contributing
+    /// preconfirmation source item entered the typed subscriber boundary.
+    pub const fn source_ingress(&self) -> Instant {
+        self.source_ingress
+    }
+
+    /// Total monotonic source-ingress-to-preview-publication latency.
+    pub const fn elapsed_to_publication(&self) -> Duration {
+        self.published_after_ingress
+    }
 }
 
 impl AmmPreconfirmedSnapshot {
@@ -243,6 +279,7 @@ impl AmmPreconfirmedSnapshot {
         registry: Arc<AdapterRegistrySnapshot>,
         pool_changes: Vec<AmmSyncPoolChange>,
         event_refs: Vec<AmmEventRef>,
+        timing: Option<AmmPreconfirmationTiming>,
     ) -> Self {
         Self {
             runtime_id,
@@ -254,6 +291,7 @@ impl AmmPreconfirmedSnapshot {
             registry,
             pool_changes,
             event_refs,
+            timing,
         }
     }
 
@@ -305,6 +343,12 @@ impl AmmPreconfirmedSnapshot {
     /// Source AMM logs represented by this speculative preview.
     pub fn event_refs(&self) -> &[AmmEventRef] {
         &self.event_refs
+    }
+
+    /// Original source ingress and elapsed publication timing, or `None` when
+    /// the input batch did not carry typed preconfirmation provenance.
+    pub const fn timing(&self) -> Option<AmmPreconfirmationTiming> {
+        self.timing
     }
 }
 
@@ -386,18 +430,99 @@ impl AmmStateSnapshot {
     }
 }
 
+/// Provider-free monotonic stage timing for one canonical event commit.
+///
+/// The values are process-local monotonic measurements, not wall-clock
+/// timestamps. Offsets are measured from the earliest contributing source
+/// ingress and are guaranteed to be nondecreasing. Commits produced only by
+/// topology, cold-start, repair, or other command work do not fabricate this
+/// provenance and expose no timing value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmmCommitTiming {
+    source_ingress: Instant,
+    decoded_after_ingress: Duration,
+    ordered_after_ingress: Duration,
+    transitioned_after_ingress: Duration,
+    committed_after_ingress: Duration,
+}
+
+impl AmmCommitTiming {
+    #[cfg_attr(not(feature = "live-runtime"), allow(dead_code))]
+    pub(crate) fn new(
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+        ordered_after_ingress: Duration,
+        transitioned_after_ingress: Duration,
+        committed_after_ingress: Duration,
+    ) -> Self {
+        assert!(decoded_after_ingress <= ordered_after_ingress);
+        assert!(ordered_after_ingress <= transitioned_after_ingress);
+        assert!(transitioned_after_ingress <= committed_after_ingress);
+        Self {
+            source_ingress,
+            decoded_after_ingress,
+            ordered_after_ingress,
+            transitioned_after_ingress,
+            committed_after_ingress,
+        }
+    }
+
+    /// Process-local monotonic instant at which the earliest contributing
+    /// source item entered the subscriber or typed direct-ingest boundary.
+    pub const fn source_ingress(&self) -> Instant {
+        self.source_ingress
+    }
+
+    /// Elapsed time from source ingress to the first typed domain value.
+    pub const fn decoded_after_ingress(&self) -> Duration {
+        self.decoded_after_ingress
+    }
+
+    /// Elapsed time from source ingress through deterministic ordering and
+    /// duplicate validation.
+    pub const fn ordered_after_ingress(&self) -> Duration {
+        self.ordered_after_ingress
+    }
+
+    /// Elapsed time from source ingress through all state transitions and
+    /// post-transition validation.
+    pub const fn transitioned_after_ingress(&self) -> Duration {
+        self.transitioned_after_ingress
+    }
+
+    /// Elapsed time from source ingress until the immutable commit was built
+    /// for reliable publication.
+    pub const fn committed_after_ingress(&self) -> Duration {
+        self.committed_after_ingress
+    }
+
+    /// Total monotonic event-ingress-to-commit latency.
+    pub const fn elapsed_to_commit(&self) -> Duration {
+        self.committed_after_ingress
+    }
+}
+
 /// Reliable publication unit pairing changes with their exact immutable state.
 pub struct AmmStateCommit {
     snapshot: Arc<AmmStateSnapshot>,
     changes: Arc<AmmChangeSet>,
+    timing: Option<AmmCommitTiming>,
 }
 
 impl AmmStateCommit {
     #[cfg_attr(not(feature = "live-runtime"), allow(dead_code))]
-    pub(crate) fn new(snapshot: Arc<AmmStateSnapshot>, changes: Arc<AmmChangeSet>) -> Self {
+    pub(crate) fn new(
+        snapshot: Arc<AmmStateSnapshot>,
+        changes: Arc<AmmChangeSet>,
+        timing: Option<AmmCommitTiming>,
+    ) -> Self {
         debug_assert_eq!(snapshot.version(), changes.version());
         debug_assert_eq!(snapshot.point(), changes.point());
-        Self { snapshot, changes }
+        Self {
+            snapshot,
+            changes,
+            timing,
+        }
     }
 
     /// Exact immutable state produced by this commit.
@@ -408,5 +533,11 @@ impl AmmStateCommit {
     /// Typed changes that produced the snapshot.
     pub fn changes(&self) -> &Arc<AmmChangeSet> {
         &self.changes
+    }
+
+    /// Monotonic source/decode/order/transition/commit timing for canonical
+    /// event work, or `None` for commits that have no event-source provenance.
+    pub const fn timing(&self) -> Option<AmmCommitTiming> {
+        self.timing
     }
 }

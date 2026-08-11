@@ -48,8 +48,8 @@ use super::state::UpstreamStateView;
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::storage_sync::{StorageSyncSpec, decode_storage_sync, storage_sync_spec_for_pool};
 use super::{
-    AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
-    PoolRegistration, PoolStatus, SlotChange, StateView, UnsupportedReason,
+    AdapterCache, AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    PoolRegistration, PoolStatus, SlotChange, StateUpdate, StateView, UnsupportedReason,
 };
 #[cfg(feature = "live-runtime")]
 use super::{
@@ -581,6 +581,16 @@ pub trait AdapterColdStartPlanner {
     /// just-completed round's `results` and the post-injection `state` view.
     fn on_results(&mut self, results: &ColdStartResults, state: &dyn StateView) -> ColdStartStep;
 
+    /// Authoritative full-slot writes needed to materialize successfully
+    /// verified zero values in a cache whose sparse representation otherwise
+    /// cannot distinguish a proven EVM zero from an unknown/cold cell.
+    ///
+    /// The default is empty. Implementations may only return cells classified
+    /// as [`SlotFetch::Zero`] during this exact cold-start run.
+    fn materialization_updates(&self) -> Vec<StateUpdate> {
+        Vec::new()
+    }
+
     /// Finalize after the run: mutate `pool` (metadata + status) and return the
     /// outcome built from the planner's accumulated state and the run `report`.
     fn finish(
@@ -720,7 +730,7 @@ fn inject_and_record(cache: &mut EvmCache, entries: Vec<(Address, U256, U256)>) 
 /// storage program.
 ///
 /// - No pool address → `None`.
-/// - A V3-family pool (`UniswapV3`/`PancakeV3`/`Slipstream`) that carries a
+/// - A supported V3-family pool (`UniswapV3`/`PancakeV3`) that carries a
 ///   `storage_layout` → a [`HydrationKind::V3`] full sync (only when the
 ///   `uniswap-v3` feature is enabled).
 /// - Otherwise, any pool whose flat read-set resolves via
@@ -762,24 +772,25 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 ///
 /// The **canonical Uniswap** spec (which bakes in Uniswap's fee-growth,
 /// protocol-fees, and observation slot positions) is used only for genuine
-/// Uniswap V3 pools. Other V3-family forks (PancakeSwap V3, Slipstream) use the
-/// layout-only [`V3SyncSpec::core`] (slot0 + liquidity + the ticks/bitmap the
-/// layout locates) so hydration never injects auxiliary state from unverified
-/// slot positions. Extend a fork to the full spec once its layout is confirmed.
+/// Uniswap V3 pools. PancakeSwap uses its independently verified shifted spec.
+/// Slipstream is deliberately excluded: its exact transition requires six-word
+/// Tick.Info records and an extended reward/gauge state surface that the current
+/// generic one-shot bytecode format cannot encode. It therefore falls back to
+/// the resumable adapter planner rather than warming an incomplete quote state.
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
     let (metadata, family) = match &pool.metadata {
         ProtocolMetadata::UniswapV3(metadata) => (metadata, 0),
         ProtocolMetadata::PancakeV3(metadata) => (metadata, 1),
-        ProtocolMetadata::Slipstream(metadata) => (metadata, 2),
+        ProtocolMetadata::Slipstream(_) => return None,
         _ => return None,
     };
     let layout = metadata.storage_layout.filter(|l| l.tick_spacing > 0)?;
     Some(match family {
         0 => V3SyncSpec::uniswap(layout),
         1 => V3SyncSpec::pancake(layout),
-        _ => V3SyncSpec::core(layout),
+        _ => unreachable!("Slipstream is excluded above"),
     })
 }
 
@@ -1737,6 +1748,11 @@ impl AdapterRegistry {
         };
         let report = ColdStartRunReport::from(report);
 
+        let materialization_updates = planner.materialization_updates();
+        if !materialization_updates.is_empty() {
+            <EvmCache as AdapterCache>::apply_updates(cache, &materialization_updates);
+        }
+
         let outcome = planner.finish(pool, &report);
         Ok(attach_code_seeds(outcome, code_seed_report))
     }
@@ -2088,10 +2104,11 @@ mod tests {
         assert_eq!(v3_sync_spec(&pool), Some(V3SyncSpec::uniswap(layout)));
     }
 
-    /// PancakeSwap V3 uses its verified shifted full layout; Slipstream remains
-    /// on the layout-only `core` spec until its extra slots are verified.
+    /// PancakeSwap V3 uses its verified shifted full layout. Slipstream is not
+    /// eligible until the one-shot format can transport its six-word ticks and
+    /// complete reward/gauge state surface.
     #[test]
-    fn pancake_uses_its_full_spec_while_slipstream_uses_core() {
+    fn pancake_uses_its_full_spec_while_slipstream_falls_back() {
         let pancake_layout = V3StorageLayout::pancake(10);
         let pancake = PoolRegistration::new(PoolKey::PancakeV3(Address::repeat_byte(0x22)))
             .with_metadata(ProtocolMetadata::PancakeV3(
@@ -2111,7 +2128,8 @@ mod tests {
                     .with_tick_spacing(100)
                     .with_storage_layout(slip_layout),
             ));
-        assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+        assert_eq!(v3_sync_spec(&slip), None);
+        assert!(!supports_one_shot_hydration(&slip));
         assert!(
             fast_metadata_complete(&slip),
             "tick-spacing-keyed Slipstream does not require fee metadata"

@@ -5,9 +5,9 @@ use super::cold_start::AdapterColdStartPlanner;
 use super::factory::{FactoryConfig, PoolFactory};
 use super::sim::{SimConfig, SimError, SwapQuote};
 use super::{
-    AdapterCache, AdapterEvent, AdapterEventResult, AdapterRegistry, ColdStartPolicy, EventSource,
-    PoolKey, PoolRegistration, PoolStateDependencies, ProtocolId, RepairAction, StateDiff,
-    StateView, UnsupportedReason,
+    AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventResult, AdapterRegistry,
+    ColdStartPolicy, EventSource, PoolKey, PoolRegistration, PoolStateDependencies, ProtocolId,
+    RepairAction, StateDiff, StateView, UnsupportedReason,
 };
 
 /// Protocol adapter contract for AMM-specific routing, cold-start, and decoding.
@@ -130,6 +130,23 @@ pub trait AmmAdapter: Send + Sync {
         _view: &dyn StateView,
     ) -> AdapterEventResult {
         AdapterEventResult::ignored()
+    }
+
+    /// Decode a routed log with exact block and event-ordering context.
+    ///
+    /// The default preserves source compatibility for adapters whose events
+    /// contain every value they need. Time- or ordering-dependent adapters must
+    /// override this method and fail closed when required context is absent.
+    /// The context is evidence, not an ordering guard; callers remain
+    /// responsible for canonical sequencing and deduplication.
+    fn decode_event_with_context(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        _context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        self.decode_event(pool, log, view)
     }
 
     /// Follow-up repair after `event`'s updates were applied, given the resulting

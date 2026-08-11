@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use alloy_network::{Ethereum, primitives::BlockResponse as _};
 use alloy_provider::Provider;
@@ -1074,6 +1075,11 @@ where
         &mut self,
         batch: evm_fork_cache::reactive::SubscriberInputBatch<Ethereum>,
     ) -> Result<(), AmmSubscriberDriverError> {
+        // `SubscriberInputBatch` is already the typed domain form at this
+        // boundary. Preserve this ingress across canonical reconciliation so
+        // provider wait is included instead of resetting latency downstream.
+        let source_ingress = Instant::now();
+        let decoded_after_ingress = Duration::ZERO;
         if batch.preconfirmation_invalidated() {
             self.runtime.invalidate_preconfirmation().await?;
             if batch.records().is_empty() && batch.chain_controls().is_empty() {
@@ -1109,12 +1115,24 @@ where
         }
         headers.sort_by_key(|header| header.inner.number);
         for header in headers {
-            self.deliver_through(header).await?;
+            self.deliver_through_with_timing(header, source_ingress, decoded_after_ingress)
+                .await?;
         }
         Ok(())
     }
 
     async fn deliver_through(&mut self, header: RpcHeader) -> Result<(), AmmSubscriberDriverError> {
+        let source_ingress = Instant::now();
+        self.deliver_through_with_timing(header, source_ingress, Duration::ZERO)
+            .await
+    }
+
+    async fn deliver_through_with_timing(
+        &mut self,
+        header: RpcHeader,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+    ) -> Result<(), AmmSubscriberDriverError> {
         let current = self.runtime.latest_snapshot().point();
         if header.inner.number == current.block_number() && header.hash == current.block_hash() {
             return Ok(());
@@ -1122,7 +1140,8 @@ where
         for header in self.delivery_lineage(header).await? {
             let number = header.inner.number;
             let hash = header.hash;
-            self.reconcile_and_deliver(header).await?;
+            self.reconcile_and_deliver_with_timing(header, source_ingress, decoded_after_ingress)
+                .await?;
             self.record_canonical_block(number, hash);
         }
         Ok(())
@@ -1195,9 +1214,21 @@ where
         }
     }
 
+    #[cfg(all(test, feature = "uniswap-v2"))]
     async fn reconcile_and_deliver(
         &mut self,
         header: RpcHeader,
+    ) -> Result<(), AmmSubscriberDriverError> {
+        let source_ingress = Instant::now();
+        self.reconcile_and_deliver_with_timing(header, source_ingress, Duration::ZERO)
+            .await
+    }
+
+    async fn reconcile_and_deliver_with_timing(
+        &mut self,
+        header: RpcHeader,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
@@ -1256,11 +1287,13 @@ where
                 ReactiveInputRecord::new(ReactiveInput::Log(log), context)
             })
             .collect();
-        let batch = AmmCanonicalBatch::from_verified_block(
+        let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
             header,
             self.interest_revision,
             ReactiveInputBatch::new(records),
+            source_ingress,
+            decoded_after_ingress,
         )?;
         self.ingest_while_servicing_controls(batch).await?;
         if self.stop_requested {
@@ -1378,6 +1411,7 @@ fn reconciliation_filters(filters: &[Filter], max_addresses: usize) -> Vec<Filte
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use alloy_consensus::Header as ConsensusHeader;
     use alloy_network::Ethereum;
@@ -1447,6 +1481,81 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscriber_commit_timing_preserves_ingress_across_reconciliation() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let mut cache = setup_cache().await;
+                cache.advance_block(&baseline_header)?;
+                let runtime = AmmRuntime::spawn(
+                    cache,
+                    AdapterRegistry::new(),
+                    AmmRuntimeBaseline::from_verified_header(1, baseline_header.clone())?,
+                    AmmRuntimeConfig::default(),
+                )?;
+                let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+                let subscriber = AlloySubscriber::new(
+                    provider,
+                    SubscriberMode::Polling,
+                    SubscriberConfig::default(),
+                );
+                let (command_tx, command_rx) = mpsc::channel(4);
+                let (state, _) = watch::channel(AmmSubscriberDriverState::Paused);
+                let control = AmmSubscriberControl {
+                    commands: command_tx,
+                };
+                let mut driver = AlloyAmmSubscriberDriver {
+                    runtime: runtime.clone(),
+                    subscriber,
+                    initial_interests: Vec::new(),
+                    commands: command_rx,
+                    state,
+                    paused: true,
+                    interest_revision: 0,
+                    owners: HashMap::new(),
+                    pending: None,
+                    next_transaction: 0,
+                    max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
+                    report_stop: true,
+                    stop_requested: false,
+                    canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                };
+                let attach = runtime.attach_subscriber_control(control);
+                tokio::pin!(attach);
+                tokio::select! {
+                    result = &mut attach => result?,
+                    command = driver.commands.recv() => {
+                        driver.handle_control(command.expect("adoption command")).await?;
+                        attach.await?;
+                    }
+                }
+
+                let mut commits = runtime.subscribe_changes().await?;
+                let source_ingress = Instant::now();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                driver
+                    .reconcile_and_deliver_with_timing(
+                        header(501, baseline_header.hash),
+                        source_ingress,
+                        Duration::ZERO,
+                    )
+                    .await?;
+                let commit = commits.next_commit().await.expect("canonical commit");
+                let timing = commit.timing().expect("canonical timing provenance");
+                assert_eq!(timing.source_ingress(), source_ingress);
+                assert!(timing.elapsed_to_commit() >= Duration::from_millis(5));
+                assert!(timing.decoded_after_ingress() <= timing.ordered_after_ingress());
+                assert!(timing.ordered_after_ingress() <= timing.transitioned_after_ingress());
+                assert!(timing.transitioned_after_ingress() <= timing.committed_after_ingress());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
     }
 
     struct EmptyAdapter;

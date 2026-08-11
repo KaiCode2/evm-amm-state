@@ -1,14 +1,14 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.4`. Publish its prerequisites in
+The current release candidate is `0.3.0-alpha.5`. Publish its prerequisites in
 this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
-2. `evm-fork-cache 0.4.0-alpha.3`;
-3. publish `evm-amm-state 0.3.0-alpha.4` after the gates below pass.
+2. `evm-fork-cache 0.4.0-alpha.4`;
+3. publish `evm-amm-state 0.3.0-alpha.5` after the gates below pass.
 
 The state crate intentionally keeps a versioned sibling path during development.
-Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.3` from
+Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.4` from
 crates.io. Treat any failure to resolve that published version as a release
 blocker rather than bypassing registry verification.
 
@@ -34,6 +34,21 @@ rejected during attachment. The runtime rejects stale, missing-parent, and
 wrong-parent previews before they can alter canonical state. Typed rejection
 events preserve bounded observability without making raw error text a metric
 label.
+
+Alpha.5 adds exact provider-free canonical Uniswap V3 `Swap` replay from a
+complete parent snapshot plus ordered block/log context. It reproduces slot0,
+active liquidity, fee growth, protocol fees, observation-ring writes, and every
+crossed canonical four-word tick record, then validates the event poststate
+before atomically applying any write. Missing or contradictory evidence purges
+the stale pool and requests repair. Pancake V3 and Slipstream remain explicitly
+unsupported for exact swap replay; neither may be promoted from storage-layout
+similarity. See `docs/v3-swap-transitions.md` for the capability and evidence
+boundary.
+
+Alpha.5 depends on alpha.4's immutable `EvmSnapshot` current block-hash and
+address-bound code-hash accessors. Publish and verify that companion version
+first. The retained Slipstream evaluator/corpus is research-only and does not
+make Base/Optimism Flashblocks execution-ready.
 
 ## Offline release matrix
 
@@ -125,7 +140,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0-alpha.3` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.0-alpha.4` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, live gates, downstream compatibility, changelog, and benchmark evidence
 pass.

@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.5] - 2026-08-11
+
+### Added
+
+- Added context-aware, provider-free canonical Uniswap V3 `Swap` replay from an
+  exact parent state. The transition reproduces slot0, active liquidity, input
+  fee growth, protocol-fee accumulators, observation-ring writes, empty bitmap
+  word steps, and every crossed four-word `Tick.Info` record.
+- Added typed exact-transition failures, an explicit family capability API, a
+  deterministic 4,096-step work ceiling, and provider-free deployed-runtime
+  differential coverage across directions, exact-input/output modes, protocol
+  fees, price limits, rounding edges, initialized crossings, and oracle-ring
+  behavior.
+- Added authoritative canonical-batch sequencing and duplicate-block rejection
+  in the live actor. Replayed fee-only swaps cannot accrue fee growth twice, and
+  same-height different-hash replacements still enter the existing reorg path.
+- Added mutation-completeness regressions that deliberately omit fee-growth,
+  protocol-fee, observation, and tick-outside writes and prove the full-slot
+  deployed-runtime comparison rejects each omission.
+- Added provider-free monotonic timing provenance to canonical
+  `AmmStateCommit`s: source ingress, typed decode, deterministic ordering,
+  transition completion, and reliable commit publication. Subscriber ingress
+  is retained across reconciliation; non-event commits expose no fabricated
+  timing.
+- Added optional provider-free `AmmPreconfirmationTiming` to published preview
+  snapshots. Subscriber-supplied monotonic ingress survives AMM transition and
+  quote-readiness validation; direct or legacy batches without provenance
+  expose `None` rather than a fabricated later start.
+
+### Changed
+
+- Direct and reactive adapter paths now accept exact chain, block/parent,
+  transaction, timestamp, and log-position context. The stateless direct driver
+  treats this as evidence only; complete canonical batches enforce strict
+  transaction/log order and the live actor rejects duplicate committed blocks.
+- Pancake V3 and Slipstream swaps now explicitly fail closed for exact replay
+  pending independent family parity. A recognized unsupported, contextless, or
+  failed exact swap purges stale pool storage and requests repair instead of
+  leaving quote-ready parent state behind.
+- Added non-authoritative Slipstream research fixtures and provider-free fee
+  inference for the pinned Base/Optimism BIFI runtimes. The public capability
+  remains `Unsupported`: evidence cannot elevate it, incomplete one-shot state
+  is never accepted, and the generated corpus is not the exhaustive
+  family-parity proof required for Flashblocks execution.
+- Canonical V3 cold-start now materializes only provider-proven zero bitmap
+  words; missing bitmap or tick cells remain failures rather than implicit zero.
+- Canonical V3 now subscribes the complete standard pool-mutation topic set.
+  Every non-`Swap` mutation, including warm `Mint`/`Burn`, `Flash`, observation
+  cardinality and protocol-fee administration, emits typed `RequiresRepair`
+  and purges the whole pool before a later exact Swap can consume the parent.
+
 ## [0.3.0-alpha.4] - 2026-08-07
 
 ### Added
@@ -527,7 +578,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...HEAD
+[0.3.0-alpha.5]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...v0.3.0-alpha.5
 [0.3.0-alpha.4]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...v0.3.0-alpha.4
 [0.3.0-alpha.3]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...v0.3.0-alpha.3
 [0.3.0-alpha.2]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...v0.3.0-alpha.2

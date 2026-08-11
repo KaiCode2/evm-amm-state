@@ -81,12 +81,12 @@ offline `reactive_apply`) and agrees; the other apply rows come from
 | Apply one Uniswap V2 `Sync` (exact write) | **~250–285 ns** | one masked reserves-word write; ~3.5–4M events/sec |
 | Apply one Balancer V2 `Swap` (TWO_TOKEN, event-sourced) | **~430 ns** | both 112-bit cash fields, one shared-slot write |
 | Apply one Balancer V2 `Swap` (GENERAL, event-sourced) | **~520 ns** | two per-token cash-field writes |
-| Apply one Uniswap V3 `Mint` (warm ticks, event-sourced) | **~1.4 µs** | packed gross/net on both boundary ticks + in-range global liquidity |
-| Apply one Uniswap V3 `Burn` (warm ticks, event-sourced) | **~1.4 µs** | the same three writes, negated |
 | Cold-start one pool (Uniswap V3) | **~1.06 s** | **one-time, network-bound** — archive-node latency dominates; amortized over every later offline quote |
 
-The reactive event-sourced paths are effectively free relative to a quote
-(hundreds of nanoseconds to ~1.4 µs vs 8–85 µs). Cold-start is a one-time
+The exact reactive event-sourced paths are effectively free relative to a quote
+(hundreds of nanoseconds vs 8–85 µs). V3 non-`Swap` mutations are excluded from
+this table because alpha.5 deliberately purges and rebuilds rather than claiming
+partial event-only exactness. Cold-start is a one-time
 setup cost gated by RPC latency, not a steady-state cost — the crate's design
 pays it once and then quotes offline forever.
 

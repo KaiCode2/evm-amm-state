@@ -20,7 +20,8 @@ use anyhow::Result;
 use evm_amm_state::adapters::storage::SolidlyStorageLayout;
 use evm_amm_state::adapters::storage::{
     V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, V3StorageLayout,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
+    slipstream_tick_info_storage_keys_with_base, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use evm_amm_state::adapters::{
     AdapterRegistry, BalancerV2Adapter, BalancerV2Metadata, ColdStartOutcome, ColdStartPolicy,
@@ -433,6 +434,171 @@ async fn v3_cold_start_ready_warms_slot0_and_liquidity() -> Result<()> {
             .cached_storage_value(pool, layout.liquidity_slot)
             .is_some()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_exact_cold_start_materializes_proven_zero_parent_cells() -> Result<()> {
+    let pool = Address::repeat_byte(0x30);
+    let layout = V3StorageLayout::uniswap(60);
+    let bitmap =
+        v3_tick_bitmap_storage_key_with_base(v3_word_position(0, 60), layout.tick_bitmap_base_slot);
+    // observationIndex=0, cardinality=1, cardinalityNext=1, unlocked=true.
+    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 56);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, slot0_high),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+        ]),
+        Vec::new(),
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_fee(3_000)
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    for slot in [
+        U256::from(1),
+        U256::from(2),
+        U256::from(3),
+        U256::from(8),
+        bitmap,
+    ] {
+        assert_eq!(
+            cache.cached_storage_value(pool, slot),
+            Some(U256::ZERO),
+            "an authoritative zero at {slot} must remain distinguishable from an unknown cell"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v3_exact_cold_start_does_not_treat_failed_bitmap_as_zero() -> Result<()> {
+    let pool = Address::repeat_byte(0x31);
+    let layout = V3StorageLayout::uniswap(60);
+    let bitmap =
+        v3_tick_bitmap_storage_key_with_base(v3_word_position(0, 60), layout.tick_bitmap_base_slot);
+    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 56);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(
+        HashMap::from([
+            (
+                (pool, layout.slot0_slot),
+                v3_slot0_word(U256::from(99_u64), 0, slot0_high),
+            ),
+            ((pool, layout.liquidity_slot), U256::from(5_u64)),
+        ]),
+        vec![(pool, bitmap)],
+    ));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(
+            V3Metadata::default()
+                .with_fee(3_000)
+                .with_storage_layout(layout)
+                .with_tick_spacing(60),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(matches!(
+        outcome,
+        ColdStartOutcome::NeedsRepair(_, RepairAction::VerifySlots(ref slots))
+            if slots.contains(&(pool, bitmap))
+    ));
+    assert_eq!(registration.status, PoolStatus::Degraded);
+    assert_eq!(cache.cached_storage_value(pool, bitmap), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slipstream_exact_cold_start_warms_extended_surface_and_six_word_ticks() -> Result<()> {
+    let pool = Address::repeat_byte(0x32);
+    let layout = V3StorageLayout::slipstream(100);
+    let initialized_tick = 100;
+    let bitmap = v3_tick_bitmap_storage_key_with_base(
+        v3_word_position(initialized_tick, layout.tick_spacing),
+        layout.tick_bitmap_base_slot,
+    );
+    let tick_info =
+        slipstream_tick_info_storage_keys_with_base(initialized_tick, layout.ticks_base_slot);
+    // observationIndex=0, cardinality=1, cardinalityNext=1, unlocked=true at
+    // Slipstream slot0 bit 232 (48 relative to the obs-index high word).
+    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 48);
+    let mut values = HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(99_u64), 0, slot0_high),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(5_u64)),
+        (
+            (pool, bitmap),
+            v3_bit(initialized_tick, layout.tick_spacing),
+        ),
+        ((pool, U256::from(20)), U256::from(1_u64) << 248),
+    ]);
+    for (index, slot) in tick_info.into_iter().enumerate() {
+        values.insert((pool, slot), U256::from(100 + index));
+    }
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(values, Vec::new()));
+
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Slipstream(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(100)
+                .with_warm_word_radius(0),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    for slot in [
+        U256::ZERO,
+        U256::from(7),
+        U256::from(8),
+        U256::from(9),
+        U256::from(10),
+        U256::from(11),
+        U256::from(12),
+        U256::from(14),
+        U256::from(15),
+        U256::from(20),
+        bitmap,
+    ] {
+        assert!(
+            cache.cached_storage_value(pool, slot).is_some(),
+            "Slipstream exact parent slot {slot} must be warm"
+        );
+    }
+    for slot in tick_info {
+        assert!(
+            cache.cached_storage_value(pool, slot).is_some(),
+            "all six Slipstream Tick.Info words must be warm"
+        );
+    }
     Ok(())
 }
 
