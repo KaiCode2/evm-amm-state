@@ -20,13 +20,17 @@ redact_stream() {
 
 cd "$state_dir"
 
-cargo test --all-features --test adapter_swap_sim_rpc \
+cargo test --locked --all-features --test adapter_swap_sim_rpc \
   solidly_simulate_swap_matches_eth_call -- \
   --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
 
-cargo test --all-features --test discovery_cl_rpc \
+cargo test --locked --all-features --test adapter_swap_sim_rpc \
+  slipstream_simulate_swap_matches_eth_call -- \
+  --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
+
+cargo test --locked --all-features --test discovery_cl_rpc \
   slipstream_get_pool_base_slot_matches_getter -- \
   --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
 
-cargo test --all-features --test discovery_solidly_rpc -- \
+cargo test --locked --all-features --test discovery_solidly_rpc -- \
   --ignored --nocapture --test-threads=1 2>&1 | redact_stream

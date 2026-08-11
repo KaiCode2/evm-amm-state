@@ -25,9 +25,11 @@
 //!   vault `0xBA12222222228d8Ba445958a75a0704d566BF2C8`.
 //! - Token amounts use a 1e6 USDC / 1e18 WETH-scaled input as noted per test.
 //!
-//! The Solidly V2 parity test forks **Base** (not Ethereum), block
-//! `47_700_000`, against the Aerodrome WETH/USDC volatile pool
-//! `0xcDAC0d6c6C59727a65F871236188350531885C43`. It uses a Base RPC url —
+//! The Solidly V2 and Slipstream parity tests fork **Base** (not Ethereum).
+//! Solidly uses block `47_700_000` and the Aerodrome WETH/USDC volatile pool
+//! `0xcDAC0d6c6C59727a65F871236188350531885C43`; Slipstream uses block
+//! `49_154_640` and the Aerodrome WETH/mooBIFI concentrated-liquidity pool.
+//! Both use a Base RPC url —
 //! `E2E_BASE_RPC_URL`, or `E2E_RPC_URL` with the Alchemy `eth-mainnet` host
 //! swapped to `base-mainnet`:
 //! ```text
@@ -110,6 +112,28 @@ alloy_sol_types::sol! {
     }
 }
 
+mod slipstream_quote_abi {
+    alloy_sol_types::sol! {
+        struct QuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            int24 tickSpacing;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        interface ISlipstreamQuoter {
+            function quoteExactInputSingle(QuoteExactInputSingleParams params)
+                returns (
+                    uint256 amountOut,
+                    uint160 sqrtPriceX96After,
+                    uint32 initializedTicksCrossed,
+                    uint256 gasEstimate
+                );
+        }
+    }
+}
+
 const FORK_BLOCK: u64 = 20_000_000;
 
 const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -155,6 +179,18 @@ const AERO_RESERVE0_SLOT: u64 = 20;
 const AERO_RESERVE1_SLOT: u64 = 21;
 const AERO_TOKEN0_SLOT: u64 = 13;
 const AERO_TOKEN1_SLOT: u64 = 14;
+
+// --- Slipstream / Aerodrome CL (Base) ---
+//
+// Pinned to the same block and deployment used by the BIFI runtime's initial
+// Base inventory snapshot. The native QuoterV2 ABI consumes signed tick
+// spacing, not the Uniswap V3 fee field.
+const SLIPSTREAM_FORK_BLOCK: u64 = 49_154_640;
+const BASE_MOO_BIFI: Address = address!("c55E93C62874D8100dBd2DfE307EDc1036ad5434");
+const AERODROME_SLIPSTREAM_WETH_MOO_BIFI: Address =
+    address!("b378137c90444BbceCD44a1f766851fbf53D2a9E");
+const AERODROME_SLIPSTREAM_QUOTER: Address = address!("254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0");
+const AERODROME_SLIPSTREAM_TICK_SPACING: i32 = 200;
 
 fn rpc_url() -> Option<String> {
     std::env::var("E2E_RPC_URL").ok()
@@ -494,6 +530,90 @@ async fn solidly_simulate_swap_matches_eth_call() -> Result<()> {
     assert_eq!(
         sim.amount_out, truth,
         "Solidly sim amount_out must match eth_call getAmountOut"
+    );
+    Ok(())
+}
+
+/// Slipstream parity on Base: execute the native signed-tick-spacing quoter
+/// against a provider-backed fork and require byte-for-byte quote equality with
+/// the same call through `eth_call` at the pinned block.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Base RPC (E2E_BASE_RPC_URL, or E2E_RPC_URL on Alchemy); run with --ignored"]
+async fn slipstream_simulate_swap_matches_eth_call() -> Result<()> {
+    let Some(url) = base_rpc_url() else {
+        eprintln!("no Base RPC (E2E_BASE_RPC_URL / E2E_RPC_URL); skipping");
+        return Ok(());
+    };
+
+    let amount_in = U256::from(1_000_000_000_000_000_u64); // 0.001 WETH
+    let mut cache = fork_cache(&url, SLIPSTREAM_FORK_BLOCK).await?;
+    let registry = {
+        let mut registry = AdapterRegistry::new();
+        registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
+        registry
+    };
+    let mut registration =
+        PoolRegistration::new(PoolKey::Slipstream(AERODROME_SLIPSTREAM_WETH_MOO_BIFI))
+            .with_state_address(AERODROME_SLIPSTREAM_WETH_MOO_BIFI)
+            .with_metadata(ProtocolMetadata::Slipstream(
+                V3Metadata::default()
+                    .with_token0(BASE_WETH)
+                    .with_token1(BASE_MOO_BIFI)
+                    .with_tick_spacing(AERODROME_SLIPSTREAM_TICK_SPACING)
+                    .with_storage_layout(
+                        evm_amm_state::adapters::storage::V3StorageLayout::slipstream(
+                            AERODROME_SLIPSTREAM_TICK_SPACING,
+                        ),
+                    )
+                    .with_quoter(AERODROME_SLIPSTREAM_QUOTER),
+            ));
+    registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let simulated = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            BASE_WETH,
+            BASE_MOO_BIFI,
+            amount_in,
+            &SimConfig::default(),
+        )
+        .map_err(|error| anyhow!("Slipstream sim failed: {error}"))?;
+
+    let calldata = Bytes::from(
+        slipstream_quote_abi::ISlipstreamQuoter::quoteExactInputSingleCall {
+            params: slipstream_quote_abi::QuoteExactInputSingleParams {
+                tokenIn: BASE_WETH,
+                tokenOut: BASE_MOO_BIFI,
+                amountIn: amount_in,
+                tickSpacing: alloy_primitives::aliases::I24::try_from(
+                    AERODROME_SLIPSTREAM_TICK_SPACING,
+                )?,
+                sqrtPriceLimitX96: U256::ZERO.to(),
+            },
+        }
+        .abi_encode(),
+    );
+    let output = eth_call_at(
+        &url,
+        AERODROME_SLIPSTREAM_QUOTER,
+        calldata,
+        SLIPSTREAM_FORK_BLOCK,
+    )
+    .await?;
+    let truth =
+        slipstream_quote_abi::ISlipstreamQuoter::quoteExactInputSingleCall::abi_decode_returns_validate(
+            &output,
+        )?;
+
+    assert!(
+        truth.amountOut > U256::ZERO,
+        "ground-truth quote should be non-zero"
+    );
+    assert_eq!(
+        simulated.amount_out, truth.amountOut,
+        "Slipstream simulation must match native QuoterV2 eth_call"
     );
     Ok(())
 }

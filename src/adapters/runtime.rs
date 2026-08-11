@@ -37,6 +37,38 @@ impl AmmRuntimeId {
     }
 }
 
+/// Stable identity of one AMM log across speculative and canonical delivery.
+///
+/// Flashblock `pendingLogs` and the later canonical log carry the same
+/// transaction hash and log index even though their block hashes differ. This
+/// identity lets applications reconcile both observations without collapsing
+/// distinct swaps in the same transaction or block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AmmEventRef {
+    transaction_hash: B256,
+    log_index: u64,
+}
+
+impl AmmEventRef {
+    /// Construct an event identity from its transaction and log position.
+    pub const fn new(transaction_hash: B256, log_index: u64) -> Self {
+        Self {
+            transaction_hash,
+            log_index,
+        }
+    }
+
+    /// Transaction that emitted the log.
+    pub const fn transaction_hash(self) -> B256 {
+        self.transaction_hash
+    }
+
+    /// Log position within the transaction's block.
+    pub const fn log_index(self) -> u64 {
+        self.log_index
+    }
+}
+
 /// Error returned when a monotonic runtime sequence would overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeSequenceOverflow {
@@ -968,6 +1000,7 @@ pub struct AmmChangeSet {
     point: AmmStatePoint,
     quality: AmmStateQuality,
     pool_changes: Vec<AmmPoolChange>,
+    event_refs: Vec<AmmEventRef>,
     incidents: Vec<AmmStateIncident>,
     requires_full_refresh: bool,
 }
@@ -1009,9 +1042,19 @@ impl AmmChangeSet {
             point,
             quality,
             pool_changes,
+            event_refs: Vec::new(),
             incidents,
             requires_full_refresh,
         })
+    }
+
+    /// Attach the source AMM logs and canonicalize their ordering.
+    #[must_use]
+    pub fn with_event_refs(mut self, event_refs: impl IntoIterator<Item = AmmEventRef>) -> Self {
+        self.event_refs = event_refs.into_iter().collect();
+        self.event_refs.sort_unstable();
+        self.event_refs.dedup();
+        self
     }
 
     /// Published state version.
@@ -1032,6 +1075,11 @@ impl AmmChangeSet {
     /// Canonically ordered one-per-pool changes.
     pub fn pool_changes(&self) -> &[AmmPoolChange] {
         &self.pool_changes
+    }
+
+    /// Source AMM logs committed at this canonical state point.
+    pub fn event_refs(&self) -> &[AmmEventRef] {
+        &self.event_refs
     }
 
     /// Canonical incidents carried by this version.
@@ -1375,6 +1423,28 @@ impl AmmRuntimeStatusSnapshot {
     }
 }
 
+/// Bounded reason for rejecting one disposable preconfirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmmPreconfirmationRejectionReason {
+    /// A routed speculative log decoded or applied with an error.
+    ReactiveBatch,
+    /// The speculative batch was not exact and repair-free.
+    StateReadiness,
+    /// A representative offline quote was incomplete or failed.
+    QuoteReadiness,
+}
+
+impl AmmPreconfirmationRejectionReason {
+    /// Stable telemetry label for this rejection class.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReactiveBatch => "reactive_batch",
+            Self::StateReadiness => "state_readiness",
+            Self::QuoteReadiness => "quote_readiness",
+        }
+    }
+}
+
 /// Observer-facing runtime event payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1510,6 +1580,11 @@ pub enum AmmRuntimeEventKind {
         address: Address,
         /// Block at which the gap was detected.
         block: u64,
+    },
+    /// One speculative preview was discarded without changing canonical state.
+    PreconfirmationRejected {
+        /// Stable, low-cardinality rejection class.
+        reason: AmmPreconfirmationRejectionReason,
     },
     /// Runtime health changed.
     HealthChanged {

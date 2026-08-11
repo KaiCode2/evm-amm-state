@@ -7,10 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
+  CACHE_REF: 2be88d15fa15b5c44188b318463aa4705bb75aef
 
 permissions:
   contents: read
-  checks: write
 
 defaults:
   run:
@@ -21,40 +22,55 @@ jobs:
     name: test / clippy / fmt / docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - uses: actions/checkout@v4
+          fetch-depth: 0
+      - name: Check out exact cache candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-fork-cache
+          ref: ${{ env.CACHE_REF }}
           path: evm-fork-cache
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-amm-state -> target
+
+      - name: Authoring hygiene
+        run: bash scripts/check-authoring-hygiene.sh
 
       - name: Formatting
         run: cargo fmt --all --check
 
-      # Lint the whole surface together: every protocol adapter (incl. the
-      # PancakeSwap V3 / Slipstream family flags, which are not in `default`).
+      - name: Diff hygiene
+        run: git diff --check
+
+      # Lint the whole surface together: every protocol adapter (including the
+      # PancakeSwap V3 and Slipstream family flags, which are not in `default`).
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
 
-      # Bare adapter build (no protocol adapters) must also compile/lint.
       - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --locked --no-default-features --all-targets --no-deps -- -D warnings
 
-      # The crate is adapters-only (the legacy simulation/search path was cut),
-      # so no build should pull in the old heavy deps. Guard against a
-      # regression that re-introduces them.
       - name: Verify build is heavy-dep-free
         run: |
-          if cargo tree -e normal --all-features \
+          if cargo tree --locked -e normal --all-features \
               | grep -E '(amms|amm-math|rayon) v[0-9]'; then
             echo "::error::build unexpectedly pulled amms/amm-math/rayon"
             exit 1
@@ -62,52 +78,44 @@ jobs:
           echo "build pulls no amms/amm-math/rayon"
 
       - name: Tests (all features)
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       - name: Tests (default features)
-        run: cargo test
+        run: cargo test --locked
 
       - name: Tests (no default features)
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: Check (live runtime only)
-        run: cargo check --all-targets --no-default-features --features live-runtime
+        run: cargo check --locked --all-targets --no-default-features --features live-runtime
 
       - name: Docs
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --locked --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # The reserved (unimplemented) protocol variants live behind an
-      # off-by-default feature; make sure enabling it still compiles — both on
-      # top of the default adapters and on the bare no-default surface.
       - name: Check (experimental protocols)
-        run: cargo check --features experimental-protocols
+        run: cargo check --locked --features experimental-protocols
       - name: Check (experimental protocols, no default features)
-        run: cargo check --no-default-features --features experimental-protocols
+        run: cargo check --locked --no-default-features --features experimental-protocols
+
+      - name: Benchmarks compile
+        run: cargo bench --locked --no-run --all-features
+
+      - name: Package
+        run: cargo package --locked
+
+      - name: Verify security-exception scope
+        run: bash scripts/check-security-exceptions.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Security audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: evm-amm-state
-          # ark-relations records tracing-subscriber 0.2.25 as an optional
-          # dependency, but it is absent from the active all-target/all-feature
-          # graph (`cargo tree -i tracing-subscriber@0.2.25 --target all`).
-          ignore: RUSTSEC-2025-0055
+        run: cargo audit --ignore RUSTSEC-2025-0055
 
-  # Per-protocol ISOLATION matrix. The combined `check` job builds every adapter
-  # together, which can mask a protocol whose code/imports are not correctly
-  # `#[cfg]`-gated on its own feature (a `--features <one-protocol>` build then
-  # fails even though the all-features build is green — exactly the class of bug
-  # the Solidly adapter audit caught). Building/linting each protocol adapter on
-  # its own surfaces that immediately. Clippy `--all-targets` compiles the lib
-  # plus any target whose `required-features` are satisfied by the isolated set
-  # (e.g. the single-protocol `reactive_ws_e2e` / `reactive_curve_ws_e2e` tests
-  # and the `adapter_pipeline` example — desirable extra lint coverage);
-  # multi-protocol integration tests whose `required-features` exceed the
-  # isolated set are skipped, so their behaviour coverage stays in the
-  # all-features `cargo test` above.
+  # Build each protocol independently so a combined all-feature build cannot
+  # hide incorrect cfg-gating.
   isolation:
     name: clippy (isolated · ${{ matrix.feature }})
     runs-on: ubuntu-latest
@@ -123,46 +131,67 @@ jobs:
           - solidly-v2
           - curve
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - uses: actions/checkout@v4
+      - name: Check out exact cache candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-fork-cache
+          ref: ${{ env.CACHE_REF }}
           path: evm-fork-cache
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-amm-state -> target
 
       - name: Clippy (adapters + ${{ matrix.feature }} only)
-        run: cargo clippy --no-default-features --features adapters,${{ matrix.feature }} --all-targets --no-deps -- -D warnings
+        run: cargo clippy --locked --no-default-features --features adapters,${{ matrix.feature }} --all-targets --no-deps -- -D warnings
 
-  # Guard the declared MSRV (Cargo.toml `rust-version`). The `stable` jobs above
-  # use whatever stable is current, so without this a >1.88 API or a dep MSRV
-  # bump would pass CI yet break downstream consumers pinned to 1.88. `check`
-  # (not test) keeps it cheap; it is the build that the MSRV claim is about.
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.90)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - uses: actions/checkout@v4
+      - name: Check out exact cache candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-fork-cache
+          ref: ${{ env.CACHE_REF }}
           path: evm-fork-cache
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.90.0
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-amm-state -> target
 
       - name: Check on MSRV
-        run: cargo check --all-features
+        run: cargo check --locked --all-features

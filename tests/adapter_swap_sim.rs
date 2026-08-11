@@ -230,6 +230,78 @@ async fn v3_simulate_swap_returns_quoter_amount_offline() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slipstream_simulate_swap_uses_tick_spacing_quoter_abi() -> Result<()> {
+    let quoter = Address::repeat_byte(0xb4);
+    let token_in = Address::repeat_byte(0x01);
+    let token_out = Address::repeat_byte(0x02);
+    let expected_out = U256::from(8_453_u64);
+
+    let (mut cache, asserter) = setup_cache_with_asserter().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_runtime(
+        &mut cache,
+        quoter,
+        include_str!("fixtures/mock_slipstream_quoter_runtime.hex"),
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(quoter, U256::ZERO, expected_out)?;
+
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Slipstream(Address::repeat_byte(0x22)))
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_token0(token_in)
+                .with_token1(token_out)
+                .with_tick_spacing(200)
+                .with_quoter(quoter),
+        ));
+
+    let quote = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            token_in,
+            token_out,
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect("Slipstream quote should use the tick-spacing-keyed ABI");
+
+    assert_eq!(quote.amount_out, expected_out);
+    assert!(asserter.read_q().is_empty(), "must be fully offline");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slipstream_simulate_swap_requires_tick_spacing_not_fee() -> Result<()> {
+    let quoter = Address::repeat_byte(0xb5);
+    let (mut cache, _asserter) = setup_cache_with_asserter().await?;
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let registration = PoolRegistration::new(PoolKey::Slipstream(Address::repeat_byte(0x23)))
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default().with_quoter(quoter),
+        ));
+
+    let err = adapter
+        .simulate_swap(
+            &registration,
+            &mut cache,
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            U256::from(1_000_u64),
+            &SimConfig::default(),
+        )
+        .expect_err("Slipstream quote without tick spacing must fail closed");
+
+    assert!(matches!(
+        err,
+        SimError::MissingMetadata("Slipstream tick spacing")
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn v3_simulate_swap_reverting_target_is_reverted() -> Result<()> {
     let quoter = Address::repeat_byte(0xb2);
     let token_in = Address::repeat_byte(0x01);
@@ -436,7 +508,7 @@ fn included_context(block_number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),

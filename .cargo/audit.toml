@@ -6,13 +6,12 @@
 [advisories]
 ignore = [
     # tracing-subscriber 0.2.25 (ANSI-escape log poisoning) enters Cargo.lock
-    # only through revm-precompile's OPTIONAL arkworks bn254 backend
-    # (revm-precompile -> ark-bn254 -> ark-relations -> tracing-subscriber).
+    # only below ark-bn254's optional r1cs support
+    # (ark-bn254 -> ark-r1cs-std -> ark-relations -> tracing-subscriber).
     # No feature of this crate (or of its enabled dependency features) turns
-    # that backend on: `cargo tree -i tracing-subscriber@0.2.25 --target all
-    # --all-features` resolves to nothing, so the crate is never compiled,
-    # linked, or shipped — the advisory is lockfile-resolution noise. Remove
-    # this entry when upstream revm-precompile drops or upgrades the arkworks
-    # backend.
+    # that proof-system support on: `cargo tree -i
+    # tracing-subscriber@0.2.25 --target all --all-features` resolves to
+    # nothing, so the crate is never compiled, linked, or shipped. Remove this
+    # entry when upstream arkworks drops or upgrades the inactive dependency.
     "RUSTSEC-2025-0055",
 ]

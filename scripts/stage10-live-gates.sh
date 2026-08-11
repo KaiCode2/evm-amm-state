@@ -36,16 +36,16 @@ redact_stream() {
     v3_simulate_swap_matches_eth_call
   )
   for test_name in "${mainnet_swap_tests[@]}"; do
-    cargo test --all-features --test adapter_swap_sim_rpc "$test_name" -- \
+    cargo test --locked --all-features --test adapter_swap_sim_rpc "$test_name" -- \
       --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
   done
-  cargo test --all-features --test v3_full_sync_rpc -- \
+  cargo test --locked --all-features --test v3_full_sync_rpc -- \
     --ignored --nocapture --test-threads=1 2>&1 \
     | redact_stream
-  cargo test --all-features --test v3_liquidity_rpc -- \
+  cargo test --locked --all-features --test v3_liquidity_rpc -- \
     --ignored --nocapture --test-threads=1 2>&1 \
     | redact_stream
-  cargo test --all-features --test balancer_liquidity_rpc -- \
+  cargo test --locked --all-features --test balancer_liquidity_rpc -- \
     --ignored --nocapture --test-threads=1 2>&1 \
     | redact_stream
   pancake_discovery_tests=(
@@ -54,14 +54,14 @@ redact_stream() {
     pancake_discovery_resolves_live_pool
   )
   for test_name in "${pancake_discovery_tests[@]}"; do
-    cargo test --all-features --test discovery_cl_rpc "$test_name" -- \
+    cargo test --locked --all-features --test discovery_cl_rpc "$test_name" -- \
       --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
   done
-  cargo test --all-features --test reactive_ws_e2e \
+  cargo test --locked --all-features --test reactive_ws_e2e \
     ws_subscription_health_probe -- \
     --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
   E2E_WS_SECONDS="${E2E_CURVE_WS_SECONDS:-180}" \
-    cargo test --all-features --test reactive_curve_ws_e2e \
+    cargo test --locked --all-features --test reactive_curve_ws_e2e \
       ws_curve_liquidity_events_flow_route_and_stay_accurate -- \
       --exact --ignored --nocapture --test-threads=1 2>&1 | redact_stream
 )
@@ -72,6 +72,6 @@ redact_stream() {
   AMM_ROUTE_TUI_BENCH_BOOTSTRAP_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_BOOTSTRAP_TIMEOUT_SECS:-120}" \
   AMM_ROUTE_TUI_BENCH_ROUTE_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_ROUTE_TIMEOUT_SECS:-120}" \
   AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS:-0}" \
-    cargo run --release --features live-runtime --bin amm-route-tui 2>&1 \
+    cargo run --locked --release --features live-runtime --bin amm-route-tui 2>&1 \
       | redact_stream
 )

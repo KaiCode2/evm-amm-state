@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, Bytes, U256};
+use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
 use evm_fork_cache::cache::EvmCache;
 
 pub use super::state::{
@@ -155,6 +156,23 @@ pub trait AdapterCache: StateView {
         commit: bool,
     ) -> Result<CallOutcome, CacheError>;
 
+    /// Execute a non-committing call and capture the exact accounts and storage
+    /// slots touched by the EVM.
+    ///
+    /// The default preserves compatibility for custom cache facades by
+    /// returning an empty access set. Live [`EvmCache`] overrides this with the
+    /// upstream journal-backed tracer; read-set warming relies on that concrete
+    /// implementation.
+    fn call_raw_with_access_list(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+    ) -> Result<(CallOutcome, UpstreamStorageAccessList), CacheError> {
+        self.call_raw(from, to, calldata, false)
+            .map(|outcome| (outcome, UpstreamStorageAccessList::default()))
+    }
+
     /// Execute a raw EVM call with simulation-scoped runtime-code overrides.
     ///
     /// The default delegates to [`call_raw`](Self::call_raw), which is correct
@@ -172,6 +190,22 @@ pub trait AdapterCache: StateView {
     ) -> Result<CallOutcome, CacheError> {
         let _ = code_overrides;
         self.call_raw(from, to, calldata, commit)
+    }
+
+    /// Traced counterpart to [`Self::call_raw_with_code_overrides`].
+    ///
+    /// Live-backed caches may execute against real code and ignore the temporary
+    /// overrides, matching their existing override behavior. Snapshot-backed
+    /// caches can override both code and tracing when needed.
+    fn call_raw_with_code_overrides_and_access_list(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        code_overrides: &[(Address, Bytes)],
+    ) -> Result<(CallOutcome, UpstreamStorageAccessList), CacheError> {
+        self.call_raw_with_code_overrides(from, to, calldata, code_overrides, false)
+            .map(|outcome| (outcome, UpstreamStorageAccessList::default()))
     }
 }
 
@@ -265,6 +299,31 @@ impl AdapterCache for EvmCache {
     ) -> Result<CallOutcome, CacheError> {
         EvmCache::call_raw(self, from, to, calldata, commit)
             .map(CallOutcome::from)
+            .map_err(CacheError::from)
+    }
+
+    fn call_raw_with_access_list(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+    ) -> Result<(CallOutcome, UpstreamStorageAccessList), CacheError> {
+        EvmCache::call_raw_with_access_list(self, from, to, calldata)
+            .map(|(outcome, accesses)| (CallOutcome::from(outcome), accesses))
+            .map_err(CacheError::from)
+    }
+
+    fn call_raw_with_code_overrides_and_access_list(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        _code_overrides: &[(Address, Bytes)],
+    ) -> Result<(CallOutcome, UpstreamStorageAccessList), CacheError> {
+        // EvmCache's existing live-backed override behavior intentionally uses
+        // the real provider-backed code. Preserve that behavior while tracing.
+        EvmCache::call_raw_with_access_list(self, from, to, calldata)
+            .map(|(outcome, accesses)| (CallOutcome::from(outcome), accesses))
             .map_err(CacheError::from)
     }
 }

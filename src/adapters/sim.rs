@@ -7,8 +7,10 @@
 //! bytecode performs the AMM math — this crate only builds calldata, runs it,
 //! and decodes the output (no `amm-math` / `LocalAMM` / hand-rolled AMM math).
 //!
-//! - **Uniswap V3 (+ family):** `QuoterV2.quoteExactInputSingle(..)`. Target =
-//!   the QuoterV2 contract (mainnet default, per-pool/chain override).
+//! - **Uniswap V3 (+ family):** `QuoterV2.quoteExactInputSingle(..)`. Uniswap
+//!   and Pancake use the fee-keyed struct; Slipstream uses its signed
+//!   tick-spacing struct. Target = the QuoterV2 contract (mainnet default,
+//!   per-pool/chain override).
 //! - **Uniswap V2:** `UniswapV2Router02.getAmountsOut(amountIn, path)`. Target =
 //!   the router (mainnet default, override).
 //! - **Balancer V2:** `Vault.queryBatchSwap(GIVEN_IN, swaps, assets, funds)`.
@@ -325,6 +327,28 @@ pub(crate) mod abi {
         /// decodes the `uint256` output.
         interface CurveCryptoSwap {
             function get_dy(uint256 i, uint256 j, uint256 dx) returns (uint256 dy);
+        }
+    }
+
+    sol! {
+        /// Slipstream `QuoterV2.quoteExactInputSingle` uses signed tick spacing
+        /// in place of the Uniswap V3 fee field.
+        struct SlipstreamQuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            int24 tickSpacing;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        interface ISlipstreamQuoter {
+            function quoteExactInputSingle(SlipstreamQuoteExactInputSingleParams params)
+                returns (
+                    uint256 amountOut,
+                    uint160 sqrtPriceX96After,
+                    uint32 initializedTicksCrossed,
+                    uint256 gasEstimate
+                );
         }
     }
 }

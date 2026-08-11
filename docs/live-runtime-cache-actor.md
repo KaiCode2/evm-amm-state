@@ -32,7 +32,12 @@ revisions, and an `Arc<EvmSnapshot>` suitable for independent worker overlays.
 
 - `subscribe_changes()` atomically returns a current snapshot plus the one
   correctness-critical bounded commit receiver. Every first commit is strictly
-  newer than that baseline and pairs the exact snapshot/change set.
+  newer than that baseline and pairs the exact snapshot/change set. Canonical
+  event commits also expose `AmmCommitTiming`: process-local monotonic source
+  ingress plus decode, order, transition, and commit offsets. These are not
+  wall-clock timestamps. Subscriber ingress survives provider-backed
+  reconciliation, while topology/cold-start/repair commits return `None`
+  instead of inventing event provenance.
 - `subscribe_snapshots()` and `subscribe_status()` are recoverable latest-value
   watches for late consumers.
 - `subscribe_events()` is a lossy observer stream. Lag is explicit; actor exit
@@ -46,6 +51,56 @@ command must run. In attached mode only the driver can submit canonical input.
 During a lifecycle handshake the actor continues servicing the driver's
 already-in-flight canonical delivery until the driver acknowledges its pause;
 that acknowledgement is the topology transaction's delivery fence.
+
+## Flashblock previews
+
+`AmmRuntimeHandle::ingest_preconfirmation` accepts only batches whose records
+carry `ChainStatus::Preconfirmed` and `DeliveryScope::Preconfirmed`. An attached
+`AlloySubscriber` forwards those batches through the same owner driver and AMM
+handlers used for canonical logs. The runtime publishes the result separately as
+`AmmPreconfirmedSnapshot` via `latest_preconfirmation()` and
+`subscribe_preconfirmations()`.
+
+A preview names its canonical base version/point, subscriber interest revision,
+exact `FlashblockRef` (including provider provenance), immutable cache state,
+registry topology, and quote-relevant pool changes. It is deliberately not an
+`AmmStateCommit`: canonical version, pool revisions, lifecycle, health, repair
+ownership, and the reliable canonical change stream do not advance. Consumers
+must treat the outer `Arc` as short-lived simulation input rather than confirmed
+state. The runtime installs its verified full-header startup point as the
+reactive canonical baseline, and accepts only a preview whose block number and
+parent hash identify that baseline's exact child. Canonical advancement moves
+the baseline before another preview can be accepted.
+
+When the subscriber batch carries typed source provenance, the published
+snapshot also exposes `AmmPreconfirmationTiming`: the exact process-local
+monotonic ingress and elapsed time through preview publication. This is
+optional, provider-free metadata. Missing timing remains `None` rather than
+being inferred at the runtime watch boundary, and the value has no ordering,
+identity, canonical-state, or execution authority.
+
+Each cumulative Flashblock replaces the previous overlay. Canonical progress
+first restores the saved canonical cache and clears the preview watch; subscriber
+trust loss, coupled-stream termination, explicit invalidation, and shutdown do
+the same. The actor continues to defer provider I/O, so it publishes a preview
+only when the existing event-sourced handlers leave every affected pool ready
+for immediate simulation. A required full refresh, pending or failed repair,
+unresolved reactive resync, unknown pool impact, or non-ready applied quality
+rejects the complete speculative branch. Rejection restores canonical state,
+clears the preview watch, and cannot degrade canonical registrations or acquire
+canonical repair ownership. Callers that need pending-tag repair may use the
+synchronous `AmmSyncEngine` path, but that repaired state is not silently mixed
+into the actor's no-I/O fast path.
+
+Representative quote manifests add a second readiness gate. They are learned
+and proven offline against the canonical cache before subscriber attachment.
+Every preview replays affected manifests against its immutable snapshot; a
+missing account, code body, slot, or block hash rejects the branch and extends
+the bounded manifest. The actor performs no provider read. At the next exact
+canonical state point, missing quote-only slots are queued through the existing
+hash-pinned cold-start worker and installed only if the pool generation and
+baseline still match. A runtime-code hash change invalidates every dependent
+manifest instead of assuming the old storage layout remains valid.
 
 ## Complete canonical blocks
 

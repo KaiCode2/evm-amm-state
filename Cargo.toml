@@ -1,8 +1,8 @@
 [package]
 name = "evm-amm-state"
-version = "0.2.0"
+version = "0.3.0-alpha.6"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 description = "EVM-backed AMM state loading, cache synchronization, and pool simulation models"
 keywords = ["evm", "amm", "defi", "uniswap", "revm"]
@@ -68,11 +68,10 @@ experimental-protocols = []
 live-runtime = ["dep:tokio"]
 
 [dependencies]
-# Companion crate. The reactive runtime requires 0.3.0's exact log-route index
-# and generation-safe pending-resync cancellation. The sibling path keeps the
-# cross-crate lifecycle work source-identical until that minor release is
-# published; Cargo preserves the version requirement when packaging.
-evm-fork-cache = { version = "0.3.0", path = "../evm-fork-cache" }
+# Companion crate. The reactive runtime requires 0.4.0-alpha.4's preconfirmed overlay,
+# provider provenance, exact log-route index, and generation-safe pending-resync
+# cancellation. The exact registry pin keeps downstream builds reproducible.
+evm-fork-cache = { version = "=0.4.0-alpha.4" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -89,7 +88,7 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-evm-fork-cache = { version = "0.3.0", path = "../evm-fork-cache", features = ["reactive-polling"] }
+evm-fork-cache = { version = "=0.4.0-alpha.4", features = ["reactive-polling", "raw-flashblocks-json"] }
 alloy-consensus = "1.0.38"
 alloy-json-rpc = "1.0.38"
 alloy-rpc-client = "1.0.38"
@@ -134,6 +133,10 @@ required-features = ["live-runtime", "uniswap-v2"]
 [[example]]
 name = "adapter_pipeline"
 required-features = ["uniswap-v2"]
+
+[[example]]
+name = "flashblocks_latency_live"
+required-features = ["uniswap-v3"]
 
 # From-scratch third-party-adapter demo: define a novel AMM (Custom protocol id /
 # pool key / metadata) entirely outside the crate, register it, and quote. Fully
@@ -218,6 +221,25 @@ required-features = ["uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", "c
 # Offline revm execution of the generated V3 one-shot sync programs.
 [[test]]
 name = "v3_sync"
+required-features = ["uniswap-v3"]
+
+# Provider-free exact-transition acceptance and deployed-runtime differential
+# corpus. Keep these explicitly gated so `--no-default-features` remains a
+# meaningful protocol-neutral build.
+[[test]]
+name = "v3_swap_transition_acceptance"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "v3_swap_transition_differential"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "slipstream_swap_transition_acceptance"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "slipstream_swap_transition_differential"
 required-features = ["uniswap-v3"]
 
 # Live parity for the one-shot V3 sync (env-gated, #[ignore]): state, quote,

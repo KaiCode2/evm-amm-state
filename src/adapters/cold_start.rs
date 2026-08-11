@@ -48,8 +48,8 @@ use super::state::UpstreamStateView;
 use super::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, decode_address_slot};
 use super::storage_sync::{StorageSyncSpec, decode_storage_sync, storage_sync_spec_for_pool};
 use super::{
-    AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
-    PoolRegistration, PoolStatus, SlotChange, StateView, UnsupportedReason,
+    AdapterCache, AdapterRegistry, CallOutcome, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    PoolRegistration, PoolStatus, SlotChange, StateUpdate, StateView, UnsupportedReason,
 };
 #[cfg(feature = "live-runtime")]
 use super::{
@@ -305,15 +305,56 @@ impl From<evm_fork_cache::cold_start::ColdStartCallResult> for ColdStartCallResu
 pub struct StorageAccessList {
     /// Accounts the call touched.
     pub accounts: Vec<Address>,
+    /// Runtime-code hashes the call executed or inspected.
+    pub code_hashes: Vec<B256>,
     /// Storage `(address, slot)` pairs the call touched.
     pub slots: Vec<(Address, U256)>,
+    /// Historical block numbers read through `BLOCKHASH`.
+    pub block_numbers: Vec<u64>,
+}
+
+impl StorageAccessList {
+    /// Whether the access list contains no account, code, storage, or block-hash
+    /// dependencies.
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+            && self.code_hashes.is_empty()
+            && self.slots.is_empty()
+            && self.block_numbers.is_empty()
+    }
+
+    /// Union another access list into this one without duplicate dependencies.
+    pub fn extend(&mut self, other: &Self) {
+        for account in &other.accounts {
+            if !self.accounts.contains(account) {
+                self.accounts.push(*account);
+            }
+        }
+        for code_hash in &other.code_hashes {
+            if !self.code_hashes.contains(code_hash) {
+                self.code_hashes.push(*code_hash);
+            }
+        }
+        for slot in &other.slots {
+            if !self.slots.contains(slot) {
+                self.slots.push(*slot);
+            }
+        }
+        for block_number in &other.block_numbers {
+            if !self.block_numbers.contains(block_number) {
+                self.block_numbers.push(*block_number);
+            }
+        }
+    }
 }
 
 impl From<evm_fork_cache::access_set::StorageAccessList> for StorageAccessList {
     fn from(access: evm_fork_cache::access_set::StorageAccessList) -> Self {
         Self {
             accounts: access.accounts.into_iter().collect(),
+            code_hashes: access.code_hashes.into_iter().collect(),
             slots: access.slots.into_iter().collect(),
+            block_numbers: access.block_numbers.into_iter().collect(),
         }
     }
 }
@@ -540,6 +581,16 @@ pub trait AdapterColdStartPlanner {
     /// just-completed round's `results` and the post-injection `state` view.
     fn on_results(&mut self, results: &ColdStartResults, state: &dyn StateView) -> ColdStartStep;
 
+    /// Authoritative full-slot writes needed to materialize successfully
+    /// verified zero values in a cache whose sparse representation otherwise
+    /// cannot distinguish a proven EVM zero from an unknown/cold cell.
+    ///
+    /// The default is empty. Implementations may only return cells classified
+    /// as [`SlotFetch::Zero`] during this exact cold-start run.
+    fn materialization_updates(&self) -> Vec<StateUpdate> {
+        Vec::new()
+    }
+
     /// Finalize after the run: mutate `pool` (metadata + status) and return the
     /// outcome built from the planner's accumulated state and the run `report`.
     fn finish(
@@ -679,7 +730,7 @@ fn inject_and_record(cache: &mut EvmCache, entries: Vec<(Address, U256, U256)>) 
 /// storage program.
 ///
 /// - No pool address → `None`.
-/// - A V3-family pool (`UniswapV3`/`PancakeV3`/`Slipstream`) that carries a
+/// - A supported V3-family pool (`UniswapV3`/`PancakeV3`/`Slipstream`) that carries a
 ///   `storage_layout` → a [`HydrationKind::V3`] full sync (only when the
 ///   `uniswap-v3` feature is enabled).
 /// - Otherwise, any pool whose flat read-set resolves via
@@ -721,10 +772,13 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 ///
 /// The **canonical Uniswap** spec (which bakes in Uniswap's fee-growth,
 /// protocol-fees, and observation slot positions) is used only for genuine
-/// Uniswap V3 pools. Other V3-family forks (PancakeSwap V3, Slipstream) use the
-/// layout-only [`V3SyncSpec::core`] (slot0 + liquidity + the ticks/bitmap the
-/// layout locates) so hydration never injects auxiliary state from unverified
-/// slot positions. Extend a fork to the full spec once its layout is confirmed.
+/// Uniswap V3 pools. PancakeSwap uses its independently verified shifted spec.
+/// Slipstream uses the layout-only [`V3SyncSpec::core`] as a **quote-surface**
+/// bootstrap: it loads slot0, active liquidity, the full bitmap range, and the
+/// four tick words used by its configured quoter. That deliberately does not
+/// claim the six-word tick and reward/gauge surface required for exact event
+/// transitions; Slipstream mutations remain unsupported and force an
+/// authoritative repair.
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
@@ -769,20 +823,23 @@ pub fn supports_one_shot_hydration(pool: &PoolRegistration) -> bool {
 /// the fast path.
 ///
 /// For a V3-family pool `finish` *preserves* (never merges) metadata, so
-/// completeness here means the fields a later `simulate_swap` needs (`fee`) plus
-/// the layout the fast path already requires. A V3 fork with no fee tier (e.g. a
-/// discovered Slipstream pool, whose `fee` is deliberately unset) therefore
-/// forgoes the fast path and takes the normal `cold_start` — acceptable, since it
-/// is discovery-only for quoting anyway. Balancer/Curve flat hydration only
-/// applies once a discovered read-set exists, which itself is produced by a
-/// prior discover→verify `cold_start` that already ran `finish`.
+/// completeness here means the fields its quote ABI needs plus the layout the
+/// fast path already requires. Fee-keyed V3 pools require `fee`; Slipstream
+/// instead requires a valid signed tick spacing that agrees with its storage
+/// layout. Balancer/Curve flat hydration only applies once a discovered read-set
+/// exists, which itself is produced by a prior discover→verify `cold_start` that
+/// already ran `finish`.
 fn fast_metadata_complete(pool: &PoolRegistration) -> bool {
     use super::ProtocolMetadata;
     match &pool.metadata {
         ProtocolMetadata::UniswapV2(m) => m.token0.is_some() && m.token1.is_some(),
-        ProtocolMetadata::UniswapV3(m)
-        | ProtocolMetadata::PancakeV3(m)
-        | ProtocolMetadata::Slipstream(m) => m.fee.is_some() && m.storage_layout.is_some(),
+        ProtocolMetadata::UniswapV3(m) | ProtocolMetadata::PancakeV3(m) => {
+            m.fee.is_some() && m.storage_layout.is_some()
+        }
+        ProtocolMetadata::Slipstream(m) => m.storage_layout.is_some_and(|layout| {
+            m.tick_spacing == Some(layout.tick_spacing)
+                && (-8_388_608..=8_388_607).contains(&layout.tick_spacing)
+        }),
         // Solidly `finish` decodes+merges token0/token1 like V2, so require them
         // here too — otherwise the fast path would leave metadata tokens `None`
         // while the fallback populates them (an inconsistency for consumers that
@@ -1693,6 +1750,11 @@ impl AdapterRegistry {
         };
         let report = ColdStartRunReport::from(report);
 
+        let materialization_updates = planner.materialization_updates();
+        if !materialization_updates.is_empty() {
+            <EvmCache as AdapterCache>::apply_updates(cache, &materialization_updates);
+        }
+
         let outcome = planner.finish(pool, &report);
         Ok(attach_code_seeds(outcome, code_seed_report))
     }
@@ -2044,10 +2106,11 @@ mod tests {
         assert_eq!(v3_sync_spec(&pool), Some(V3SyncSpec::uniswap(layout)));
     }
 
-    /// PancakeSwap V3 uses its verified shifted full layout; Slipstream remains
-    /// on the layout-only `core` spec until its extra slots are verified.
+    /// PancakeSwap V3 uses its verified shifted full layout. Slipstream uses a
+    /// full-range layout-only quote surface without acquiring exact transition
+    /// authority over its six-word ticks or reward/gauge state.
     #[test]
-    fn pancake_uses_its_full_spec_while_slipstream_uses_core() {
+    fn pancake_and_slipstream_use_family_appropriate_full_range_specs() {
         let pancake_layout = V3StorageLayout::pancake(10);
         let pancake = PoolRegistration::new(PoolKey::PancakeV3(Address::repeat_byte(0x22)))
             .with_metadata(ProtocolMetadata::PancakeV3(
@@ -2063,9 +2126,16 @@ mod tests {
         let slip_layout = V3StorageLayout::slipstream(100);
         let slip = PoolRegistration::new(PoolKey::Slipstream(Address::repeat_byte(0x33)))
             .with_metadata(ProtocolMetadata::Slipstream(
-                V3Metadata::default().with_storage_layout(slip_layout),
+                V3Metadata::default()
+                    .with_tick_spacing(100)
+                    .with_storage_layout(slip_layout),
             ));
         assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+        assert!(supports_one_shot_hydration(&slip));
+        assert!(
+            fast_metadata_complete(&slip),
+            "tick-spacing-keyed Slipstream does not require fee metadata"
+        );
     }
 
     /// A non-positive tick spacing would panic in `full_word_range` /

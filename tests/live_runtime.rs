@@ -3,32 +3,37 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, hex, keccak256};
 use alloy_provider::{ProviderBuilder, RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::{EIP1186AccountProofResponse, Header as RpcHeader, Log as RpcLog};
 use alloy_transport::mock::{Asserter, MockTransport};
 use alloy_transport::{TransportError, TransportFut};
 use anyhow::Result;
-use evm_amm_state::adapters::storage::{V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT};
+use evm_amm_state::adapters::storage::{
+    V2_RESERVES_SLOT, V2_TOKEN0_SLOT, V2_TOKEN1_SLOT, v3_tick_bitmap_storage_key,
+};
 use evm_amm_state::adapters::{
     AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult, AdapterRegistry,
     AmmAdapter, AmmCanonicalBatch, AmmCanonicalBatchError, AmmColdStartOptions,
-    AmmColdStartWorkerConfig, AmmDiscoveryOptions, AmmEvictionPolicy,
-    AmmFactoryWatcherRegistration, AmmObserverError, AmmPoolChangeKind, AmmPreparedPoolState,
+    AmmColdStartWorkerConfig, AmmDiscoveryOptions, AmmEventRef, AmmEvictionPolicy,
+    AmmFactoryWatcherRegistration, AmmObserverError, AmmPoolChangeKind,
+    AmmPreconfirmationRejectionPolicy, AmmPreconfirmationRejectionReason, AmmPreparedPoolState,
     AmmPreparedStorage, AmmRuntime, AmmRuntimeBaseline, AmmRuntimeCommandError, AmmRuntimeConfig,
     AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeSubmitError, AmmStatePoint, AmmStateVersion,
     AmmSubscriberDriverConfig, AmmSubscriberDriverError, AmmSubscriberDriverState, ColdStartPolicy,
-    CreationLogContext, CustomPoolKey, DeferredWork, DiscoveredPool, DiscoveryError,
-    DiscoveryOwnerKey, EventSource, FactoryConfig, OwnerRuntimeState, PoolDiscovery, PoolFactory,
-    PoolGeneration, PoolInstanceId, PoolKey, PoolRegistration, PoolStateDependencies, PoolStatus,
-    ProtocolId, ProtocolMetadata, RepairAction, RuntimeOwnerId, StateSlot,
-    StateUpdate as AdapterStateUpdate, StateView, TokenEdgeDiscoveryRequest, UniswapV2Adapter,
-    UniswapV2Metadata, UpdateQuality, uniswap_v2_pair_runtime_code_hash,
+    ConcentratedLiquidityAdapter, CreationLogContext, CustomPoolKey, DeferredWork, DiscoveredPool,
+    DiscoveryError, DiscoveryOwnerKey, EventSource, FactoryConfig, OwnerRuntimeState,
+    PoolDiscovery, PoolFactory, PoolGeneration, PoolInstanceId, PoolKey, PoolRegistration,
+    PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata, QuoteWarmup, RepairAction,
+    RuntimeOwnerId, SimConfig, StateSlot, StateUpdate as AdapterStateUpdate, StateView,
+    TokenEdgeDiscoveryRequest, UniswapV2Adapter, UniswapV2Metadata, UpdateQuality, V3Metadata,
+    V3StorageLayout, uniswap_v2_pair_runtime_code_hash,
 };
 
 #[test]
@@ -40,10 +45,14 @@ use evm_fork_cache::StateUpdate as ForkStateUpdate;
 use evm_fork_cache::bulk_storage::pack_slots_calldata;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay};
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockRef, ChainStatus, InputSource, ReactiveContext, ReactiveInput,
+    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, FlashblockIngressTiming, FlashblockRef,
+    InputSource, PreconfirmationMode, ProviderRef, ReactiveContext, ReactiveInput,
     ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig, SubscriberMode,
 };
-use revm::Database;
+use revm::{
+    Database,
+    state::{AccountInfo, Bytecode},
+};
 use tower::Service;
 
 #[derive(Clone)]
@@ -394,10 +403,10 @@ fn canonical_log_batch(
                         chain_id: Some(1),
                         source: InputSource::Synthetic,
                         chain_status: ChainStatus::Included {
-                            block: block.clone(),
+                            block,
                             confirmations: 0,
                         },
-                        block: Some(block.clone()),
+                        block: Some(block),
                         transaction_index: Some(0),
                         log_index: Some(log_index),
                     },
@@ -407,6 +416,29 @@ fn canonical_log_batch(
     );
     AmmCanonicalBatch::from_verified_block(1, canonical_header(block_number), 0, records)
         .expect("test batch is block coherent")
+}
+
+fn canonical_record_at(
+    block_number: u64,
+    transaction_index: u64,
+    log_index: u64,
+) -> ReactiveInputRecord<Ethereum> {
+    let mut record = raw_canonical_batch(block_number)
+        .into_records()
+        .into_iter()
+        .next()
+        .expect("raw canonical fixture contains one log");
+    let ReactiveInput::Log(log) = &mut record.input else {
+        unreachable!("raw canonical fixture is a log")
+    };
+    log.transaction_hash = Some(B256::from(
+        U256::from(transaction_index + 1).to_be_bytes::<32>(),
+    ));
+    log.transaction_index = Some(transaction_index);
+    log.log_index = Some(log_index);
+    record.context.transaction_index = Some(transaction_index);
+    record.context.log_index = Some(log_index);
+    record
 }
 
 fn canonical_primitive_log_batch(
@@ -434,7 +466,7 @@ fn canonical_primitive_log_batch(
             chain_id: Some(1),
             source: InputSource::Synthetic,
             chain_status: ChainStatus::Included {
-                block: block.clone(),
+                block,
                 confirmations: 0,
             },
             block: Some(block),
@@ -504,7 +536,7 @@ fn raw_canonical_batch(block_number: u64) -> ReactiveInputBatch<Ethereum> {
             chain_id: Some(1),
             source: InputSource::Synthetic,
             chain_status: ChainStatus::Included {
-                block: block.clone(),
+                block,
                 confirmations: 0,
             },
             block: Some(block),
@@ -512,6 +544,421 @@ fn raw_canonical_batch(block_number: u64) -> ReactiveInputBatch<Ethereum> {
             log_index: Some(0),
         },
     )])
+}
+
+fn flashblock_batch(block_number: u64, generation: u64) -> ReactiveInputBatch<Ethereum> {
+    flashblock_batch_with_transaction_hash(block_number, generation, B256::repeat_byte(0xf1))
+}
+
+fn flashblock_batch_with_transaction_hash(
+    block_number: u64,
+    generation: u64,
+    transaction_hash: B256,
+) -> ReactiveInputBatch<Ethereum> {
+    flashblock_primitive_log_batch(
+        block_number,
+        generation,
+        PrimitiveLog::new_unchecked(Address::ZERO, Vec::new(), Bytes::new()),
+        transaction_hash,
+    )
+}
+
+fn flashblock_primitive_log_batch(
+    block_number: u64,
+    generation: u64,
+    log: PrimitiveLog,
+    transaction_hash: B256,
+) -> ReactiveInputBatch<Ethereum> {
+    let flashblock = FlashblockRef {
+        provider: ProviderRef::new("base-flashblocks", generation),
+        payload_id: None,
+        index: Some(1),
+        block_number,
+        content_hash: block_hash(block_number),
+        partial_block_hash: Some(block_hash(block_number)),
+        parent_hash: Some(block_hash(block_number.saturating_sub(1))),
+        state_root: None,
+        transactions_root: None,
+        transaction_hashes: vec![B256::repeat_byte(0x22)],
+        timestamp: Some(1_700_000_000 + block_number),
+        base_fee_per_gas: Some(7),
+        beneficiary: Some(Address::repeat_byte(0xcb)),
+        prevrandao: Some(B256::repeat_byte(0x77)),
+        gas_limit: Some(30_000_000),
+    };
+    let block = flashblock.block_ref();
+    let provider = flashblock.provider.clone();
+    ReactiveInputBatch::new(vec![
+        ReactiveInputRecord::new(
+            ReactiveInput::Log(RpcLog {
+                inner: log,
+                block_hash: Some(block.hash),
+                block_number: Some(block.number),
+                transaction_hash: Some(transaction_hash),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                ..RpcLog::default()
+            }),
+            ReactiveContext {
+                chain_id: Some(1),
+                source: InputSource::Flashblocks,
+                chain_status: ChainStatus::Preconfirmed {
+                    flashblock: Arc::new(flashblock),
+                },
+                block: Some(block),
+                transaction_index: Some(0),
+                log_index: Some(0),
+            },
+        )
+        .with_provider(provider),
+    ])
+    .with_delivery_scope(DeliveryScope::Preconfirmed)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_with_pending_repair_is_rejected_and_restored() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let address = Address::repeat_byte(0x91);
+            let slot = U256::from(9);
+            let canonical_value = U256::from(123);
+            cache.apply_updates(&[ForkStateUpdate::slot(address, slot, canonical_value)]);
+            let topic = B256::repeat_byte(0x92);
+            let mut registry = AdapterRegistry::new();
+            registry.register_adapter(Arc::new(TestRepairAdapter {
+                protocol: "runtime-preconfirmation-repair",
+                emitter: address,
+                topic,
+                target: StateSlot::new(address, slot),
+            }))?;
+            registry.register_pool(
+                custom_registration("runtime-preconfirmation-repair", address)
+                    .with_state_address(address),
+            )?;
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let mut observer = runtime.subscribe_events();
+
+            let error = match runtime
+                .ingest_preconfirmation(flashblock_primitive_log_batch(
+                    501,
+                    9,
+                    PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new()),
+                    B256::repeat_byte(0xf1),
+                ))
+                .await
+            {
+                Ok(_) => panic!("unresolved speculative repairs must fail closed"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                AmmRuntimeCommandError::PreconfirmationBatch(ref message)
+                    if message.contains("repair") || message.contains("resync")
+            ));
+            assert!(runtime.latest_preconfirmation().is_none());
+            assert_eq!(
+                runtime
+                    .latest_snapshot()
+                    .cache()
+                    .storage_value(address, slot),
+                Some(canonical_value)
+            );
+            assert!(matches!(
+                observer.next_event().await?.kind(),
+                AmmRuntimeEventKind::PreconfirmationRejected {
+                    reason: AmmPreconfirmationRejectionReason::StateReadiness,
+                }
+            ));
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_with_an_incomplete_learned_quote_is_rejected() -> Result<()> {
+    let mut cache = setup_cache().await;
+    align_cache(&mut cache, 500);
+    cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    cache
+        .db_mut()
+        .insert_account_info(Address::repeat_byte(0xcb), AccountInfo::default());
+    let pool = Address::repeat_byte(0x93);
+    let router = Address::repeat_byte(0x94);
+    let token0 = Address::repeat_byte(0xa0);
+    let token1 = Address::repeat_byte(0xa1);
+    let router_code = Bytecode::new_raw(Bytes::from(hex::decode(
+        include_str!("fixtures/mock_v2_router_runtime.hex").trim(),
+    )?));
+    cache.db_mut().insert_account_info(
+        router,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash: router_code.hash_slow(),
+            code: Some(router_code),
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(router, U256::ZERO, U256::from(4_242))?;
+    cache.apply_updates(&[ForkStateUpdate::slot(
+        pool,
+        V2_RESERVES_SLOT,
+        U256::from(100) | (U256::from(200) << 112),
+    )]);
+
+    let adapter = Arc::new(UniswapV2Adapter::default());
+    let key = PoolKey::UniswapV2(pool);
+    let mut registry =
+        AdapterRegistry::new().with_sim_config(SimConfig::default().with_v2_router(router));
+    registry.register_adapter(adapter.clone())?;
+    let registration = complete_v2_registration(pool)
+        .with_status(PoolStatus::Ready)
+        .with_event_sources(adapter.event_sources(&complete_v2_registration(pool)));
+    registry.register_pool(registration)?;
+    registry.warm_quote_read_sets(
+        &mut cache,
+        [QuoteWarmup::exact_input(
+            key,
+            token0,
+            token1,
+            U256::from(1_000),
+        )],
+    )?;
+
+    // Remove one learned quote dependency after warmup. The subsequent
+    // Flashblock event itself is otherwise exact and repair-free.
+    cache.purge_contract_slots(router, &[U256::ZERO]);
+
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let mut observer = runtime.subscribe_events();
+            let error = match runtime
+                .ingest_preconfirmation(flashblock_primitive_log_batch(
+                    501,
+                    9,
+                    PrimitiveLog::new_unchecked(
+                        pool,
+                        vec![keccak256("Sync(uint112,uint112)")],
+                        encoded_words([U256::from(150), U256::from(250)]),
+                    ),
+                    B256::repeat_byte(0xf1),
+                ))
+                .await
+            {
+                Ok(_) => panic!("incomplete learned quote state must fail closed"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                AmmRuntimeCommandError::PreconfirmationBatch(ref message)
+                    if message.contains("incomplete")
+            ));
+            assert!(runtime.latest_preconfirmation().is_none());
+            assert!(matches!(
+                observer.next_event().await?.kind(),
+                AmmRuntimeEventKind::PreconfirmationRejected {
+                    reason: AmmPreconfirmationRejectionReason::QuoteReadiness,
+                }
+            ));
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+async fn warmed_v2_quote_state(
+    pool: Address,
+    router: Address,
+) -> Result<(EvmCache, AdapterRegistry, PoolKey)> {
+    let token0 = Address::repeat_byte(0xb0);
+    let token1 = Address::repeat_byte(0xb1);
+    let mut cache = setup_cache().await;
+    align_cache(&mut cache, 500);
+    cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    cache
+        .db_mut()
+        .insert_account_info(Address::repeat_byte(0xcb), AccountInfo::default());
+    let router_code = Bytecode::new_raw(Bytes::from(hex::decode(
+        include_str!("fixtures/mock_v2_router_runtime.hex").trim(),
+    )?));
+    cache.db_mut().insert_account_info(
+        router,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash: router_code.hash_slow(),
+            code: Some(router_code),
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .insert_account_storage(router, U256::ZERO, U256::from(4_242))?;
+    cache.apply_updates(&[ForkStateUpdate::slot(
+        pool,
+        V2_RESERVES_SLOT,
+        U256::from(100) | (U256::from(200) << 112),
+    )]);
+
+    let adapter = Arc::new(UniswapV2Adapter::default());
+    let key = PoolKey::UniswapV2(pool);
+    let mut registry =
+        AdapterRegistry::new().with_sim_config(SimConfig::default().with_v2_router(router));
+    registry.register_adapter(adapter.clone())?;
+    registry.register_pool(
+        complete_v2_registration(pool)
+            .with_status(PoolStatus::Ready)
+            .with_event_sources(adapter.event_sources(&complete_v2_registration(pool))),
+    )?;
+    registry.warm_quote_read_sets(
+        &mut cache,
+        [QuoteWarmup::exact_input(
+            key.clone(),
+            token0,
+            token1,
+            U256::from(1_000),
+        )],
+    )?;
+    Ok((cache, registry, key))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warmed_quote_read_set_survives_preview_invalidation_and_new_generation() -> Result<()> {
+    let pool = Address::repeat_byte(0x95);
+    let router = Address::repeat_byte(0x96);
+    let (cache, registry, key) = warmed_v2_quote_state(pool, router).await?;
+
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let sync = || {
+                PrimitiveLog::new_unchecked(
+                    pool,
+                    vec![keccak256("Sync(uint112,uint112)")],
+                    encoded_words([U256::from(150), U256::from(250)]),
+                )
+            };
+
+            let first = runtime
+                .ingest_preconfirmation(flashblock_primitive_log_batch(
+                    501,
+                    9,
+                    sync(),
+                    B256::repeat_byte(0xf1),
+                ))
+                .await?;
+            assert!(
+                first
+                    .pool_changes()
+                    .iter()
+                    .any(|change| change.pool() == &key)
+            );
+            runtime.invalidate_preconfirmation().await?;
+            assert!(runtime.latest_preconfirmation().is_none());
+
+            let second = runtime
+                .ingest_preconfirmation(flashblock_primitive_log_batch(
+                    501,
+                    10,
+                    sync(),
+                    B256::repeat_byte(0xf1),
+                ))
+                .await?;
+            assert_eq!(
+                second.flashblock().provider,
+                ProviderRef::new("base-flashblocks", 10)
+            );
+            assert!(
+                second
+                    .pool_changes()
+                    .iter()
+                    .any(|change| change.pool() == &key)
+            );
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_progress_hydrates_a_learned_quote_only_slot_off_actor() -> Result<()> {
+    let pool = Address::repeat_byte(0xa5);
+    let router = Address::repeat_byte(0xa6);
+    let (mut cache, registry, key) = warmed_v2_quote_state(pool, router).await?;
+    cache.purge_contract_slots(router, &[U256::ZERO]);
+
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let assertions = Asserter::new();
+            assertions.push_success(&encoded_words([U256::from(4_242)]));
+            let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(assertions));
+            let worker = runtime
+                .attach_cold_start_worker(
+                    provider,
+                    AmmColdStartWorkerConfig::default().with_queue_capacity(1),
+                )
+                .await?;
+
+            runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            let mut snapshots = runtime.subscribe_snapshots();
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    if snapshots.borrow().cache().storage_value(router, U256::ZERO)
+                        == Some(U256::from(4_242))
+                    {
+                        break;
+                    }
+                    snapshots.changed().await.expect("runtime remains alive");
+                }
+            })
+            .await?;
+            assert!(
+                runtime
+                    .latest_snapshot()
+                    .registry()
+                    .pool_instance(&key)
+                    .is_some()
+            );
+
+            worker.shutdown();
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
 }
 
 fn empty_canonical_batch(block_number: u64) -> AmmCanonicalBatch {
@@ -533,6 +980,155 @@ fn alternate_empty_canonical_batch(block_number: u64) -> AmmCanonicalBatch {
         ReactiveInputBatch::new(Vec::new()),
     )
     .expect("alternate test header is sealed")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_is_published_then_invalidated_by_canonical_progress() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let mut previews = runtime.subscribe_preconfirmations();
+
+            let preview = runtime
+                .ingest_preconfirmation(flashblock_batch(501, 9))
+                .await?;
+            assert_eq!(preview.base_version(), AmmStateVersion::initial());
+            assert_eq!(
+                preview.base_point(),
+                AmmStatePoint::post_block(1, 500, block_hash(500))
+            );
+            assert_eq!(
+                preview.flashblock().provider,
+                ProviderRef::new("base-flashblocks", 9)
+            );
+            assert_eq!(preview.cache().block_number(), Some(501));
+            assert_eq!(preview.cache().basefee(), Some(7));
+            assert_eq!(preview.cache().coinbase(), Some(Address::repeat_byte(0xcb)));
+            assert_eq!(preview.cache().prevrandao(), Some(B256::repeat_byte(0x77)));
+            assert_eq!(preview.cache().gas_limit(), Some(30_000_000));
+            assert_eq!(preview.cache().timestamp(), Some(1_700_000_000 + 501));
+            assert!(preview.pool_changes().is_empty());
+            assert_eq!(preview.event_refs().len(), 1);
+            assert_eq!(preview.timing(), None);
+            assert_eq!(
+                preview.event_refs()[0],
+                AmmEventRef::new(B256::repeat_byte(0xf1), 0)
+            );
+            assert!(runtime.latest_preconfirmation().is_some());
+            previews.changed().await?;
+            assert!(previews.borrow().is_some());
+
+            runtime.invalidate_preconfirmation().await?;
+            previews.changed().await?;
+            assert!(previews.borrow().is_none());
+            assert!(runtime.latest_preconfirmation().is_none());
+
+            runtime
+                .ingest_preconfirmation(flashblock_batch(501, 10))
+                .await?;
+            previews.changed().await?;
+            assert!(previews.borrow().is_some());
+
+            runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            previews.changed().await?;
+            assert!(previews.borrow().is_none());
+            assert!(runtime.latest_preconfirmation().is_none());
+            assert_eq!(runtime.latest_snapshot().point().block_number(), 501);
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flashblock_preview_retains_typed_source_ingress_through_publication() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let source_ingress = Instant::now() - Duration::from_millis(25);
+            let batch = flashblock_batch(501, 9)
+                .with_preconfirmation_timing(FlashblockIngressTiming::new(source_ingress));
+
+            let preview = runtime.ingest_preconfirmation(batch).await?;
+            let timing = preview
+                .timing()
+                .expect("typed Flashblock ingress must survive runtime publication");
+            assert_eq!(timing.source_ingress(), source_ingress);
+            assert!(timing.elapsed_to_publication() >= Duration::from_millis(25));
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn placeholder_transaction_hash_is_not_published_as_event_identity() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+
+            let preview = runtime
+                .ingest_preconfirmation(flashblock_batch_with_transaction_hash(501, 9, B256::ZERO))
+                .await?;
+
+            assert!(preview.event_refs().is_empty());
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_changes_publish_source_event_identity() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+
+            let changes = runtime
+                .ingest_batch(canonical_log_batch(
+                    501,
+                    [(Address::repeat_byte(0x31), B256::repeat_byte(0x32), 7)],
+                ))
+                .await?;
+            assert_eq!(
+                changes.event_refs(),
+                &[AmmEventRef::new(B256::repeat_byte(8), 7)]
+            );
+
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,7 +1188,9 @@ async fn alloy_driver_attaches_paused_then_stops_without_stranding_the_actor() -
                 runtime_baseline(500),
                 AmmRuntimeConfig::default(),
             )?;
-            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let asserter = Asserter::new();
+            asserter.push_success(&U256::from(1));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let subscriber =
                 AlloySubscriber::new(provider, SubscriberMode::Auto, SubscriberConfig::default());
             let driver = runtime
@@ -659,6 +1257,42 @@ async fn alloy_driver_rejects_polling_before_mutating_runtime_attachment() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn canonical_continuation_policy_rejects_required_preconfirmations() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let subscriber = AlloySubscriber::new(
+                provider,
+                SubscriberMode::PubSub,
+                SubscriberConfig {
+                    preconfirmations: PreconfirmationMode::Required,
+                    ..SubscriberConfig::default()
+                },
+            );
+            let config = AmmSubscriberDriverConfig::default()
+                .with_preconfirmation_rejection_policy(
+                    AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+                );
+
+            assert!(matches!(
+                runtime.attach_alloy_subscriber(subscriber, config).await,
+                Err(AmmSubscriberDriverError::IncompatiblePreconfirmationPolicy)
+            ));
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn published_chain_reorg_rolls_forward_to_the_replacement_hash() -> Result<()> {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -702,6 +1336,117 @@ async fn published_chain_reorg_rolls_forward_to_the_replacement_hash() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn canonical_actor_rejects_an_exact_duplicate_block_before_reapply() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let runtime = AmmRuntime::spawn(
+                cache,
+                AdapterRegistry::new(),
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            let committed = runtime.latest_snapshot();
+            assert!(matches!(
+                runtime.ingest_batch(empty_canonical_batch(501)).await,
+                Err(AmmRuntimeCommandError::DuplicateCanonicalBlock { current })
+                    if current == committed.point()
+            ));
+            assert_eq!(runtime.latest_snapshot().version(), committed.version());
+            assert_eq!(runtime.latest_snapshot().point(), committed.point());
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_actor_duplicate_guard_prevents_tiny_fee_only_double_accrual() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let pool = Address::repeat_byte(0xd3);
+            let q96 = U256::from(1) << 96_usize;
+            let liquidity = U256::from(1_000_000_000_000_000_000_u128);
+            let slot0 = q96
+                | (U256::from(1) << 200_usize)
+                | (U256::from(1) << 216_usize)
+                | (U256::from(1) << 240_usize);
+            let observation = U256::from(1_700_000_500_u64) | (U256::from(1) << 248_usize);
+            cache.apply_updates(&[
+                ForkStateUpdate::slot(pool, U256::ZERO, slot0),
+                ForkStateUpdate::slot(pool, U256::from(1), U256::from(5)),
+                ForkStateUpdate::slot(pool, U256::from(2), U256::from(7)),
+                ForkStateUpdate::slot(pool, U256::from(3), U256::ZERO),
+                ForkStateUpdate::slot(pool, U256::from(4), liquidity),
+                ForkStateUpdate::slot(pool, U256::from(8), observation),
+                ForkStateUpdate::slot(pool, v3_tick_bitmap_storage_key(0), U256::ZERO),
+            ]);
+
+            let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
+            let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+                .with_state_address(pool)
+                .with_metadata(ProtocolMetadata::UniswapV3(
+                    V3Metadata::default()
+                        .with_fee(3_000)
+                        .with_tick_spacing(1)
+                        .with_storage_layout(V3StorageLayout::uniswap(1)),
+                ))
+                .with_status(PoolStatus::Ready);
+            let sources = adapter.event_sources(&registration);
+            let registration = registration.with_event_sources(sources);
+            let mut registry = AdapterRegistry::new();
+            registry.register_adapter(adapter)?;
+            registry.register_pool(registration)?;
+
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let swap = PrimitiveLog::new_unchecked(
+                pool,
+                vec![
+                    keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+                    B256::ZERO,
+                    B256::ZERO,
+                ],
+                encoded_words([U256::from(1), U256::ZERO, q96, liquidity, U256::MAX]),
+            );
+            let make_batch =
+                || canonical_primitive_log_batch(501, runtime.interest_revision(), swap.clone());
+
+            runtime.ingest_batch(make_batch()).await?;
+            let committed = runtime.latest_snapshot();
+            let fee_growth_after_first = committed
+                .cache()
+                .storage_value(pool, U256::from(1))
+                .expect("fee-growth slot remains resident");
+            assert!(fee_growth_after_first > U256::from(5));
+
+            assert!(matches!(
+                runtime.ingest_batch(make_batch()).await,
+                Err(AmmRuntimeCommandError::DuplicateCanonicalBlock { current })
+                    if current == committed.point()
+            ));
+            let after_duplicate = runtime.latest_snapshot();
+            assert_eq!(after_duplicate.version(), committed.version());
+            assert_eq!(
+                after_duplicate.cache().storage_value(pool, U256::from(1)),
+                Some(fee_growth_after_first),
+                "the rejected duplicate must not accrue the fee a second time",
+            );
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn change_subscription_starts_after_its_snapshot_and_observes_publication_order() -> Result<()>
 {
     tokio::task::LocalSet::new()
@@ -722,7 +1467,10 @@ async fn change_subscription_starts_after_its_snapshot_and_observes_publication_
                 AmmStateVersion::initial()
             );
 
-            let committed = runtime.ingest_batch(empty_canonical_batch(501)).await?;
+            let constructor_started = std::time::Instant::now();
+            let batch = empty_canonical_batch(501);
+            let constructor_finished = std::time::Instant::now();
+            let committed = runtime.ingest_batch(batch).await?;
             snapshots.changed().await?;
             statuses.changed().await?;
             let delivered = subscription.next_commit().await.expect("change delivery");
@@ -734,6 +1482,20 @@ async fn change_subscription_starts_after_its_snapshot_and_observes_publication_
                 delivered.changes().version()
             );
             assert_eq!(delivered.changes().point().block_number(), 501);
+            let timing = delivered
+                .timing()
+                .expect("canonical event commit carries monotonic provenance");
+            assert!(timing.source_ingress() >= constructor_started);
+            assert!(timing.source_ingress() <= constructor_finished);
+            assert_eq!(
+                timing.decoded_after_ingress(),
+                std::time::Duration::ZERO,
+                "the public constructor receives an already typed payload",
+            );
+            assert!(timing.decoded_after_ingress() <= timing.ordered_after_ingress());
+            assert!(timing.ordered_after_ingress() <= timing.transitioned_after_ingress());
+            assert!(timing.transitioned_after_ingress() <= timing.committed_after_ingress());
+            assert_eq!(timing.elapsed_to_commit(), timing.committed_after_ingress());
             let delivered_overlay = EvmOverlay::new(delivered.snapshot().cache_snapshot(), None);
             assert_eq!(delivered_overlay.block_number(), Some(501));
             assert_eq!(delivered_overlay.basefee(), Some(601));
@@ -952,6 +1714,7 @@ async fn adapter_lifecycle_is_dynamic_generation_fenced_and_published() -> Resul
                 AmmRuntimeConfig::default(),
             )?;
             let mut observer = runtime.subscribe_events();
+            let mut commits = runtime.subscribe_changes().await?;
             let adapter = Arc::new(TestWriteAdapter {
                 protocol: "runtime-dynamic-adapter",
                 emitter: Address::repeat_byte(0xa1),
@@ -960,6 +1723,11 @@ async fn adapter_lifecycle_is_dynamic_generation_fenced_and_published() -> Resul
             });
 
             let first = runtime.add_adapter(adapter.clone()).await?;
+            let topology_commit = commits.next_commit().await.expect("adapter-add commit");
+            assert!(
+                topology_commit.timing().is_none(),
+                "command-only topology work must not fabricate event timing",
+            );
             assert_eq!(first.generation().get(), 0);
             assert_eq!(runtime.latest_snapshot().version(), AmmStateVersion::new(1));
             assert_eq!(runtime.latest_snapshot().registry().adapter_count(), 1);
@@ -3221,6 +3989,7 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                 )
                 .await?;
 
+            let mut snapshots = runtime.subscribe_snapshots();
             let log = PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new());
             let degraded = runtime
                 .ingest_batch(canonical_primitive_log_batch(
@@ -3236,18 +4005,22 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     .any(|change| change.pool() == &instance
                         && change.kind() == AmmPoolChangeKind::Degraded)
             );
-            assert_eq!(
-                runtime
-                    .latest_snapshot()
-                    .registry()
-                    .pool(&instance)
-                    .expect("degraded generation remains registered")
-                    .status,
-                PoolStatus::Degraded
-            );
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                loop {
+                    let is_degraded = snapshots
+                        .borrow()
+                        .registry()
+                        .pool(&instance)
+                        .is_some_and(|pool| pool.status == PoolStatus::Degraded);
+                    if is_degraded {
+                        break;
+                    }
+                    snapshots.changed().await.expect("runtime remains alive");
+                }
+            })
+            .await?;
             transport.release_one();
 
-            let mut snapshots = runtime.subscribe_snapshots();
             tokio::time::timeout(std::time::Duration::from_millis(250), async {
                 while snapshots
                     .borrow()
@@ -3745,6 +4518,34 @@ fn canonical_envelope_rejects_intrinsic_log_mismatch_and_duplicates() {
             ReactiveInputBatch::new(records)
         ),
         Err(AmmCanonicalBatchError::MalformedRecord { index: 0, .. })
+    ));
+}
+
+#[test]
+fn canonical_envelope_requires_strict_transaction_and_log_order() {
+    let valid = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 0, 1),
+        canonical_record_at(501, 0, 2),
+        canonical_record_at(501, 1, 3),
+    ]);
+    assert!(AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, valid).is_ok());
+
+    let lower_log = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 0, 2),
+        canonical_record_at(501, 0, 1),
+    ]);
+    assert!(matches!(
+        AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, lower_log),
+        Err(AmmCanonicalBatchError::OutOfOrderRecord { index: 1, .. })
+    ));
+
+    let lower_transaction = ReactiveInputBatch::new(vec![
+        canonical_record_at(501, 1, 2),
+        canonical_record_at(501, 0, 3),
+    ]);
+    assert!(matches!(
+        AmmCanonicalBatch::from_verified_block(1, canonical_header(501), 7, lower_transaction),
+        Err(AmmCanonicalBatchError::OutOfOrderRecord { index: 1, .. })
     ));
 }
 

@@ -18,10 +18,9 @@
 //!   `QuoterV2`. `verify_derivations` is ON (the mapping answer is cross-checked
 //!   against the CREATE2 derivation on first use).
 //! - **Slipstream / Aerodrome CL** ([`ClFactorySpec::slipstream`]): `getPool`
-//!   base slot **6** (verified). Discovery-only: `quoter` is `None` because the
-//!   Slipstream quoter takes a `tickSpacing`-keyed struct, not the Uniswap
-//!   `(…, fee, …)` struct this crate encodes — so its sim rides the caller's
-//!   Uniswap-compatible quoter (see the [`ClFactorySpec::slipstream`] docs).
+//!   base slot **6** (verified). The preset leaves the chain-specific `quoter`
+//!   address unset; configure one with [`ClFactorySpec::with_quoter`] (or use a
+//!   compatible [`SimConfig`](super::SimConfig)) for native tick-spacing quotes.
 //! - **Solidly V2 / Aerodrome** ([`SolidlyFactoryConfig::aerodrome`]): `getPool`
 //!   base slot **5** + the pool storage layout (reserves @ 20/21, tokens @ 13/14),
 //!   verified on-chain.
@@ -832,10 +831,10 @@ impl ClFactorySpec {
     /// A tickSpacing-keyed CL fork (Slipstream shape): `getPool[t0][t1][spacing]`
     /// only — no `feeAmountTickSpacing` read. Fee defaults to `Fixed(0)`, the
     /// "no fee mapping" sentinel: discovered registrations leave `V3Metadata.fee`
-    /// **unset** (so `simulate_swap` returns `MissingMetadata("V3 fee")` rather
-    /// than quoting at fee 0 — these forks are discovery-only for quoting unless
-    /// the caller supplies a compatible quoter). Set a real
-    /// [`fee_source`](Self::with_fee_source) if the fork exposes one on-chain.
+    /// **unset**. Slipstream simulation uses the discovered signed tick spacing,
+    /// while the caller still supplies the chain-specific compatible quoter.
+    /// Set a real [`fee_source`](Self::with_fee_source) for another fork whose
+    /// quote ABI still consumes an on-chain fee.
     pub fn tick_spacing_keyed(
         protocol: ProtocolId,
         factory: Address,
@@ -993,12 +992,10 @@ impl ClFactorySpec {
     /// and `quoter` are left `None` on purpose:
     /// - the pool init-code hash + full spacing table are not pinned here (the
     ///   gated parity test covers the base slot);
-    /// - the Slipstream quoter takes a `tickSpacing`-keyed struct, NOT the
-    ///   Uniswap `(…, fee, …)` struct this crate encodes, so wiring it as the V3
-    ///   quote target would send malformed calldata. Slipstream is therefore
-    ///   discovery-only for quoting: its discovered `fee` is left unset, so
-    ///   `simulate_swap` returns `MissingMetadata("V3 fee")` unless the caller
-    ///   supplies a Slipstream-compatible quoter and fee.
+    /// - quoter deployments are chain-specific. The adapter encodes the native
+    ///   signed `tickSpacing` struct and does not need `fee`, but the caller must
+    ///   set a compatible quote target with [`Self::with_quoter`] or
+    ///   [`SimConfig`](super::SimConfig).
     pub fn slipstream(factory: Address) -> Self {
         Self::tick_spacing_keyed(
             ProtocolId::Slipstream,
@@ -1903,8 +1900,7 @@ impl ConcentratedLiquidityFactory {
         // A resolved fee of 0 is the tickSpacing-keyed "no fee mapping" sentinel
         // (Slipstream / Aerodrome CL have no on-chain fee→pool mapping and set
         // `FeeSource::Fixed(0)`): leave `fee` UNSET rather than record a bogus 0,
-        // so `simulate_swap` surfaces `MissingMetadata("V3 fee")` — Slipstream is
-        // discovery-only for quoting — instead of silently quoting at fee 0.
+        // because tick-spacing-keyed Slipstream quoting does not consume a fee.
         // Fee-keyed forks always resolve a real, non-zero tier.
         if fee != 0 {
             metadata = metadata.with_fee(fee);

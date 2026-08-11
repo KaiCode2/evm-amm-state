@@ -4,25 +4,31 @@
 [![docs.rs](https://img.shields.io/docsrs/evm-amm-state)](https://docs.rs/evm-amm-state)
 [![CI](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml/badge.svg)](https://github.com/KaiCode2/evm-amm-state/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90-informational)](https://github.com/KaiCode2/evm-amm-state/blob/main/Cargo.toml)
 
 `evm-amm-state` is a real-time AMM state engine built on a forked-EVM state
 cache ([`evm-fork-cache`]). It tracks a working set of pools, **cold-starts**
 their on-chain state into the cache, and keeps them current **from chain log
 events**: events that carry absolute state (Uniswap V2 / Solidly `Sync`) are
-applied as exact writes with **no RPC at all**, Uniswap V3 `Mint`/`Burn` and
-Balancer vault `Swap`s are **event-sourced** onto warm tick / cash slots the
-same way, and only genuinely cold slots and delta-only events (Curve, Balancer
+applied as exact writes with **no RPC at all**, canonical Uniswap V3 `Swap`s
+are replayed across the complete fee/oracle/tick storage surface from exact
+parent state. Every standard non-`Swap` V3 pool mutation (`Initialize`,
+`Mint`/`Burn`, `Collect`, `Flash`, oracle-cardinality and protocol-fee events)
+is routed but conservatively purges the pool and requires an exact rebuild;
+partial warm-tick accounting is never presented as an exact later-Swap parent.
+Balancer vault `Swap`s remain event-sourced onto warm cash slots. Only genuinely
+cold slots and delta-only events (Curve, Balancer
 joins/exits) turn into a bounded, hash-pinned storage **resync** (block trace
 first, then bulk-storage / point-read fallback). Once a pool's quote read-set is warmed and current, swap
 **simulations run fully offline** against the live-synced state.
 
-The defining design choice: **no reimplemented AMM math.** Every quote runs the
+The defining quote-path design choice: **no reimplemented quote math.** Every quote runs the
 protocol's *canonical* on-chain quote entrypoint inside a local revm against the
 warmed cache — the pool's own `get_dy` / `getAmountOut`, or the protocol's
 official router/quoter (Uniswap `QuoterV2` / `Router02`) — then decodes the
-result. There is no `LocalAMM`/`amm-math` formula layer to drift from the real
-contracts.
+result. Canonical Uniswap V3 event transitions separately replay the reference
+pool's swap-storage semantics and are differential-tested against that deployed
+runtime; quoting itself still executes the real quoter bytecode.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 
@@ -37,14 +43,14 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.1", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.5", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
 ] }
 ```
 
-Requires Rust **1.88+** (the declared MSRV, checked in CI). The two public
+Requires Rust **1.90+** (the declared MSRV, checked in CI). The two public
 dependencies whose types appear in this crate's API are re-exported at the
 crate root — import `evm_amm_state::evm_fork_cache` and
 `evm_amm_state::alloy_primitives` instead of pinning them yourself, and the
@@ -78,23 +84,37 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
-| Uniswap V3 family (V3, PancakeSwap V3, Slipstream) | `uniswap-v3` (`pancake-v3`, `slipstream`) | `QuoterV2.quoteExactInputSingle` | slot0 + liquidity + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | `Swap` → slot0/liquidity; `Mint`/`Burn` → exact tick + global-liquidity writes where warm, resync only cold ticks |
+| Canonical Uniswap V3 | `uniswap-v3` | `QuoterV2.quoteExactInputSingle` | complete canonical swap surface + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | ordered/context-aware `Swap` → exact provider-free replay of slot0, liquidity, fees, oracle, and crossed ticks; every non-`Swap` pool mutation purges and repairs |
+| PancakeSwap V3 / Slipstream | `pancake-v3`, `slipstream` | family-native `QuoterV2.quoteExactInputSingle` | family layout warm-up; Slipstream uses a full-range layout-only one-shot quote surface, while resumable repair verifies its extended state | `Swap` exactness is **unsupported** pending exhaustive independent deployed-runtime parity; routed mutations invalidate and repair, never label state exact |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`), verify-only once known | `Swap` → exact 112-bit cash writes where warm, resync fallback; `PoolBalanceChanged` → resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
-All protocol adapters are on by default; `pancake-v3` and `slipstream` are
-thin aliases of `uniswap-v3` (one V3-family adapter serves all three). See
+All protocol adapters are on by default; one V3-family adapter routes
+Uniswap V3, Pancake V3, and Slipstream, but swap-transition capability is
+family-specific. Only canonical Uniswap V3 currently returns
+`V3SwapTransitionCapability::Exact`; layout similarity does not grant exactness. See
 [`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
 per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
 discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
 for the Curve adapter in depth.
 
-> **Slipstream quoting caveat.** Slipstream / Aerodrome CL ships as
-> discovery + cold-start: its own quoter ABI differs (int24 tickSpacing), so
-> discovered registrations leave `fee` unset and `simulate_swap` returns
-> `MissingMetadata` until you supply a Uniswap-compatible quoter + fee — see
-> the [support matrix](docs/protocol-support-matrix.md).
+> **Exact V3 event context.** Canonical Uniswap V3 exact replay requires a
+> complete parent snapshot plus chain, block timestamp/hash/parent, transaction
+> hash, and transaction/log positions. `AdapterEventContext` carries that
+> evidence but does not itself sequence it. The complete canonical-batch
+> constructor enforces strict position order and the live actor rejects an exact
+> duplicate committed block; users of the stateless direct driver must enforce
+> those invariants themselves. Missing or contradictory evidence atomically
+> purges the stale pool snapshot and exposes a typed failure. See [V3 swap
+> transitions](docs/v3-swap-transitions.md).
+
+> **Slipstream quoting configuration.** Slipstream / Aerodrome CL uses its
+> native `int24 tickSpacing` QuoterV2 struct; `fee` is intentionally unset and
+> is not used. Factory discovery supplies the tick spacing but does not pin a
+> chain-specific quoter address, so configure a compatible Slipstream quoter on
+> the factory/pool metadata (or in `SimConfig`) before cold-start. See the
+> [support matrix](docs/protocol-support-matrix.md).
 
 > **Solidly offline caveat.** Solidly's `getAmountOut` reads more than the
 > reserves its cold-start warms — the pool's `stable` flag and token `decimals`,
@@ -324,6 +344,49 @@ changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
 
+The same attached subscriber can opt into Base or Optimism Flashblocks through
+`evm-fork-cache`. Base consumes native `newFlashblocks` plus `pendingLogs`;
+Optimism uses the cache crate's bounded, generation-pinned pending-state
+sampler. Applications that do not want recurring OP request usage can keep
+`PreconfirmationMode::Disabled` and use the ordinary canonical subscriber.
+Preconfirmed logs pass through the existing AMM handlers—there is no second
+protocol adapter path—and publish an `AmmPreconfirmedSnapshot`
+through `latest_preconfirmation` / `subscribe_preconfirmations`. Each preview is
+anchored to the current canonical version and must identify the exact next block
+by number and parent hash. It carries its `FlashblockRef` and announcing provider
+ID, and exposes an immutable cache snapshot plus the affected pool changes for
+immediate simulation. `AmmPreconfirmedSnapshot::event_refs`
+and `AmmChangeSet::event_refs` expose the same sorted, deduplicated transaction
+hash/log-index identity across pending and canonical delivery; placeholder zero
+transaction hashes are omitted. A newer Flashblock replaces it; canonical
+progress, subscriber trust loss, explicit discard, or shutdown invalidates it.
+`AmmPreconfirmedSnapshot::timing` optionally retains the earliest process-local
+Flashblock source ingress through runtime publication. It is monotonic
+observability metadata only; an un-timed direct batch reports `None`, and timing
+never contributes to preview identity or canonical authority.
+Speculative decode/resync failures never degrade canonical pool health or create
+canonical repair ownership. The cache-owner runtime publishes only a fully
+simulation-ready preview: pending repairs, unresolved resyncs, unknown pool
+impact, degraded update quality, or a required full refresh reject the complete
+speculative branch and restore canonical state. Direct
+`AmmSyncEngine::ingest_batch` can still execute pending-tag resyncs for callers
+that deliberately use the synchronous path.
+
+Before attaching a Flashblocks subscriber, call
+`AdapterRegistry::warm_quote_read_sets` with the representative pool,
+direction, and size classes the strategy will simulate. Each successful warmup
+records account, code, storage, and block-hash dependencies, verifies the quote
+again against an RPC-disconnected snapshot, requires the complete `SwapQuote`
+to equal the canonical warmup result, and enables fail-closed readiness for
+every affected pool. A mismatch returns `QuoteWarmupError::ReplayMismatch` and
+installs none of the batch's manifests. The live runtime replays those
+representative quotes offline before publishing each preview. An unexpected
+cold dependency rejects that preview, grows the bounded manifest, and is fetched
+only after the next exact canonical point by the hash-pinned background worker.
+Typed proof/code-residency failures remain visible in
+`QuoteReadSetHydrationReport::failures`; code identity changes invalidate
+dependent manifests and require re-warming.
+
 ```mermaid
 flowchart LR
     A["AMM log"] --> B["Adapter decode"]
@@ -487,6 +550,7 @@ Everything else is env-gated and prints a skip message when unset:
 | --- | --- | --- |
 | [`custom_adapter`](examples/custom_adapter.rs) | third-party adapter, register → quote | — |
 | [`adapter_pipeline`](examples/adapter_pipeline.rs) | register → cold-start → WS react → quote | `ETH_WS_URL` or `E2E_RPC_URL` |
+| [`flashblocks_latency_live`](examples/flashblocks_latency_live.rs) | Base Flashblocks vs canonical cache/quote latency | matching paid HTTP and WS endpoints |
 | [`factory_discovery_live`](examples/factory_discovery_live.rs) | discovery → cold-start → reactive | `E2E_RPC_URL` |
 | [`declarative_discovery`](examples/declarative_discovery.rs) | token-basket `PoolQuery` → `cold_start_many` | `E2E_RPC_URL` |
 | [`token_basket_bench`](examples/token_basket_bench.rs) | batched vs per-pair discovery timing | `E2E_RPC_URL` |

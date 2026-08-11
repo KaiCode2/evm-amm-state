@@ -364,9 +364,8 @@ fn report_cold_start_latency(rt: &Rt, url: &str) {
     cold_start(&mut reg, &mut cache);
     let elapsed = start.elapsed();
     eprintln!(
-        "\ncold_start/uniswap_v3 (one-time, NETWORK-BOUND): {:?} \
-         — depends on archive-node latency; amortized over all later offline quotes\n",
-        elapsed
+        "\ncold_start/uniswap_v3 (one-time, NETWORK-BOUND): {elapsed:?} \
+         — depends on archive-node latency; amortized over all later offline quotes\n"
     );
 }
 

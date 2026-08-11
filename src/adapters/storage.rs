@@ -38,10 +38,10 @@ pub const PANCAKE_V3_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]
 pub const SLIPSTREAM_SLOT0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
 
 /// Storage slot for Slipstream CL global liquidity.
-pub const SLIPSTREAM_LIQUIDITY_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
+pub const SLIPSTREAM_LIQUIDITY_SLOT: U256 = U256::from_limbs([16, 0, 0, 0]);
 
 /// Base storage slot for Slipstream CL `ticks` mapping.
-pub const SLIPSTREAM_TICKS_BASE_SLOT: U256 = U256::from_limbs([19, 0, 0, 0]);
+pub const SLIPSTREAM_TICKS_BASE_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
 
 /// Base storage slot for Slipstream CL `tickBitmap` mapping.
 pub const SLIPSTREAM_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([18, 0, 0, 0]);
@@ -107,7 +107,12 @@ impl V3StorageLayout {
         )
     }
 
-    /// Slipstream CL storage layout.
+    /// Deployed Aerodrome/Velodrome Slipstream CL core layout.
+    ///
+    /// This four-field descriptor covers only the common V3 geometry. Exact
+    /// event replay additionally validates a reviewed runtime identity and
+    /// applies Slipstream's fee, reward, gauge, staked-liquidity, oracle, and
+    /// six-word tick semantics.
     pub const fn slipstream(tick_spacing: i32) -> Self {
         Self::new(
             SLIPSTREAM_SLOT0_SLOT,
@@ -204,17 +209,34 @@ pub fn v3_tick_info_storage_keys(tick: i32) -> [U256; 4] {
 
 /// Compute the four storage keys occupied by a V3-style `Tick.Info` struct.
 pub fn v3_tick_info_storage_keys_with_base(tick: i32, ticks_slot: U256) -> [U256; 4] {
-    let tick_i256 = i256_from_i24(tick);
-    let mut preimage = [0u8; 64];
-    preimage[..32].copy_from_slice(&tick_i256);
-    preimage[32..64].copy_from_slice(&ticks_slot.to_be_bytes::<32>());
-    let base: U256 = keccak256(preimage).into();
+    let base = v3_tick_info_storage_base(tick, ticks_slot);
     [
         base,
         base + U256::from(1),
         base + U256::from(2),
         base + U256::from(3),
     ]
+}
+
+/// Compute the six storage keys occupied by deployed Slipstream `Tick.Info`.
+pub fn slipstream_tick_info_storage_keys_with_base(tick: i32, ticks_slot: U256) -> [U256; 6] {
+    let base = v3_tick_info_storage_base(tick, ticks_slot);
+    [
+        base,
+        base + U256::from(1),
+        base + U256::from(2),
+        base + U256::from(3),
+        base + U256::from(4),
+        base + U256::from(5),
+    ]
+}
+
+fn v3_tick_info_storage_base(tick: i32, ticks_slot: U256) -> U256 {
+    let tick_i256 = i256_from_i24(tick);
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&tick_i256);
+    preimage[32..64].copy_from_slice(&ticks_slot.to_be_bytes::<32>());
+    keccak256(preimage).into()
 }
 
 fn i256_from_i16(value: i16) -> [u8; 32] {

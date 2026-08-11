@@ -136,11 +136,11 @@ fn log_record(
             source: InputSource::Synthetic,
             chain_status: if removed {
                 ChainStatus::Reorged {
-                    dropped_from: block.clone(),
+                    dropped_from: block,
                 }
             } else {
                 ChainStatus::Included {
-                    block: block.clone(),
+                    block,
                     confirmations: 0,
                 }
             },

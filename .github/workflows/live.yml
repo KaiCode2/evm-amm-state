@@ -9,6 +9,14 @@ concurrency:
   group: stage10-live
   cancel-in-progress: false
 
+env:
+  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
+  CACHE_REF: 2be88d15fa15b5c44188b318463aa4705bb75aef
+  SEARCH_REF: 564d3d9ccbe260fd4d6606359ea0ddb639350acf
+
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: evm-amm-state
@@ -18,25 +26,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - uses: actions/checkout@v4
+      - name: Check out exact search candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-amm-search
+          ref: ${{ env.SEARCH_REF }}
           path: evm-amm-search
-      - uses: actions/checkout@v4
+      - name: Check out exact cache candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KaiCode2/evm-fork-cache
+          ref: ${{ env.CACHE_REF }}
           path: evm-fork-cache
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: |
-            evm-amm-state
-            evm-amm-search
+            evm-amm-state -> target
+            evm-amm-search -> target
 
       - name: Mainnet parity, WS health, and progressive route bootstrap
         env:

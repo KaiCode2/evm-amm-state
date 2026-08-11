@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Log};
 
+use super::quote_warmup::{QuoteReadSetLimits, QuoteWarmup};
 use super::{
     AdapterCache, AmmAdapter, CacheError, DeferredOutcome, DeferredWork, EventRoute, EventSource,
     PoolKey, PoolRegistration, ProtocolId, RepairAction, SimConfig,
 };
+use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
 
 /// Registry of tracked AMM pools and protocol adapters.
 #[derive(Clone)]
@@ -25,6 +27,14 @@ pub struct AdapterRegistry {
     /// [`with_sim_config`](Self::with_sim_config) to match what you pass to
     /// [`simulate_swap`](super::AmmAdapter::simulate_swap).
     pub(crate) sim_config: SimConfig,
+    /// Representative quote read sets learned against an exact canonical
+    /// baseline and replayed as offline speculative-readiness probes.
+    pub(crate) quote_read_sets: HashMap<QuoteWarmup, UpstreamStorageAccessList>,
+    /// Bound for each learned representative quote manifest.
+    pub(crate) quote_read_set_limits: QuoteReadSetLimits,
+    /// Once representative warming is enabled, every affected speculative pool
+    /// must have at least one learned quote manifest before it can be published.
+    pub(crate) quote_readiness_required: bool,
 }
 
 impl Default for AdapterRegistry {
@@ -34,6 +44,9 @@ impl Default for AdapterRegistry {
             pools: HashMap::new(),
             code_seeding: true,
             sim_config: SimConfig::default(),
+            quote_read_sets: HashMap::new(),
+            quote_read_set_limits: QuoteReadSetLimits::default(),
+            quote_readiness_required: false,
         }
     }
 }
@@ -63,8 +76,45 @@ impl AdapterRegistry {
     /// is the one you quote against; the default warms the canonical
     /// Ethereum-mainnet quoter/router.
     pub fn with_sim_config(mut self, config: SimConfig) -> Self {
+        if self.sim_config != config {
+            self.quote_read_sets.clear();
+        }
         self.sim_config = config;
         self
+    }
+
+    /// Set bounded dependency growth for representative quote manifests.
+    pub fn with_quote_read_set_limits(mut self, limits: QuoteReadSetLimits) -> Self {
+        self.quote_read_set_limits = limits;
+        self
+    }
+
+    /// Active representative quote dependency limits.
+    pub const fn quote_read_set_limits(&self) -> QuoteReadSetLimits {
+        self.quote_read_set_limits
+    }
+
+    /// Require representative quote readiness for speculative publications.
+    ///
+    /// Successful [`warm_quote_read_sets`](Self::warm_quote_read_sets) enables
+    /// this automatically. This setter is useful when constructing a registry
+    /// that must fail closed before its first warmup has completed.
+    pub const fn with_quote_readiness_required(mut self, required: bool) -> Self {
+        self.quote_readiness_required = required;
+        self
+    }
+
+    /// Whether affected speculative pools require learned quote manifests.
+    pub const fn quote_readiness_required(&self) -> bool {
+        self.quote_readiness_required
+    }
+
+    /// Whether the registry has any learned representative quote dependencies.
+    ///
+    /// Canonical runtimes use this as a cheap guard before inspecting the
+    /// published cache snapshot for newly learned speculative slots.
+    pub fn has_quote_read_sets(&self) -> bool {
+        !self.quote_read_sets.is_empty()
     }
 
     /// Register a pool. Errors [`RegistryError::DuplicatePool`] if its key is
@@ -85,6 +135,7 @@ impl AdapterRegistry {
     /// pool is untouched (`AmmSyncEngine::unregister_pools_evicting` also
     /// releases that).
     pub fn unregister_pool(&mut self, key: &PoolKey) -> Option<PoolRegistration> {
+        self.quote_read_sets.retain(|warmup, _| &warmup.pool != key);
         self.pools.remove(key)
     }
 
@@ -169,7 +220,25 @@ impl AdapterRegistry {
 
     /// A mutable borrow of the registration for `key`, if tracked.
     pub fn pool_mut(&mut self, key: &PoolKey) -> Option<&mut PoolRegistration> {
+        self.quote_read_sets.retain(|warmup, _| &warmup.pool != key);
         self.pools.get_mut(key)
+    }
+
+    /// Change only a pool's lifecycle status without invalidating learned quote
+    /// dependencies.
+    ///
+    /// Status transitions do not change code, metadata, storage layout, or
+    /// routing identity, so the representative quote manifests remain valid.
+    /// Full registration replacements continue to use [`Self::pool_mut`] and
+    /// invalidate them conservatively.
+    pub(crate) fn update_pool_status(
+        &mut self,
+        key: &PoolKey,
+        status: super::PoolStatus,
+    ) -> Option<PoolRegistration> {
+        let registration = self.pools.get_mut(key)?;
+        registration.status = status;
+        Some(registration.clone())
     }
 
     /// Iterate the tracked pool registrations.

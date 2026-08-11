@@ -2,15 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use alloy_network::{Ethereum, primitives::BlockResponse as _};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, Header as RpcHeader, Log as RpcLog};
 use evm_fork_cache::reactive::{
     AlloySubscriber, BlockInterest, BlockRef, ChainStatus, EventSubscriber, HandlerId, InputSource,
-    ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest,
-    SubscriberDriverPoll, SubscriberMode, SubscriberOwnerEpoch, SubscriberOwnerError,
-    SubscriberOwnerStart, SubscriberOwnerState,
+    PreconfirmationMode, ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
+    ReactiveInterest, SubscriberDriverPoll, SubscriberMode, SubscriberOwnerEpoch,
+    SubscriberOwnerError, SubscriberOwnerStart, SubscriberOwnerState,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -19,11 +20,31 @@ use super::{
     AmmRuntimeHandle, AmmStatePoint,
 };
 
+/// Policy for a data-quality rejection of one disposable preconfirmation.
+///
+/// Canonical invariants, subscriber transport errors, and runtime lifecycle
+/// failures are unaffected by this policy and always remain fatal. Only the
+/// typed [`AmmRuntimeCommandError::PreconfirmationBatch`] rejection may be
+/// discarded so a `Preferred` preview stream cannot tear down canonical
+/// delivery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AmmPreconfirmationRejectionPolicy {
+    /// Preserve the historical fail-closed behavior for required previews.
+    #[default]
+    FailDriver,
+    /// Discard the rejected preview and continue canonical delivery.
+    ///
+    /// Attachment rejects this policy unless the subscriber explicitly uses
+    /// [`PreconfirmationMode::Preferred`].
+    ContinueCanonical,
+}
+
 /// Configuration for the Alloy subscriber driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmmSubscriberDriverConfig {
     control_capacity: usize,
     max_addresses_per_get_logs: usize,
+    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
 }
 
 impl Default for AmmSubscriberDriverConfig {
@@ -31,6 +52,7 @@ impl Default for AmmSubscriberDriverConfig {
         Self {
             control_capacity: 32,
             max_addresses_per_get_logs: 256,
+            preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
         }
     }
 }
@@ -56,6 +78,20 @@ impl AmmSubscriberDriverConfig {
     /// Maximum addresses placed in one hash-pinned `eth_getLogs` request.
     pub const fn max_addresses_per_get_logs(&self) -> usize {
         self.max_addresses_per_get_logs
+    }
+
+    /// Select whether a rejected disposable preview terminates this driver.
+    pub const fn with_preconfirmation_rejection_policy(
+        mut self,
+        policy: AmmPreconfirmationRejectionPolicy,
+    ) -> Self {
+        self.preconfirmation_rejection_policy = policy;
+        self
+    }
+
+    /// Active rejected-preview policy.
+    pub const fn preconfirmation_rejection_policy(&self) -> AmmPreconfirmationRejectionPolicy {
+        self.preconfirmation_rejection_policy
     }
 }
 
@@ -86,6 +122,9 @@ pub enum AmmSubscriberDriverError {
     ZeroControlCapacity,
     /// Stage 4 complete-block delivery requires header-capable pubsub mode.
     UnsupportedMode,
+    /// Canonical continuation was paired with a subscriber mode that does not
+    /// permit disposable previews.
+    IncompatiblePreconfirmationPolicy,
     /// The driver task or its control channel is closed.
     Closed,
     /// The upstream subscriber rejected or failed an operation.
@@ -128,6 +167,10 @@ impl fmt::Display for AmmSubscriberDriverError {
             Self::UnsupportedMode => write!(
                 f,
                 "AMM subscriber driver requires Auto or PubSub header delivery"
+            ),
+            Self::IncompatiblePreconfirmationPolicy => write!(
+                f,
+                "canonical continuation requires Preferred preconfirmations"
             ),
             Self::Closed => write!(f, "AMM subscriber driver is closed"),
             Self::Subscriber(error) => write!(f, "AMM subscriber failed: {error}"),
@@ -500,7 +543,7 @@ impl PendingSubscriberTransaction {
 
 pub(crate) fn spawn_alloy_subscriber<P>(
     runtime: AmmRuntimeHandle,
-    mut subscriber: AlloySubscriber<P, Ethereum>,
+    subscriber: AlloySubscriber<P, Ethereum>,
     config: AmmSubscriberDriverConfig,
 ) -> Result<(AmmSubscriberControl, AmmSubscriberDriverHandle), AmmSubscriberDriverError>
 where
@@ -512,6 +555,12 @@ where
     if subscriber.mode() == SubscriberMode::Polling {
         return Err(AmmSubscriberDriverError::UnsupportedMode);
     }
+    if config.preconfirmation_rejection_policy
+        == AmmPreconfirmationRejectionPolicy::ContinueCanonical
+        && subscriber.config().preconfirmations != PreconfirmationMode::Preferred
+    {
+        return Err(AmmSubscriberDriverError::IncompatiblePreconfirmationPolicy);
+    }
     let mut base_interests = subscriber.registered_interests().to_vec();
     if !base_interests
         .iter()
@@ -519,8 +568,6 @@ where
     {
         base_interests.push(ReactiveInterest::Blocks(BlockInterest::default()));
     }
-    subscriber.register_interests(&base_interests)?;
-
     let (command_tx, command_rx) = mpsc::channel(config.control_capacity);
     let (state_tx, state_rx) = watch::channel(AmmSubscriberDriverState::Paused);
     let canonical_lineage = initial_canonical_lineage(runtime.latest_snapshot().point());
@@ -530,6 +577,7 @@ where
     let actor = AlloyAmmSubscriberDriver {
         runtime,
         subscriber,
+        initial_interests: base_interests,
         commands: command_rx,
         state: state_tx,
         paused: true,
@@ -538,6 +586,7 @@ where
         pending: None,
         next_transaction: 0,
         max_addresses_per_get_logs: config.max_addresses_per_get_logs,
+        preconfirmation_rejection_policy: config.preconfirmation_rejection_policy,
         report_stop: true,
         stop_requested: false,
         canonical_lineage,
@@ -555,6 +604,7 @@ where
 struct AlloyAmmSubscriberDriver<P> {
     runtime: AmmRuntimeHandle,
     subscriber: AlloySubscriber<P, Ethereum>,
+    initial_interests: Vec<ReactiveInterest<Ethereum>>,
     commands: mpsc::Receiver<SubscriberControlCommand>,
     state: watch::Sender<AmmSubscriberDriverState>,
     paused: bool,
@@ -563,6 +613,7 @@ struct AlloyAmmSubscriberDriver<P> {
     pending: Option<PendingSubscriberTransaction>,
     next_transaction: u64,
     max_addresses_per_get_logs: usize,
+    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
     report_stop: bool,
     stop_requested: bool,
     canonical_lineage: BTreeMap<u64, alloy_primitives::B256>,
@@ -574,12 +625,34 @@ fn initial_canonical_lineage(point: AmmStatePoint) -> BTreeMap<u64, alloy_primit
     BTreeMap::from([(point.block_number(), point.block_hash())])
 }
 
+fn handle_preconfirmation_result<T>(
+    policy: AmmPreconfirmationRejectionPolicy,
+    result: Result<T, AmmRuntimeCommandError>,
+) -> Result<(), AmmSubscriberDriverError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(AmmRuntimeCommandError::PreconfirmationBatch(_))
+            if policy == AmmPreconfirmationRejectionPolicy::ContinueCanonical =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl<P> AlloyAmmSubscriberDriver<P>
 where
     P: Provider<Ethereum> + Clone + Send + Sync + 'static,
 {
     async fn run(mut self) {
-        let result = self.run_inner().await;
+        let result = match self
+            .subscriber
+            .register_interests(&self.initial_interests)
+            .await
+        {
+            Ok(()) => self.run_inner().await,
+            Err(error) => Err(error.into()),
+        };
         let message = match result {
             Err(error) => {
                 let message = error.to_string();
@@ -820,7 +893,7 @@ where
         let replacement = match self.subscriber.stage_interest_owner_replacement(
             plan.owner().clone(),
             plan.interests(),
-            SubscriberOwnerStart::PostBlock(block.clone()),
+            SubscriberOwnerStart::PostBlock(block),
         ) {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -963,7 +1036,7 @@ where
             let epoch = match self.subscriber.stage_interest_owner(
                 plan.owner().clone(),
                 plan.interests(),
-                SubscriberOwnerStart::PostBlock(block.clone()),
+                SubscriberOwnerStart::PostBlock(block),
             ) {
                 Ok(epoch) => epoch,
                 Err(error) => {
@@ -1002,6 +1075,31 @@ where
         &mut self,
         batch: evm_fork_cache::reactive::SubscriberInputBatch<Ethereum>,
     ) -> Result<(), AmmSubscriberDriverError> {
+        // `SubscriberInputBatch` is already the typed domain form at this
+        // boundary. Preserve this ingress across canonical reconciliation so
+        // provider wait is included instead of resetting latency downstream.
+        let source_ingress = Instant::now();
+        let decoded_after_ingress = Duration::ZERO;
+        if batch.preconfirmation_invalidated() {
+            self.runtime.invalidate_preconfirmation().await?;
+            if batch.records().is_empty() && batch.chain_controls().is_empty() {
+                return Ok(());
+            }
+        }
+        if !batch.records().is_empty()
+            && batch
+                .records()
+                .iter()
+                .all(|record| record.scope().is_preconfirmed())
+        {
+            handle_preconfirmation_result(
+                self.preconfirmation_rejection_policy,
+                self.runtime
+                    .ingest_preconfirmation(batch.into_reactive_batch())
+                    .await,
+            )?;
+            return Ok(());
+        }
         let mut headers = Vec::new();
         for scoped in batch.into_records() {
             if !scoped.scope().is_canonical() {
@@ -1017,12 +1115,24 @@ where
         }
         headers.sort_by_key(|header| header.inner.number);
         for header in headers {
-            self.deliver_through(header).await?;
+            self.deliver_through_with_timing(header, source_ingress, decoded_after_ingress)
+                .await?;
         }
         Ok(())
     }
 
     async fn deliver_through(&mut self, header: RpcHeader) -> Result<(), AmmSubscriberDriverError> {
+        let source_ingress = Instant::now();
+        self.deliver_through_with_timing(header, source_ingress, Duration::ZERO)
+            .await
+    }
+
+    async fn deliver_through_with_timing(
+        &mut self,
+        header: RpcHeader,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+    ) -> Result<(), AmmSubscriberDriverError> {
         let current = self.runtime.latest_snapshot().point();
         if header.inner.number == current.block_number() && header.hash == current.block_hash() {
             return Ok(());
@@ -1030,7 +1140,8 @@ where
         for header in self.delivery_lineage(header).await? {
             let number = header.inner.number;
             let hash = header.hash;
-            self.reconcile_and_deliver(header).await?;
+            self.reconcile_and_deliver_with_timing(header, source_ingress, decoded_after_ingress)
+                .await?;
             self.record_canonical_block(number, hash);
         }
         Ok(())
@@ -1103,9 +1214,21 @@ where
         }
     }
 
+    #[cfg(all(test, feature = "uniswap-v2"))]
     async fn reconcile_and_deliver(
         &mut self,
         header: RpcHeader,
+    ) -> Result<(), AmmSubscriberDriverError> {
+        let source_ingress = Instant::now();
+        self.reconcile_and_deliver_with_timing(header, source_ingress, Duration::ZERO)
+            .await
+    }
+
+    async fn reconcile_and_deliver_with_timing(
+        &mut self,
+        header: RpcHeader,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
@@ -1154,21 +1277,23 @@ where
                     chain_id: Some(point.chain_id()),
                     source: InputSource::Batch,
                     chain_status: ChainStatus::Included {
-                        block: block.clone(),
+                        block,
                         confirmations: 0,
                     },
-                    block: Some(block.clone()),
+                    block: Some(block),
                     transaction_index: log.transaction_index,
                     log_index: log.log_index,
                 };
                 ReactiveInputRecord::new(ReactiveInput::Log(log), context)
             })
             .collect();
-        let batch = AmmCanonicalBatch::from_verified_block(
+        let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
             header,
             self.interest_revision,
             ReactiveInputBatch::new(records),
+            source_ingress,
+            decoded_after_ingress,
         )?;
         self.ingest_while_servicing_controls(batch).await?;
         if self.stop_requested {
@@ -1286,6 +1411,7 @@ fn reconciliation_filters(filters: &[Filter], max_addresses: usize) -> Vec<Filte
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use alloy_consensus::Header as ConsensusHeader;
     use alloy_network::Ethereum;
@@ -1305,8 +1431,9 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        AlloyAmmSubscriberDriver, AmmSubscriberControl, AmmSubscriberDriverState,
-        AmmSubscriberOwnerPlan, SubscriberControlCommand, SubscriberTransaction,
+        AlloyAmmSubscriberDriver, AmmPreconfirmationRejectionPolicy, AmmSubscriberControl,
+        AmmSubscriberDriverConfig, AmmSubscriberDriverState, AmmSubscriberOwnerPlan,
+        SubscriberControlCommand, SubscriberTransaction, handle_preconfirmation_result,
         initial_canonical_lineage, reconciliation_filters,
     };
     use crate::adapters::{
@@ -1317,6 +1444,119 @@ mod tests {
         PoolStateDependencies, PoolStatus, ProtocolId, UniswapV2Adapter,
         uniswap_v2_pair_runtime_code_hash,
     };
+
+    #[test]
+    fn preferred_preview_rejection_continues_canonical_delivery() {
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+            Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                "quote call reverted or halted".to_owned(),
+            )),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preferred_preview_policy_keeps_runtime_failures_fatal() {
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::ContinueCanonical,
+            Err(AmmRuntimeCommandError::Closed),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn preview_rejections_remain_fatal_by_default() {
+        assert_eq!(
+            AmmSubscriberDriverConfig::default().preconfirmation_rejection_policy(),
+            AmmPreconfirmationRejectionPolicy::FailDriver
+        );
+        let result = handle_preconfirmation_result::<()>(
+            AmmPreconfirmationRejectionPolicy::FailDriver,
+            Err(AmmRuntimeCommandError::PreconfirmationBatch(
+                "quote call reverted or halted".to_owned(),
+            )),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscriber_commit_timing_preserves_ingress_across_reconciliation() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let mut cache = setup_cache().await;
+                cache.advance_block(&baseline_header)?;
+                let runtime = AmmRuntime::spawn(
+                    cache,
+                    AdapterRegistry::new(),
+                    AmmRuntimeBaseline::from_verified_header(1, baseline_header.clone())?,
+                    AmmRuntimeConfig::default(),
+                )?;
+                let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+                let subscriber = AlloySubscriber::new(
+                    provider,
+                    SubscriberMode::Polling,
+                    SubscriberConfig::default(),
+                );
+                let (command_tx, command_rx) = mpsc::channel(4);
+                let (state, _) = watch::channel(AmmSubscriberDriverState::Paused);
+                let control = AmmSubscriberControl {
+                    commands: command_tx,
+                };
+                let mut driver = AlloyAmmSubscriberDriver {
+                    runtime: runtime.clone(),
+                    subscriber,
+                    initial_interests: Vec::new(),
+                    commands: command_rx,
+                    state,
+                    paused: true,
+                    interest_revision: 0,
+                    owners: HashMap::new(),
+                    pending: None,
+                    next_transaction: 0,
+                    max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
+                    report_stop: true,
+                    stop_requested: false,
+                    canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                };
+                let attach = runtime.attach_subscriber_control(control);
+                tokio::pin!(attach);
+                tokio::select! {
+                    result = &mut attach => result?,
+                    command = driver.commands.recv() => {
+                        driver.handle_control(command.expect("adoption command")).await?;
+                        attach.await?;
+                    }
+                }
+
+                let mut commits = runtime.subscribe_changes().await?;
+                let source_ingress = Instant::now();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                driver
+                    .reconcile_and_deliver_with_timing(
+                        header(501, baseline_header.hash),
+                        source_ingress,
+                        Duration::ZERO,
+                    )
+                    .await?;
+                let commit = commits.next_commit().await.expect("canonical commit");
+                let timing = commit.timing().expect("canonical timing provenance");
+                assert_eq!(timing.source_ingress(), source_ingress);
+                assert!(timing.elapsed_to_commit() >= Duration::from_millis(5));
+                assert!(timing.decoded_after_ingress() <= timing.ordered_after_ingress());
+                assert!(timing.ordered_after_ingress() <= timing.transitioned_after_ingress());
+                assert!(timing.transitioned_after_ingress() <= timing.committed_after_ingress());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
 
     struct EmptyAdapter;
 
@@ -1410,7 +1650,7 @@ mod tests {
                 chain_id: Some(1),
                 source: InputSource::Synthetic,
                 chain_status: ChainStatus::Included {
-                    block: block.clone(),
+                    block,
                     confirmations: 0,
                 },
                 block: Some(block),
@@ -1828,7 +2068,9 @@ mod tests {
                 worker.shutdown();
 
                 let reconciliation = Asserter::new();
-                reconciliation.push_success(&U256::from(1));
+                reconciliation.push_success(&U256::from(1)); // eth_chainId
+                reconciliation.push_success(&U256::from(1)); // eth_newFilter
+                reconciliation.push_success(&U256::from(2)); // eth_newFilter
                 let canonical_block: Block = Block::empty(header(501, baseline_header.hash));
                 reconciliation.push_success(&Some(canonical_block.clone()));
                 reconciliation.push_success(&Some(canonical_block));
@@ -1847,6 +2089,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: true,
@@ -1855,6 +2098,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
@@ -1927,6 +2171,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: true,
@@ -1935,6 +2180,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
@@ -2009,6 +2255,7 @@ mod tests {
                 let mut driver = AlloyAmmSubscriberDriver {
                     runtime: runtime.clone(),
                     subscriber,
+                    initial_interests: Vec::new(),
                     commands: command_rx,
                     state,
                     paused: false,
@@ -2017,6 +2264,7 @@ mod tests {
                     pending: None,
                     next_transaction: 0,
                     max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),

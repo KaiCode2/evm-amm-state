@@ -17,9 +17,9 @@ use alloy_network::Ethereum;
 use alloy_primitives::{Address, U256};
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::reactive::{
-    HandlerId, ReactiveBatchReport, ReactiveConfig, ReactiveError, ReactiveInputBatch,
-    ReactiveInterest, ReactiveReport, ReactiveRuntime, RegisterError, ResyncFailure, ResyncId,
-    ResyncRequest, ResyncTarget,
+    ChainStatus, FlashblockRef, HandlerId, ReactiveBatchReport, ReactiveConfig, ReactiveError,
+    ReactiveInputBatch, ReactiveInterest, ReactiveReport, ReactiveRuntime, RegisterError,
+    ResyncFailure, ResyncId, ResyncRequest, ResyncTarget,
 };
 
 use super::{
@@ -28,8 +28,10 @@ use super::{
     AmmPoolReactiveHandlerError, AmmReactiveRoutingContext, AmmReactiveSignal, OwnerRuntimeState,
     PoolGeneration, PoolInstanceId, PoolKey, PoolOwnership, PoolRegistration, PoolRuntimeState,
     PoolStateDependencies, PoolStatus, RegistryError, RepairAction, RuntimeLifecycleMap,
-    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StateSlot, UpdateQuality,
+    RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, SlipstreamFeeEvidenceInsertOutcome,
+    SlipstreamSwapFeeEvidence, StateSlot, UpdateQuality,
 };
+use super::{QuoteReadSetHydrationReport, QuoteReadinessReport, QuoteWarmupError};
 
 /// Error constructing or running [`AmmSyncEngine`].
 ///
@@ -607,6 +609,12 @@ pub struct AmmSyncBatchReport {
     /// Full upstream reactive report, including applied effects and resync
     /// details.
     pub reactive: ReactiveBatchReport<Ethereum>,
+    /// Flashblock represented by this disposable preview, or `None` for a
+    /// canonical ingest.
+    ///
+    /// Preconfirmed reports expose fast quote-relevant pool changes but never
+    /// mutate canonical pool health, repair ownership, or lifecycle state.
+    pub preconfirmation: Option<FlashblockRef>,
     /// Canonically ordered pools whose state or search eligibility changed.
     ///
     /// Attribution is derived after direct effects, authoritative resyncs, and
@@ -647,6 +655,11 @@ pub struct AmmSyncBatchReport {
 }
 
 impl AmmSyncBatchReport {
+    /// Flashblock provenance when this report describes speculative state.
+    pub const fn preconfirmation(&self) -> Option<&FlashblockRef> {
+        self.preconfirmation.as_ref()
+    }
+
     /// Typed adapter repair signals available to higher-level orchestration.
     ///
     /// This is additive observability: repair effects already lowered into the
@@ -726,9 +739,70 @@ impl AmmSyncEngine {
         &self.registry
     }
 
+    /// Inject effective dynamic-fee evidence for one exact Slipstream event.
+    ///
+    /// Callers derive this from their canonical transaction/state pipeline
+    /// before ingesting the corresponding log. The event callback performs no
+    /// provider read or local EVM execution.
+    pub fn inject_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> SlipstreamFeeEvidenceInsertOutcome {
+        self.routing.inject_slipstream_fee_evidence(evidence)
+    }
+
+    /// Remove one exact Slipstream fee-evidence record.
+    pub fn remove_slipstream_fee_evidence(
+        &self,
+        evidence: SlipstreamSwapFeeEvidence,
+    ) -> Option<SlipstreamSwapFeeEvidence> {
+        self.routing.remove_slipstream_fee_evidence(evidence)
+    }
+
+    /// Drop retained Slipstream fee evidence older than `minimum_block`.
+    pub fn prune_slipstream_fee_evidence(&self, chain_id: u64, minimum_block: u64) -> usize {
+        self.routing
+            .prune_slipstream_fee_evidence(chain_id, minimum_block)
+    }
+
+    /// At one reorged height, retain only evidence for the canonical block hash.
+    pub fn retain_slipstream_fee_evidence_for_block(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        canonical_hash: alloy_primitives::B256,
+    ) -> usize {
+        self.routing.retain_slipstream_fee_evidence_for_block(
+            chain_id,
+            block_number,
+            canonical_hash,
+        )
+    }
+
+    /// Replay learned representative quotes against one RPC-disconnected cache
+    /// snapshot before publishing speculative state.
+    pub fn validate_quote_read_sets<'a>(
+        &mut self,
+        snapshot: Arc<evm_fork_cache::cache::EvmSnapshot>,
+        pools: impl IntoIterator<Item = &'a PoolKey>,
+    ) -> Result<QuoteReadinessReport, QuoteWarmupError> {
+        self.registry.validate_quote_read_sets(snapshot, pools)
+    }
+
+    /// Refresh every learned representative quote dependency at the cache's
+    /// exact canonical block pin.
+    pub fn hydrate_quote_read_sets(&mut self, cache: &mut EvmCache) -> QuoteReadSetHydrationReport {
+        self.registry.hydrate_quote_read_sets(cache)
+    }
+
     /// Number of active registrations whose current status is degraded.
     pub const fn degraded_pool_count(&self) -> usize {
         self.degraded_pool_count
+    }
+
+    /// Discard the active Flashblock preview and restore canonical cache state.
+    pub fn discard_preconfirmation(&mut self, cache: &mut EvmCache) {
+        self.runtime.discard_preconfirmation(cache);
     }
 
     /// Whether an active degraded registration exists other than `excluded`.
@@ -802,6 +876,16 @@ impl AmmSyncEngine {
     /// Current reactive runtime.
     pub fn runtime(&self) -> &ReactiveRuntime<Ethereum> {
         &self.runtime
+    }
+
+    /// Install the verified canonical starting point owned by the asynchronous
+    /// runtime before any speculative input can be accepted.
+    #[cfg(feature = "live-runtime")]
+    pub(crate) fn adopt_canonical_baseline(
+        &mut self,
+        baseline: evm_fork_cache::reactive::BlockRef,
+    ) -> Result<(), evm_fork_cache::reactive::ReactiveBaselineError> {
+        self.runtime.adopt_canonical_baseline(baseline)
     }
 
     /// Replace the registry and rebuild the underlying handler registration.
@@ -1898,6 +1982,26 @@ impl AmmSyncEngine {
         reactive: ReactiveBatchReport<Ethereum>,
         defer_repairs: bool,
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
+        if let Some(flashblock) = report_preconfirmation(&reactive) {
+            let pool_changes = sync_pool_changes(&self.ownership, &reactive, &[], &[], &[]);
+            let affected_pools = pool_changes
+                .iter()
+                .map(|change| change.pool.clone())
+                .collect();
+            return Ok(AmmSyncBatchReport {
+                resync_state_updates: resync_state_update_count(&reactive),
+                resync_failures: resync_failure_count(&reactive),
+                pending_repairs: collect_pending_repairs(&reactive),
+                reactive,
+                preconfirmation: Some(flashblock),
+                affected_pools,
+                pool_changes,
+                incidents: Vec::new(),
+                requires_full_refresh: false,
+                degraded_pools: Vec::new(),
+                recovered_pools: Vec::new(),
+            });
+        }
         if reactive
             .reports
             .iter()
@@ -1989,6 +2093,7 @@ impl AmmSyncEngine {
 
         Ok(AmmSyncBatchReport {
             reactive,
+            preconfirmation: None,
             affected_pools,
             pool_changes,
             incidents,
@@ -2276,27 +2381,30 @@ impl AmmSyncEngine {
     }
 
     fn set_pool_status(&mut self, key: &PoolKey, status: PoolStatus) -> bool {
-        let Some(registration) = self.registry.pool_mut(key) else {
+        let Some(previous_status) = self.registry.pool(key).map(|pool| pool.status) else {
             return false;
         };
         match (
-            registration.status == PoolStatus::Degraded,
+            previous_status == PoolStatus::Degraded,
             status == PoolStatus::Degraded,
         ) {
             (false, true) => self.degraded_pool_count = self.degraded_pool_count.saturating_add(1),
             (true, false) => self.degraded_pool_count = self.degraded_pool_count.saturating_sub(1),
             _ => {}
         }
-        registration.status = status;
-        let routing_registration = registration.clone();
+        let registration = self
+            .registry
+            .update_pool_status(key, status)
+            .expect("pool existence was checked before its status update");
         debug_assert!(
-            self.routing.update_pool(routing_registration),
+            self.routing.update_pool_status(key, status),
             "active pool status must exist in the routing registry"
         );
         if let Some(instance) = self.ownership.active_pool(key).cloned() {
             self.lifecycles
                 .set_pool(instance, pool_runtime_state(status));
         }
+        debug_assert_eq!(registration.status, status);
         true
     }
 }
@@ -2471,6 +2579,33 @@ fn sync_pool_changes(
     }
 
     changes.into_values().collect()
+}
+
+fn report_preconfirmation(report: &ReactiveBatchReport<Ethereum>) -> Option<FlashblockRef> {
+    let mut flashblock = None;
+    for input in report
+        .reports
+        .iter()
+        .filter_map(|report| match report.as_ref() {
+            ReactiveReport::Input(input) => Some(input),
+            _ => None,
+        })
+    {
+        let ChainStatus::Preconfirmed {
+            flashblock: current,
+        } = &input.context.chain_status
+        else {
+            continue;
+        };
+        debug_assert!(
+            flashblock
+                .as_ref()
+                .is_none_or(|existing: &FlashblockRef| existing == current.as_ref()),
+            "one reactive batch must represent exactly one Flashblock snapshot"
+        );
+        flashblock.get_or_insert_with(|| current.as_ref().clone());
+    }
+    flashblock
 }
 
 fn collect_pending_repairs(report: &ReactiveBatchReport<Ethereum>) -> Vec<AmmPendingRepair> {
@@ -3003,7 +3138,7 @@ mod tests {
     use super::super::{
         AdapterEvent, AdapterEventKind, AdapterEventResult, AdapterGeneration, AdapterInstanceId,
         AdapterKey, AdapterRegistry, AmmAdapter, CustomPoolKey, EventSource, PoolStatus,
-        ProtocolId, RepairAction, StateUpdate, StateView, UpdateQuality,
+        ProtocolId, QuoteWarmup, RepairAction, StateUpdate, StateView, UpdateQuality,
     };
     use super::*;
 
@@ -3076,6 +3211,54 @@ mod tests {
             vec![work]
         );
         assert_eq!(ownership.resync_owner(&resync), Some(&instance));
+    }
+
+    #[test]
+    fn status_transition_preserves_quote_read_sets_in_both_registries() {
+        let address = Address::repeat_byte(0x70);
+        let key = PoolKey::Custom(CustomPoolKey::Address {
+            protocol: FENCE_PROTOCOL,
+            address,
+        });
+        let warmup = QuoteWarmup::exact_input(
+            key.clone(),
+            Address::repeat_byte(0x71),
+            Address::repeat_byte(0x72),
+            U256::from(1_000_u64),
+        );
+        let mut registry = AdapterRegistry::new();
+        registry
+            .register_adapter(Arc::new(FenceAdapter {
+                topic: B256::repeat_byte(0x73),
+                slot: U256::from(3),
+            }))
+            .unwrap();
+        registry
+            .register_pool(
+                PoolRegistration::new(key.clone())
+                    .with_state_address(address)
+                    .with_status(PoolStatus::Ready),
+            )
+            .unwrap();
+        registry.quote_read_sets.insert(
+            warmup,
+            evm_fork_cache::access_set::StorageAccessList::default(),
+        );
+
+        let mut engine = AmmSyncEngine::new(registry).unwrap();
+        assert!(engine.set_pool_status(&key, PoolStatus::Degraded));
+
+        assert!(engine.registry.has_quote_read_set(&key));
+        assert_eq!(
+            engine.registry.pool(&key).map(|pool| pool.status),
+            Some(PoolStatus::Degraded)
+        );
+        let routing = engine.routing.registry();
+        assert!(routing.has_quote_read_set(&key));
+        assert_eq!(
+            routing.pool(&key).map(|pool| pool.status),
+            Some(PoolStatus::Degraded)
+        );
     }
 
     #[test]
@@ -3490,7 +3673,7 @@ mod tests {
                 chain_id: Some(1),
                 source: InputSource::Synthetic,
                 chain_status: ChainStatus::Included {
-                    block: block.clone(),
+                    block,
                     confirmations: 0,
                 },
                 block: Some(block),
@@ -3609,10 +3792,10 @@ mod tests {
                     chain_id: Some(1),
                     source: InputSource::Synthetic,
                     chain_status: ChainStatus::Included {
-                        block: canonical_block.clone(),
+                        block: canonical_block,
                         confirmations: 0,
                     },
-                    block: Some(canonical_block.clone()),
+                    block: Some(canonical_block),
                     transaction_index: Some(0),
                     log_index: Some(0),
                 },
@@ -3637,7 +3820,7 @@ mod tests {
         let mut removed_log = canonical_log;
         removed_log.removed = true;
         let conflict_block = BlockRef {
-            number: 2,
+            number: 1,
             hash: B256::repeat_byte(2),
             parent_hash: Some(B256::ZERO),
             timestamp: Some(2),
@@ -3665,7 +3848,7 @@ mod tests {
                             chain_id: Some(1),
                             source: InputSource::Synthetic,
                             chain_status: ChainStatus::Reorged {
-                                dropped_from: canonical_block.clone(),
+                                dropped_from: canonical_block,
                             },
                             block: Some(canonical_block),
                             transaction_index: Some(0),
@@ -3678,7 +3861,7 @@ mod tests {
                             chain_id: Some(1),
                             source: InputSource::Synthetic,
                             chain_status: ChainStatus::Included {
-                                block: conflict_block.clone(),
+                                block: conflict_block,
                                 confirmations: 0,
                             },
                             block: Some(conflict_block),
@@ -3690,10 +3873,13 @@ mod tests {
             )
             .expect_err("the later input must fail after reorg recovery mutates the cache");
 
-        assert!(matches!(
-            error,
-            AmmSyncError::Reactive(ReactiveError::ConflictingEffects { .. })
-        ));
+        assert!(
+            matches!(
+                &error,
+                AmmSyncError::Reactive(ReactiveError::ConflictingEffects { .. })
+            ),
+            "unexpected ingest error: {error:?}"
+        );
         assert_eq!(
             cache.cached_storage_value(pool, slot),
             None,

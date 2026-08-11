@@ -5,32 +5,57 @@ use super::cold_start::{
 };
 use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    QuoteExactInputSingleParams, SimConfig, SimError, SwapQuote,
-    quote_via_call_with_code_overrides_from, quoteExactInputSingleCall,
+    ISlipstreamQuoter, QuoteExactInputSingleParams, SimConfig, SimError,
+    SlipstreamQuoteExactInputSingleParams, SwapQuote, quote_via_call_with_code_overrides_from,
+    quoteExactInputSingleCall,
+};
+use super::v3_transition::{
+    DecodedSwap, derive_slipstream_swap, derive_uniswap_v3_swap, infer_slipstream_swap_fee,
 };
 use super::{
-    AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
-    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata,
-    RepairAction, SlotChange, StateDiff, StateSlot, StateUpdate, StateView, UnsupportedReason,
-    UpdateQuality, V3Metadata,
+    AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind,
+    AdapterEventResult, AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport,
+    DeferredWork, EventSource, PoolRegistration, PoolStateDependencies, PoolStatus, ProtocolId,
+    ProtocolMetadata, PurgeScope, RepairAction, SlipstreamRuntimeFamily,
+    SlipstreamSnapshotIdentity, SlipstreamUnstakedFeeEvaluation,
+    SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof, SlotChange, StateDiff,
+    StateSlot, StateUpdate, StateView, UnsupportedReason, UpdateQuality, V3Metadata,
+    V3SwapTransitionCapability,
 };
 use crate::adapters::storage::{
-    V3StorageLayout, layout_for, v3_tick_bitmap_storage_key_with_base,
-    v3_tick_info_storage_keys_with_base, v3_word_position,
+    V3StorageLayout, layout_for, slipstream_tick_info_storage_keys_with_base,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
-use alloy_primitives::{Address, B256, Bytes, Log, U256, aliases::U24};
+use alloy_primitives::{
+    Address, B256, Bytes, Log, U256,
+    aliases::{I24, U24},
+    keccak256,
+};
 use alloy_sol_types::{SolCall, SolEvent};
+use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+use revm::context::result::ExecutionResult;
+use std::{collections::BTreeSet, sync::Arc};
 
 /// `sol!`-generated pool event bindings (crate-internal, not public API).
 mod abi {
     alloy_sol_types::sol! {
+        event Initialize(uint160 sqrtPriceX96, int24 tick);
         event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
         event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+        event Collect(address indexed owner, address recipient, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount0, uint128 amount1);
         event Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+        event Flash(address indexed sender, address indexed recipient, uint256 amount0, uint256 amount1, uint256 paid0, uint256 paid1);
+        event IncreaseObservationCardinalityNext(uint16 observationCardinalityNextOld, uint16 observationCardinalityNextNew);
+        event SetFeeProtocol(uint8 feeProtocol0Old, uint8 feeProtocol1Old, uint8 feeProtocol0New, uint8 feeProtocol1New);
+        event CollectProtocol(address indexed sender, address indexed recipient, uint128 amount0, uint128 amount1);
     }
 }
-use abi::{Burn, Mint, Swap};
+use abi::{
+    Burn, Collect, CollectProtocol, Flash, IncreaseObservationCardinalityNext, Initialize, Mint,
+    SetFeeProtocol, Swap,
+};
+
+const SLOT0_TICK_SHIFT: usize = 160;
 
 /// PancakeSwap V3 `Swap` appends `protocolFeesToken0`/`protocolFeesToken1`
 /// (`uint128`) to the Uniswap V3 event, so its `topic0` differs (`0x19b47279…`
@@ -47,9 +72,6 @@ mod pancake_v3 {
     }
 }
 use pancake_v3::Swap as PancakeV3Swap;
-
-const SLOT0_PRICE_TICK_BITS: usize = 184;
-const SLOT0_TICK_SHIFT: usize = 160;
 
 /// Minimal runtime that ABI-returns `true` for any call.
 ///
@@ -87,12 +109,13 @@ const V3_MAX_TICK: i32 = 887272;
 /// refinement; this single named constant is the tuning knob until then.
 pub(crate) const V3_TICK_WORD_RADIUS: i16 = 2;
 
-/// Adapter for the Uniswap V3 storage-layout family.
+/// Adapter for the Uniswap V3 concentrated-liquidity family.
 ///
-/// A single instance serves Uniswap V3, Pancake V3, and Slipstream: those
-/// protocols differ only in storage-slot offsets, which `layout_for` resolves
-/// per-pool from the registration metadata. The struct is registered once and
-/// claims all three ids via [`AmmAdapter::protocols`].
+/// A single instance routes Uniswap V3, Pancake V3, and Slipstream and resolves
+/// their configured storage layouts. Layout similarity is not semantic parity:
+/// only canonical Uniswap V3 currently supports exact event-only `Swap`
+/// transitions. Pancake and Slipstream swaps invalidate stale state and request
+/// repair until each family has independent deployed-runtime parity evidence.
 #[derive(Clone, Debug, Default)]
 pub struct ConcentratedLiquidityAdapter {
     _private: (),
@@ -114,16 +137,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
         pool.key
             .address()
-            .map(|address| {
-                EventSource::direct(
-                    address,
-                    vec![
-                        swap_topic_for(pool.protocol()),
-                        Mint::SIGNATURE_HASH,
-                        Burn::SIGNATURE_HASH,
-                    ],
-                )
-            })
+            .map(|address| EventSource::direct(address, v3_mutating_event_topics(pool.protocol())))
             .into_iter()
             .collect()
     }
@@ -182,8 +196,23 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         // constant when the field (or the metadata) is absent.
         let radius = v3_warm_word_radius(pool).unwrap_or(V3_TICK_WORD_RADIUS);
 
+        let exact_surface = if pool.protocol() == ProtocolId::UniswapV3
+            && layout == V3StorageLayout::uniswap(layout.tick_spacing)
+        {
+            V3ColdStartExactSurface::CanonicalUniswap
+        } else if pool.protocol() == ProtocolId::Slipstream
+            && layout == V3StorageLayout::slipstream(layout.tick_spacing)
+        {
+            V3ColdStartExactSurface::Slipstream
+        } else {
+            V3ColdStartExactSurface::None
+        };
         Ok(Box::new(UniswapV3ColdStartPlanner::new(
-            address, layout, policy, radius,
+            address,
+            layout,
+            policy,
+            radius,
+            exact_surface,
         )))
     }
 
@@ -227,16 +256,42 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             return AdapterEventResult::ignored();
         };
 
-        if topic0 == Swap::SIGNATURE_HASH {
-            self.decode_swap(pool, log, topic0, SwapAbi::Uniswap)
-        } else if topic0 == PancakeV3Swap::SIGNATURE_HASH {
-            self.decode_swap(pool, log, topic0, SwapAbi::Pancake)
+        if topic0 == Swap::SIGNATURE_HASH || topic0 == PancakeV3Swap::SIGNATURE_HASH {
+            self.decode_swap_without_context(pool, log, topic0)
         } else if topic0 == Mint::SIGNATURE_HASH {
             self.decode_liquidity_event(pool, log, view, true)
         } else if topic0 == Burn::SIGNATURE_HASH {
             self.decode_liquidity_event(pool, log, view, false)
+        } else if canonical_v3_non_swap_mutation_topics().contains(&topic0) {
+            self.decode_non_swap_mutation(pool, log, topic0)
         } else {
             AdapterEventResult::ignored()
+        }
+    }
+
+    fn decode_event_with_context(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        let Some(topic0) = log.topics().first().copied() else {
+            return AdapterEventResult::ignored();
+        };
+
+        if topic0 == Swap::SIGNATURE_HASH {
+            if Self::swap_transition_capability_with_context(pool, context)
+                == V3SwapTransitionCapability::Exact
+            {
+                self.decode_swap_exact(pool, log, topic0, view, context)
+            } else {
+                self.decode_swap_without_context(pool, log, topic0)
+            }
+        } else if topic0 == PancakeV3Swap::SIGNATURE_HASH {
+            self.decode_swap_without_context(pool, log, topic0)
+        } else {
+            self.decode_event(pool, log, view)
         }
     }
 
@@ -270,16 +325,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     ///
     /// The Quoter executes a real V3 swap against the warmed pool slots and
     /// returns the encoded `amountOut` (chain code, not reimplemented math). The
-    /// pool `fee` is taken from the V3-family metadata; tick-crossing swaps stay
-    /// correct because the cache lazily fetches any cold tick/bitmap slot from
-    /// the backend.
+    /// Fee-keyed pools take `fee` from metadata; Slipstream instead takes the
+    /// signed `tick_spacing` used by its native quoter ABI. Tick-crossing swaps
+    /// stay correct because the cache lazily fetches any cold tick/bitmap slot
+    /// from the backend.
     ///
     /// The quote target is the pool's own [`V3Metadata::quoter`] when set (a
     /// fork's QuoterV2, e.g. PancakeSwap's, filled in by factory discovery),
-    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The quote
-    /// ABI is unchanged (the `fee`-param struct variant) — forks whose quoter
-    /// takes a different struct (e.g. Slipstream's `tickSpacing`-keyed quoter)
-    /// leave `quoter` unset and ride the caller's Uniswap-compatible quoter.
+    /// falling back to the caller's [`SimConfig::v3_quoter`] otherwise. The
+    /// adapter selects the fee-keyed struct for Uniswap/Pancake and the native
+    /// signed-tick-spacing struct for Slipstream. A discovered Slipstream pool
+    /// must therefore be paired with a compatible Slipstream quote target.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -289,19 +345,44 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         amount_in: U256,
         config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
-        let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
         // Same resolver `ProtocolMetadata::quote_code_targets` uses, so the quoter
         // we call is always the one an eager cold-start pre-warmed.
         let quoter = v3_metadata(pool).map_or(config.v3_quoter, |m| m.quote_target(config));
-
-        let params = QuoteExactInputSingleParams {
-            tokenIn: token_in,
-            tokenOut: token_out,
-            amountIn: amount_in,
-            fee: U24::from(fee),
-            sqrtPriceLimitX96: U256::ZERO.to(),
+        let slipstream = pool.protocol() == ProtocolId::Slipstream;
+        let calldata = if slipstream {
+            let tick_spacing = v3_metadata(pool)
+                .and_then(|metadata| metadata.tick_spacing)
+                .ok_or(SimError::MissingMetadata("Slipstream tick spacing"))?;
+            let tick_spacing = I24::try_from(tick_spacing).map_err(|_| {
+                SimError::Custom("Slipstream tick spacing exceeds signed int24".to_owned())
+            })?;
+            Bytes::from(
+                ISlipstreamQuoter::quoteExactInputSingleCall {
+                    params: SlipstreamQuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: amount_in,
+                        tickSpacing: tick_spacing,
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    },
+                }
+                .abi_encode(),
+            )
+        } else {
+            let fee = v3_fee(pool).ok_or(SimError::MissingMetadata("V3 fee"))?;
+            Bytes::from(
+                quoteExactInputSingleCall {
+                    params: QuoteExactInputSingleParams {
+                        tokenIn: token_in,
+                        tokenOut: token_out,
+                        amountIn: amount_in,
+                        fee: U24::from(fee),
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    },
+                }
+                .abi_encode(),
+            )
         };
-        let calldata = Bytes::from(quoteExactInputSingleCall { params }.abi_encode());
 
         let transfer_success = Bytes::from_static(ERC20_TRANSFER_SUCCESS_RUNTIME);
         let code_overrides = [
@@ -315,10 +396,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             calldata,
             &code_overrides,
         )?;
-        let decoded = quoteExactInputSingleCall::abi_decode_returns_validate(&output)
-            .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?;
+        let amount_out = if slipstream {
+            ISlipstreamQuoter::quoteExactInputSingleCall::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?
+                .amountOut
+        } else {
+            quoteExactInputSingleCall::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactInputSingle return"))?
+                .amountOut
+        };
 
-        Ok(SwapQuote::new(decoded.amountOut))
+        Ok(SwapQuote::new(amount_out))
     }
 }
 
@@ -337,14 +425,6 @@ fn v3_warm_word_radius(pool: &PoolRegistration) -> Option<i16> {
     v3_metadata(pool).and_then(|m| m.warm_word_radius)
 }
 
-/// Which `Swap` ABI a routed log matched — the Uniswap V3 shape or the
-/// PancakeSwap V3 shape (two extra `uint128` fields, so a distinct `topic0`).
-#[derive(Clone, Copy)]
-enum SwapAbi {
-    Uniswap,
-    Pancake,
-}
-
 /// The `Swap` event `topic0` to subscribe/route for `protocol`.
 ///
 /// PancakeSwap V3 emits an extended `Swap` (extra `protocolFeesToken0/1`), so its
@@ -355,6 +435,32 @@ fn swap_topic_for(protocol: ProtocolId) -> B256 {
         ProtocolId::PancakeV3 => PancakeV3Swap::SIGNATURE_HASH,
         _ => Swap::SIGNATURE_HASH,
     }
+}
+
+/// Every standard V3 pool event which can mutate pool storage.
+///
+/// Swap has a family-specific topic on Pancake V3. The remaining canonical
+/// topics are routed for every V3-family registration so a matching mutation
+/// can never silently bypass invalidation merely because exact family parity is
+/// unavailable.
+fn v3_mutating_event_topics(protocol: ProtocolId) -> Vec<B256> {
+    let mut topics = Vec::with_capacity(9);
+    topics.push(swap_topic_for(protocol));
+    topics.extend(canonical_v3_non_swap_mutation_topics());
+    topics
+}
+
+fn canonical_v3_non_swap_mutation_topics() -> [B256; 8] {
+    [
+        Initialize::SIGNATURE_HASH,
+        Mint::SIGNATURE_HASH,
+        Collect::SIGNATURE_HASH,
+        Burn::SIGNATURE_HASH,
+        Flash::SIGNATURE_HASH,
+        IncreaseObservationCardinalityNext::SIGNATURE_HASH,
+        SetFeeProtocol::SIGNATURE_HASH,
+        CollectProtocol::SIGNATURE_HASH,
+    ]
 }
 
 /// Borrow the [`V3Metadata`] for a pool if it registered as any V3-family
@@ -368,33 +474,521 @@ fn v3_metadata(pool: &PoolRegistration) -> Option<&V3Metadata> {
     }
 }
 
+fn swap_invalidation(
+    pool: &PoolRegistration,
+    emitter: Address,
+    topic0: B256,
+    address: Address,
+) -> AdapterEvent {
+    AdapterEvent {
+        pool: pool.key.clone(),
+        emitter,
+        topic0,
+        kind: AdapterEventKind::Swap,
+        updates: vec![StateUpdate::purge(address, PurgeScope::AllStorage)],
+        quality: UpdateQuality::RequiresRepair,
+        repair: RepairAction::PurgeStorage(address),
+    }
+}
+
+fn non_swap_mutation_invalidation(
+    pool: &PoolRegistration,
+    emitter: Address,
+    topic0: B256,
+    address: Address,
+) -> AdapterEvent {
+    let kind = if topic0 == Mint::SIGNATURE_HASH {
+        AdapterEventKind::LiquidityAdded
+    } else if topic0 == Burn::SIGNATURE_HASH {
+        AdapterEventKind::LiquidityRemoved
+    } else {
+        AdapterEventKind::Unknown
+    };
+    AdapterEvent {
+        pool: pool.key.clone(),
+        emitter,
+        topic0,
+        kind,
+        updates: vec![StateUpdate::purge(address, PurgeScope::AllStorage)],
+        quality: UpdateQuality::RequiresRepair,
+        repair: RepairAction::PurgeStorage(address),
+    }
+}
+
+fn offline_call_word(
+    overlay: &mut EvmOverlay,
+    from: Address,
+    to: Address,
+    signature: &'static str,
+    argument: Option<Address>,
+    observed_code_hashes: &mut BTreeSet<B256>,
+) -> Result<U256, SlipstreamUnstakedFeeEvaluationError> {
+    let mut calldata = Vec::with_capacity(if argument.is_some() { 36 } else { 4 });
+    calldata.extend_from_slice(&keccak256(signature)[..4]);
+    if let Some(argument) = argument {
+        calldata.extend_from_slice(&[0_u8; 12]);
+        calldata.extend_from_slice(argument.as_slice());
+    }
+    let result = overlay.call_raw_with_access_list(from, to, Bytes::from(calldata));
+    if !overlay.missing_state().is_empty() {
+        return Err(SlipstreamUnstakedFeeEvaluationError::MissingState);
+    }
+    let output = match result {
+        Ok((ExecutionResult::Success { output, .. }, access)) => {
+            observed_code_hashes.extend(access.code_hashes);
+            output.into_data()
+        }
+        Ok((ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. }, _)) | Err(_) => {
+            return Err(SlipstreamUnstakedFeeEvaluationError::ExecutionFailed);
+        }
+    };
+    if output.len() < 32 {
+        return Err(SlipstreamUnstakedFeeEvaluationError::MalformedOutput);
+    }
+    Ok(U256::from_be_slice(&output[..32]))
+}
+
+#[derive(Clone, Copy)]
+struct ReviewedSlipstreamFeeRuntime {
+    chain_id: u64,
+    pool: Address,
+    factory: Address,
+    proxy_runtime_code_hash: B256,
+    implementation: Address,
+    implementation_runtime_code_hash: B256,
+    factory_runtime_code_hash: B256,
+    voter: Address,
+    voter_runtime_code_hash: B256,
+    gauge: Address,
+    module: Address,
+    module_runtime_code_hash: B256,
+}
+
+fn reviewed_slipstream_fee_runtime(
+    family: SlipstreamRuntimeFamily,
+) -> ReviewedSlipstreamFeeRuntime {
+    match family {
+        SlipstreamRuntimeFamily::AerodromeBaseBifi => ReviewedSlipstreamFeeRuntime {
+            chain_id: 8_453,
+            pool: alloy_primitives::address!("b378137c90444bbcecd44a1f766851fbf53d2a9e"),
+            factory: alloy_primitives::address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"),
+            proxy_runtime_code_hash: alloy_primitives::b256!(
+                "acd6710f7037ad095b1e4d5f8ee5b2681069cb4dd316e77e4e0cb8f85716a2a1"
+            ),
+            implementation: alloy_primitives::address!("ec8e5342b19977b4ef8892e02d8daecfa1315831"),
+            implementation_runtime_code_hash: alloy_primitives::b256!(
+                "772fb5c610b40a122036f544e5b9b5bce6becb19db9524331289d1aaed2d5888"
+            ),
+            factory_runtime_code_hash: alloy_primitives::b256!(
+                "7340cf80843bd721bcaefbfc050e38304cb4174c239e6e914e3056f27f39b11c"
+            ),
+            voter: alloy_primitives::address!("16613524e02ad97edfeF371bC883F2F5d6C480A5"),
+            voter_runtime_code_hash: alloy_primitives::b256!(
+                "465dc52dbb30fca5cca06c57fb266ec0e36c10530cdc6738dc4f035c81a0ae96"
+            ),
+            gauge: alloy_primitives::address!("6e415053aacdddc8b678a806a5279a8dcdd4f6f1"),
+            module: alloy_primitives::address!("0ad08370c76ff426f534bb2affd9b5555338ee68"),
+            module_runtime_code_hash: alloy_primitives::b256!(
+                "ab88b0a965d9f221253c1affc473f1326156c89c15ebae6dc257a2654b063fdd"
+            ),
+        },
+        SlipstreamRuntimeFamily::VelodromeOptimismBifi => ReviewedSlipstreamFeeRuntime {
+            chain_id: 10,
+            pool: alloy_primitives::address!("173cdc71e29d5cffa6d090ad99f555a24b8831f9"),
+            factory: alloy_primitives::address!("cc0bddb707055e04e497ab22a59c2af4391cd12f"),
+            proxy_runtime_code_hash: alloy_primitives::b256!(
+                "063ca35333cb7f2463f087d40ff9485475550abf4858a2f63c387d4d102b0f4f"
+            ),
+            implementation: alloy_primitives::address!("c28ad28853a547556780bebf7847628501a3bcbb"),
+            implementation_runtime_code_hash: alloy_primitives::b256!(
+                "36c3da904ca0b58544254cd0d978fe4801c32dc1f9e3b3e644487ef541299794"
+            ),
+            factory_runtime_code_hash: alloy_primitives::b256!(
+                "54e70bfdb89910349654db2f06c4a5cdbb9f4c74c781fe59276c1fa7b3f7f95e"
+            ),
+            voter: alloy_primitives::address!("41c914ee0c7e1a5edcd0295623e6dc557b5abf3c"),
+            voter_runtime_code_hash: alloy_primitives::b256!(
+                "6b54418007a7361638cff3c94032cb17f2728a6cda864d4ac65753c5445f1062"
+            ),
+            gauge: alloy_primitives::address!("41160e66fcaa10cbb148ace60bc2a22d609ec519"),
+            module: alloy_primitives::address!("c565f7ba9c56b157da983c4db30e13f5f06c59d9"),
+            module_runtime_code_hash: alloy_primitives::b256!(
+                "23425577e3d433f535309680b44b53e5cbd1ad581b1d2248e015030fd9816e37"
+            ),
+        },
+    }
+}
+
+fn validate_snapshot_identity(
+    snapshot: &EvmSnapshot,
+    reviewed: ReviewedSlipstreamFeeRuntime,
+    identity: SlipstreamSnapshotIdentity,
+    context: &AdapterEventContext,
+) -> Result<(), SlipstreamUnstakedFeeEvaluationError> {
+    if !identity.matches_context(context)
+        || snapshot.chain_id() != reviewed.chain_id
+        || identity.chain_id() != reviewed.chain_id
+        || snapshot.block_number() != Some(identity.block_number())
+        || snapshot.block_context_hash() != Some(identity.block_hash())
+        || snapshot.timestamp() != Some(identity.block_timestamp())
+        || identity
+            .block_number()
+            .checked_sub(1)
+            .and_then(|number| snapshot.block_hash(number))
+            != Some(identity.parent_hash())
+    {
+        return Err(SlipstreamUnstakedFeeEvaluationError::SnapshotIdentity);
+    }
+    Ok(())
+}
+
+fn validate_reviewed_runtime_addresses(
+    snapshot: &EvmSnapshot,
+    reviewed: ReviewedSlipstreamFeeRuntime,
+    include_fee_path: bool,
+) -> Result<(), SlipstreamUnstakedFeeEvaluationError> {
+    let pool_runtimes = [
+        (reviewed.pool, reviewed.proxy_runtime_code_hash),
+        (
+            reviewed.implementation,
+            reviewed.implementation_runtime_code_hash,
+        ),
+    ];
+    let fee_runtimes = [
+        (reviewed.factory, reviewed.factory_runtime_code_hash),
+        (reviewed.voter, reviewed.voter_runtime_code_hash),
+        (reviewed.module, reviewed.module_runtime_code_hash),
+    ];
+    for (address, expected) in pool_runtimes.into_iter().chain(
+        include_fee_path
+            .then_some(fee_runtimes)
+            .into_iter()
+            .flatten(),
+    ) {
+        if snapshot.account_code_hash(address) != Some(expected) {
+            return Err(SlipstreamUnstakedFeeEvaluationError::RuntimeCodeIdentity {
+                missing: expected,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewedUnstakedFeeOutcome {
+    effective_fee: u32,
+    gauge_alive: bool,
+    observed_code_hashes: BTreeSet<B256>,
+}
+
+fn evaluate_reviewed_unstaked_fee_path(
+    snapshot: Arc<EvmSnapshot>,
+    reviewed: ReviewedSlipstreamFeeRuntime,
+    caller: Address,
+) -> Result<ReviewedUnstakedFeeOutcome, SlipstreamUnstakedFeeEvaluationError> {
+    let mut observed_code_hashes = BTreeSet::new();
+    let mut overlay = EvmOverlay::new(snapshot, None);
+    let actual_pool_factory = Address::from_slice(
+        &offline_call_word(
+            &mut overlay,
+            caller,
+            reviewed.pool,
+            "factory()",
+            None,
+            &mut observed_code_hashes,
+        )?
+        .to_be_bytes::<32>()[12..],
+    );
+    let _ = offline_call_word(
+        &mut overlay,
+        caller,
+        reviewed.implementation,
+        "factory()",
+        None,
+        &mut observed_code_hashes,
+    )?;
+    let actual_voter = Address::from_slice(
+        &offline_call_word(
+            &mut overlay,
+            caller,
+            reviewed.factory,
+            "voter()",
+            None,
+            &mut observed_code_hashes,
+        )?
+        .to_be_bytes::<32>()[12..],
+    );
+    let actual_module = Address::from_slice(
+        &offline_call_word(
+            &mut overlay,
+            caller,
+            reviewed.factory,
+            "unstakedFeeModule()",
+            None,
+            &mut observed_code_hashes,
+        )?
+        .to_be_bytes::<32>()[12..],
+    );
+    let actual_gauge = Address::from_slice(
+        &offline_call_word(
+            &mut overlay,
+            caller,
+            reviewed.voter,
+            "gauges(address)",
+            Some(reviewed.pool),
+            &mut observed_code_hashes,
+        )?
+        .to_be_bytes::<32>()[12..],
+    );
+    if actual_pool_factory != reviewed.factory
+        || actual_voter != reviewed.voter
+        || actual_module != reviewed.module
+        || actual_gauge != reviewed.gauge
+    {
+        return Err(SlipstreamUnstakedFeeEvaluationError::RuntimeAddressIdentity);
+    }
+    let alive_word = offline_call_word(
+        &mut overlay,
+        caller,
+        reviewed.voter,
+        "isAlive(address)",
+        Some(reviewed.gauge),
+        &mut observed_code_hashes,
+    )?;
+    if alive_word > U256::from(1) {
+        return Err(SlipstreamUnstakedFeeEvaluationError::MalformedOutput);
+    }
+    let gauge_alive = !alive_word.is_zero();
+    let effective_word = offline_call_word(
+        &mut overlay,
+        caller,
+        reviewed.factory,
+        "getUnstakedFee(address)",
+        Some(reviewed.pool),
+        &mut observed_code_hashes,
+    )?;
+    if effective_word > U256::from(1_000_000) {
+        return Err(SlipstreamUnstakedFeeEvaluationError::FeeRange);
+    }
+    let effective_fee = effective_word.to::<u32>();
+    let module_fee = offline_call_word(
+        &mut overlay,
+        caller,
+        reviewed.module,
+        "getFee(address)",
+        Some(reviewed.pool),
+        &mut observed_code_hashes,
+    )?;
+    if (gauge_alive && module_fee != effective_word) || (!gauge_alive && effective_fee != 0) {
+        return Err(SlipstreamUnstakedFeeEvaluationError::FeePathMismatch);
+    }
+    let expected_code_hashes = [
+        reviewed.proxy_runtime_code_hash,
+        reviewed.implementation_runtime_code_hash,
+        reviewed.factory_runtime_code_hash,
+        reviewed.voter_runtime_code_hash,
+        reviewed.module_runtime_code_hash,
+    ];
+    if let Some(missing) = expected_code_hashes
+        .iter()
+        .find(|hash| !observed_code_hashes.contains(*hash))
+    {
+        return Err(SlipstreamUnstakedFeeEvaluationError::RuntimeCodeIdentity {
+            missing: *missing,
+        });
+    }
+    Ok(ReviewedUnstakedFeeOutcome {
+        effective_fee,
+        gauge_alive,
+        observed_code_hashes,
+    })
+}
+
 impl ConcentratedLiquidityAdapter {
-    fn decode_swap(
+    /// Return the independently proven event-only transition capability for a
+    /// concrete V3-family registration.
+    pub fn swap_transition_capability(pool: &PoolRegistration) -> V3SwapTransitionCapability {
+        let Some(layout) = layout_for(pool) else {
+            return V3SwapTransitionCapability::Unsupported;
+        };
+        if pool.protocol() == ProtocolId::UniswapV3
+            && layout == V3StorageLayout::uniswap(layout.tick_spacing)
+            && layout.tick_spacing > 0
+            && v3_fee(pool).is_some_and(|fee| fee < 1_000_000)
+        {
+            V3SwapTransitionCapability::Exact
+        } else {
+            V3SwapTransitionCapability::Unsupported
+        }
+    }
+
+    /// Return the event-scoped exact capability.
+    ///
+    /// Alpha.5 grants this only to canonical Uniswap V3. Slipstream candidate
+    /// replay and fee-evidence research deliberately cannot elevate public
+    /// capability until the full family-specific differential matrix is proven.
+    pub fn swap_transition_capability_with_context(
+        pool: &PoolRegistration,
+        _context: &AdapterEventContext,
+    ) -> V3SwapTransitionCapability {
+        Self::swap_transition_capability(pool)
+    }
+
+    /// Evaluate the reviewed Slipstream unstaked-liquidity fee against an
+    /// immutable, provider-free transaction-parent snapshot.
+    ///
+    /// This executes the factory, voter, liveness, and custom-module calls used
+    /// by the deployed pool. Every runtime must already be resident in the
+    /// snapshot and every storage read must resolve locally; otherwise the
+    /// evaluation fails closed. The snapshot block number, timestamp, and chain
+    /// must match `context`. The reviewed `factory -> voter/module` path is
+    /// caller-independent for these exact deployed runtime hashes; calls use a
+    /// fixed zero caller so no transaction-origin feed is needed on the event
+    /// hot path.
+    pub fn evaluate_slipstream_unstaked_fee(
+        family: SlipstreamRuntimeFamily,
+        snapshot: Arc<EvmSnapshot>,
+        identity: SlipstreamSnapshotIdentity,
+        context: &AdapterEventContext,
+    ) -> Result<SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError> {
+        let reviewed = reviewed_slipstream_fee_runtime(family);
+        validate_snapshot_identity(&snapshot, reviewed, identity, context)?;
+        validate_reviewed_runtime_addresses(&snapshot, reviewed, true)?;
+        let outcome =
+            evaluate_reviewed_unstaked_fee_path(Arc::clone(&snapshot), reviewed, Address::ZERO)?;
+        // The reviewed factory/voter/custom-module source reaches only mapping
+        // getters on this path. Execute the exact deployed runtimes again with
+        // a distinct caller in every build so caller independence remains a
+        // release-enforced property of the opaque proof.
+        let alternate = evaluate_reviewed_unstaked_fee_path(snapshot, reviewed, reviewed.pool)?;
+        if alternate != outcome {
+            return Err(SlipstreamUnstakedFeeEvaluationError::FeePathMismatch);
+        }
+        Ok(SlipstreamUnstakedFeeEvaluation::new(
+            outcome.effective_fee,
+            SlipstreamUnstakedFeeProof::reviewed_runtime_evaluation(
+                family,
+                outcome.gauge_alive,
+                outcome.effective_fee,
+                identity,
+            ),
+        ))
+    }
+
+    /// Produce an all-liquidity-staked research candidate from an exact,
+    /// provider-free snapshot of a reviewed pool runtime.
+    ///
+    /// This attests the address-bound pool proxy and implementation hashes and
+    /// exact block/event lineage. Candidate replay must still prove every step
+    /// has `stakedLiquidity == liquidity`. Alpha.5 does not grant public
+    /// Slipstream Exact capability from this result.
+    pub fn evaluate_slipstream_all_staked_candidate(
+        family: SlipstreamRuntimeFamily,
+        snapshot: Arc<EvmSnapshot>,
+        identity: SlipstreamSnapshotIdentity,
+        context: &AdapterEventContext,
+    ) -> Result<SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError> {
+        let reviewed = reviewed_slipstream_fee_runtime(family);
+        validate_snapshot_identity(&snapshot, reviewed, identity, context)?;
+        validate_reviewed_runtime_addresses(&snapshot, reviewed, false)?;
+        Ok(SlipstreamUnstakedFeeEvaluation::new(
+            0,
+            SlipstreamUnstakedFeeProof::unused_all_liquidity_staked(family, identity),
+        ))
+    }
+
+    /// Infer the unique effective swap fee from a reviewed Slipstream event and
+    /// exact parent state without a provider read.
+    ///
+    /// The supplied context must carry reviewed runtime/lineage evidence and
+    /// the effective unstaked fee. Its provisional `effective_swap_fee` is not
+    /// trusted by this method; callers replace it with the returned value via
+    /// [`super::SlipstreamSwapFeeEvidence::with_effective_swap_fee`] before
+    /// injecting the final evidence into [`super::AmmSyncEngine`]. Ambiguous
+    /// tiny/rounded events fail closed.
+    pub fn infer_slipstream_swap_fee(
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        context: &AdapterEventContext,
+    ) -> Result<u32, AdapterEventError> {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return Err(AdapterEventError::Unsupported(UnsupportedReason::Protocol(
+                pool.protocol(),
+            )));
+        }
+        let address = pool.key.address().ok_or(AdapterEventError::MalformedLog(
+            "Slipstream pool key is not address-keyed",
+        ))?;
+        let layout = layout_for(pool).ok_or(AdapterEventError::Unsupported(
+            UnsupportedReason::MissingMetadata("Slipstream storage layout"),
+        ))?;
+        if log.topics().first().copied() != Some(Swap::SIGNATURE_HASH)
+            || Swap::decode_log_data_validate(&log.data).is_err()
+        {
+            return Err(AdapterEventError::MalformedLog(
+                "malformed Slipstream Swap log",
+            ));
+        }
+        let swap = decode_swap_body(log)?;
+        infer_slipstream_swap_fee(address, layout, swap, view, context)
+    }
+
+    fn decode_swap_without_context(
         &self,
         pool: &PoolRegistration,
         log: &Log,
         topic0: B256,
-        abi: SwapAbi,
     ) -> AdapterEventResult {
-        // Validate against the ABI whose topic0 matched. Cross-protocol safety
-        // comes from topic0 routing — a pool only subscribes its own Swap hash
-        // (`swap_topic_for`), so `decode_event` always pairs the matched topic0
-        // with its `SwapAbi` — NOT from payload length: alloy's log decoder reads
-        // only the leading static words, so the Uniswap validator tolerates the
-        // Pancake body's two trailing `uint128`s (the Pancake validator, which
-        // needs more words, does reject the shorter Uniswap body). Either way
-        // `sqrtPriceX96`/`liquidity`/`tick` share data words 2/3/4, so the body
-        // decode below is ABI-agnostic once the matched validator passes.
-        let valid = match abi {
-            SwapAbi::Uniswap => Swap::decode_log_data_validate(&log.data).is_ok(),
-            SwapAbi::Pancake => PancakeV3Swap::decode_log_data_validate(&log.data).is_ok(),
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "V3 pool key is not address-keyed",
+            ));
+        };
+        if layout_for(pool).is_none() {
+            return AdapterEventResult::event_with_error(
+                swap_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::Unsupported(UnsupportedReason::MissingMetadata(
+                    "V3 storage layout",
+                )),
+            );
+        }
+        let valid = if topic0 == PancakeV3Swap::SIGNATURE_HASH {
+            PancakeV3Swap::decode_log_data_validate(&log.data).is_ok()
+        } else {
+            Swap::decode_log_data_validate(&log.data).is_ok()
         };
         if !valid {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "malformed V3 Swap log",
-            ));
+            return AdapterEventResult::event_with_error(
+                swap_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::MalformedLog("malformed V3 Swap log"),
+            );
         }
 
+        let error = if Self::swap_transition_capability(pool) == V3SwapTransitionCapability::Exact {
+            AdapterEventError::V3Transition(super::V3TransitionError::MissingContext(
+                "complete event context",
+            ))
+        } else {
+            AdapterEventError::Unsupported(UnsupportedReason::Protocol(pool.protocol()))
+        };
+        AdapterEventResult::event_with_error(
+            swap_invalidation(pool, log.address, topic0, address),
+            error,
+        )
+    }
+
+    fn decode_swap_exact(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        topic0: B256,
+        view: &dyn StateView,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        // Canonical Uniswap and reviewed Slipstream runtimes use independent
+        // transition implementations. Fork-family events never enter replay
+        // merely because their ABI or slot offsets look similar.
         let Some(address) = pool.key.address() else {
             return AdapterEventResult::error(AdapterEventError::MalformedLog(
                 "V3 pool key is not address-keyed",
@@ -405,265 +999,121 @@ impl ConcentratedLiquidityAdapter {
                 super::UnsupportedReason::MissingMetadata("V3 storage layout"),
             ));
         };
+        let valid = Swap::decode_log_data_validate(&log.data).is_ok();
+        if !valid {
+            return AdapterEventResult::event_with_error(
+                swap_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::MalformedLog("malformed V3 Swap log"),
+            );
+        }
 
-        let Some(sqrt_price) = data_word(log, 2) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "missing V3 sqrtPriceX96",
-            ));
+        let swap = match decode_swap_body(log) {
+            Ok(swap) => swap,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    swap_invalidation(pool, log.address, topic0, address),
+                    error,
+                );
+            }
         };
-        let Some(liquidity) = data_word(log, 3) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "missing V3 liquidity",
-            ));
+        let updates = match pool.protocol() {
+            ProtocolId::UniswapV3 => {
+                let Some(fee) = v3_fee(pool) else {
+                    return AdapterEventResult::error(AdapterEventError::Unsupported(
+                        UnsupportedReason::MissingMetadata("V3 fee"),
+                    ));
+                };
+                derive_uniswap_v3_swap(address, layout, fee, swap, view, context)
+            }
+            ProtocolId::Slipstream => derive_slipstream_swap(address, layout, swap, view, context),
+            _ => Err(AdapterEventError::Unsupported(UnsupportedReason::Protocol(
+                pool.protocol(),
+            ))),
         };
-        let Some(tick_word) = data_word(log, 4) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog("missing V3 tick"));
+        let updates = match updates {
+            Ok(updates) => updates,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    AdapterEvent {
+                        pool: pool.key.clone(),
+                        emitter: log.address,
+                        topic0,
+                        kind: AdapterEventKind::Swap,
+                        updates: vec![StateUpdate::purge(address, PurgeScope::AllStorage)],
+                        quality: UpdateQuality::ConservativeInvalidation,
+                        repair: RepairAction::PurgeStorage(address),
+                    },
+                    error,
+                );
+            }
         };
-
-        let tick = int24_from_word(tick_word);
-        let tick24 = U256::from((tick as u32) & 0x00FF_FFFF);
-        let mask = low_mask(SLOT0_PRICE_TICK_BITS);
-        let value = sqrt_price | (tick24 << SLOT0_TICK_SHIFT);
 
         AdapterEventResult::event(AdapterEvent {
             pool: pool.key.clone(),
             emitter: log.address,
             topic0,
             kind: AdapterEventKind::Swap,
-            updates: vec![
-                StateUpdate::slot_masked(address, layout.slot0_slot, mask, value),
-                StateUpdate::slot(address, layout.liquidity_slot, liquidity),
-            ],
-            quality: UpdateQuality::ExactIfApplied,
+            updates,
+            quality: UpdateQuality::Exact,
             repair: RepairAction::None,
         })
     }
 
-    /// Decode a Uniswap V3 `Mint`/`Burn` and **event-source** the affected state
-    /// directly wherever it is already warm — no RPC — falling back to a targeted
-    /// resync only for boundary ticks whose base value is cold (outside the warmed
-    /// window).
+    fn decode_non_swap_mutation(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        topic0: B256,
+    ) -> AdapterEventResult {
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "V3 pool key is not address-keyed",
+            ));
+        };
+        AdapterEventResult::event_with_error(
+            non_swap_mutation_invalidation(pool, log.address, topic0, address),
+            AdapterEventError::Unsupported(UnsupportedReason::Custom(
+                "exact event-only canonical V3 non-Swap transition is unsupported".to_owned(),
+            )),
+        )
+    }
+
+    /// Decode a Uniswap V3 `Mint`/`Burn` conservatively.
     ///
-    /// The event carries the exact liquidity delta (`amount`) and the boundary
-    /// ticks; the current tick comes from cached `slot0`. For each **warm**
-    /// boundary tick this read-modify-writes the packed `Tick.Info` word 0
-    /// (`liquidityGross` in the low 128 bits, `liquidityNet` in the high 128 —
-    /// moving in *opposite* directions for the lower vs. upper tick) and toggles
-    /// the `tickBitmap` bit when the tick initializes or clears (the contract's
-    /// `flipTick` is exactly an XOR of that bit). The global `liquidity` slot is
-    /// adjusted by `±amount` when the position straddles the current tick. Those
-    /// are precisely the slots a `QuoterV2` swap reads; `feeGrowthOutside` and the
-    /// `positions` mapping are accounting-only (they do not affect `amountOut`) and
-    /// are intentionally not maintained here.
-    ///
-    /// A **cold** boundary tick (its word 0 not cached) cannot be
-    /// read-modify-written, so its info + bitmap slots are emitted as a
-    /// [`RepairAction::VerifySlots`] resync instead — the hybrid write-where-warm /
-    /// resync-cold policy. A pool with no resolvable layout falls back to a
-    /// conservative whole-storage invalidation.
+    /// The event carries a liquidity delta and boundary ticks, but not every
+    /// canonical Tick.Info and position-accounting write needed by a later exact
+    /// Swap. Even a fully warm cache is therefore purged after the log is
+    /// validated; no partial state is computed or briefly applied.
     fn decode_liquidity_event(
         &self,
         pool: &PoolRegistration,
         log: &Log,
-        view: &dyn StateView,
+        _view: &dyn StateView,
         is_mint: bool,
     ) -> AdapterEventResult {
+        let topic0 = if is_mint {
+            Mint::SIGNATURE_HASH
+        } else {
+            Burn::SIGNATURE_HASH
+        };
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "V3 pool key is not address-keyed",
+            ));
+        };
         let decode_ok = if is_mint {
             Mint::decode_log_data_validate(&log.data).is_ok()
         } else {
             Burn::decode_log_data_validate(&log.data).is_ok()
         };
         if !decode_ok {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "malformed V3 liquidity log",
-            ));
-        }
-
-        let Some(tick_lower_topic) = log.topics().get(2) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "missing V3 tickLower topic",
-            ));
-        };
-        let Some(tick_upper_topic) = log.topics().get(3) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "missing V3 tickUpper topic",
-            ));
-        };
-        let tick_lower = topic_to_i32(tick_lower_topic);
-        let tick_upper = topic_to_i32(tick_upper_topic);
-
-        let topic0 = if is_mint {
-            Mint::SIGNATURE_HASH
-        } else {
-            Burn::SIGNATURE_HASH
-        };
-        let kind = if is_mint {
-            AdapterEventKind::LiquidityAdded
-        } else {
-            AdapterEventKind::LiquidityRemoved
-        };
-
-        let Some(address) = pool.key.address() else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "V3 pool key is not address-keyed",
-            ));
-        };
-
-        // The `amount` (uint128 liquidity L) is the first NON-indexed data word:
-        // index 1 for Mint (a non-indexed `sender` precedes it) and index 0 for
-        // Burn (no leading non-indexed field).
-        let amount_word_index = if is_mint { 1 } else { 0 };
-        let Some(amount_word) = data_word(log, amount_word_index) else {
-            return AdapterEventResult::error(AdapterEventError::MalformedLog(
-                "missing V3 liquidity amount",
-            ));
-        };
-        let amount = u128_low(amount_word);
-
-        // Without a resolvable layout the protocol slots cannot be named safely, so
-        // conservatively invalidate all of the pool's storage (prior behavior).
-        let Some(layout) = layout_for(pool) else {
-            return AdapterEventResult::event(
-                AdapterEvent::new(
-                    pool.key.clone(),
-                    log.address,
-                    topic0,
-                    kind,
-                    UpdateQuality::RequiresRepair,
-                )
-                .with_repair(RepairAction::PurgeStorage(address)),
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::MalformedLog("malformed V3 liquidity log"),
             );
-        };
-
-        let mut updates: Vec<StateUpdate> = Vec::new();
-        let mut resync: Vec<(Address, U256)> = Vec::new();
-
-        // Current tick from cached slot0 drives the in-range check for the global
-        // liquidity. slot0 is a mandatory cold-start slot; the boundary-tick writes
-        // below are independent of it.
-        let current_tick = view
-            .storage(address, layout.slot0_slot)
-            .map(|slot0| int24_from_word(slot0 >> SLOT0_TICK_SHIFT));
-
-        match current_tick {
-            // In range: apply ±amount to the warm global liquidity, or resync it.
-            Some(tick) if tick_lower <= tick && tick < tick_upper => {
-                match view.storage(address, layout.liquidity_slot) {
-                    // Checked, not saturating: if the delta cannot apply (a
-                    // duplicated / out-of-order log, a reorg, or a bad cache
-                    // base), resync the slot to on-chain truth rather than write a
-                    // plausible-but-wrong value — the same self-healing choice the
-                    // boundary-tick path (`apply_liquidity_delta`) makes.
-                    Some(old) => {
-                        let delta = U256::from(amount);
-                        let updated = if is_mint {
-                            old.checked_add(delta)
-                        } else {
-                            old.checked_sub(delta)
-                        };
-                        match updated {
-                            Some(new) => {
-                                updates.push(StateUpdate::slot(address, layout.liquidity_slot, new))
-                            }
-                            None => resync.push((address, layout.liquidity_slot)),
-                        }
-                    }
-                    None => resync.push((address, layout.liquidity_slot)),
-                }
-            }
-            // Out of range: the position does not straddle the current tick, so the
-            // global liquidity is unaffected.
-            Some(_) => {}
-            // slot0 cold (a degraded pool): the in-range decision cannot be made, so
-            // conservatively resync the global liquidity slot to its on-chain truth
-            // rather than silently dropping a possible delta (self-healing, and it
-            // correctly forces RequiresRepair).
-            None => resync.push((address, layout.liquidity_slot)),
         }
 
-        // Bitmap-bit flips are accumulated per bitmap word as an XOR mask, then
-        // emitted as ONE combined write per word below. Both boundary ticks can
-        // land in the same word; two separate full-slot writes — each computed
-        // from the same pre-event `view` — would not compose (the second would
-        // clobber the first), so they must be merged before writing.
-        let mut bitmap_toggles: Vec<(U256, U256)> = Vec::new();
-
-        // Each boundary tick: read-modify-write the packed `Tick.Info` word 0 (and
-        // record a bitmap-bit flip on an init/clear) when warm; resync when cold.
-        for (tick, is_lower) in [(tick_lower, true), (tick_upper, false)] {
-            let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
-            let word_pos = v3_word_position(tick, layout.tick_spacing);
-            let bitmap_key =
-                v3_tick_bitmap_storage_key_with_base(word_pos, layout.tick_bitmap_base_slot);
-
-            let cold_fallback = |resync: &mut Vec<(Address, U256)>| {
-                resync.extend(keys.iter().map(|slot| (address, *slot)));
-                resync.push((address, bitmap_key));
-            };
-
-            let Some(old_word0) = view.storage(address, keys[0]) else {
-                // Cold tick: cannot read-modify-write; resync its info + bitmap slots.
-                cold_fallback(&mut resync);
-                continue;
-            };
-
-            let Some((new_word0, was_init, now_init)) =
-                apply_liquidity_delta(old_word0, amount, is_mint, is_lower)
-            else {
-                // Arithmetic out of range (should not happen for valid chain data):
-                // resync this tick rather than write a wrong value.
-                cold_fallback(&mut resync);
-                continue;
-            };
-
-            updates.push(StateUpdate::slot(address, keys[0], new_word0));
-
-            // The bitmap bit flips exactly when the tick's initialized state
-            // changes (Uniswap `flipTick` XORs the bit).
-            if was_init != now_init {
-                if view.storage(address, bitmap_key).is_some() {
-                    let mask = U256::from(1u8) << v3_bit_position(tick, layout.tick_spacing);
-                    match bitmap_toggles
-                        .iter_mut()
-                        .find(|(key, _)| *key == bitmap_key)
-                    {
-                        Some((_, acc)) => *acc ^= mask,
-                        None => bitmap_toggles.push((bitmap_key, mask)),
-                    }
-                } else {
-                    // Cold bitmap word: cannot toggle without the base; resync it.
-                    resync.push((address, bitmap_key));
-                }
-            }
-        }
-
-        // Emit one combined write per touched bitmap word (base XOR accumulated
-        // mask), so both ticks' flips in a shared word compose correctly.
-        for (bitmap_key, mask) in bitmap_toggles {
-            match view.storage(address, bitmap_key) {
-                Some(base) => updates.push(StateUpdate::slot(address, bitmap_key, base ^ mask)),
-                None => resync.push((address, bitmap_key)),
-            }
-        }
-
-        // Dedup the resync set (both boundary ticks can share a bitmap word).
-        resync.sort_unstable();
-        resync.dedup();
-
-        let (quality, repair) = if resync.is_empty() {
-            (UpdateQuality::Exact, RepairAction::None)
-        } else {
-            (
-                UpdateQuality::RequiresRepair,
-                RepairAction::VerifySlots(resync),
-            )
-        };
-
-        AdapterEventResult::event(
-            AdapterEvent::new(pool.key.clone(), log.address, topic0, kind, quality)
-                .with_updates(updates)
-                .with_repair(repair),
-        )
+        self.decode_non_swap_mutation(pool, log, topic0)
     }
 }
 
@@ -695,6 +1145,9 @@ struct UniswapV3ColdStartPlanner {
     /// the pool's [`V3Metadata::warm_word_radius`], or [`V3_TICK_WORD_RADIUS`]
     /// when unset). Clamped to `>= 0` in [`Self::resolve_window`].
     radius: i16,
+    /// Independently proven state surface that must be complete before the
+    /// planner can leave a pool quote-ready for event-only swaps.
+    exact_surface: V3ColdStartExactSurface,
     phase: V3Phase,
     /// The cold-start window: each `(word, bitmap_key)` pair in
     /// `[W0 - R, W0 + R]` clamped to the valid V3 word range, resolved from the
@@ -702,6 +1155,13 @@ struct UniswapV3ColdStartPlanner {
     window: Vec<(i16, U256)>,
     verified_slots: Vec<(Address, U256)>,
     changed_slots: Vec<SlotChange>,
+    /// Exact canonical cells fetched as genuine zero during this run. They are
+    /// materialized explicitly so `StateView::storage(None)` remains unknown,
+    /// never an implicit zero assumption.
+    proven_zero_slots: Vec<U256>,
+    /// Exact canonical cells that could not be fetched. A planner carrying any
+    /// such cell cannot mark the pool ready for event-only transitions.
+    failed_exact_slots: Vec<U256>,
     deferred: Vec<DeferredWork>,
     /// `true` once round 1 found `slot0` cold (unfetchable / genuine zero).
     slot0_cold: bool,
@@ -719,22 +1179,33 @@ enum V3Phase {
     TickInfo,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V3ColdStartExactSurface {
+    None,
+    CanonicalUniswap,
+    Slipstream,
+}
+
 impl UniswapV3ColdStartPlanner {
     fn new(
         address: Address,
         layout: V3StorageLayout,
         policy: ColdStartPolicy,
         radius: i16,
+        exact_surface: V3ColdStartExactSurface,
     ) -> Self {
         Self {
             address,
             layout,
             policy,
             radius,
+            exact_surface,
             phase: V3Phase::Slot0Liquidity,
             window: Vec::new(),
             verified_slots: Vec::new(),
             changed_slots: Vec::new(),
+            proven_zero_slots: Vec::new(),
+            failed_exact_slots: Vec::new(),
             deferred: Vec::new(),
             slot0_cold: false,
         }
@@ -778,10 +1249,31 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
         // Round 1: slot0 + global liquidity. slot0 is mandatory (it carries the
         // current tick that drives the bounded tick warm-up); liquidity is an
         // absolute write that the reactive Swap always reapplies.
-        let verify = vec![
+        let mut verify = vec![
             (self.address, self.layout.slot0_slot),
             (self.address, self.layout.liquidity_slot),
         ];
+        match self.exact_surface {
+            V3ColdStartExactSurface::CanonicalUniswap => verify.extend([
+                (self.address, U256::from(1)),
+                (self.address, U256::from(2)),
+                (self.address, U256::from(3)),
+            ]),
+            V3ColdStartExactSurface::Slipstream => verify.extend([
+                // Factory identity plus every non-mapping parent cell the
+                // reviewed swap transition can read or mutate.
+                (self.address, U256::ZERO),
+                (self.address, U256::from(7)),
+                (self.address, U256::from(8)),
+                (self.address, U256::from(9)),
+                (self.address, U256::from(10)),
+                (self.address, U256::from(11)),
+                (self.address, U256::from(12)),
+                (self.address, U256::from(14)),
+                (self.address, U256::from(15)),
+            ]),
+            V3ColdStartExactSurface::None => {}
+        }
         self.verified_slots.extend_from_slice(&verify);
         ColdStartPlan {
             verify,
@@ -791,6 +1283,26 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
 
     fn on_results(&mut self, results: &ColdStartResults, state: &dyn StateView) -> ColdStartStep {
         self.changed_slots.extend(results.verified.iter().cloned());
+        if self.exact_surface != V3ColdStartExactSurface::None {
+            self.proven_zero_slots
+                .extend(results.fetched.iter().filter_map(|outcome| {
+                    (outcome.address == self.address && matches!(outcome.fetch, SlotFetch::Zero))
+                        .then_some(outcome.slot)
+                }));
+            self.proven_zero_slots.sort_unstable();
+            self.proven_zero_slots.dedup();
+            self.failed_exact_slots
+                .extend(results.fetched.iter().filter_map(|outcome| {
+                    (outcome.address == self.address
+                        && matches!(
+                            outcome.fetch,
+                            SlotFetch::FetchFailed { .. } | SlotFetch::NotAttempted
+                        ))
+                    .then_some(outcome.slot)
+                }));
+            self.failed_exact_slots.sort_unstable();
+            self.failed_exact_slots.dedup();
+        }
 
         match self.phase {
             V3Phase::Slot0Liquidity => {
@@ -810,6 +1322,9 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                     self.slot0_cold = true;
                     return ColdStartStep::Done;
                 };
+                if !self.failed_exact_slots.is_empty() {
+                    return ColdStartStep::Done;
+                }
 
                 // Decode the current tick from the warm slot0 word (bits
                 // [160, 184), 24-bit signed), reusing the reactive Swap decode,
@@ -822,11 +1337,24 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                     ColdStartPolicy::Strict | ColdStartPolicy::Eager => {
                         // Round 2: warm every bitmap word in the window in one round.
                         self.phase = V3Phase::BitmapWord;
-                        let verify: Vec<(Address, U256)> = self
+                        let mut verify: Vec<(Address, U256)> = self
                             .window
                             .iter()
                             .map(|(_, key)| (self.address, *key))
                             .collect();
+                        if self.exact_surface != V3ColdStartExactSurface::None {
+                            let observation_index =
+                                ((slot0 >> 184_usize) & U256::from(u16::MAX)).to::<u16>();
+                            let observations_base = match self.exact_surface {
+                                V3ColdStartExactSurface::CanonicalUniswap => 8,
+                                V3ColdStartExactSurface::Slipstream => 20,
+                                V3ColdStartExactSurface::None => unreachable!(),
+                            };
+                            verify.push((
+                                self.address,
+                                U256::from(observations_base) + U256::from(observation_index),
+                            ));
+                        }
                         self.verified_slots.extend_from_slice(&verify);
                         ColdStartStep::Continue(ColdStartPlan {
                             verify,
@@ -847,6 +1375,9 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 }
             }
             V3Phase::BitmapWord => {
+                if !self.failed_exact_slots.is_empty() {
+                    return ColdStartStep::Done;
+                }
                 // Round 3: warm ALL FOUR `Tick.Info` words of every tick
                 // initialized across the whole window. A tick-crossing swap quote
                 // reads the full struct — `liquidityGross`/`liquidityNet` (word 0),
@@ -860,9 +1391,22 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 // tick_spacing`, skipping any tick outside [MIN_TICK, MAX_TICK].
                 let mut tick_slots: Vec<(Address, U256)> = Vec::new();
                 for (word, bitmap_key) in &self.window {
-                    let bitmap = state
-                        .storage(self.address, *bitmap_key)
-                        .unwrap_or(U256::ZERO);
+                    let bitmap = results
+                        .fetched
+                        .iter()
+                        .find(|outcome| {
+                            outcome.address == self.address && outcome.slot == *bitmap_key
+                        })
+                        .and_then(|outcome| match &outcome.fetch {
+                            SlotFetch::Value(value) => Some(*value),
+                            SlotFetch::Zero => Some(U256::ZERO),
+                            SlotFetch::FetchFailed { .. } | SlotFetch::NotAttempted => None,
+                        })
+                        .or_else(|| state.storage(self.address, *bitmap_key));
+                    let Some(bitmap) = bitmap else {
+                        self.failed_exact_slots.push(*bitmap_key);
+                        continue;
+                    };
                     for bit in 0..256u32 {
                         if (bitmap >> bit) & U256::from(1) == U256::from(1) {
                             // Compute the tick index in i32; word/bit/spacing are
@@ -872,11 +1416,19 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                             if !(V3_MIN_TICK..=V3_MAX_TICK).contains(&tick_i) {
                                 continue;
                             }
-                            let keys = v3_tick_info_storage_keys_with_base(
-                                tick_i,
-                                self.layout.ticks_base_slot,
-                            );
-                            tick_slots.extend(keys.iter().map(|key| (self.address, *key)));
+                            if self.exact_surface == V3ColdStartExactSurface::Slipstream {
+                                let keys = slipstream_tick_info_storage_keys_with_base(
+                                    tick_i,
+                                    self.layout.ticks_base_slot,
+                                );
+                                tick_slots.extend(keys.iter().map(|key| (self.address, *key)));
+                            } else {
+                                let keys = v3_tick_info_storage_keys_with_base(
+                                    tick_i,
+                                    self.layout.ticks_base_slot,
+                                );
+                                tick_slots.extend(keys.iter().map(|key| (self.address, *key)));
+                            }
                         }
                     }
                 }
@@ -896,6 +1448,16 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
         }
     }
 
+    fn materialization_updates(&self) -> Vec<StateUpdate> {
+        if self.slot0_cold {
+            return Vec::new();
+        }
+        self.proven_zero_slots
+            .iter()
+            .map(|slot| StateUpdate::slot(self.address, *slot, U256::ZERO))
+            .collect()
+    }
+
     fn finish(
         &mut self,
         pool: &mut PoolRegistration,
@@ -907,10 +1469,23 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
 
         if self.slot0_cold {
             report.status = PoolStatus::Degraded;
+            pool.status = PoolStatus::Degraded;
             return ColdStartOutcome::NeedsRepair(
                 report,
                 RepairAction::VerifySlots(vec![(self.address, self.layout.slot0_slot)]),
             );
+        }
+
+        if !self.failed_exact_slots.is_empty() {
+            report.status = PoolStatus::Degraded;
+            pool.status = PoolStatus::Degraded;
+            let slots = self
+                .failed_exact_slots
+                .iter()
+                .copied()
+                .map(|slot| (self.address, slot))
+                .collect();
+            return ColdStartOutcome::NeedsRepair(report, RepairAction::VerifySlots(slots));
         }
 
         // Preserve the config-supplied V3 metadata (token0/token1/fee/
@@ -958,6 +1533,37 @@ fn data_word(log: &Log, index: usize) -> Option<U256> {
         .map(U256::from_be_slice)
 }
 
+fn decode_swap_body(log: &Log) -> Result<DecodedSwap, AdapterEventError> {
+    let amount0 = data_word(log, 0).ok_or(AdapterEventError::MalformedLog("missing V3 amount0"))?;
+    let amount1 = data_word(log, 1).ok_or(AdapterEventError::MalformedLog("missing V3 amount1"))?;
+    let sqrt_price_x96 =
+        data_word(log, 2).ok_or(AdapterEventError::MalformedLog("missing V3 sqrtPriceX96"))?;
+    let liquidity =
+        data_word(log, 3).ok_or(AdapterEventError::MalformedLog("missing V3 liquidity"))?;
+    let tick = int24_from_word(
+        data_word(log, 4).ok_or(AdapterEventError::MalformedLog("missing V3 tick"))?,
+    );
+    let (amount0_negative, amount0) = signed_word_magnitude(amount0);
+    let (amount1_negative, amount1) = signed_word_magnitude(amount1);
+    Ok(DecodedSwap {
+        amount0_negative,
+        amount0,
+        amount1_negative,
+        amount1,
+        sqrt_price_x96,
+        liquidity,
+        tick,
+    })
+}
+
+fn signed_word_magnitude(word: U256) -> (bool, U256) {
+    if (word >> 255_usize).is_zero() {
+        (false, word)
+    } else {
+        (true, (!word).wrapping_add(U256::from(1)))
+    }
+}
+
 fn int24_from_word(word: U256) -> i32 {
     let raw = (word & U256::from(0x00FF_FFFFu32)).to::<u32>();
     if raw & 0x0080_0000 != 0 {
@@ -967,17 +1573,8 @@ fn int24_from_word(word: U256) -> i32 {
     }
 }
 
-fn topic_to_i32(topic: &B256) -> i32 {
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&topic.as_slice()[28..32]);
-    i32::from_be_bytes(bytes)
-}
-
-fn low_mask(bits: usize) -> U256 {
-    (U256::from(1) << bits) - U256::from(1)
-}
-
 /// The low 128 bits of a 256-bit word (a `Tick.Info` word 0's `liquidityGross`).
+#[cfg(test)]
 fn u128_low(word: U256) -> u128 {
     let limbs = word.as_limbs();
     (limbs[0] as u128) | ((limbs[1] as u128) << 64)
@@ -985,6 +1582,7 @@ fn u128_low(word: U256) -> u128 {
 
 /// The high 128 bits of a 256-bit word, as raw bits (word 0's `liquidityNet`,
 /// two's-complement `int128`).
+#[cfg(test)]
 fn u128_high(word: U256) -> u128 {
     let limbs = word.as_limbs();
     (limbs[2] as u128) | ((limbs[3] as u128) << 64)
@@ -992,6 +1590,7 @@ fn u128_high(word: U256) -> u128 {
 
 /// Pack `liquidityGross` (low 128) and `liquidityNet` (high 128, two's complement)
 /// back into a `Tick.Info` word-0 value.
+#[cfg(test)]
 fn pack_gross_net(gross: u128, net: i128) -> U256 {
     U256::from(gross) | (U256::from(net as u128) << 128)
 }
@@ -999,6 +1598,7 @@ fn pack_gross_net(gross: u128, net: i128) -> U256 {
 /// The `tickBitmap` bit index (0..256) for `tick`, matching the V3
 /// `TickBitmap.position` low byte (`compressed % 256`, floor-toward-negative).
 /// `tick_spacing` must be positive (guaranteed by [`layout_for`]).
+#[cfg(test)]
 fn v3_bit_position(tick: i32, tick_spacing: i32) -> usize {
     tick.div_euclid(tick_spacing).rem_euclid(256) as usize
 }
@@ -1011,6 +1611,7 @@ fn v3_bit_position(tick: i32, tick_spacing: i32) -> usize {
 /// on a mint (negated on a burn) — captured by `add_to_net = is_mint == is_lower`.
 /// Returns `None` on arithmetic overflow/underflow (invalid chain data) so the
 /// caller can resync the tick instead of writing a wrong value.
+#[cfg(test)]
 fn apply_liquidity_delta(
     word0: U256,
     amount: u128,

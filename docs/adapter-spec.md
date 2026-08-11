@@ -482,17 +482,13 @@ Steps:
 Event handling:
 
 - `Swap` is exact from event data:
-  - masked `slot0` update for sqrt price and tick
-  - absolute liquidity slot update
-- `Mint`/`Burn` is exact only if needed tick/global-liquidity pre-state is hot:
-  - recompute tick liquidityGross/liquidityNet
-  - update initialized flag
-  - update tick bitmap
-  - update global liquidity if the current tick is inside the affected range
-- If needed pre-state is cold, do not invent zero values. Emit repair:
-  - targeted tick-range resync when tick range is known
-  - incremental resync when only liquidity mismatch is known
-  - full resync when no useful snapshot exists
+  - replay the complete canonical fee/oracle/tick transition from exact parent
+    state and ordered block/transaction/log context
+  - validate event deltas and final sqrt price, tick, active liquidity
+- Every standard non-`Swap` pool mutation is routed. `Initialize`, `Mint`,
+  `Collect`, `Burn`, `Flash`, oracle-cardinality, fee-protocol, and protocol-fee
+  collection events emit typed `RequiresRepair` and purge the complete pool.
+  Warm quote cells are not enough to establish the full accounting parent.
 
 ### Balancer Cold Start
 
@@ -562,10 +558,9 @@ pub enum UpdateQuality {
 }
 ```
 
-`ExactIfApplied` is important for cold-aware updates. A V3 Mint may produce
-correct `StateUpdate`s, but if `StateDiff` reports skipped masks because a tick
-word was cold, the update was not actually applied. The adapter driver's
-post-apply step must inspect the diff and schedule repair.
+`ExactIfApplied` is important for cold-aware updates generally. Canonical V3
+does not use it for non-`Swap` events: those mutations whole-storage purge and
+remain `RequiresRepair` until an authoritative exact rebuild completes.
 
 ## Repair Model
 
@@ -782,8 +777,8 @@ The first implementation should be deliberately narrow:
    - metadata/layout hydration
    - slot0/liquidity cold start
    - V3 snapshot validation decision
-   - `Swap` -> masked slot0 + liquidity
-   - `Mint`/`Burn` -> exact tick updates when hot, repair when cold
+   - canonical `Swap` -> complete exact fee/oracle/tick transition
+   - every non-`Swap` mutator -> typed whole-storage purge + repair
 
 6. Implement a minimal AMM event driver:
    - route

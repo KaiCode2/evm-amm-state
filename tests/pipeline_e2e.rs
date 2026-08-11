@@ -64,7 +64,7 @@ fn included_context(block_number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -336,30 +336,16 @@ async fn v2_full_pipeline_cold_start_react_simulate() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
+async fn v3_core_cold_start_invalidates_incomplete_swap_parent() -> Result<()> {
     let pool = Address::repeat_byte(0x93);
-    let quoter = Address::repeat_byte(0xb2);
-    let token0 = Address::repeat_byte(0xa2);
-    let token1 = Address::repeat_byte(0xa3);
-    let quote_out = U256::from(9_999_u64);
 
     let metadata = V3Metadata::default()
-        .with_token0(token0)
-        .with_token1(token1)
         .with_fee(500)
         .with_tick_spacing(10)
         .with_storage_layout(V3StorageLayout::uniswap(10));
 
     let mut cache = setup_cache().await?;
     install_default_account(&mut cache, Address::ZERO);
-    install_mock_runtime(
-        &mut cache,
-        quoter,
-        include_str!("fixtures/mock_v3_quoter_runtime.hex"),
-    );
-    cache
-        .db_mut()
-        .insert_account_storage(quoter, U256::ZERO, quote_out)?;
     // cold-start warms slot0 (non-zero -> Ready) + liquidity.
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
         ((pool, V3_SLOT0_SLOT), U256::from(123_456_u64)),
@@ -379,7 +365,9 @@ async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
         ColdStartOutcome::Ready(_)
     ));
 
-    // 2) react: a Swap updates slot0 (sqrtPrice/tick) + liquidity
+    // 2) react: this deliberately incomplete synthetic Swap (zero signed
+    // amounts and no exact full parent surface) must not partially mutate the
+    // parent snapshot or leave it available to later quote evaluation.
     let sources = adapter.event_sources(&registration);
     registry.register_pool(registration.clone().with_event_sources(sources))?;
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
@@ -398,32 +386,15 @@ async fn v3_full_pipeline_cold_start_react_simulate() -> Result<()> {
         12,
     );
     runtime.ingest_batch(&mut cache, batch(log, 12))?;
-    let raw_slot0 = cache
-        .cached_storage_value(pool, V3_SLOT0_SLOT)
-        .expect("slot0 warm");
     assert_eq!(
-        raw_slot0 & low_mask(160),
-        new_sqrt,
-        "react leg updated sqrtPrice"
+        cache.cached_storage_value(pool, V3_SLOT0_SLOT),
+        None,
+        "failed exact transition purged stale slot0"
     );
     assert_eq!(
         cache.cached_storage_value(pool, V3_LIQUIDITY_SLOT),
-        Some(new_liq),
-        "react leg updated liquidity"
+        None,
+        "failed exact transition purged stale liquidity"
     );
-
-    // 3) simulate against the post-event state
-    let config = SimConfig::default().with_v3_quoter(quoter);
-    let quote = adapter
-        .simulate_swap(
-            &registration,
-            &mut cache,
-            token0,
-            token1,
-            U256::from(1_000_u64),
-            &config,
-        )
-        .map_err(|e| anyhow!("v3 sim failed: {e}"))?;
-    assert_eq!(quote.amount_out, quote_out, "simulate leg returned a quote");
     Ok(())
 }

@@ -341,7 +341,7 @@ fn ctx_from_log(log: &RpcLog) -> Result<ReactiveContext> {
         chain_id: Some(CHAIN_ID),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),

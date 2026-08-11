@@ -21,8 +21,8 @@ use evm_fork_cache::cache::{
     BlockStateAccountDiff, BlockStateDiff, BlockStateStorageDiff, EvmCache,
 };
 use evm_fork_cache::reactive::{
-    BlockRef, ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput,
-    ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
+    BlockRef, ChainStatus, DeliveryScope, FlashblockRef, InputSource, ProviderRef, ReactiveConfig,
+    ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime,
 };
 use evm_fork_cache::{StateUpdate, StorageFetchError};
 
@@ -42,7 +42,7 @@ fn included_context(block_number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -71,6 +71,28 @@ fn batch(log: RpcLog, block_number: u64) -> ReactiveInputBatch<Ethereum> {
     )])
 }
 
+fn preconfirmed_batch(log: RpcLog, flashblock: FlashblockRef) -> ReactiveInputBatch<Ethereum> {
+    let block = flashblock.block_ref();
+    let provider = flashblock.provider.clone();
+    ReactiveInputBatch::new(vec![
+        ReactiveInputRecord::new(
+            ReactiveInput::Log(log.clone()),
+            ReactiveContext {
+                chain_id: Some(1),
+                source: InputSource::Flashblocks,
+                chain_status: ChainStatus::Preconfirmed {
+                    flashblock: Arc::new(flashblock),
+                },
+                block: Some(block),
+                transaction_index: log.transaction_index,
+                log_index: log.log_index,
+            },
+        )
+        .with_provider(provider),
+    ])
+    .with_delivery_scope(DeliveryScope::Preconfirmed)
+}
+
 fn reorged_batch(mut log: RpcLog, block_number: u64) -> ReactiveInputBatch<Ethereum> {
     let dropped_from = BlockRef {
         number: block_number,
@@ -84,9 +106,7 @@ fn reorged_batch(mut log: RpcLog, block_number: u64) -> ReactiveInputBatch<Ether
         ReactiveContext {
             chain_id: Some(1),
             source: InputSource::Synthetic,
-            chain_status: ChainStatus::Reorged {
-                dropped_from: dropped_from.clone(),
-            },
+            chain_status: ChainStatus::Reorged { dropped_from },
             block: Some(dropped_from),
             transaction_index: Some(0),
             log_index: Some(0),
@@ -1782,7 +1802,7 @@ async fn exclusive_eviction_survives_reorg_of_removed_pool_generation() -> Resul
 }
 
 #[tokio::test]
-async fn ordinary_ingest_ages_eviction_fence_without_cache_mutation() -> Result<()> {
+async fn ordinary_ingest_ages_eviction_fence_without_repurging_rewarmed_state() -> Result<()> {
     let pool = Address::repeat_byte(0xd6);
     let slot_a = U256::from(46);
     let slot_b = U256::from(47);
@@ -1816,11 +1836,12 @@ async fn ordinary_ingest_ages_eviction_fence_without_cache_mutation() -> Result<
             127,
         ),
     )?;
-    assert_eq!(
-        cache.snapshot_generation(),
-        evicted_generation,
-        "ordinary fence aging must not issue a redundant purge"
+    assert!(
+        cache.snapshot_generation() >= evicted_generation,
+        "canonical block-context progress may advance the cache generation"
     );
+    assert_eq!(cache.cached_storage_value(pool, slot_a), None);
+    assert_eq!(cache.cached_storage_value(pool, slot_b), None);
 
     cache.apply_updates(&[
         StateUpdate::slot(pool, slot_a, U256::from(300)),
@@ -1835,7 +1856,7 @@ async fn ordinary_ingest_ages_eviction_fence_without_cache_mutation() -> Result<
         ),
     )?;
 
-    assert_eq!(cache.snapshot_generation(), rewarmed_generation);
+    assert!(cache.snapshot_generation() >= rewarmed_generation);
     assert_eq!(
         cache.cached_storage_value(pool, slot_a),
         Some(U256::from(300)),
@@ -2227,6 +2248,142 @@ async fn sync_engine_applies_solidly_sync_exactly_with_no_resync() -> Result<()>
     assert!(report.degraded_pools.is_empty());
     assert_eq!(cache.cached_storage_value(pool, r0_slot), Some(reserve0));
     assert_eq!(cache.cached_storage_value(pool, r1_slot), Some(reserve1));
+    assert_eq!(
+        engine
+            .registry()
+            .pool(&PoolKey::SolidlyV2(pool))
+            .expect("registered pool")
+            .status,
+        PoolStatus::Ready
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn flashblock_preview_is_attributed_and_discard_restores_canonical_pool_state() -> Result<()>
+{
+    let pool = Address::repeat_byte(0x61);
+    let (r0_slot, r1_slot) = (U256::from(10_u64), U256::from(11_u64));
+    let canonical_reserve0 = U256::from(100_u64);
+    let canonical_reserve1 = U256::from(200_u64);
+    let preview_reserve0 = U256::from(300_u64);
+    let preview_reserve1 = U256::from(400_u64);
+    let mut cache = setup_cache().await?;
+    cache.apply_updates(&[
+        StateUpdate::slot(pool, r0_slot, canonical_reserve0),
+        StateUpdate::slot(pool, r1_slot, canonical_reserve1),
+    ]);
+    let mut engine = AmmSyncEngine::new(solidly_registry(pool, r0_slot, r1_slot)?)?;
+    engine.ingest_batch(
+        &mut cache,
+        batch(rpc_log(Address::ZERO, Vec::new(), Vec::new(), 90), 90),
+    )?;
+    let provider = ProviderRef::new("base-flashblocks", 7);
+    let flashblock = FlashblockRef {
+        provider: provider.clone(),
+        payload_id: None,
+        index: Some(2),
+        block_number: 91,
+        content_hash: block_hash(91),
+        partial_block_hash: Some(block_hash(91)),
+        parent_hash: Some(block_hash(90)),
+        state_root: None,
+        transactions_root: None,
+        transaction_hashes: vec![B256::repeat_byte(0x22)],
+        timestamp: Some(1_700_000_091),
+        base_fee_per_gas: Some(7),
+        beneficiary: Some(Address::repeat_byte(0xcb)),
+        prevrandao: Some(B256::repeat_byte(0x77)),
+        gas_limit: Some(30_000_000),
+    };
+    let log = rpc_log(
+        pool,
+        vec![solidly_sync_topic()],
+        abi_words([preview_reserve0, preview_reserve1]),
+        91,
+    );
+
+    let report = engine.ingest_batch(&mut cache, preconfirmed_batch(log, flashblock.clone()))?;
+
+    assert_eq!(report.preconfirmation(), Some(&flashblock));
+    assert_eq!(report.affected_pools, vec![PoolKey::SolidlyV2(pool)]);
+    assert!(report.degraded_pools.is_empty());
+    assert!(report.incidents.is_empty());
+    assert!(!report.requires_full_refresh);
+    assert_eq!(
+        cache.cached_storage_value(pool, r0_slot),
+        Some(preview_reserve0)
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, r1_slot),
+        Some(preview_reserve1)
+    );
+    assert_eq!(engine.degraded_pool_count(), 0);
+
+    engine.discard_preconfirmation(&mut cache);
+    assert_eq!(
+        cache.cached_storage_value(pool, r0_slot),
+        Some(canonical_reserve0)
+    );
+    assert_eq!(
+        cache.cached_storage_value(pool, r1_slot),
+        Some(canonical_reserve1)
+    );
+    assert_eq!(
+        engine
+            .registry()
+            .pool(&PoolKey::SolidlyV2(pool))
+            .expect("registered pool")
+            .status,
+        PoolStatus::Ready
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_flashblock_event_does_not_degrade_canonical_pool_health() -> Result<()> {
+    let pool = Address::repeat_byte(0x62);
+    let (r0_slot, r1_slot) = (U256::from(10_u64), U256::from(11_u64));
+    let mut cache = setup_cache().await?;
+    let mut engine = AmmSyncEngine::new(solidly_registry(pool, r0_slot, r1_slot)?)?;
+    engine.ingest_batch(
+        &mut cache,
+        batch(rpc_log(Address::ZERO, Vec::new(), Vec::new(), 90), 90),
+    )?;
+    let flashblock = FlashblockRef {
+        provider: ProviderRef::new("op-flashblocks", 3),
+        payload_id: None,
+        index: None,
+        block_number: 91,
+        content_hash: block_hash(91),
+        partial_block_hash: Some(block_hash(91)),
+        parent_hash: Some(block_hash(90)),
+        state_root: None,
+        transactions_root: None,
+        transaction_hashes: vec![B256::repeat_byte(0x22)],
+        timestamp: Some(1_700_000_091),
+        base_fee_per_gas: Some(7),
+        beneficiary: Some(Address::repeat_byte(0xcb)),
+        prevrandao: Some(B256::repeat_byte(0x77)),
+        gas_limit: Some(30_000_000),
+    };
+    let malformed = rpc_log(
+        pool,
+        vec![solidly_sync_topic()],
+        abi_words([U256::from(123_u64)]),
+        91,
+    );
+
+    let report = engine.ingest_batch(
+        &mut cache,
+        preconfirmed_batch(malformed, flashblock.clone()),
+    )?;
+
+    assert_eq!(report.preconfirmation(), Some(&flashblock));
+    assert!(report.degraded_pools.is_empty());
+    assert!(report.recovered_pools.is_empty());
+    assert!(!report.requires_full_refresh);
+    assert_eq!(engine.degraded_pool_count(), 0);
     assert_eq!(
         engine
             .registry()

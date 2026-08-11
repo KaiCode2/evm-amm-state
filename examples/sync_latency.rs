@@ -467,10 +467,7 @@ fn print_pair(name: &str, prior: &SyncStats, new: &SyncStats) {
         new.slots,
         new.details
     );
-    println!(
-        "| Relative | {:.2}x | {:.1}% lower latency | | |\n",
-        speedup, reduction
-    );
+    println!("| Relative | {speedup:.2}x | {reduction:.1}% lower latency | | |\n");
 }
 
 fn redact_url(url: &str) -> String {

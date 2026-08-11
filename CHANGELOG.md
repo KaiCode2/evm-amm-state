@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.6] - 2026-08-11
+
+### Fixed
+
+- Restored Slipstream's one-shot, full-range **quote-surface** hydration during
+  multi-pool cold start. The program loads slot0, active liquidity, every
+  reachable bitmap word, and the four tick words consumed by canonical quote
+  execution, so strict provider-free applications do not fall back to the
+  bounded resumable window at startup. This does not grant event-transition
+  authority: Slipstream mutations remain typed `Unsupported`, purge stale
+  state, and require an authoritative repair.
+
+## [0.3.0-alpha.5] - 2026-08-11
+
+### Added
+
+- Added context-aware, provider-free canonical Uniswap V3 `Swap` replay from an
+  exact parent state. The transition reproduces slot0, active liquidity, input
+  fee growth, protocol-fee accumulators, observation-ring writes, empty bitmap
+  word steps, and every crossed four-word `Tick.Info` record.
+- Added typed exact-transition failures, an explicit family capability API, a
+  deterministic 4,096-step work ceiling, and provider-free deployed-runtime
+  differential coverage across directions, exact-input/output modes, protocol
+  fees, price limits, rounding edges, initialized crossings, and oracle-ring
+  behavior.
+- Added authoritative canonical-batch sequencing and duplicate-block rejection
+  in the live actor. Replayed fee-only swaps cannot accrue fee growth twice, and
+  same-height different-hash replacements still enter the existing reorg path.
+- Added mutation-completeness regressions that deliberately omit fee-growth,
+  protocol-fee, observation, and tick-outside writes and prove the full-slot
+  deployed-runtime comparison rejects each omission.
+- Added provider-free monotonic timing provenance to canonical
+  `AmmStateCommit`s: source ingress, typed decode, deterministic ordering,
+  transition completion, and reliable commit publication. Subscriber ingress
+  is retained across reconciliation; non-event commits expose no fabricated
+  timing.
+- Added optional provider-free `AmmPreconfirmationTiming` to published preview
+  snapshots. Subscriber-supplied monotonic ingress survives AMM transition and
+  quote-readiness validation; direct or legacy batches without provenance
+  expose `None` rather than a fabricated later start.
+
+### Changed
+
+- Direct and reactive adapter paths now accept exact chain, block/parent,
+  transaction, timestamp, and log-position context. The stateless direct driver
+  treats this as evidence only; complete canonical batches enforce strict
+  transaction/log order and the live actor rejects duplicate committed blocks.
+- Pancake V3 and Slipstream swaps now explicitly fail closed for exact replay
+  pending independent family parity. A recognized unsupported, contextless, or
+  failed exact swap purges stale pool storage and requests repair instead of
+  leaving quote-ready parent state behind.
+- Added non-authoritative Slipstream research fixtures and provider-free fee
+  inference for the pinned Base/Optimism BIFI runtimes. The public capability
+  remains `Unsupported`: evidence cannot elevate it, incomplete one-shot state
+  is never accepted, and the generated corpus is not the exhaustive
+  family-parity proof required for Flashblocks execution.
+- Canonical V3 cold-start now materializes only provider-proven zero bitmap
+  words; missing bitmap or tick cells remain failures rather than implicit zero.
+- Canonical V3 now subscribes the complete standard pool-mutation topic set.
+  Every non-`Swap` mutation, including warm `Mint`/`Burn`, `Flash`, observation
+  cardinality and protocol-fee administration, emits typed `RequiresRepair`
+  and purges the whole pool before a later exact Swap can consume the parent.
+
+## [0.3.0-alpha.4] - 2026-08-07
+
+### Added
+
+- Added a typed, low-cardinality observer event for rejected speculative AMM
+  batches so applications can alert on reactive, state-readiness, and offline
+  quote-readiness failures without using raw error strings as labels.
+- Added an explicit subscriber-driver rejection policy. Required/default
+  previews remain fail-closed, while applications using `Preferred` mode may
+  discard only a typed preconfirmation-batch rejection and continue canonical
+  delivery. Attachment rejects a continuation policy paired with `Required` or
+  `Disabled` preconfirmations.
+
+### Fixed
+
+- The asynchronous runtime now installs its already-verified canonical
+  full-header baseline into the embedded reactive engine before accepting a
+  speculative preview. A preview must identify that baseline's exact child by
+  block number and parent hash; stale, missing-parent, and wrong-parent inputs
+  fail closed without altering canonical state.
+- A failed disposable preview no longer has to terminate the shared canonical
+  subscriber driver when the application explicitly selects canonical
+  continuation. Canonical transport, lifecycle, chain, and trust errors remain
+  fatal under either policy.
+
+## [0.3.0-alpha.3] - 2026-08-05
+
+### Fixed
+
+- Slipstream/Aerodrome CL quotes now encode the protocol's native QuoterV2
+  `int24 tickSpacing` parameter instead of the Uniswap V3 `uint24 fee`
+  parameter. Discovered pools no longer require synthetic fee metadata, and
+  one-shot cold-start accepts complete tick-spacing metadata while preserving
+  provider-disconnected quote execution.
+
+## [0.3.0-alpha.2] - 2026-08-05
+
+### Added
+
+- Added representative AMM quote read-set learning, exact-canonical hydration,
+  exact canonical-to-offline quote equality, offline preview-readiness replay,
+  bounded manifest growth, typed hydration failures, and runtime-code identity
+  invalidation.
+- Added automatic next-canonical background hydration for quote-only slots that
+  an unexpected speculative path discovered, keeping provider I/O off the
+  preview actor.
+- Added provider-read-free repeated-warmup and cache-to-quote acceptance gates
+  to the live Base benchmark, with recent-activity pool selection.
+- Added explicit preconfirmation invalidation on the runtime handle and attached
+  subscriber bridge, allowing a lost/replaced provider generation to revoke
+  signing and simulation authority before reconnect work begins.
+- Added sorted, deduplicated `AmmEventRef` source identities to speculative
+  snapshots and canonical change sets. Applications can reconcile a pending
+  and canonical AMM log by transaction hash and log index without relying on a
+  pending block hash; placeholder zero transaction hashes are omitted.
+- Added the preview's pending EVM block environment to immutable AMM snapshots.
+- Extended the live latency acceptance example to run the 100-swap or
+  five-minute gate against Base's native streams or Optimism's bounded pending
+  sampler, with a bounded connection timeout, exact RPC/failure metrics, and
+  documented paid-provider results.
+- OP acceptance now uses the cache adapter's 250 ms exact pending-parent fence
+  and exact transaction-receipt recovery, and reports completed/null
+  receipt and raced-sample counts alongside the total RPC-method rate.
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.90 and updated the locked
+  `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+- CI and live gates now use the checked-in lockfile, immutable third-party
+  action revisions, exact sibling candidate commits, and a release-delta
+  authoring-hygiene check.
+
+### Fixed
+
+- Representative warm-up now rejects and atomically withholds manifests when
+  the immediate RPC-disconnected replay returns a different `SwapQuote` from
+  the canonical execution.
+- Flashblock previews now fail closed when ingest requires a full refresh,
+  schedules or fails a repair/resync, reports unknown pool impact, or applies a
+  non-ready update quality. Rejected speculative work restores canonical cache
+  and AMM state and is never published to observers.
+- Pool readiness transitions now preserve learned quote manifests in both the
+  registry and routing views, so canonical status changes cannot silently
+  disable offline Flashblock quote validation.
+
+## [0.3.0-alpha.1] - 2026-07-28
+
+### Added
+
+- Added immutable `AmmPreconfirmedSnapshot` publication and observation APIs,
+  including exact Flashblock/provider provenance and quote-relevant pool
+  changes over a disposable cache view.
+- Added direct and attached-subscriber preconfirmation ingestion. Canonical
+  progress, topology changes, trust loss, shutdown, or an explicit discard
+  invalidate the speculative view without incrementing the canonical AMM state
+  version.
+
+### Changed
+
+- Upgraded the live runtime to `evm-fork-cache 0.4.0-alpha.1` and its
+  asynchronous subscriber registration contract.
+- Canonical full-header ingestion now preserves the complete verified EVM block
+  environment while exact-hash pinning provider reads.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added
@@ -423,6 +590,11 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...HEAD
+[0.3.0-alpha.5]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...v0.3.0-alpha.5
+[0.3.0-alpha.4]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...v0.3.0-alpha.4
+[0.3.0-alpha.3]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...v0.3.0-alpha.3
+[0.3.0-alpha.2]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
+[0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0
