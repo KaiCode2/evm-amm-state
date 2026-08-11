@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -70,9 +70,8 @@ live-runtime = ["dep:tokio"]
 [dependencies]
 # Companion crate. The reactive runtime requires 0.4.0-alpha.4's preconfirmed overlay,
 # provider provenance, exact log-route index, and generation-safe pending-resync
-# cancellation. The sibling path keeps the cross-crate lifecycle work source-identical until that release is
-# published; Cargo preserves the version requirement when packaging.
-evm-fork-cache = { version = "0.4.0-alpha.4", path = "../evm-fork-cache-alpha4.KTuemq" }
+# cancellation. The exact registry pin keeps downstream builds reproducible.
+evm-fork-cache = { version = "=0.4.0-alpha.4" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -89,7 +88,7 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-evm-fork-cache = { version = "0.4.0-alpha.4", path = "../evm-fork-cache-alpha4.KTuemq", features = ["reactive-polling", "raw-flashblocks-json"] }
+evm-fork-cache = { version = "=0.4.0-alpha.4", features = ["reactive-polling", "raw-flashblocks-json"] }
 alloy-consensus = "1.0.38"
 alloy-json-rpc = "1.0.38"
 alloy-rpc-client = "1.0.38"

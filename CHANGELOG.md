@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.6] - 2026-08-11
+
+### Fixed
+
+- Restored Slipstream's one-shot, full-range **quote-surface** hydration during
+  multi-pool cold start. The program loads slot0, active liquidity, every
+  reachable bitmap word, and the four tick words consumed by canonical quote
+  execution, so strict provider-free applications do not fall back to the
+  bounded resumable window at startup. This does not grant event-transition
+  authority: Slipstream mutations remain typed `Unsupported`, purge stale
+  state, and require an authoritative repair.
+
 ## [0.3.0-alpha.5] - 2026-08-11
 
 ### Added

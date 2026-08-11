@@ -604,6 +604,8 @@ dependencies = [
 [[package]]
 name = "alloy-transport-balancer"
 version = "0.3.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "badb1ecb3caedc66308ca82ac63459221ab3d58bd5537ba31ee6a310d93ebffa"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
@@ -1976,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "evm-amm-state"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2004,6 +2006,8 @@ dependencies = [
 [[package]]
 name = "evm-fork-cache"
 version = "0.4.0-alpha.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38eee68a81052e22cf9d4e594b57fd6ae1495d206fb544cb9a4b647516b8e523"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",

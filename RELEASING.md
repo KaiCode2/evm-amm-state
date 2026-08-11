@@ -1,16 +1,15 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.5`. Publish its prerequisites in
+The current release candidate is `0.3.0-alpha.6`. Publish its prerequisites in
 this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
 2. `evm-fork-cache 0.4.0-alpha.4`;
-3. publish `evm-amm-state 0.3.0-alpha.5` after the gates below pass.
+3. publish `evm-amm-state 0.3.0-alpha.6` after the gates below pass.
 
-The state crate intentionally keeps a versioned sibling path during development.
-Packaging removes the path and resolves `evm-fork-cache 0.4.0-alpha.4` from
-crates.io. Treat any failure to resolve that published version as a release
-blocker rather than bypassing registry verification.
+The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.4`.
+Treat any failure to resolve that published version as a release blocker rather
+than bypassing registry verification.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
 hydration, exact equality between the canonical warm-up quote and its immediate
@@ -49,6 +48,11 @@ Alpha.5 depends on alpha.4's immutable `EvmSnapshot` current block-hash and
 address-bound code-hash accessors. Publish and verify that companion version
 first. The retained Slipstream evaluator/corpus is research-only and does not
 make Base/Optimism Flashblocks execution-ready.
+
+Alpha.6 restores the full-range, layout-only Slipstream quote bootstrap used by
+strict provider-free consumers. This is a quote-readiness correction only:
+Slipstream event transitions remain unsupported and fail closed exactly as in
+alpha.5.
 
 ## Offline release matrix
 

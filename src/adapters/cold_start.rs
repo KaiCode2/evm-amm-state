@@ -730,7 +730,7 @@ fn inject_and_record(cache: &mut EvmCache, entries: Vec<(Address, U256, U256)>) 
 /// storage program.
 ///
 /// - No pool address → `None`.
-/// - A supported V3-family pool (`UniswapV3`/`PancakeV3`) that carries a
+/// - A supported V3-family pool (`UniswapV3`/`PancakeV3`/`Slipstream`) that carries a
 ///   `storage_layout` → a [`HydrationKind::V3`] full sync (only when the
 ///   `uniswap-v3` feature is enabled).
 /// - Otherwise, any pool whose flat read-set resolves via
@@ -773,24 +773,26 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 /// The **canonical Uniswap** spec (which bakes in Uniswap's fee-growth,
 /// protocol-fees, and observation slot positions) is used only for genuine
 /// Uniswap V3 pools. PancakeSwap uses its independently verified shifted spec.
-/// Slipstream is deliberately excluded: its exact transition requires six-word
-/// Tick.Info records and an extended reward/gauge state surface that the current
-/// generic one-shot bytecode format cannot encode. It therefore falls back to
-/// the resumable adapter planner rather than warming an incomplete quote state.
+/// Slipstream uses the layout-only [`V3SyncSpec::core`] as a **quote-surface**
+/// bootstrap: it loads slot0, active liquidity, the full bitmap range, and the
+/// four tick words used by its configured quoter. That deliberately does not
+/// claim the six-word tick and reward/gauge surface required for exact event
+/// transitions; Slipstream mutations remain unsupported and force an
+/// authoritative repair.
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
     let (metadata, family) = match &pool.metadata {
         ProtocolMetadata::UniswapV3(metadata) => (metadata, 0),
         ProtocolMetadata::PancakeV3(metadata) => (metadata, 1),
-        ProtocolMetadata::Slipstream(_) => return None,
+        ProtocolMetadata::Slipstream(metadata) => (metadata, 2),
         _ => return None,
     };
     let layout = metadata.storage_layout.filter(|l| l.tick_spacing > 0)?;
     Some(match family {
         0 => V3SyncSpec::uniswap(layout),
         1 => V3SyncSpec::pancake(layout),
-        _ => unreachable!("Slipstream is excluded above"),
+        _ => V3SyncSpec::core(layout),
     })
 }
 
@@ -2104,11 +2106,11 @@ mod tests {
         assert_eq!(v3_sync_spec(&pool), Some(V3SyncSpec::uniswap(layout)));
     }
 
-    /// PancakeSwap V3 uses its verified shifted full layout. Slipstream is not
-    /// eligible until the one-shot format can transport its six-word ticks and
-    /// complete reward/gauge state surface.
+    /// PancakeSwap V3 uses its verified shifted full layout. Slipstream uses a
+    /// full-range layout-only quote surface without acquiring exact transition
+    /// authority over its six-word ticks or reward/gauge state.
     #[test]
-    fn pancake_uses_its_full_spec_while_slipstream_falls_back() {
+    fn pancake_and_slipstream_use_family_appropriate_full_range_specs() {
         let pancake_layout = V3StorageLayout::pancake(10);
         let pancake = PoolRegistration::new(PoolKey::PancakeV3(Address::repeat_byte(0x22)))
             .with_metadata(ProtocolMetadata::PancakeV3(
@@ -2128,8 +2130,8 @@ mod tests {
                     .with_tick_spacing(100)
                     .with_storage_layout(slip_layout),
             ));
-        assert_eq!(v3_sync_spec(&slip), None);
-        assert!(!supports_one_shot_hydration(&slip));
+        assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+        assert!(supports_one_shot_hydration(&slip));
         assert!(
             fast_metadata_complete(&slip),
             "tick-spacing-keyed Slipstream does not require fee metadata"
