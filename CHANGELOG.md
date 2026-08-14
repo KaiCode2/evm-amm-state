@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   search cell, and follow-up quotes against a cache whose provider panics on
   access. Historical reactive fixtures also prove the evidence-free path emits
   `ExactFromInput` with no resync or invalidation.
+- Added a deterministic event-to-simulation release gate for both historical
+  deployments. It ingests the real Swap log, executes bid and ask simulations
+  through the native Slipstream quote ABI and reviewed deployed pool bytecode,
+  proves a provider-failure sentinel was untouched, and enforces a one-second
+  maximum across an operator-selected optimized sample count.
 
 ### Changed
 

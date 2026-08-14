@@ -15,7 +15,7 @@ use alloy_transport::mock::Asserter;
 use evm_amm_state::adapters::{
     AdapterEventContext, AdapterRegistry, AmmAdapter, AmmPoolReactiveHandler,
     AmmReactiveRoutingContext, ConcentratedLiquidityAdapter, PoolGeneration, PoolInstanceId,
-    PoolKey, PoolRegistration, ProtocolMetadata, SlipstreamFeeEvidenceError,
+    PoolKey, PoolRegistration, ProtocolMetadata, SimConfig, SlipstreamFeeEvidenceError,
     SlipstreamFeeEvidenceInsertOutcome, SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity,
     SlipstreamSwapFeeEvidence, StateUpdate, StateView, UpdateQuality, V3Metadata, V3StorageLayout,
     V3SwapTransitionCapability,
@@ -27,6 +27,9 @@ use evm_fork_cache::reactive::{
 };
 use revm::state::{AccountInfo, Bytecode};
 use serde_json::Value;
+
+const LOCAL_SLIPSTREAM_QUOTER: Address =
+    alloy_primitives::address!("00000000000000000000000000000000000000c6");
 
 #[derive(Clone, Default)]
 struct FixtureState(BTreeMap<(Address, U256), U256>);
@@ -72,10 +75,31 @@ async fn cache(chain_id: u64) -> EvmCache {
     cache
 }
 
+async fn provider_disconnected_cache(chain_id: u64) -> (EvmCache, Asserter) {
+    let asserter = Asserter::new();
+    let client = RpcClient::mocked(asserter.clone());
+    let provider = RootProvider::<AnyNetwork>::new(client);
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
+    cache.set_chain_id(chain_id);
+    asserter.push_failure_msg("Slipstream event-to-simulation must not access the provider");
+    (cache, asserter)
+}
+
 fn runtime(hex_runtime: &str) -> Bytes {
     Bytes::from(
         alloy_primitives::hex::decode(hex_runtime.trim()).expect("checked-in deployed runtime"),
     )
+}
+
+fn address_word(address: Address) -> U256 {
+    U256::from_be_slice(address.as_slice())
+}
+
+fn mapping_slot(address: Address, slot: U256) -> U256 {
+    let mut encoded = [0_u8; 64];
+    encoded[12..32].copy_from_slice(address.as_slice());
+    encoded[32..].copy_from_slice(&slot.to_be_bytes::<32>());
+    U256::from_be_slice(keccak256(encoded).as_slice())
 }
 
 fn install(cache: &mut EvmCache, address: Address, code: Bytes, slots: &[(U256, U256)]) {
@@ -184,6 +208,16 @@ async fn assert_fixture(contents: &str) {
         .map(word)
         .map(|word| Address::from_slice(&word.to_be_bytes::<32>()[12..]))
         .expect("factory storage word");
+    let token0 = fixture["parent_storage"]["0x01"]
+        .as_str()
+        .map(word)
+        .map(|word| Address::from_slice(&word.to_be_bytes::<32>()[12..]))
+        .expect("token0 storage word");
+    let token1 = fixture["parent_storage"]["0x02"]
+        .as_str()
+        .map(word)
+        .map(|word| Address::from_slice(&word.to_be_bytes::<32>()[12..]))
+        .expect("token1 storage word");
     let transaction_hash = hash(&reference["transaction_hash"]);
     let block_number = reference["block_number"].as_u64().expect("block number");
     let block_hash = hash(&reference["block_hash"]);
@@ -433,7 +467,10 @@ async fn assert_fixture(contents: &str) {
         .with_state_address(pool)
         .with_metadata(ProtocolMetadata::Slipstream(
             V3Metadata::default()
+                .with_token0(token0)
+                .with_token1(token1)
                 .with_tick_spacing(spacing)
+                .with_quoter(LOCAL_SLIPSTREAM_QUOTER)
                 .with_storage_layout(V3StorageLayout::slipstream(spacing)),
         ));
     assert_eq!(
@@ -583,18 +620,62 @@ async fn assert_fixture(contents: &str) {
     // reactive runtime backed by a mock provider with no prepared response:
     // any provider access would fail the test. The event must publish an exact
     // quote/search update without invalidation or repair.
-    let mut quote_cache = cache(chain_id).await;
+    let (mut quote_cache, quote_provider) = provider_disconnected_cache(chain_id).await;
     let parent_slots = fixture["parent_storage"]
         .as_object()
         .expect("parent storage map")
         .iter()
         .map(|(slot, value)| (word(slot), word(value.as_str().expect("parent word"))))
         .collect::<Vec<_>>();
-    let pool_runtime = reviewed_runtimes(family)
-        .into_iter()
-        .find_map(|(runtime_address, runtime)| (runtime_address == pool).then_some(runtime))
-        .expect("reviewed pool runtime");
-    install(&mut quote_cache, pool, pool_runtime, &parent_slots);
+    for (runtime_address, runtime_code) in reviewed_runtimes(family) {
+        let slots = if runtime_address == pool {
+            parent_slots.clone()
+        } else {
+            fixture["fee_parent_state"]
+                .get(format!("{runtime_address:#x}"))
+                .and_then(Value::as_object)
+                .map(|slots| {
+                    slots
+                        .iter()
+                        .map(|(slot, value)| {
+                            (word(slot), word(value.as_str().expect("fee parent word")))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        install(&mut quote_cache, runtime_address, runtime_code, &slots);
+    }
+    quote_cache
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    let token_code = runtime(include_str!("fixtures/reference_swap_token_runtime.hex"));
+    let pool_balance_slot = mapping_slot(pool, U256::ZERO);
+    let pool_balance = U256::from(1) << 200_usize;
+    install(
+        &mut quote_cache,
+        token0,
+        token_code.clone(),
+        &[(pool_balance_slot, pool_balance)],
+    );
+    install(
+        &mut quote_cache,
+        token1,
+        token_code,
+        &[(pool_balance_slot, pool_balance)],
+    );
+    install(
+        &mut quote_cache,
+        LOCAL_SLIPSTREAM_QUOTER,
+        runtime(include_str!(
+            "fixtures/v3_reference_swap_harness_runtime.hex"
+        )),
+        &[
+            (U256::ZERO, address_word(token0)),
+            (U256::from(1), address_word(token1)),
+            (U256::from(2), address_word(pool)),
+        ],
+    );
 
     let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let registration_with_sources = registration
@@ -602,7 +683,7 @@ async fn assert_fixture(contents: &str) {
         .with_event_sources(adapter.event_sources(&registration));
     let mut registry = AdapterRegistry::new();
     registry
-        .register_adapter(adapter)
+        .register_adapter(adapter.clone())
         .expect("register Slipstream adapter");
     registry
         .register_pool(registration_with_sources)
@@ -617,6 +698,7 @@ async fn assert_fixture(contents: &str) {
     quote_reactive
         .register_handler(handler)
         .expect("register evidence-free pool-scoped handler");
+    let event_started = Instant::now();
     let quote_report = quote_reactive
         .ingest_batch(
             &mut quote_cache,
@@ -626,6 +708,7 @@ async fn assert_fixture(contents: &str) {
             )]),
         )
         .expect("evidence-free Slipstream event must remain provider-disconnected");
+    let event_elapsed = event_started.elapsed();
     assert_eq!(quote_report.applied.len(), 1);
     assert_eq!(
         quote_report.applied[0].quality,
@@ -633,6 +716,8 @@ async fn assert_fixture(contents: &str) {
     );
     assert!(quote_report.applied[0].resyncs.is_empty());
     assert!(quote_report.applied[0].invalidations.is_empty());
+    assert!(quote_report.resyncs.is_empty());
+    assert!(quote_reactive.pending_resyncs().is_empty());
     assert_eq!(
         quote_cache.cached_storage_value(pool, U256::from(6)),
         fixture["expected_writes"]
@@ -726,6 +811,79 @@ async fn assert_fixture(contents: &str) {
             );
         }
     }
+
+    let quote_amounts = if chain_id == 10 {
+        [
+            U256::from(1_000_000_u64),
+            U256::from(10_000_000_000_000_000_u64),
+        ]
+    } else {
+        [
+            U256::from(1_000_000_000_000_000_u64),
+            U256::from(1_000_000_000_000_000_u64),
+        ]
+    };
+    let sample_count = std::env::var("SLIPSTREAM_E2E_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(32);
+    let mut end_to_end = Vec::with_capacity(sample_count);
+    let mut expected_outputs = None;
+    for _ in 0..sample_count {
+        let quote_started = Instant::now();
+        let token0_to_token1 = adapter
+            .simulate_swap(
+                &registration,
+                &mut quote_cache,
+                token0,
+                token1,
+                quote_amounts[0],
+                &SimConfig::default(),
+            )
+            .expect("post-event token0-to-token1 full pool simulation");
+        let token1_to_token0 = adapter
+            .simulate_swap(
+                &registration,
+                &mut quote_cache,
+                token1,
+                token0,
+                quote_amounts[1],
+                &SimConfig::default(),
+            )
+            .expect("post-event token1-to-token0 full pool simulation");
+        let outputs = [token0_to_token1.amount_out, token1_to_token0.amount_out];
+        assert!(outputs.iter().all(|amount| !amount.is_zero()));
+        if let Some(expected) = expected_outputs {
+            assert_eq!(outputs, expected, "post-event quotes must be deterministic");
+        } else {
+            expected_outputs = Some(outputs);
+        }
+        end_to_end.push(event_elapsed + quote_started.elapsed());
+    }
+    end_to_end.sort_unstable();
+    let percentile = |percent: usize| -> Duration {
+        let index = (sample_count * percent).div_ceil(100).saturating_sub(1);
+        end_to_end[index]
+    };
+    let p50 = percentile(50);
+    let p95 = percentile(95);
+    let p99 = percentile(99);
+    let max = *end_to_end.last().expect("positive sample count");
+    let outputs = expected_outputs.expect("at least one simulation sample");
+    eprintln!(
+        "Slipstream event-to-full-simulation chain={chain_id} family={family:?} block={block_number} samples={sample_count} event_apply={event_elapsed:?} token0_to_token1_out={} token1_to_token0_out={} p50={p50:?} p95={p95:?} p99={p99:?} max={max:?} provider_calls=0 invalidations=0 resyncs=0",
+        outputs[0], outputs[1],
+    );
+    assert!(
+        max < Duration::from_secs(1),
+        "every event-to-full-simulation sample must stay below one second; max={max:?}",
+    );
+    assert_eq!(
+        quote_provider.read_q().len(),
+        1,
+        "the untouched failure sentinel proves zero provider calls",
+    );
 
     if let Some(sample_count) = std::env::var("SLIPSTREAM_PERF_SAMPLES")
         .ok()

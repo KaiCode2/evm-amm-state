@@ -583,6 +583,17 @@ cargo test                       # unit + offline integration tests
 cargo test --no-default-features # protocol-neutral core
 ```
 
+The reviewed Base/Optimism Slipstream event-to-simulation examples are local
+and credential-free. They process checked-in historical Swap logs through the
+reactive runtime, execute both post-event quote directions against the real
+pool proxy/implementation bytecode, and assert zero provider calls,
+invalidations, or resyncs:
+
+```bash
+SLIPSTREAM_E2E_SAMPLES=1000 cargo test --release --locked \
+  --test slipstream_swap_transition_acceptance -- --nocapture
+```
+
 These run from a clone of the repository. The published crate **excludes the
 integration test suite** (`tests/`) to stay lean, so `cargo test` on a crates.io
 download exercises only the inline unit tests — clone the repo for the full

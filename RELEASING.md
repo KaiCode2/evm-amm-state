@@ -54,6 +54,24 @@ strict provider-free consumers. This is a quote-readiness correction only:
 Slipstream event transitions remain unsupported and fail closed exactly as in
 alpha.5.
 
+Alpha.7 adds event-only quote/search transitions for the reviewed Base BIFI and
+Optimism mooBIFI Slipstream deployments. `Swap`, `Mint`, `Burn`, and `Collect`
+advance the state consumed by search without a provider reconstruction; full
+fee-growth, gauge, reward, position, and token accounting remain outside that
+guarantee unless the separately attested evidence is present. Arbitrary
+Slipstream deployments remain unsupported.
+
+The local alpha.7 gate routes the two checked-in historical Swap logs through
+the pool-scoped reactive runtime and then executes both quote directions through
+the native Slipstream ABI and the real reviewed proxy/implementation bytecode.
+It leaves a provider-failure sentinel queued, requires zero invalidations and
+resyncs, and fails if any optimized event-to-bid/ask sample reaches one second:
+
+```bash
+SLIPSTREAM_E2E_SAMPLES=1000 cargo test --release --locked \
+  --test slipstream_swap_transition_acceptance -- --nocapture
+```
+
 ## Offline release matrix
 
 ```bash

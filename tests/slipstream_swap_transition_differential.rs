@@ -7,9 +7,11 @@
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use alloy_eips::BlockId;
+use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256, hex, keccak256};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
+use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
 use anyhow::{Context, Result, anyhow};
 use evm_amm_state::adapters::storage::{
@@ -17,12 +19,17 @@ use evm_amm_state::adapters::storage::{
     v3_word_position,
 };
 use evm_amm_state::adapters::{
-    AdapterEventContext, AmmAdapter, ConcentratedLiquidityAdapter, PoolKey, PoolRegistration,
-    ProtocolMetadata, SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity,
-    SlipstreamSwapFeeEvidence, StateUpdate, StateView, UpdateQuality, V3Metadata, V3StorageLayout,
-    V3SwapTransitionCapability,
+    AdapterEventContext, AdapterRegistry, AmmAdapter, AmmPoolReactiveHandler,
+    AmmReactiveRoutingContext, ConcentratedLiquidityAdapter, PoolGeneration, PoolInstanceId,
+    PoolKey, PoolRegistration, ProtocolMetadata, SlipstreamRuntimeFamily,
+    SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence, StateUpdate, StateView, UpdateQuality,
+    V3Metadata, V3StorageLayout, V3SwapTransitionCapability,
 };
 use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::reactive::{
+    BlockRef, ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput,
+    ReactiveInputBatch, ReactiveInputRecord, ReactiveRuntime, StateEffectQuality,
+};
 use revm::{
     context::result::ExecutionResult,
     state::{AccountInfo, Bytecode},
@@ -118,6 +125,16 @@ async fn cache(chain_id: u64) -> EvmCache {
     let mut cache = EvmCache::new(Arc::new(provider)).await;
     cache.set_chain_id(chain_id);
     cache
+}
+
+async fn provider_disconnected_cache(chain_id: u64) -> (EvmCache, Asserter) {
+    let asserter = Asserter::new();
+    let client = RpcClient::mocked(asserter.clone());
+    let provider = RootProvider::<AnyNetwork>::new(client);
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
+    cache.set_chain_id(chain_id);
+    asserter.push_failure_msg("Slipstream transition matrix must not access the provider");
+    (cache, asserter)
 }
 
 fn runtime(value: &str) -> Bytes {
@@ -505,6 +522,98 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
             other => return Err(anyhow!("unexpected quote-exact update: {other:?}")),
         }
     }
+
+    let (mut reactive_cache, reactive_provider) = provider_disconnected_cache(spec.chain_id).await;
+    reactive_cache.set_block(BlockId::from((BLOCK_HASH, Some(true))));
+    reactive_cache.set_timestamp(Some(1_800_000_000 + sequence));
+    reactive_cache.set_block_context(Some(1_000 + sequence), Some(0));
+    reactive_cache
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(999 + sequence), PARENT_HASH);
+    install(
+        &mut reactive_cache,
+        spec.pool,
+        runtime(spec.proxy_runtime),
+        &slots,
+    );
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
+    let routed_registration = registration
+        .clone()
+        .with_event_sources(adapter.event_sources(&registration));
+    let mut registry = AdapterRegistry::new();
+    registry.register_adapter(adapter)?;
+    registry.register_pool(routed_registration)?;
+    let routing = AmmReactiveRoutingContext::new(Arc::new(registry));
+    let instance = PoolInstanceId::new(registration.key.clone(), PoolGeneration::new(1));
+    let handler = Arc::new(AmmPoolReactiveHandler::with_routing_context(
+        routing, instance,
+    )?);
+    let mut reactive = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    reactive.register_handler(handler)?;
+    let block = BlockRef {
+        number: 1_000 + sequence,
+        hash: BLOCK_HASH,
+        parent_hash: Some(PARENT_HASH),
+        timestamp: Some(1_800_000_000 + sequence),
+    };
+    let reactive_context = ReactiveContext {
+        chain_id: Some(spec.chain_id),
+        source: InputSource::Synthetic,
+        chain_status: ChainStatus::Included {
+            block,
+            confirmations: 0,
+        },
+        block: Some(block),
+        transaction_index: Some(1),
+        log_index: Some(2),
+    };
+    let rpc_log = RpcLog {
+        inner: log.clone(),
+        block_hash: Some(BLOCK_HASH),
+        block_number: Some(1_000 + sequence),
+        block_timestamp: Some(1_800_000_000 + sequence),
+        transaction_hash: Some(transaction_hash),
+        transaction_index: Some(1),
+        log_index: Some(2),
+        removed: false,
+    };
+    let report = reactive.ingest_batch(
+        &mut reactive_cache,
+        ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
+            ReactiveInput::Log(rpc_log),
+            reactive_context,
+        )]),
+    )?;
+    assert_eq!(report.applied.len(), 1, "{} reactive apply", case.name);
+    assert_eq!(
+        report.applied[0].quality,
+        StateEffectQuality::ExactFromInput,
+        "{} reactive quality",
+        case.name,
+    );
+    assert!(report.applied[0].resyncs.is_empty());
+    assert!(report.applied[0].invalidations.is_empty());
+    assert!(report.resyncs.is_empty());
+    assert!(reactive.pending_resyncs().is_empty());
+    for ((address, slot), expected) in &quote_derived {
+        if *address == spec.pool {
+            assert_eq!(
+                reactive_cache.cached_storage_value(*address, *slot),
+                Some(*expected),
+                "{} {:?} reactive event diverged at pool slot {slot}",
+                case.name,
+                spec.family,
+            );
+        }
+    }
+    assert_eq!(
+        reactive_provider.read_q().len(),
+        1,
+        "{} untouched failure sentinel proves zero provider calls",
+        case.name,
+    );
     assert!(
         access
             .slots
