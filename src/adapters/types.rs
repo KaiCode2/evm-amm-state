@@ -1059,7 +1059,13 @@ pub struct V3Metadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum V3SwapTransitionCapability {
     /// Exact parent state plus ordered event context can reproduce the complete
-    /// declared swap-induced storage surface without provider reads.
+    /// declared swap surface without provider reads.
+    ///
+    /// The declared surface is family-specific: canonical Uniswap includes all
+    /// swap-mutated pool accounting, while reviewed Slipstream deployments
+    /// guarantee every state cell that can affect a subsequent executable quote
+    /// and optionally reproduce stronger accounting writes with runtime-bound
+    /// fee evidence.
     Exact,
     /// This release has no independent parity proof for the registered family
     /// or layout, so callers must hold/rebuild rather than claim exactness.
@@ -1660,7 +1666,8 @@ impl std::error::Error for AdapterEventError {}
 pub enum V3TransitionError {
     /// Exact replay requires a context field that the caller omitted.
     MissingContext(&'static str),
-    /// A reviewed Slipstream runtime was missing exact effective fee evidence.
+    /// Full Slipstream accounting replay was requested without its runtime-bound
+    /// effective-fee evidence.
     MissingSlipstreamFeeEvidence,
     /// Supplied Slipstream fee/runtime evidence did not match the exact event.
     SlipstreamFeeEvidence(&'static str),

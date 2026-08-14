@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.7] - 2026-08-14
+
+### Added
+
+- Added event-only quote/search-state transitions for the reviewed Aerodrome
+  Base BIFI and Velodrome Optimism mooBIFI Slipstream pools. Ordered `Swap`
+  events now replay price, active liquidity, staked-liquidity bounds, oracle
+  state, and initialized-tick traversal from an exact parent without provider
+  reads or a reconstruction request. The effective fee is inferred uniquely
+  from the event's signed amounts.
+- Added exact pool-search transitions for Slipstream `Mint` and `Burn`,
+  including six-word boundary ticks, gross/net liquidity, initialization,
+  shared bitmap words, active liquidity, oracle state, and the reviewed
+  Base/Optimism reward-initialization difference. `Collect` is an exact empty
+  transition because it changes positions and token balances, not pool quote
+  state.
+- Added deployed-proxy/implementation differential tests for both reviewed
+  runtime families: ten swap shapes, Mint/Burn round trips, every adapter-owned
+  search cell, and follow-up quotes against a cache whose provider panics on
+  access. Historical reactive fixtures also prove the evidence-free path emits
+  `ExactFromInput` with no resync or invalidation.
+- Added a deterministic event-to-simulation release gate for both historical
+  deployments. It ingests the real Swap log, executes bid and ask simulations
+  through the native Slipstream quote ABI and reviewed deployed pool bytecode,
+  proves a provider-failure sentinel was untouched, and enforces a one-second
+  maximum across an operator-selected optimized sample count.
+- Corrected the pinned canonical Uniswap V3 liquidity live gate to enforce the
+  documented fail-closed purge-and-repair boundary for `Mint` and `Burn`,
+  instead of expecting the retired partial event reconstruction.
+
+### Changed
+
+- Split Slipstream search exactness from optional byte/accounting parity.
+  Runtime-bound `SlipstreamSwapFeeEvidence` still enables complete fee-growth,
+  gauge, reward, and crossed-tick accounting writes and is compared with every
+  accessed deployed pool cell. Its absence no longer forces reconstruction
+  when the event belongs to a reviewed deployment and the exact quote parent is
+  complete; invalid supplied evidence still fails closed.
+- Kept the capability intentionally narrower than protocol-wide parity. Silent
+  gauge stake/unstake activity, position/token accounting, unsupported
+  administrative mutations, and unreviewed Slipstream pools are outside the
+  event-sourced search guarantee and do not gain `Exact` authority.
+
 ## [0.3.0-alpha.6] - 2026-08-11
 
 ### Fixed
@@ -590,7 +633,9 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...HEAD
+[0.3.0-alpha.7]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.6...v0.3.0-alpha.7
+[0.3.0-alpha.6]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...v0.3.0-alpha.6
 [0.3.0-alpha.5]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...v0.3.0-alpha.5
 [0.3.0-alpha.4]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.3...v0.3.0-alpha.4
 [0.3.0-alpha.3]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.2...v0.3.0-alpha.3

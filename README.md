@@ -12,10 +12,11 @@ their on-chain state into the cache, and keeps them current **from chain log
 events**: events that carry absolute state (Uniswap V2 / Solidly `Sync`) are
 applied as exact writes with **no RPC at all**, canonical Uniswap V3 `Swap`s
 are replayed across the complete fee/oracle/tick storage surface from exact
-parent state. Every standard non-`Swap` V3 pool mutation (`Initialize`,
-`Mint`/`Burn`, `Collect`, `Flash`, oracle-cardinality and protocol-fee events)
-is routed but conservatively purges the pool and requires an exact rebuild;
-partial warm-tick accounting is never presented as an exact later-Swap parent.
+parent state, and the reviewed Base/Optimism Slipstream pools translate
+`Swap`, `Mint`, `Burn`, and `Collect` into provider-free quote/search-state
+transitions. Unsupported V3-family mutations conservatively purge the pool and
+require an exact rebuild; partial state is never presented as an exact later
+swap parent.
 Balancer vault `Swap`s remain event-sourced onto warm cash slots. Only genuinely
 cold slots and delta-only events (Curve, Balancer
 joins/exits) turn into a bounded, hash-pinned storage **resync** (block trace
@@ -43,7 +44,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.5", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.7", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -85,15 +86,19 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
 | Canonical Uniswap V3 | `uniswap-v3` | `QuoterV2.quoteExactInputSingle` | complete canonical swap surface + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | ordered/context-aware `Swap` → exact provider-free replay of slot0, liquidity, fees, oracle, and crossed ticks; every non-`Swap` pool mutation purges and repairs |
-| PancakeSwap V3 / Slipstream | `pancake-v3`, `slipstream` | family-native `QuoterV2.quoteExactInputSingle` | family layout warm-up; Slipstream uses a full-range layout-only one-shot quote surface, while resumable repair verifies its extended state | `Swap` exactness is **unsupported** pending exhaustive independent deployed-runtime parity; routed mutations invalidate and repair, never label state exact |
+| PancakeSwap V3 | `pancake-v3` | family-native `QuoterV2.quoteExactInputSingle` | family layout warm-up | `Swap` and non-`Swap` mutations invalidate and repair pending independent deployed-runtime parity |
+| Reviewed Slipstream / Aerodrome CL | `slipstream` | native tick-spacing-keyed `QuoterV2.quoteExactInputSingle` | full-range quote surface plus six-word initialized ticks and extended globals | Base BIFI and Optimism mooBIFI pools: ordered `Swap`, `Mint`, `Burn`, and `Collect` preserve exact quote/search state with no provider reads or repair; optional runtime-bound evidence also reproduces swap accounting writes |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`), verify-only once known | `Swap` → exact 112-bit cash writes where warm, resync fallback; `PoolBalanceChanged` → resync |
 | Solidly V2 (Aerodrome / Velodrome) | `solidly-v2` | pool `getAmountOut` | named slots (config layout) | `Sync` → two exact slot writes |
 | **Curve** (StableSwap, StableSwap-NG, CryptoSwap v2, Tricrypto-NG) | `curve` | pool `get_dy` | discover → verify (`get_dy` read-set) | `TokenExchange` + liquidity events → slot resync |
 
 All protocol adapters are on by default; one V3-family adapter routes
 Uniswap V3, Pancake V3, and Slipstream, but swap-transition capability is
-family-specific. Only canonical Uniswap V3 currently returns
-`V3SwapTransitionCapability::Exact`; layout similarity does not grant exactness. See
+family- and deployment-specific. Canonical Uniswap V3 has registration-scoped
+`Exact` capability. The reviewed Base BIFI and Optimism mooBIFI Slipstream
+pools receive event-scoped `Exact` capability only with complete lineage and
+their deployed layout; arbitrary Slipstream registrations remain unsupported.
+Layout similarity alone never grants exactness. See
 [`docs/protocol-support-matrix.md`](docs/protocol-support-matrix.md) for the
 per-protocol capability matrix (offline-after-cold-start, exact-write vs resync,
 discovery, and known limitations), and [`docs/curve-adapter.md`](docs/curve-adapter.md)
@@ -108,6 +113,15 @@ for the Curve adapter in depth.
 > those invariants themselves. Missing or contradictory evidence atomically
 > purges the stale pool snapshot and exposes a typed failure. See [V3 swap
 > transitions](docs/v3-swap-transitions.md).
+
+> **Slipstream exactness boundary.** For the two reviewed deployments, ordinary
+> `Swap` replay infers the unique effective fee from event amounts and updates
+> every cell needed by later quote/search evaluation. Optional runtime-bound
+> fee evidence enables the stronger fee-growth, gauge, reward, and crossed-tick
+> accounting replay. `Mint`/`Burn` update pool geometry and initialized-tick
+> state; `Collect` is an exact no-op for the pool search surface. Position
+> ownership, token balances, silent gauge stake/unstake activity, and arbitrary
+> Slipstream deployments are outside this capability.
 
 > **Slipstream quoting configuration.** Slipstream / Aerodrome CL uses its
 > native `int24 tickSpacing` QuoterV2 struct; `fee` is intentionally unset and
@@ -567,6 +581,17 @@ Everything else is env-gated and prints a skip message when unset:
 ```bash
 cargo test                       # unit + offline integration tests
 cargo test --no-default-features # protocol-neutral core
+```
+
+The reviewed Base/Optimism Slipstream event-to-simulation examples are local
+and credential-free. They process checked-in historical Swap logs through the
+reactive runtime, execute both post-event quote directions against the real
+pool proxy/implementation bytecode, and assert zero provider calls,
+invalidations, or resyncs:
+
+```bash
+SLIPSTREAM_E2E_SAMPLES=1000 cargo test --release --locked \
+  --test slipstream_swap_transition_acceptance -- --nocapture
 ```
 
 These run from a clone of the repository. The published crate **excludes the

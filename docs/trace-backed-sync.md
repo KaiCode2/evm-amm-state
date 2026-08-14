@@ -68,8 +68,10 @@ authoritative repair/rebuild phase.
 | --- | --- |
 | Uniswap V2 `Sync` | exact masked reserve write |
 | Solidly V2 `Sync` | exact reserve writes when layout is configured |
-| Canonical V3 `Swap` | exact provider-free replay of the complete swap-mutated fee/oracle/tick/liquidity surface from an exact parent and ordered context; Pancake/Slipstream remain unsupported and purge |
-| V3 non-`Swap` mutations | route the complete standard topic set and purge the whole pool with `RequiresRepair`; partial warm `Mint`/`Burn` tick writes cannot establish an exact later-Swap parent |
+| Canonical V3 `Swap` | exact provider-free replay of the complete swap-mutated fee/oracle/tick/liquidity surface from an exact parent and ordered context; Pancake remains unsupported and purges |
+| Reviewed Base/Optimism Slipstream `Swap` | exact provider-free quote/search replay from exact parent and ordered context; infer the effective fee from event amounts, emit no resync/invalidation, and optionally reproduce the full accounting surface when runtime-bound fee evidence is present |
+| Reviewed Base/Optimism Slipstream `Mint` / `Burn` / `Collect` | exact provider-free search-state transition (`Collect` is empty); other V3 non-`Swap` mutations and unreviewed pools purge with `RequiresRepair` |
+| Other V3 non-`Swap` mutations | route the complete standard topic set and purge the whole pool with `RequiresRepair`; partial or unreviewed mutations cannot establish an exact later-Swap parent |
 | Balancer V2 `Swap` | exact 112-bit `cash`-field writes when both tokens' probed cash locations are warm; resync known Vault balance slots otherwise |
 | Balancer V2 `PoolBalanceChanged` | resync known Vault balance slots |
 | Curve swap/liquidity events | resync known pool read-set slots |

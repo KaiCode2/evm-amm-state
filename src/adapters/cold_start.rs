@@ -775,10 +775,11 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 /// Uniswap V3 pools. PancakeSwap uses its independently verified shifted spec.
 /// Slipstream uses the layout-only [`V3SyncSpec::core`] as a **quote-surface**
 /// bootstrap: it loads slot0, active liquidity, the full bitmap range, and the
-/// four tick words used by its configured quoter. That deliberately does not
-/// claim the six-word tick and reward/gauge surface required for exact event
-/// transitions; Slipstream mutations remain unsupported and force an
-/// authoritative repair.
+/// tick words used by its configured quoter. The reviewed Base/Optimism pools
+/// subsequently keep that search surface current from `Swap`, `Mint`, `Burn`,
+/// and `Collect` events without reconstruction. This program does not itself
+/// grant capability to an unreviewed pool or claim position, token, reward, or
+/// gauge-accounting parity.
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;

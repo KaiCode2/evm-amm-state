@@ -1,13 +1,14 @@
 # Exact V3 swap transitions
 
-`evm-amm-state 0.3.0-alpha.5` can replay a canonical Uniswap V3 `Swap` from
-event data without a provider read. Exactness is deliberately narrower than
-“V3-like”: it is a capability granted only to a proven runtime family and
-storage surface.
+`evm-amm-state 0.3.0-alpha.7` can replay a canonical Uniswap V3 `Swap` and the
+reviewed Base/Optimism Slipstream `Swap`, `Mint`, `Burn`, and `Collect` events
+without a provider read. Exactness is deliberately narrower than “V3-like”:
+it is granted only to a proven runtime family, deployment, and declared state
+surface.
 
 ## Exactness contract
 
-The exact path requires all of the following:
+Canonical Uniswap's exact path requires all of the following:
 
 - canonical Uniswap V3 protocol metadata, fee, positive tick spacing, and the
   canonical storage layout;
@@ -55,50 +56,68 @@ that error; they never leave the parent state quote-ready. A deterministic
 
 No provider or network I/O occurs in this transition.
 
+### Reviewed Slipstream search exactness
+
+The Aerodrome Base BIFI pool and Velodrome Optimism mooBIFI pool receive a
+narrower event-scoped exact capability when chain, address, positive tick
+spacing, deployed core layout, complete lineage, and an exact parent all match.
+For `Swap`, the event's signed amounts, final price, tick, and liquidity let the
+adapter replay the exact geometry and infer the unique effective fee. It then
+publishes slot0, active liquidity, staked-liquidity bounds, oracle state, and
+the initialized-tick traversal needed by subsequent executable quotes. No fee
+evaluation or provider reconstruction is required on this ordinary path.
+
+`SlipstreamSwapFeeEvidence` is optional. When the caller supplies evidence
+bound to the exact runtime hashes, lineage, and provider-free fee evaluation,
+the same transition also reproduces fee growth, gauge fees, reward accounting,
+and crossed-tick outside accumulators. Invalid supplied evidence fails closed;
+its absence merely selects quote/search exactness instead of forcing an RPC
+rebuild.
+
+For `Mint` and `Burn`, replay updates both six-word boundary ticks, gross/net
+liquidity, initialization state, one or two bitmap words, current active
+liquidity, and the oracle state. It models the deployed Base/Optimism difference
+in reward-growth initialization. A zero-amount `Burn` is an exact search no-op.
+`Collect` is also an exact empty search transition because it changes position
+and ERC-20 balance accounting, not pool pricing state.
+
+This is not byte parity for the whole Slipstream system. Position ownership,
+token transfers, silent gauge stake/unstake activity, gauges and rewards outside
+the pool search surface, administrative mutations, and arbitrary Slipstream
+deployments remain outside the capability. Their presence is not inferred from
+layout similarity.
+
 ## Family capability boundary
 
 | Family | Exact `Swap` capability | Reason |
 | --- | --- | --- |
 | Canonical Uniswap V3 | `Exact` with complete parent/context | Canonical storage and swap semantics are covered by historical traces and local deployed-runtime differential execution. |
 | PancakeSwap V3 | `Unsupported` | Its extended event and family-specific fee/oracle/tick behavior require independent deployed-bytecode parity. Canonical semantics are not inferred from similar fields or slots. |
-| Slipstream / Aerodrome CL | `Unsupported` | Deployed runtimes mutate reward, gauge, staked-liquidity, oracle, and extended tick state beyond canonical Uniswap V3. |
+| Reviewed Base/Optimism Slipstream pools | event-scoped `Exact` for the declared quote/search surface | Deployed proxy and implementation runtimes, historical crossings, generated swap shapes, Mint/Burn state, and provider-disconnected follow-up quotes are differential-tested. Optional runtime-bound evidence covers the stronger swap accounting surface. |
+| Other Slipstream / Aerodrome CL | `Unsupported` | Address, chain, runtime semantics, and layout have not been independently proven. |
 
-The checked-in Base and Optimism Slipstream trace fixtures pin actual deployed
-runtime identities and complete accessed/write sets for continued independent
-research. In those captured runtimes, the core layout includes slot0 at
-6, active/staked liquidity packing at 15/16, ticks at mapping base 17, and the
-bitmap at mapping base 18. A swap can also mutate global fee growth, gauge fees,
-reward growth/reserve, staked-liquidity/time state, observations, and words 2–5
-of a six-word `Tick.Info`. Therefore `V3StorageLayout`'s four-field legacy
-Slipstream preset is quote/cold-start configuration only, not an exactness
-claim.
-
-The crate retains a provider-free candidate transition, address-bound runtime
-attestation, unique event-derived fee inference, two historical initialized
-crossings, and a ten-case local runtime corpus. That corpus is deliberately
-non-authoritative: it does not yet cover the required generated mixed-liquidity
-fee branch, multiple initialized crossings with staked-liquidity net changes,
-ordered same-timestamp sequences, oracle growth/wrap, and reward
-reserve/rollover/no-staked variants. Consequently valid research evidence can
-never elevate the public capability above `Unsupported`; every real reactive
-Slipstream swap purges and requests repair. Base/Optimism Flashblocks execution
-is not enabled by alpha.5.
+The checked-in Base and Optimism Slipstream fixtures pin the deployed proxy and
+implementation identities and complete accessed/write sets used by the stronger
+accounting differential. The core layout includes slot0 at 6,
+active/staked-liquidity packing at 15/16, ticks at mapping base 17, and the
+bitmap at mapping base 18. The public no-evidence path deliberately writes only
+the quote/search subset of that state; callers must not reinterpret
+`V3SwapTransitionCapability::Exact` as protocol-wide storage parity.
 
 ## Non-Swap parent integrity
 
-`Exact` in alpha.5 applies only to the canonical Uniswap V3 `Swap` transition.
-The adapter subscribes every standard pool mutation topic: `Initialize`,
-`Mint`, `Collect`, `Burn`, `Flash`, `IncreaseObservationCardinalityNext`,
-`SetFeeProtocol`, and `CollectProtocol`. Each recognized non-`Swap` event emits
-a typed unsupported/`RequiresRepair` result with an explicit whole-storage purge.
-This is intentionally conservative: warm `Mint`/`Burn` quote cells do not cover
-the complete Tick.Info and position-accounting writes, so no later Swap may use
-that partial state as an exact parent. Exact Swap eligibility resumes only after
-an authoritative complete rebuild.
+Canonical Uniswap still treats every standard non-`Swap` mutation as
+unsupported and requests an explicit whole-storage rebuild. Reviewed
+Slipstream handles `Mint`, `Burn`, and `Collect` as described above. `Initialize`,
+`Flash`, `IncreaseObservationCardinalityNext`, `SetFeeProtocol`,
+`CollectProtocol`, malformed events, missing parent cells, wrong chain/address,
+and unreviewed Slipstream registrations remain typed fail-closed invalidations.
+Exact eligibility resumes only after authoritative repair for those cases.
 
 ## Verification evidence
 
-The provider-free test suite contains three complementary layers:
+The provider-free test suite contains complementary canonical and Slipstream
+layers:
 
 - deterministic transition regressions for empty bitmap words, initialized
   crossings, missing cells, oracle growth/wrap/same-timestamp sequences,
@@ -117,6 +136,16 @@ The provider-free test suite contains three complementary layers:
   were independently traced with geth `debug_traceTransaction` and
   `prestateTracer(diffMode=true)`; the fixture asserts both the intermediate
   first-transaction poststate and final second-transaction poststate.
+- deployed Base and Optimism Slipstream proxy/implementation execution across
+  five swap shapes per family, including both directions, exact input/output,
+  fee variants, and a partial price limit. The accounting-evidence path is
+  compared over every accessed pool cell; the evidence-free path is applied to
+  a mock-provider cache and both follow-up quote directions must match the real
+  deployed runtime without provider access; and
+- Mint/Burn round trips on both Slipstream runtimes, including initialized tick
+  creation/removal, bitmap changes, active liquidity, and the chain-specific
+  reward initialization behavior, followed by provider-disconnected quotes
+  after each state transition.
 
 The generated local corpus is deterministic and network-free. It is not a
 claim that arbitrary future forks share canonical behavior; family promotion

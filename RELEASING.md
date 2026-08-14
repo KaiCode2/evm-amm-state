@@ -1,11 +1,11 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.6`. Publish its prerequisites in
+The current release candidate is `0.3.0-alpha.7`. Publish its prerequisites in
 this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
 2. `evm-fork-cache 0.4.0-alpha.4`;
-3. publish `evm-amm-state 0.3.0-alpha.6` after the gates below pass.
+3. publish `evm-amm-state 0.3.0-alpha.7` after the gates below pass.
 
 The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.4`.
 Treat any failure to resolve that published version as a release blocker rather
@@ -53,6 +53,24 @@ Alpha.6 restores the full-range, layout-only Slipstream quote bootstrap used by
 strict provider-free consumers. This is a quote-readiness correction only:
 Slipstream event transitions remain unsupported and fail closed exactly as in
 alpha.5.
+
+Alpha.7 adds event-only quote/search transitions for the reviewed Base BIFI and
+Optimism mooBIFI Slipstream deployments. `Swap`, `Mint`, `Burn`, and `Collect`
+advance the state consumed by search without a provider reconstruction; full
+fee-growth, gauge, reward, position, and token accounting remain outside that
+guarantee unless the separately attested evidence is present. Arbitrary
+Slipstream deployments remain unsupported.
+
+The local alpha.7 gate routes the two checked-in historical Swap logs through
+the pool-scoped reactive runtime and then executes both quote directions through
+the native Slipstream ABI and the real reviewed proxy/implementation bytecode.
+It leaves a provider-failure sentinel queued, requires zero invalidations and
+resyncs, and fails if any optimized event-to-bid/ask sample reaches one second:
+
+```bash
+SLIPSTREAM_E2E_SAMPLES=1000 cargo test --release --locked \
+  --test slipstream_swap_transition_acceptance -- --nocapture
+```
 
 ## Offline release matrix
 
@@ -107,8 +125,9 @@ export E2E_RPC_URL="${E2E_RPC_URL:-${ETH_RPC_URL:-}}"
 ```
 
 The runner refuses to start without a configured endpoint and executes pinned
-mainnet swap, liquidity-event, full-sync, and discovery parity; V2 and Curve
-WebSocket soaks; and the search crate's headless progressive-route benchmark.
+mainnet swap/full-sync/discovery parity, canonical V3 liquidity-event
+fail-closed validation, V2 and Curve WebSocket soaks, and the search crate's
+headless progressive-route benchmark.
 The release runner stops after the first usable route. Full background idle is
 a separately recorded provider-sensitive diagnostic; opt into it with
 `AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS=<seconds>` without turning prolonged

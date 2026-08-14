@@ -85,10 +85,34 @@ offline `reactive_apply`) and agrees; the other apply rows come from
 
 The exact reactive event-sourced paths are effectively free relative to a quote
 (hundreds of nanoseconds vs 8–85 µs). V3 non-`Swap` mutations are excluded from
-this table because alpha.5 deliberately purges and rebuilds rather than claiming
-partial event-only exactness. Cold-start is a one-time
+this legacy table because canonical Uniswap still purges them; alpha.7 adds
+provider-free `Mint`/`Burn`/`Collect` search transitions for the two reviewed
+Slipstream deployments. Cold-start is a one-time
 setup cost gated by RPC latency, not a steady-state cost — the crate's design
 pays it once and then quotes offline forever.
+
+### Reviewed Slipstream event-transition latency
+
+On August 14, 2026, the alpha.7 historical acceptance test sampled 10,000
+evidence-free `Swap` decode-and-transition operations per reviewed deployment
+in the optimized `release` profile on the Apple M1 Pro host above. The input is
+an in-memory exact parent `StateView`, so the measured path has zero RPC batch
+elements, retries, and fallbacks. Reproduce with:
+
+```bash
+SLIPSTREAM_PERF_SAMPLES=10000 cargo test --release --locked \
+  --test slipstream_swap_transition_acceptance -- --nocapture
+```
+
+| Deployment | p50 | p95 | p99 | max | RPC elements / retries / fallbacks |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Aerodrome Base BIFI | 16.625 µs | 20.708 µs | 29.375 µs | 217.500 µs | 0 / 0 / 0 |
+| Velodrome Optimism mooBIFI | 17.125 µs | 18.875 µs | 30.334 µs | 246.292 µs | 0 / 0 / 0 |
+
+The release test enforces a 10 ms p95 ceiling. This measures event translation,
+not a complete multi-pool opportunity scan; the deployed-runtime differential
+separately proves that provider-disconnected follow-up quotes in both directions
+match after the translated state is applied.
 
 ### One-shot sync latency — network-bound state loading
 
