@@ -1,14 +1,12 @@
-//! Live RPC parity for **event-sourced** Uniswap V3 `Mint`/`Burn` (env-gated,
-//! `#[ignore]`).
+//! Live RPC validation for fail-closed Uniswap V3 `Mint`/`Burn` handling
+//! (env-gated, `#[ignore]`).
 //!
 //! For a real add-liquidity (`Mint`) and remove-liquidity (`Burn`) transaction,
 //! this fetches the transaction's *exact per-tx* storage diff via
 //! `trace_replayTransaction(stateDiff)` — the on-chain ground truth, immune to
-//! other transactions in the same block — warms the pre-tx (`from`) values into a
-//! cache, applies the event through the adapter, and asserts the adapter's
-//! event-sourced writes reproduce the on-chain post-tx (`to`) values for every
-//! slot the adapter maintains (each boundary tick's packed `Tick.Info` word 0 and
-//! the in-range global `liquidity`).
+//! other transactions in the same block — warms the pre-tx (`from`) values into
+//! a cache, applies the real event through the public driver, and proves the
+//! adapter rejects partial event reconstruction and purges the stale pool.
 //!
 //! The pinned pair is a just-in-time (JIT) add + remove of the same liquidity on
 //! the same in-range, already-initialized ticks of the USDC/WETH 0.05% pool, so
@@ -31,8 +29,9 @@ use evm_amm_state::adapters::storage::{
     v3_word_position,
 };
 use evm_amm_state::adapters::{
-    AdapterCache, AdapterRegistry, AmmAdapter, ConcentratedLiquidityAdapter, PoolKey,
-    PoolRegistration, ProtocolMetadata, StateUpdate, V3Metadata,
+    AdapterCache, AdapterEventError, AdapterRegistry, AmmAdapter, ConcentratedLiquidityAdapter,
+    PoolKey, PoolRegistration, ProtocolId, ProtocolMetadata, StateUpdate, UnsupportedReason,
+    V3Metadata, driver::DriverError,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -101,9 +100,9 @@ async fn pool_state_diff(
     Ok(diff)
 }
 
-async fn run_parity(is_mint: bool) -> Result<()> {
+async fn run_fail_closed(is_mint: bool) -> Result<()> {
     let Ok(url) = std::env::var("E2E_RPC_URL") else {
-        eprintln!("E2E_RPC_URL unset — skipping V3 liquidity RPC parity test.");
+        eprintln!("E2E_RPC_URL unset — skipping V3 liquidity fail-closed test.");
         return Ok(());
     };
     let (tx, topic0) = if is_mint {
@@ -123,7 +122,7 @@ async fn run_parity(is_mint: bool) -> Result<()> {
         layout.tick_bitmap_base_slot,
     );
 
-    // The adapter maintains exactly these on a warm in-range liquidity event.
+    // These quote-facing cells all change in the pinned liquidity event.
     let asserted = [
         ("tickLower.word0", lower_w0),
         ("tickUpper.word0", upper_w0),
@@ -213,36 +212,47 @@ async fn run_parity(is_mint: bool) -> Result<()> {
         .expect("event log not found in block")
         .inner;
 
-    driver
-        .apply_log(&mut cache, &log)?
-        .expect("event must route and apply");
+    let error = driver
+        .apply_log(&mut cache, &log)
+        .expect_err("canonical V3 liquidity events must fail closed");
+    match error {
+        DriverError::Decode {
+            protocol: ProtocolId::UniswapV3,
+            error: AdapterEventError::Unsupported(UnsupportedReason::Custom(message)),
+        } => assert_eq!(
+            message,
+            "exact event-only canonical V3 non-Swap transition is unsupported",
+        ),
+        other => panic!("unexpected canonical V3 liquidity rejection: {other:?}"),
+    }
 
-    // The adapter's event-sourced writes must equal the on-chain post-tx values.
+    // Every quote-facing parent cell is stale after the mutation. The public
+    // driver applies the conservative whole-storage purge before surfacing the
+    // typed error, so no partial reconstruction can reach a later quote.
     for (name, slot) in asserted {
-        let (_from, to) = diff[&slot];
         assert_eq!(
             cache.cached_storage_value(POOL, slot),
-            Some(to),
-            "{name} ({slot:#x}): event-sourced value != on-chain post-tx value"
-        );
-        eprintln!(
-            "{}  {name}: matches on-chain {to:#x}",
-            if is_mint { "MINT" } else { "BURN" }
+            None,
+            "{name} ({slot:#x}) remained cached after fail-closed invalidation"
         );
     }
-    // The bitmap was not flipped, so it is left exactly as warmed.
-    assert_eq!(cache.cached_storage_value(POOL, bitmap), Some(bitmap_pre));
+    assert_eq!(cache.cached_storage_value(POOL, layout.slot0_slot), None);
+    assert_eq!(cache.cached_storage_value(POOL, bitmap), None);
+    eprintln!(
+        "{} fail-closed invalidation matched the reviewed canonical V3 boundary",
+        if is_mint { "MINT" } else { "BURN" }
+    );
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires an archive+trace RPC via E2E_RPC_URL; run with --ignored"]
-async fn mint_event_sourcing_matches_onchain_state_diff() -> Result<()> {
-    run_parity(true).await
+async fn mint_event_fails_closed_against_onchain_state_diff() -> Result<()> {
+    run_fail_closed(true).await
 }
 
 #[tokio::test]
 #[ignore = "requires an archive+trace RPC via E2E_RPC_URL; run with --ignored"]
-async fn burn_event_sourcing_matches_onchain_state_diff() -> Result<()> {
-    run_parity(false).await
+async fn burn_event_fails_closed_against_onchain_state_diff() -> Result<()> {
+    run_fail_closed(false).await
 }

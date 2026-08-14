@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the native Slipstream quote ABI and reviewed deployed pool bytecode,
   proves a provider-failure sentinel was untouched, and enforces a one-second
   maximum across an operator-selected optimized sample count.
+- Corrected the pinned canonical Uniswap V3 liquidity live gate to enforce the
+  documented fail-closed purge-and-repair boundary for `Mint` and `Burn`,
+  instead of expecting the retired partial event reconstruction.
 
 ### Changed
 

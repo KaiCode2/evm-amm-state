@@ -125,8 +125,9 @@ export E2E_RPC_URL="${E2E_RPC_URL:-${ETH_RPC_URL:-}}"
 ```
 
 The runner refuses to start without a configured endpoint and executes pinned
-mainnet swap, liquidity-event, full-sync, and discovery parity; V2 and Curve
-WebSocket soaks; and the search crate's headless progressive-route benchmark.
+mainnet swap/full-sync/discovery parity, canonical V3 liquidity-event
+fail-closed validation, V2 and Curve WebSocket soaks, and the search crate's
+headless progressive-route benchmark.
 The release runner stops after the first usable route. Full background idle is
 a separately recorded provider-sensitive diagnostic; opt into it with
 `AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS=<seconds>` without turning prolonged
