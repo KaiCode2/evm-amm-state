@@ -1,10 +1,8 @@
-//! Non-authoritative local-EVM research corpus for the two deployed BIFI
+//! Local-EVM differential corpus for the two deployed BIFI
 //! Slipstream pool runtimes. The real proxy + implementation execute each
 //! generated swap; only the factory fee getters are replaced by a deterministic
 //! local runtime so direction, exactness, price-limit, and fee inference cases
 //! can be varied without provider or transaction-origin policy dependencies.
-//! The public adapter must still report `Unsupported` and purge: this matrix is
-//! intentionally narrower than the family-parity gate required for `Exact`.
 
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
@@ -14,6 +12,10 @@ use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use anyhow::{Context, Result, anyhow};
+use evm_amm_state::adapters::storage::{
+    slipstream_tick_info_storage_keys_with_base, v3_tick_bitmap_storage_key_with_base,
+    v3_word_position,
+};
 use evm_amm_state::adapters::{
     AdapterEventContext, AmmAdapter, ConcentratedLiquidityAdapter, PoolKey, PoolRegistration,
     ProtocolMetadata, SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity,
@@ -178,6 +180,52 @@ fn execute_calldata(pool: Address, zero_for_one: bool, amount: i128, limit: U256
     data.extend_from_slice(&signed_word(amount).to_be_bytes::<32>());
     data.extend_from_slice(&limit.to_be_bytes::<32>());
     Bytes::from(data)
+}
+
+fn liquidity_calldata(
+    pool: Address,
+    is_mint: bool,
+    tick_lower: i32,
+    tick_upper: i32,
+    amount: u128,
+) -> Bytes {
+    let mut data = Vec::with_capacity(4 + 32 * 4);
+    data.extend_from_slice(
+        &keccak256(if is_mint {
+            "executeMint(address,int24,int24,uint128)"
+        } else {
+            "executeBurn(address,int24,int24,uint128)"
+        })[..4],
+    );
+    data.extend_from_slice(&address_word(pool).to_be_bytes::<32>());
+    data.extend_from_slice(&signed_word(i128::from(tick_lower)).to_be_bytes::<32>());
+    data.extend_from_slice(&signed_word(i128::from(tick_upper)).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
+    Bytes::from(data)
+}
+
+fn signed_i24(raw: U256) -> i32 {
+    let raw = (raw & U256::from(0x00ff_ffff_u32)).to::<u32>();
+    if raw & 0x0080_0000 == 0 {
+        raw as i32
+    } else {
+        (raw | 0xff00_0000) as i32
+    }
+}
+
+fn ensure_slot(slots: &mut Vec<(U256, U256)>, slot: U256) {
+    if slots.iter().all(|(candidate, _)| *candidate != slot) {
+        slots.push((slot, U256::ZERO));
+    }
+}
+
+fn set_slot(slots: &mut Vec<(U256, U256)>, slot: U256, value: U256) {
+    ensure_slot(slots, slot);
+    slots
+        .iter_mut()
+        .find(|(candidate, _)| *candidate == slot)
+        .expect("ensured slot")
+        .1 = value;
 }
 
 async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
@@ -397,7 +445,7 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
             &registration,
             &context,
         ),
-        V3SwapTransitionCapability::Unsupported,
+        V3SwapTransitionCapability::Exact,
     );
     let decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
         &registration,
@@ -405,13 +453,58 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
         &parent,
         &context,
     );
-    assert!(decoded.error.is_some(), "{} must fail closed", case.name);
+    assert_eq!(decoded.error, None, "{} must replay exactly", case.name);
     let event = decoded.event.expect("reference event");
-    assert_eq!(event.quality, UpdateQuality::RequiresRepair);
-    assert!(matches!(
-        event.updates.as_slice(),
-        [StateUpdate::Purge { .. }]
-    ));
+    assert_eq!(event.quality, UpdateQuality::Exact);
+    let mut derived = parent.0.clone();
+    for update in event.updates {
+        match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                assert_eq!(address, spec.pool);
+                derived.insert((address, slot), value);
+            }
+            other => return Err(anyhow!("unexpected exact update: {other:?}")),
+        }
+    }
+    assert_eq!(
+        ConcentratedLiquidityAdapter::swap_transition_capability_with_context(
+            &registration,
+            &base_context,
+        ),
+        V3SwapTransitionCapability::Exact,
+        "reviewed runtime must expose quote-exact replay without accounting evidence",
+    );
+    let quote_decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
+        &registration,
+        &log,
+        &parent,
+        &base_context,
+    );
+    assert_eq!(
+        quote_decoded.error, None,
+        "{} quote-exact replay",
+        case.name,
+    );
+    let quote_event = quote_decoded.event.expect("quote-exact event");
+    assert_eq!(quote_event.quality, UpdateQuality::Exact);
+    let mut quote_derived = parent.0.clone();
+    for update in quote_event.updates {
+        match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                assert_eq!(address, spec.pool);
+                quote_derived.insert((address, slot), value);
+            }
+            other => return Err(anyhow!("unexpected quote-exact update: {other:?}")),
+        }
+    }
     assert!(
         access
             .slots
@@ -419,12 +512,539 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
             .any(|(address, _)| *address == spec.pool),
         "reference execution must independently enumerate pool storage",
     );
+    for (address, slot) in access
+        .slots
+        .iter()
+        .filter(|(address, _)| *address == spec.pool)
+    {
+        let expected = reference
+            .cached_storage_value(*address, *slot)
+            .ok_or_else(|| anyhow!("reference omitted accessed pool slot {slot}"))?;
+        let actual = derived
+            .get(&(*address, *slot))
+            .copied()
+            .ok_or_else(|| anyhow!("transition omitted accessed pool slot {slot}"))?;
+        assert_eq!(
+            actual, expected,
+            "{} {:?} diverged at pool slot {slot}",
+            case.name, spec.family,
+        );
+    }
+
+    let mut offline = cache(spec.chain_id).await;
+    offline.set_block(BlockId::from((BLOCK_HASH, Some(true))));
+    offline.set_timestamp(Some(1_800_000_000 + sequence));
+    offline.set_block_context(Some(1_000 + sequence), Some(0));
+    offline
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(999 + sequence), PARENT_HASH);
+    offline
+        .db_mut()
+        .insert_account_info(CALLER, AccountInfo::default());
+    offline
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    let derived_pool_slots = quote_derived
+        .iter()
+        .filter_map(|((address, slot), value)| (*address == spec.pool).then_some((*slot, *value)))
+        .collect::<Vec<_>>();
+    install(
+        &mut offline,
+        spec.pool,
+        runtime(spec.proxy_runtime),
+        &derived_pool_slots,
+    );
+    install(
+        &mut offline,
+        spec.implementation,
+        runtime(spec.implementation_runtime),
+        &[],
+    );
+    install(
+        &mut offline,
+        spec.factory,
+        runtime(include_str!(
+            "fixtures/slipstream_reference_factory_runtime.hex"
+        )),
+        &[(
+            U256::ZERO,
+            U256::from(case.fee) | (U256::from(100_000) << 24_usize),
+        )],
+    );
+    let token_balance_slot = mapping_slot(spec.pool, U256::ZERO);
+    for token in [token0, token1] {
+        let balance = reference
+            .cached_storage_value(token, token_balance_slot)
+            .context("reference post-Swap pool token balance")?;
+        install(
+            &mut offline,
+            token,
+            runtime(include_str!("fixtures/reference_swap_token_runtime.hex")),
+            &[(token_balance_slot, balance)],
+        );
+    }
+    install(
+        &mut offline,
+        HARNESS,
+        runtime(include_str!(
+            "fixtures/v3_reference_swap_harness_runtime.hex"
+        )),
+        &[
+            (U256::ZERO, address_word(token0)),
+            (U256::from(1), address_word(token1)),
+        ],
+    );
+    for follow_up_direction in [true, false] {
+        let follow_up_limit = if follow_up_direction {
+            MIN_SQRT_LIMIT
+        } else {
+            MAX_SQRT_LIMIT
+        };
+        let calldata = execute_calldata(spec.pool, follow_up_direction, 1, follow_up_limit);
+        let expected = match reference.call_raw(CALLER, HARNESS, calldata.clone(), false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => return Err(anyhow!("reference follow-up quote failed: {other:?}")),
+        };
+        let actual = match offline.call_raw(CALLER, HARNESS, calldata, false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => {
+                return Err(anyhow!(
+                    "provider-disconnected follow-up quote failed: {other:?}"
+                ));
+            }
+        };
+        assert_eq!(
+            actual, expected,
+            "{} {:?} provider-disconnected follow-up direction {follow_up_direction}",
+            case.name, spec.family,
+        );
+    }
+    Ok(())
+}
+
+async fn run_liquidity_round_trip(spec: FamilySpec, sequence: u64) -> Result<()> {
+    let fixture: Value = serde_json::from_str(spec.fixture)?;
+    let spacing = fixture["pool"]["tick_spacing"].as_i64().unwrap() as i32;
+    let layout = V3StorageLayout::slipstream(spacing);
+    let mut slots: Vec<(U256, U256)> = fixture["parent_storage"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(slot, value)| (word(slot), word(value.as_str().unwrap())))
+        .collect();
+    let slot0 = slots
+        .iter()
+        .find(|(slot, _)| *slot == layout.slot0_slot)
+        .unwrap()
+        .1;
+    let current_tick = signed_i24(slot0 >> 160_usize);
+    let tick_lower = current_tick.div_euclid(spacing) * spacing;
+    let tick_upper = tick_lower + spacing;
+    let lower_keys =
+        slipstream_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot);
+    let upper_keys =
+        slipstream_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot);
+    let lower_bitmap = v3_tick_bitmap_storage_key_with_base(
+        v3_word_position(tick_lower, spacing),
+        layout.tick_bitmap_base_slot,
+    );
+    let upper_bitmap = v3_tick_bitmap_storage_key_with_base(
+        v3_word_position(tick_upper, spacing),
+        layout.tick_bitmap_base_slot,
+    );
+    for slot in lower_keys
+        .iter()
+        .chain(upper_keys.iter())
+        .chain([&lower_bitmap, &upper_bitmap])
+    {
+        ensure_slot(&mut slots, *slot);
+    }
+    // Build a coherent, uninitialized in-range pair around the fixture's
+    // current tick. The historical fixtures intentionally contain only the
+    // ticks needed by their swap trace, so a set bitmap bit may otherwise lack
+    // its live Tick.Info words in this generated liquidity corpus.
+    for slot in lower_keys.iter().chain(upper_keys.iter()) {
+        set_slot(&mut slots, *slot, U256::ZERO);
+    }
+    for (tick, bitmap_slot) in [(tick_lower, lower_bitmap), (tick_upper, upper_bitmap)] {
+        let bit = tick.div_euclid(spacing).rem_euclid(256) as usize;
+        let current = slots
+            .iter()
+            .find(|(candidate, _)| *candidate == bitmap_slot)
+            .expect("ensured bitmap")
+            .1;
+        set_slot(&mut slots, bitmap_slot, current & !(U256::from(1) << bit));
+    }
+    let parent = ParentState(
+        slots
+            .iter()
+            .map(|(slot, value)| ((spec.pool, *slot), *value))
+            .collect(),
+    );
+
+    let timestamp = 1_810_000_000 + sequence;
+    let mut reference = cache(spec.chain_id).await;
+    reference.set_block(BlockId::from((BLOCK_HASH, Some(true))));
+    reference.set_timestamp(Some(timestamp));
+    reference.set_block_context(Some(2_000 + sequence), Some(0));
+    reference
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(1_999 + sequence), PARENT_HASH);
+    reference
+        .db_mut()
+        .insert_account_info(CALLER, AccountInfo::default());
+    reference
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    install(
+        &mut reference,
+        spec.pool,
+        runtime(spec.proxy_runtime),
+        &slots,
+    );
+    install(
+        &mut reference,
+        spec.implementation,
+        runtime(spec.implementation_runtime),
+        &[],
+    );
+    install(
+        &mut reference,
+        spec.factory,
+        runtime(include_str!(
+            "fixtures/slipstream_reference_factory_runtime.hex"
+        )),
+        &[(U256::ZERO, U256::from(10_000_u64))],
+    );
+    let token0 = Address::from_slice(
+        &slots
+            .iter()
+            .find(|(slot, _)| *slot == U256::from(1))
+            .unwrap()
+            .1
+            .to_be_bytes::<32>()[12..],
+    );
+    let token1 = Address::from_slice(
+        &slots
+            .iter()
+            .find(|(slot, _)| *slot == U256::from(2))
+            .unwrap()
+            .1
+            .to_be_bytes::<32>()[12..],
+    );
+    let token_code = runtime(include_str!("fixtures/reference_swap_token_runtime.hex"));
+    install(&mut reference, token0, token_code.clone(), &[]);
+    install(&mut reference, token1, token_code, &[]);
+    install(
+        &mut reference,
+        HARNESS,
+        runtime(include_str!(
+            "fixtures/v3_reference_swap_harness_runtime.hex"
+        )),
+        &[
+            (U256::ZERO, address_word(token0)),
+            (U256::from(1), address_word(token1)),
+        ],
+    );
+
+    let registration = PoolRegistration::new(PoolKey::Slipstream(spec.pool))
+        .with_state_address(spec.pool)
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_tick_spacing(spacing)
+                .with_storage_layout(layout),
+        ));
+    let amount = 7_u128;
+    let mint_calldata = liquidity_calldata(spec.pool, true, tick_lower, tick_upper, amount);
+    let (_, mint_access) =
+        reference.call_raw_with_access_list(CALLER, HARNESS, mint_calldata.clone())?;
+    let mint_result = reference.call_raw(CALLER, HARNESS, mint_calldata, true)?;
+    let mint_logs = match mint_result {
+        ExecutionResult::Success { logs, .. } => logs,
+        other => return Err(anyhow!("reference Mint failed: {other:?}")),
+    };
+    let mint_topic = keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)");
+    let mint_log: Log = mint_logs
+        .into_iter()
+        .find(|log| log.address == spec.pool && log.topics().first() == Some(&mint_topic))
+        .ok_or_else(|| anyhow!("reference execution emitted no Mint"))?;
+    let mint_context = AdapterEventContext::for_block(2_000 + sequence, BLOCK_HASH, timestamp)
+        .with_chain_id(spec.chain_id)
+        .with_parent_hash(PARENT_HASH)
+        .with_transaction_hash(B256::from(
+            U256::from(20_000 + sequence).to_be_bytes::<32>(),
+        ))
+        .with_event_order(1, 2);
+    let mint_decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
+        &registration,
+        &mint_log,
+        &parent,
+        &mint_context,
+    );
+    assert_eq!(mint_decoded.error, None, "{:?} Mint", spec.family);
+    let mint_event = mint_decoded.event.expect("reference Mint event");
+    assert_eq!(mint_event.quality, UpdateQuality::Exact);
+    let mut mint_derived = parent.0.clone();
+    let mut mint_update_slots = Vec::new();
+    for update in mint_event.updates {
+        match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                assert_eq!(address, spec.pool);
+                mint_update_slots.push(slot);
+                mint_derived.insert((address, slot), value);
+            }
+            other => return Err(anyhow!("unexpected exact Mint update: {other:?}")),
+        }
+    }
+    assert!(
+        mint_access
+            .slots
+            .iter()
+            .any(|(address, _)| *address == spec.pool),
+        "deployed Mint must independently access pool storage",
+    );
+    for slot in mint_update_slots.iter().chain(
+        lower_keys
+            .iter()
+            .chain(upper_keys.iter())
+            .chain([&lower_bitmap, &upper_bitmap]),
+    ) {
+        let expected = reference
+            .cached_storage_value(spec.pool, *slot)
+            .ok_or_else(|| anyhow!("reference Mint omitted search slot {slot}"))?;
+        let actual = mint_derived
+            .get(&(spec.pool, *slot))
+            .copied()
+            .ok_or_else(|| anyhow!("derived Mint omitted search slot {slot}"))?;
+        assert_eq!(
+            actual, expected,
+            "{:?} Mint diverged at search slot {slot}",
+            spec.family,
+        );
+    }
+
+    // Materialize only the event-derived pool state plus the prewarmed local
+    // execution dependencies into a fresh cache backed by a panic-on-access
+    // mock provider. Both swap directions must execute and match the deployed
+    // reference state without any reconstruction or lazy provider read.
+    let mut offline = cache(spec.chain_id).await;
+    offline.set_block(BlockId::from((BLOCK_HASH, Some(true))));
+    offline.set_timestamp(Some(timestamp));
+    offline.set_block_context(Some(2_000 + sequence), Some(0));
+    offline
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(1_999 + sequence), PARENT_HASH);
+    offline
+        .db_mut()
+        .insert_account_info(CALLER, AccountInfo::default());
+    offline
+        .db_mut()
+        .insert_account_info(Address::ZERO, AccountInfo::default());
+    let derived_pool_slots = mint_derived
+        .iter()
+        .filter_map(|((address, slot), value)| (*address == spec.pool).then_some((*slot, *value)))
+        .collect::<Vec<_>>();
+    install(
+        &mut offline,
+        spec.pool,
+        runtime(spec.proxy_runtime),
+        &derived_pool_slots,
+    );
+    install(
+        &mut offline,
+        spec.implementation,
+        runtime(spec.implementation_runtime),
+        &[],
+    );
+    install(
+        &mut offline,
+        spec.factory,
+        runtime(include_str!(
+            "fixtures/slipstream_reference_factory_runtime.hex"
+        )),
+        &[(U256::ZERO, U256::from(10_000_u64))],
+    );
+    let token_balance_slot = mapping_slot(spec.pool, U256::ZERO);
+    let token0_balance = reference
+        .cached_storage_value(token0, token_balance_slot)
+        .context("reference Mint token0 pool balance")?;
+    let token1_balance = reference
+        .cached_storage_value(token1, token_balance_slot)
+        .context("reference Mint token1 pool balance")?;
+    install(
+        &mut offline,
+        token0,
+        runtime(include_str!("fixtures/reference_swap_token_runtime.hex")),
+        &[(token_balance_slot, token0_balance)],
+    );
+    install(
+        &mut offline,
+        token1,
+        runtime(include_str!("fixtures/reference_swap_token_runtime.hex")),
+        &[(token_balance_slot, token1_balance)],
+    );
+    install(
+        &mut offline,
+        HARNESS,
+        runtime(include_str!(
+            "fixtures/v3_reference_swap_harness_runtime.hex"
+        )),
+        &[
+            (U256::ZERO, address_word(token0)),
+            (U256::from(1), address_word(token1)),
+        ],
+    );
+    for zero_for_one in [true, false] {
+        let limit = if zero_for_one {
+            MIN_SQRT_LIMIT
+        } else {
+            MAX_SQRT_LIMIT
+        };
+        let calldata = execute_calldata(spec.pool, zero_for_one, 1, limit);
+        let expected = match reference.call_raw(CALLER, HARNESS, calldata.clone(), false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => return Err(anyhow!("reference post-Mint quote failed: {other:?}")),
+        };
+        let actual = match offline.call_raw(CALLER, HARNESS, calldata, false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => {
+                return Err(anyhow!(
+                    "provider-disconnected post-Mint quote failed: {other:?}"
+                ));
+            }
+        };
+        assert_eq!(
+            actual, expected,
+            "{:?} provider-disconnected post-Mint quote direction {zero_for_one}",
+            spec.family,
+        );
+    }
+
+    let burn_parent = ParentState(mint_derived);
+    let burn_calldata = liquidity_calldata(spec.pool, false, tick_lower, tick_upper, amount);
+    let (_, burn_access) =
+        reference.call_raw_with_access_list(CALLER, HARNESS, burn_calldata.clone())?;
+    let burn_result = reference.call_raw(CALLER, HARNESS, burn_calldata, true)?;
+    let burn_logs = match burn_result {
+        ExecutionResult::Success { logs, .. } => logs,
+        other => return Err(anyhow!("reference Burn failed: {other:?}")),
+    };
+    let burn_topic = keccak256("Burn(address,int24,int24,uint128,uint256,uint256)");
+    let burn_log: Log = burn_logs
+        .into_iter()
+        .find(|log| log.address == spec.pool && log.topics().first() == Some(&burn_topic))
+        .ok_or_else(|| anyhow!("reference execution emitted no Burn"))?;
+    let burn_context = AdapterEventContext::for_block(2_000 + sequence, BLOCK_HASH, timestamp)
+        .with_chain_id(spec.chain_id)
+        .with_parent_hash(PARENT_HASH)
+        .with_transaction_hash(B256::from(
+            U256::from(30_000 + sequence).to_be_bytes::<32>(),
+        ))
+        .with_event_order(2, 3);
+    let burn_decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
+        &registration,
+        &burn_log,
+        &burn_parent,
+        &burn_context,
+    );
+    assert_eq!(burn_decoded.error, None, "{:?} Burn", spec.family);
+    let burn_event = burn_decoded.event.expect("reference Burn event");
+    assert_eq!(burn_event.quality, UpdateQuality::Exact);
+    let mut burn_derived = burn_parent.0.clone();
+    let mut burn_update_slots = Vec::new();
+    for update in burn_event.updates {
+        match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                assert_eq!(address, spec.pool);
+                burn_update_slots.push(slot);
+                burn_derived.insert((address, slot), value);
+            }
+            other => return Err(anyhow!("unexpected exact Burn update: {other:?}")),
+        }
+    }
+    assert!(
+        burn_access
+            .slots
+            .iter()
+            .any(|(address, _)| *address == spec.pool),
+        "deployed Burn must independently access pool storage",
+    );
+    for slot in burn_update_slots.iter().chain(
+        lower_keys
+            .iter()
+            .chain(upper_keys.iter())
+            .chain([&lower_bitmap, &upper_bitmap]),
+    ) {
+        let expected = reference
+            .cached_storage_value(spec.pool, *slot)
+            .ok_or_else(|| anyhow!("reference Burn omitted search slot {slot}"))?;
+        let actual = burn_derived
+            .get(&(spec.pool, *slot))
+            .copied()
+            .ok_or_else(|| anyhow!("derived Burn omitted search slot {slot}"))?;
+        assert_eq!(
+            actual, expected,
+            "{:?} Burn diverged at search slot {slot}",
+            spec.family,
+        );
+    }
+    for slot in &burn_update_slots {
+        offline
+            .db_mut()
+            .insert_account_storage(
+                spec.pool,
+                *slot,
+                burn_derived
+                    .get(&(spec.pool, *slot))
+                    .copied()
+                    .expect("Burn update value"),
+            )
+            .context("apply event-derived Burn slot to disconnected cache")?;
+    }
+    for zero_for_one in [true, false] {
+        let limit = if zero_for_one {
+            MIN_SQRT_LIMIT
+        } else {
+            MAX_SQRT_LIMIT
+        };
+        let calldata = execute_calldata(spec.pool, zero_for_one, 1, limit);
+        let expected = match reference.call_raw(CALLER, HARNESS, calldata.clone(), false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => return Err(anyhow!("reference post-Burn quote failed: {other:?}")),
+        };
+        let actual = match offline.call_raw(CALLER, HARNESS, calldata, false)? {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => {
+                return Err(anyhow!(
+                    "provider-disconnected post-Burn quote failed: {other:?}"
+                ));
+            }
+        };
+        assert_eq!(
+            actual, expected,
+            "{:?} provider-disconnected post-Burn quote direction {zero_for_one}",
+            spec.family,
+        );
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn deployed_base_and_optimism_runtimes_match_fee_inference_and_fail_closed_matrix()
--> Result<()> {
+async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> Result<()> {
     let cases = [
         Case {
             name: "zero-fee exact-input zero-for-one",
@@ -468,6 +1088,14 @@ async fn deployed_base_and_optimism_runtimes_match_fee_inference_and_fail_closed
             run_case(spec, case, sequence).await?;
             sequence += 1;
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deployed_base_and_optimism_runtimes_match_liquidity_round_trip() -> Result<()> {
+    for (index, spec) in specs().into_iter().enumerate() {
+        run_liquidity_round_trip(spec, index as u64 + 1).await?;
     }
     Ok(())
 }

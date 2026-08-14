@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -240,6 +240,10 @@ required-features = ["uniswap-v3"]
 
 [[test]]
 name = "slipstream_swap_transition_differential"
+required-features = ["uniswap-v3"]
+
+[[test]]
+name = "slipstream_liquidity_transition"
 required-features = ["uniswap-v3"]
 
 # Live parity for the one-shot V3 sync (env-gated, #[ignore]): state, quote,

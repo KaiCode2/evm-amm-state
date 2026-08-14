@@ -10,7 +10,8 @@ use super::sim::{
     quoteExactInputSingleCall,
 };
 use super::v3_transition::{
-    DecodedSwap, derive_slipstream_swap, derive_uniswap_v3_swap, infer_slipstream_swap_fee,
+    DecodedLiquidity, DecodedSwap, derive_slipstream_liquidity, derive_slipstream_swap,
+    derive_uniswap_v3_swap, infer_slipstream_swap_fee, validate_reviewed_slipstream_event,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind,
@@ -113,9 +114,11 @@ pub(crate) const V3_TICK_WORD_RADIUS: i16 = 2;
 ///
 /// A single instance routes Uniswap V3, Pancake V3, and Slipstream and resolves
 /// their configured storage layouts. Layout similarity is not semantic parity:
-/// only canonical Uniswap V3 currently supports exact event-only `Swap`
-/// transitions. Pancake and Slipstream swaps invalidate stale state and request
-/// repair until each family has independent deployed-runtime parity evidence.
+/// canonical Uniswap V3 has registration-scoped exact `Swap` transitions, while
+/// the reviewed Base/Optimism Slipstream deployments have event-scoped exact
+/// quote/search transitions for `Swap`, `Mint`, `Burn`, and `Collect`.
+/// Pancake and unreviewed Slipstream pools invalidate stale state and request
+/// repair until their own deployed-runtime semantics are proven.
 #[derive(Clone, Debug, Default)]
 pub struct ConcentratedLiquidityAdapter {
     _private: (),
@@ -290,6 +293,12 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             }
         } else if topic0 == PancakeV3Swap::SIGNATURE_HASH {
             self.decode_swap_without_context(pool, log, topic0)
+        } else if topic0 == Mint::SIGNATURE_HASH {
+            self.decode_liquidity_event_with_context(pool, log, view, true, context)
+        } else if topic0 == Burn::SIGNATURE_HASH {
+            self.decode_liquidity_event_with_context(pool, log, view, false, context)
+        } else if topic0 == Collect::SIGNATURE_HASH {
+            self.decode_collect_with_context(pool, log, context)
         } else {
             self.decode_event(pool, log, view)
         }
@@ -824,14 +833,45 @@ impl ConcentratedLiquidityAdapter {
 
     /// Return the event-scoped exact capability.
     ///
-    /// Alpha.5 grants this only to canonical Uniswap V3. Slipstream candidate
-    /// replay and fee-evidence research deliberately cannot elevate public
-    /// capability until the full family-specific differential matrix is proven.
+    /// Canonical Uniswap V3 inherits its registration-scoped capability.
+    /// Reviewed Slipstream deployments can reproduce the quote/search surface
+    /// from the event and exact parent alone. Optional runtime-bound fee
+    /// evidence additionally enables byte-exact fee/reward accounting writes;
+    /// invalid supplied evidence always fails closed.
     pub fn swap_transition_capability_with_context(
         pool: &PoolRegistration,
-        _context: &AdapterEventContext,
+        context: &AdapterEventContext,
     ) -> V3SwapTransitionCapability {
-        Self::swap_transition_capability(pool)
+        let registration_capability = Self::swap_transition_capability(pool);
+        if registration_capability == V3SwapTransitionCapability::Exact {
+            return registration_capability;
+        }
+        let Some(layout) = layout_for(pool) else {
+            return V3SwapTransitionCapability::Unsupported;
+        };
+        let Some(address) = pool.key.address() else {
+            return V3SwapTransitionCapability::Unsupported;
+        };
+        if pool.protocol() != ProtocolId::Slipstream
+            || validate_reviewed_slipstream_event(address, layout, context).is_err()
+        {
+            return V3SwapTransitionCapability::Unsupported;
+        }
+        if let Some(evidence) = context.slipstream_fee_evidence
+            && (evidence.validate().is_err()
+                || evidence.pool != address
+                || context.chain_id != Some(evidence.chain_id)
+                || context.block_number != Some(evidence.block_number)
+                || context.block_hash != Some(evidence.block_hash)
+                || context.parent_hash != Some(evidence.parent_hash)
+                || context.block_timestamp != Some(evidence.block_timestamp)
+                || context.transaction_hash != Some(evidence.transaction_hash)
+                || context.transaction_index != Some(evidence.transaction_index)
+                || context.log_index != Some(evidence.log_index))
+        {
+            return V3SwapTransitionCapability::Unsupported;
+        }
+        V3SwapTransitionCapability::Exact
     }
 
     /// Evaluate the reviewed Slipstream unstaked-liquidity fee against an
@@ -1114,6 +1154,127 @@ impl ConcentratedLiquidityAdapter {
         }
 
         self.decode_non_swap_mutation(pool, log, topic0)
+    }
+
+    fn decode_liquidity_event_with_context(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        is_mint: bool,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return self.decode_liquidity_event(pool, log, view, is_mint);
+        }
+        let topic0 = if is_mint {
+            Mint::SIGNATURE_HASH
+        } else {
+            Burn::SIGNATURE_HASH
+        };
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "Slipstream pool key is not address-keyed",
+            ));
+        };
+        let Some(layout) = layout_for(pool) else {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::Unsupported(UnsupportedReason::MissingMetadata(
+                    "Slipstream storage layout",
+                )),
+            );
+        };
+        let decode_ok = if is_mint {
+            Mint::decode_log_data_validate(&log.data).is_ok()
+        } else {
+            Burn::decode_log_data_validate(&log.data).is_ok()
+        };
+        if !decode_ok {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::MalformedLog("malformed Slipstream liquidity log"),
+            );
+        }
+        let decoded = match decode_liquidity_body(log, is_mint) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                    error,
+                );
+            }
+        };
+        let updates = match derive_slipstream_liquidity(address, layout, decoded, view, context) {
+            Ok(updates) => updates,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                    error,
+                );
+            }
+        };
+        AdapterEventResult::event(AdapterEvent {
+            pool: pool.key.clone(),
+            emitter: log.address,
+            topic0,
+            kind: if is_mint {
+                AdapterEventKind::LiquidityAdded
+            } else {
+                AdapterEventKind::LiquidityRemoved
+            },
+            updates,
+            quality: UpdateQuality::Exact,
+            repair: RepairAction::None,
+        })
+    }
+
+    fn decode_collect_with_context(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return self.decode_non_swap_mutation(pool, log, Collect::SIGNATURE_HASH);
+        }
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "Slipstream pool key is not address-keyed",
+            ));
+        };
+        if Collect::decode_log_data_validate(&log.data).is_err() {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
+                AdapterEventError::MalformedLog("malformed Slipstream Collect log"),
+            );
+        }
+        let Some(layout) = layout_for(pool) else {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
+                AdapterEventError::Unsupported(UnsupportedReason::MissingMetadata(
+                    "Slipstream storage layout",
+                )),
+            );
+        };
+        if let Err(error) = validate_reviewed_slipstream_event(address, layout, context) {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
+                error,
+            );
+        }
+        // Collect mutates the caller's Position.Info and ERC-20 balances only.
+        // Neither is part of the pool quote/search surface, so the exact
+        // adapter-owned transition is empty and must not trigger reconstruction.
+        AdapterEventResult::event(AdapterEvent {
+            pool: pool.key.clone(),
+            emitter: log.address,
+            topic0: Collect::SIGNATURE_HASH,
+            kind: AdapterEventKind::Unknown,
+            updates: Vec::new(),
+            quality: UpdateQuality::Exact,
+            repair: RepairAction::None,
+        })
     }
 }
 
@@ -1553,6 +1714,39 @@ fn decode_swap_body(log: &Log) -> Result<DecodedSwap, AdapterEventError> {
         sqrt_price_x96,
         liquidity,
         tick,
+    })
+}
+
+fn decode_liquidity_body(log: &Log, is_mint: bool) -> Result<DecodedLiquidity, AdapterEventError> {
+    let tick_lower = log
+        .topics()
+        .get(2)
+        .copied()
+        .map(|word| int24_from_word(U256::from_be_slice(word.as_slice())))
+        .ok_or(AdapterEventError::MalformedLog(
+            "missing Slipstream lower tick",
+        ))?;
+    let tick_upper = log
+        .topics()
+        .get(3)
+        .copied()
+        .map(|word| int24_from_word(U256::from_be_slice(word.as_slice())))
+        .ok_or(AdapterEventError::MalformedLog(
+            "missing Slipstream upper tick",
+        ))?;
+    let amount_word = data_word(log, usize::from(is_mint)).ok_or(
+        AdapterEventError::MalformedLog("missing Slipstream liquidity amount"),
+    )?;
+    if amount_word > U256::from(u128::MAX) {
+        return Err(AdapterEventError::MalformedLog(
+            "Slipstream liquidity amount exceeds uint128",
+        ));
+    }
+    Ok(DecodedLiquidity {
+        tick_lower,
+        tick_upper,
+        amount: amount_word.to::<u128>(),
+        is_mint,
     })
 }
 

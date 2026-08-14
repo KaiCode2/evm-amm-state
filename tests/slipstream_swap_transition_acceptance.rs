@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_eips::BlockId;
 use alloy_network::Ethereum;
@@ -8,9 +13,9 @@ use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::mock::Asserter;
 use evm_amm_state::adapters::{
-    AdapterEventContext, AdapterEventError, AdapterRegistry, AmmAdapter, AmmPoolReactiveHandler,
+    AdapterEventContext, AdapterRegistry, AmmAdapter, AmmPoolReactiveHandler,
     AmmReactiveRoutingContext, ConcentratedLiquidityAdapter, PoolGeneration, PoolInstanceId,
-    PoolKey, PoolRegistration, ProtocolMetadata, PurgeScope, SlipstreamFeeEvidenceError,
+    PoolKey, PoolRegistration, ProtocolMetadata, SlipstreamFeeEvidenceError,
     SlipstreamFeeEvidenceInsertOutcome, SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity,
     SlipstreamSwapFeeEvidence, StateUpdate, StateView, UpdateQuality, V3Metadata, V3StorageLayout,
     V3SwapTransitionCapability,
@@ -436,8 +441,16 @@ async fn assert_fixture(contents: &str) {
             &registration,
             &context,
         ),
-        V3SwapTransitionCapability::Unsupported,
-        "reviewed evidence must not elevate Slipstream before the complete parity matrix",
+        V3SwapTransitionCapability::Exact,
+        "reviewed runtime and exact event evidence must grant provider-free Slipstream replay",
+    );
+    assert_eq!(
+        ConcentratedLiquidityAdapter::swap_transition_capability_with_context(
+            &registration,
+            &base_context,
+        ),
+        V3SwapTransitionCapability::Exact,
+        "reviewed deployments must keep the quote/search surface exact without fee evidence",
     );
     let zero_spacing = PoolRegistration::new(PoolKey::Slipstream(pool)).with_metadata(
         ProtocolMetadata::Slipstream(
@@ -549,21 +562,109 @@ async fn assert_fixture(contents: &str) {
         .ingest_batch(
             &mut fee_cache,
             ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
-                ReactiveInput::Log(rpc_log),
-                reactive_context,
+                ReactiveInput::Log(rpc_log.clone()),
+                reactive_context.clone(),
             )]),
         )
         .expect("real reactive handler fail-closes a Slipstream event");
     assert_eq!(report.applied.len(), 1);
     assert_eq!(
         report.applied[0].quality,
-        StateEffectQuality::RequiresRepair,
+        StateEffectQuality::ExactFromInput,
     );
-    assert_ne!(
+    assert_eq!(
         fee_cache.cached_storage_value(pool, U256::ZERO),
         Some(U256::from_be_slice(factory.as_slice())),
-        "unsupported Slipstream must purge the stale parent state",
+        "exact Slipstream replay must retain unrelated parent state",
     );
+
+    // The production path deliberately does not require the optional
+    // accounting evidence above. Re-run the same event through a fresh
+    // reactive runtime backed by a mock provider with no prepared response:
+    // any provider access would fail the test. The event must publish an exact
+    // quote/search update without invalidation or repair.
+    let mut quote_cache = cache(chain_id).await;
+    let parent_slots = fixture["parent_storage"]
+        .as_object()
+        .expect("parent storage map")
+        .iter()
+        .map(|(slot, value)| (word(slot), word(value.as_str().expect("parent word"))))
+        .collect::<Vec<_>>();
+    let pool_runtime = reviewed_runtimes(family)
+        .into_iter()
+        .find_map(|(runtime_address, runtime)| (runtime_address == pool).then_some(runtime))
+        .expect("reviewed pool runtime");
+    install(&mut quote_cache, pool, pool_runtime, &parent_slots);
+
+    let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
+    let registration_with_sources = registration
+        .clone()
+        .with_event_sources(adapter.event_sources(&registration));
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register_adapter(adapter)
+        .expect("register Slipstream adapter");
+    registry
+        .register_pool(registration_with_sources)
+        .expect("register reviewed pool");
+    let routing = AmmReactiveRoutingContext::new(Arc::new(registry));
+    let instance = PoolInstanceId::new(registration.key.clone(), PoolGeneration::new(1));
+    let handler = Arc::new(
+        AmmPoolReactiveHandler::with_routing_context(routing, instance)
+            .expect("build evidence-free pool-scoped handler"),
+    );
+    let mut quote_reactive = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    quote_reactive
+        .register_handler(handler)
+        .expect("register evidence-free pool-scoped handler");
+    let quote_report = quote_reactive
+        .ingest_batch(
+            &mut quote_cache,
+            ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
+                ReactiveInput::Log(rpc_log),
+                reactive_context,
+            )]),
+        )
+        .expect("evidence-free Slipstream event must remain provider-disconnected");
+    assert_eq!(quote_report.applied.len(), 1);
+    assert_eq!(
+        quote_report.applied[0].quality,
+        StateEffectQuality::ExactFromInput,
+    );
+    assert!(quote_report.applied[0].resyncs.is_empty());
+    assert!(quote_report.applied[0].invalidations.is_empty());
+    assert_eq!(
+        quote_cache.cached_storage_value(pool, U256::from(6)),
+        fixture["expected_writes"]
+            .get("0x06")
+            .and_then(Value::as_str)
+            .map(word),
+        "evidence-free transition must publish exact packed price/tick/oracle state",
+    );
+    let word_128_mask = (U256::from(1) << 128_usize) - U256::from(1);
+    for (slot, fixture_key) in [(U256::from(15), "0x0f"), (U256::from(16), "0x10")] {
+        assert_eq!(
+            quote_cache
+                .cached_storage_value(pool, slot)
+                .map(|value| value & word_128_mask),
+            fixture["expected_writes"]
+                .get(fixture_key)
+                .and_then(Value::as_str)
+                .map(word)
+                .map(|value| value & word_128_mask),
+            "evidence-free transition must publish exact executable liquidity at {slot}",
+        );
+    }
+    for (slot, value) in fixture["expected_writes"]
+        .as_object()
+        .expect("expected deployed-runtime writes")
+    {
+        assert_eq!(
+            fee_cache.cached_storage_value(pool, word(slot)),
+            Some(word(value.as_str().expect("expected write word"))),
+            "event transition must match the deployed-runtime write at {slot}",
+        );
+    }
     assert_eq!(
         ConcentratedLiquidityAdapter::infer_slipstream_swap_fee(
             &registration,
@@ -580,24 +681,91 @@ async fn assert_fixture(contents: &str) {
         &state,
         &context,
     );
-    assert_eq!(
-        decoded.error,
-        Some(AdapterEventError::Unsupported(
-            evm_amm_state::adapters::UnsupportedReason::Protocol(
-                evm_amm_state::adapters::ProtocolId::Slipstream,
-            )
-        )),
-    );
+    assert_eq!(decoded.error, None);
     let event = decoded.event.expect("recognized Slipstream swap");
-    assert_eq!(event.quality, UpdateQuality::RequiresRepair);
-    assert_eq!(
-        event.updates,
-        vec![StateUpdate::purge(pool, PurgeScope::AllStorage)],
-    );
+    assert_eq!(event.quality, UpdateQuality::Exact);
+    let actual_writes = event
+        .updates
+        .into_iter()
+        .map(|update| match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                assert_eq!(address, pool);
+                (slot, value)
+            }
+            other => panic!("exact Slipstream replay emitted a non-slot update: {other:?}"),
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected_writes = fixture["expected_writes"]
+        .as_object()
+        .expect("expected deployed-runtime writes")
+        .iter()
+        .map(|(slot, value)| {
+            (
+                word(slot),
+                word(value.as_str().expect("expected write word")),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (slot, expected) in &expected_writes {
+        assert_eq!(
+            actual_writes.get(slot),
+            Some(expected),
+            "event transition must reproduce deployed-runtime write {slot}",
+        );
+    }
+    for (slot, actual) in actual_writes {
+        if !expected_writes.contains_key(&slot) {
+            assert_eq!(
+                Some(actual),
+                state.storage(pool, slot),
+                "an update omitted by the deployed write trace must be a parent-state no-op at {slot}",
+            );
+        }
+    }
+
+    if let Some(sample_count) = std::env::var("SLIPSTREAM_PERF_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+    {
+        let adapter = ConcentratedLiquidityAdapter::default();
+        let mut samples = Vec::with_capacity(sample_count);
+        for _ in 0..sample_count {
+            let started = Instant::now();
+            let decoded =
+                adapter.decode_event_with_context(&registration, &log, &state, &base_context);
+            samples.push(started.elapsed());
+            assert_eq!(decoded.error, None);
+            assert_eq!(
+                decoded.event.expect("timed transition event").quality,
+                UpdateQuality::Exact,
+            );
+        }
+        samples.sort_unstable();
+        let percentile = |percent: usize| -> Duration {
+            let index = (sample_count * percent).div_ceil(100).saturating_sub(1);
+            samples[index]
+        };
+        let p50 = percentile(50);
+        let p95 = percentile(95);
+        let p99 = percentile(99);
+        let max = *samples.last().expect("positive sample count");
+        eprintln!(
+            "Slipstream event transition chain={chain_id} samples={sample_count} p50={p50:?} p95={p95:?} p99={p99:?} max={max:?} rpc_batch_elements=0 retries=0 fallbacks=0"
+        );
+        assert!(
+            p95 < Duration::from_millis(10),
+            "Slipstream event-transition p95 exceeded the 10ms decision gate: {p95:?}",
+        );
+    }
 }
 
 #[tokio::test]
-async fn base_aerodrome_trace_pins_fee_evidence_and_publicly_fails_closed() {
+async fn base_aerodrome_trace_proves_accounting_and_evidence_free_quote_paths() {
     assert_fixture(include_str!(
         "fixtures/base_slipstream_initialized_crossing.json"
     ))
@@ -605,7 +773,7 @@ async fn base_aerodrome_trace_pins_fee_evidence_and_publicly_fails_closed() {
 }
 
 #[tokio::test]
-async fn optimism_velodrome_trace_pins_fee_evidence_and_publicly_fails_closed() {
+async fn optimism_velodrome_trace_proves_accounting_and_evidence_free_quote_paths() {
     assert_fixture(include_str!(
         "fixtures/optimism_slipstream_initialized_crossing.json"
     ))

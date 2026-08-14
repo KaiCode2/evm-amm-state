@@ -1,11 +1,11 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.6`. Publish its prerequisites in
+The current release candidate is `0.3.0-alpha.7`. Publish its prerequisites in
 this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
 2. `evm-fork-cache 0.4.0-alpha.4`;
-3. publish `evm-amm-state 0.3.0-alpha.6` after the gates below pass.
+3. publish `evm-amm-state 0.3.0-alpha.7` after the gates below pass.
 
 The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.4`.
 Treat any failure to resolve that published version as a release blocker rather

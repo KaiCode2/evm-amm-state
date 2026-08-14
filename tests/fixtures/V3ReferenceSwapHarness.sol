@@ -9,6 +9,20 @@ interface IReferenceV3Pool {
         uint160 sqrtPriceLimitX96,
         bytes calldata data
     ) external returns (int256 amount0, int256 amount1);
+
+    function mint(
+        address recipient,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount,
+        bytes calldata data
+    ) external returns (uint256 amount0, uint256 amount1);
+
+    function burn(
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount
+    ) external returns (uint256 amount0, uint256 amount1);
 }
 
 interface IMintableToken {
@@ -56,6 +70,30 @@ contract V3ReferenceSwapHarness {
         );
     }
 
+    function executeMint(
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount
+    ) external returns (uint256 amount0, uint256 amount1) {
+        return IReferenceV3Pool(pool).mint(
+            address(this),
+            tickLower,
+            tickUpper,
+            amount,
+            bytes("")
+        );
+    }
+
+    function executeBurn(
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount
+    ) external returns (uint256 amount0, uint256 amount1) {
+        return IReferenceV3Pool(pool).burn(tickLower, tickUpper, amount);
+    }
+
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
@@ -66,6 +104,19 @@ contract V3ReferenceSwapHarness {
         }
         if (amount1Delta > 0) {
             IMintableToken(token1).mint(msg.sender, uint256(amount1Delta));
+        }
+    }
+
+    function uniswapV3MintCallback(
+        uint256 amount0Owed,
+        uint256 amount1Owed,
+        bytes calldata
+    ) external {
+        if (amount0Owed > 0) {
+            IMintableToken(token0).mint(msg.sender, amount0Owed);
+        }
+        if (amount1Owed > 0) {
+            IMintableToken(token1).mint(msg.sender, amount1Owed);
         }
     }
 }

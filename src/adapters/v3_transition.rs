@@ -1,9 +1,14 @@
-//! Exact, provider-free swap transitions for concentrated-liquidity pools.
+//! Exact, provider-free transitions for concentrated-liquidity pools.
 //!
 //! The transition starts from an exact parent [`StateView`], replays the
 //! swap-induced writes locally, validates every event postcondition, and only
 //! then returns one atomic update batch.  Missing parent cells are errors: an
 //! absent cache value is never interpreted as an EVM zero.
+//!
+//! Canonical Uniswap replay owns the complete swap-mutated accounting surface.
+//! Reviewed Slipstream replay owns the complete quote/search surface for swaps
+//! and liquidity changes; optional runtime-bound evidence additionally enables
+//! its fee, reward, gauge, and crossed-tick accounting writes.
 
 use alloy_primitives::{Address, U256, address, aliases::U512, b256};
 
@@ -98,6 +103,14 @@ pub(super) struct DecodedSwap {
     pub sqrt_price_x96: U256,
     pub liquidity: U256,
     pub tick: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedLiquidity {
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub amount: u128,
+    pub is_mint: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -617,13 +630,10 @@ pub(super) fn derive_slipstream_swap(
 ) -> Result<Vec<StateUpdate>, AdapterEventError> {
     let claimed_fee = context
         .slipstream_fee_evidence
-        .ok_or(AdapterEventError::V3Transition(
-            V3TransitionError::MissingSlipstreamFeeEvidence,
-        ))?
-        .effective_swap_fee;
+        .map(|evidence| evidence.effective_swap_fee);
     let (updates, inferred_fee) =
         derive_slipstream_swap_inner(address, layout, swap, state, context)?;
-    if claimed_fee != inferred_fee {
+    if claimed_fee.is_some_and(|claimed_fee| claimed_fee != inferred_fee) {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeEvidence(
                 "effective swap fee does not match unique event-derived fee",
@@ -631,6 +641,317 @@ pub(super) fn derive_slipstream_swap(
         ));
     }
     Ok(updates)
+}
+
+/// Derive the complete quote/search-state transition for a reviewed
+/// Aerodrome/Velodrome Slipstream `Mint` or `Burn` event.
+///
+/// Position ownership and tokens-owed accounting live outside the AMM
+/// adapter's declared search surface. Every pool cell which can affect a
+/// subsequent quote is nevertheless read from the exact parent and updated
+/// here: both boundary ticks, their bitmap words, the observation ring, and
+/// active liquidity. Missing parent cells fail closed rather than becoming
+/// implicit zeroes.
+pub(super) fn derive_slipstream_liquidity(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedLiquidity,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    validate_reviewed_slipstream_event(address, layout, context)?;
+    if event.tick_lower < -887_272
+        || event.tick_upper > 887_272
+        || event.tick_lower >= event.tick_upper
+        || event.tick_lower.rem_euclid(layout.tick_spacing) != 0
+        || event.tick_upper.rem_euclid(layout.tick_spacing) != 0
+    {
+        return Err(contradiction(
+            "Slipstream liquidity range is invalid or not spacing-aligned",
+        ));
+    }
+    if event.amount == 0 {
+        if event.is_mint {
+            return Err(contradiction("Slipstream Mint liquidity must be positive"));
+        }
+        // A zero-amount Burn is a position fee poke. It cannot change the
+        // adapter-owned pool search state.
+        return Ok(Vec::new());
+    }
+    let signed_amount =
+        i128::try_from(event.amount).map_err(|_| arithmetic("liquidity amount exceeds int128"))?;
+
+    let slot0_raw = required(state, address, layout.slot0_slot)?;
+    let slot0 = Slot0::decode(slot0_raw);
+    if ((slot0.raw >> 232_usize) & U256::from(u8::MAX)).to::<u8>() != 1 {
+        return Err(contradiction("parent Slipstream slot0 is locked"));
+    }
+    validate_parent_slot0(slot0)?;
+    let liquidity_word = required(state, address, layout.liquidity_slot)?;
+    let active_liquidity = liquidity_word & WORD_128_MASK;
+    let max_liquidity_per_tick = (liquidity_word >> 128_usize) & WORD_128_MASK;
+
+    let (observation_index, observation_cardinality, oracle_write, oracle_now) = advance_oracle(
+        address,
+        SLIPSTREAM_SURFACE,
+        slot0,
+        active_liquidity,
+        state,
+        context,
+    )?;
+    let fee_growth_0 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_0_slot)?;
+    let fee_growth_1 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_1_slot)?;
+    // The reviewed Optimism runtime initializes rewardGrowthOutside for a new
+    // tick at/below the current tick. The reviewed Base runtime does not; this
+    // is an observed deployed-bytecode semantic difference, not ABI parity.
+    let initial_reward_growth = if context.chain_id == Some(10) {
+        required(state, address, SLIPSTREAM_REWARD_GROWTH_SLOT)?
+    } else {
+        U256::ZERO
+    };
+
+    let lower = update_slipstream_liquidity_tick(
+        address,
+        layout,
+        event.tick_lower,
+        slot0.tick,
+        signed_amount,
+        event.is_mint,
+        false,
+        max_liquidity_per_tick,
+        fee_growth_0,
+        fee_growth_1,
+        initial_reward_growth,
+        oracle_now,
+        context.block_timestamp.expect("validated") as u32,
+        state,
+    )?;
+    let upper = update_slipstream_liquidity_tick(
+        address,
+        layout,
+        event.tick_upper,
+        slot0.tick,
+        signed_amount,
+        event.is_mint,
+        true,
+        max_liquidity_per_tick,
+        fee_growth_0,
+        fee_growth_1,
+        initial_reward_growth,
+        oracle_now,
+        context.block_timestamp.expect("validated") as u32,
+        state,
+    )?;
+
+    let mut updates = Vec::with_capacity(16);
+    updates.extend(
+        lower
+            .keys
+            .into_iter()
+            .zip(lower.words)
+            .map(|(slot, value)| StateUpdate::slot(address, slot, value)),
+    );
+    updates.extend(
+        upper
+            .keys
+            .into_iter()
+            .zip(upper.words)
+            .map(|(slot, value)| StateUpdate::slot(address, slot, value)),
+    );
+
+    let mut bitmap_values = std::collections::BTreeMap::<U256, U256>::new();
+    let mut changed_bitmaps = std::collections::BTreeSet::<U256>::new();
+    for tick in [lower, upper] {
+        let word = tick.tick.div_euclid(layout.tick_spacing).div_euclid(256);
+        let bit = tick.tick.div_euclid(layout.tick_spacing).rem_euclid(256) as usize;
+        let slot = v3_tick_bitmap_storage_key_with_base(word as i16, layout.tick_bitmap_base_slot);
+        let value = bitmap_values
+            .entry(slot)
+            .or_insert(required(state, address, slot)?);
+        let mask = U256::from(1) << bit;
+        let parent_is_set = !(*value & mask).is_zero();
+        if parent_is_set != tick.was_initialized {
+            return Err(AdapterEventError::V3Transition(
+                V3TransitionError::InitializedTick {
+                    tick: tick.tick,
+                    reason: "bitmap disagrees with parent Tick.Info initialization",
+                },
+            ));
+        }
+        if tick.was_initialized != tick.is_initialized {
+            *value ^= mask;
+            changed_bitmaps.insert(slot);
+        }
+    }
+    updates.extend(
+        bitmap_values
+            .into_iter()
+            .filter(|(slot, _)| changed_bitmaps.contains(slot))
+            .map(|(slot, value)| StateUpdate::slot(address, slot, value)),
+    );
+
+    if slot0.tick >= event.tick_lower && slot0.tick < event.tick_upper {
+        let next_liquidity = if event.is_mint {
+            active_liquidity
+                .checked_add(U256::from(event.amount))
+                .ok_or_else(|| arithmetic("active liquidity overflow"))?
+        } else {
+            active_liquidity
+                .checked_sub(U256::from(event.amount))
+                .ok_or_else(|| arithmetic("active liquidity underflow"))?
+        };
+        if next_liquidity > WORD_128_MASK {
+            return Err(arithmetic("active liquidity exceeds uint128"));
+        }
+        if let Some((slot, value)) = oracle_write {
+            updates.push(StateUpdate::slot(address, slot, value));
+            updates.push(StateUpdate::slot(
+                address,
+                layout.slot0_slot,
+                slot0.encode_final(
+                    slot0.sqrt_price_x96,
+                    slot0.tick,
+                    observation_index,
+                    observation_cardinality,
+                ),
+            ));
+        }
+        updates.push(StateUpdate::slot(
+            address,
+            layout.liquidity_slot,
+            next_liquidity | (max_liquidity_per_tick << 128_usize),
+        ));
+    }
+    Ok(updates)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiquidityTickUpdate {
+    tick: i32,
+    keys: [U256; 6],
+    words: [U256; 6],
+    was_initialized: bool,
+    is_initialized: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_slipstream_liquidity_tick(
+    address: Address,
+    layout: V3StorageLayout,
+    tick: i32,
+    current_tick: i32,
+    amount: i128,
+    is_mint: bool,
+    upper: bool,
+    max_liquidity_per_tick: U256,
+    fee_growth_0: U256,
+    fee_growth_1: U256,
+    initial_reward_growth: U256,
+    oracle_now: Observation,
+    timestamp: u32,
+    state: &dyn StateView,
+) -> Result<LiquidityTickUpdate, AdapterEventError> {
+    let keys = slipstream_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+    let mut words = [U256::ZERO; 6];
+    for (word, key) in words.iter_mut().zip(keys) {
+        *word = required(state, address, key)?;
+    }
+    let old_gross = words[0] & WORD_128_MASK;
+    let old_net = ((words[0] >> 128_usize) & WORD_128_MASK).to::<u128>() as i128;
+    let was_initialized = !old_gross.is_zero();
+    let initialized_flag = ((words[5] >> 248_usize) & U256::from(u8::MAX)).to::<u8>() == 1;
+    if was_initialized != initialized_flag {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::InitializedTick {
+                tick,
+                reason: "Tick.Info initialized flag disagrees with liquidityGross",
+            },
+        ));
+    }
+    if !was_initialized && words.iter().any(|word| !word.is_zero()) {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::InitializedTick {
+                tick,
+                reason: "uninitialized Tick.Info contains nonzero state",
+            },
+        ));
+    }
+    let amount_u256 = U256::from(amount as u128);
+    let new_gross = if is_mint {
+        old_gross
+            .checked_add(amount_u256)
+            .ok_or_else(|| arithmetic("tick liquidityGross overflow"))?
+    } else {
+        old_gross
+            .checked_sub(amount_u256)
+            .ok_or_else(|| arithmetic("tick liquidityGross underflow"))?
+    };
+    if new_gross > max_liquidity_per_tick {
+        return Err(arithmetic(
+            "tick liquidityGross exceeds maxLiquidityPerTick",
+        ));
+    }
+    let delta = if is_mint { amount } else { -amount };
+    let net_delta = if upper { -delta } else { delta };
+    let new_net = old_net
+        .checked_add(net_delta)
+        .ok_or_else(|| arithmetic("tick liquidityNet overflow"))?;
+    let is_initialized = !new_gross.is_zero();
+
+    if !was_initialized && is_initialized {
+        if tick <= current_tick {
+            words[2] = fee_growth_0;
+            words[3] = fee_growth_1;
+            words[4] = initial_reward_growth;
+            words[5] = unsigned_bits(oracle_now.tick_cumulative, 56)
+                | ((oracle_now.seconds_per_liquidity_cumulative_x128 & WORD_160_MASK) << 56_usize)
+                | (U256::from(timestamp) << 216_usize)
+                | (U256::from(1) << 248_usize);
+        } else {
+            words[5] = U256::from(1) << 248_usize;
+        }
+    }
+    words[0] = new_gross | (U256::from(new_net as u128) << 128_usize);
+    if !is_initialized {
+        words = [U256::ZERO; 6];
+    }
+    Ok(LiquidityTickUpdate {
+        tick,
+        keys,
+        words,
+        was_initialized,
+        is_initialized,
+    })
+}
+
+pub(super) fn validate_reviewed_slipstream_event(
+    address: Address,
+    layout: V3StorageLayout,
+    context: &AdapterEventContext,
+) -> Result<(), AdapterEventError> {
+    validate_context(context)?;
+    if layout != V3StorageLayout::slipstream(layout.tick_spacing) {
+        return Err(contradiction(
+            "exact Slipstream event transition requires the deployed core storage layout",
+        ));
+    }
+    if layout.tick_spacing <= 0 {
+        return Err(contradiction("Slipstream tick spacing must be positive"));
+    }
+    let reviewed = match context.chain_id {
+        Some(8_453) => reviewed_slipstream_runtime(SlipstreamRuntimeFamily::AerodromeBaseBifi),
+        Some(10) => reviewed_slipstream_runtime(SlipstreamRuntimeFamily::VelodromeOptimismBifi),
+        _ => return Err(contradiction("unreviewed Slipstream chain identity")),
+    };
+    if address != reviewed.pool {
+        return Err(contradiction("unreviewed Slipstream pool identity"));
+    }
+    if layout.tick_spacing != 200 {
+        return Err(contradiction(
+            "reviewed Slipstream pool tick spacing does not match registration",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn infer_slipstream_swap_fee(
@@ -650,17 +971,12 @@ fn derive_slipstream_swap_inner(
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<(Vec<StateUpdate>, u32), AdapterEventError> {
-    validate_context(context)?;
-    if layout != V3StorageLayout::slipstream(layout.tick_spacing) {
-        return Err(contradiction(
-            "exact Slipstream transition requires the deployed core storage layout",
-        ));
-    }
-    if layout.tick_spacing <= 0 {
-        return Err(contradiction("Slipstream tick spacing must be positive"));
-    }
-    let evidence = validate_slipstream_evidence(address, state, context)?;
-    let unstaked_fee = evidence.effective_unstaked_fee;
+    validate_reviewed_slipstream_event(address, layout, context)?;
+    let evidence = context
+        .slipstream_fee_evidence
+        .map(|_| validate_slipstream_evidence(address, state, context))
+        .transpose()?;
+    let unstaked_fee = evidence.map_or(0, |evidence| evidence.effective_unstaked_fee);
     if swap.sqrt_price_x96 > SLOT0_SQRT_MASK || swap.liquidity > WORD_128_MASK {
         return Err(AdapterEventError::MalformedLog(
             "Slipstream Swap final value exceeds its ABI width",
@@ -691,10 +1007,26 @@ fn derive_slipstream_swap_inner(
         ));
     }
     let mut last_updated = ((staked_word >> 128_usize) & WORD_32_MASK).to::<u32>();
-    let mut fee_growth_0 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_0_slot)?;
-    let mut fee_growth_1 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_1_slot)?;
-    let mut reward_growth = required(state, address, SLIPSTREAM_REWARD_GROWTH_SLOT)?;
-    let mut gauge_fees = required(state, address, SLIPSTREAM_GAUGE_FEES_SLOT)?;
+    let mut fee_growth_0 = if evidence.is_some() {
+        required(state, address, SLIPSTREAM_SURFACE.fee_growth_0_slot)?
+    } else {
+        U256::ZERO
+    };
+    let mut fee_growth_1 = if evidence.is_some() {
+        required(state, address, SLIPSTREAM_SURFACE.fee_growth_1_slot)?
+    } else {
+        U256::ZERO
+    };
+    let mut reward_growth = if evidence.is_some() {
+        required(state, address, SLIPSTREAM_REWARD_GROWTH_SLOT)?
+    } else {
+        U256::ZERO
+    };
+    let mut gauge_fees = if evidence.is_some() {
+        required(state, address, SLIPSTREAM_GAUGE_FEES_SLOT)?
+    } else {
+        U256::ZERO
+    };
 
     let zero_for_one = match (
         swap.amount0_negative,
@@ -876,11 +1208,12 @@ fn derive_slipstream_swap_inner(
             U256::from((swap.tick as u32) & 0x00ff_ffff),
         ));
     }
-    if evidence.unstaked_fee_proof.kind()
-        == SlipstreamUnstakedFeeProofKind::UnusedAllLiquidityStaked
-        && segments
-            .iter()
-            .any(|segment| segment.liquidity != segment.staked_liquidity)
+    if evidence.is_some_and(|evidence| {
+        evidence.unstaked_fee_proof.kind()
+            == SlipstreamUnstakedFeeProofKind::UnusedAllLiquidityStaked
+    }) && segments
+        .iter()
+        .any(|segment| segment.liquidity != segment.staked_liquidity)
     {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeEvidence(
@@ -912,6 +1245,36 @@ fn derive_slipstream_swap_inner(
         .checked_sub(principal_input)
         .ok_or_else(|| final_mismatch("signed input principal", principal_input, actual_input))?;
     let fee = infer_slipstream_fee(&segments, total_fee)?;
+
+    // Search needs the exact price/liquidity traversal, observation state, and
+    // staked-liquidity bound used by subsequent pool execution. Fee growth,
+    // gauge accrual, and reward bookkeeping do not influence executable swap
+    // amounts. When runtime-bound fee evidence is unavailable, publish only
+    // this quote-exact surface instead of forcing an RPC reconstruction.
+    if evidence.is_none() {
+        let final_slot0 = slot0.encode_final(
+            swap.sqrt_price_x96,
+            swap.tick,
+            oracle_index,
+            oracle_cardinality,
+        );
+        let final_staked_word = (staked_word & !WORD_128_MASK) | current_staked_liquidity;
+        let final_liquidity_word =
+            (liquidity_word & (WORD_128_MASK << 128_usize)) | current_liquidity;
+        let mut updates = vec![
+            StateUpdate::slot(address, layout.slot0_slot, final_slot0),
+            StateUpdate::slot(
+                address,
+                SLIPSTREAM_STAKED_LAST_SPACING_SLOT,
+                final_staked_word,
+            ),
+            StateUpdate::slot(address, layout.liquidity_slot, final_liquidity_word),
+        ];
+        if let Some((slot, value)) = oracle_write {
+            updates.push(StateUpdate::slot(address, slot, value));
+        }
+        return Ok((updates, fee));
+    }
     if segments
         .last()
         .is_some_and(|segment| segment.reached_boundary)

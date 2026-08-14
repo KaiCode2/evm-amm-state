@@ -109,10 +109,11 @@ impl V3StorageLayout {
 
     /// Deployed Aerodrome/Velodrome Slipstream CL core layout.
     ///
-    /// This four-field descriptor covers only the common V3 geometry. Exact
-    /// event replay additionally validates a reviewed runtime identity and
-    /// applies Slipstream's fee, reward, gauge, staked-liquidity, oracle, and
-    /// six-word tick semantics.
+    /// This four-field descriptor covers the quote/search geometry. Exact event
+    /// replay additionally validates a reviewed deployment identity and keeps
+    /// its active/staked-liquidity, oracle, bitmap, and six-word tick search
+    /// state coherent. Runtime-bound fee evidence opts into the stronger fee,
+    /// reward, gauge, and crossed-tick accounting replay.
     pub const fn slipstream(tick_spacing: i32) -> Self {
         Self::new(
             SLIPSTREAM_SLOT0_SLOT,
