@@ -39,6 +39,7 @@ use evm_fork_cache::cold_start::{
 };
 #[cfg(feature = "live-runtime")]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(feature = "live-runtime")]
 use std::sync::Arc;
 
@@ -773,13 +774,12 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
 /// The **canonical Uniswap** spec (which bakes in Uniswap's fee-growth,
 /// protocol-fees, and observation slot positions) is used only for genuine
 /// Uniswap V3 pools. PancakeSwap uses its independently verified shifted spec.
-/// Slipstream uses the layout-only [`V3SyncSpec::core`] as a **quote-surface**
-/// bootstrap: it loads slot0, active liquidity, the full bitmap range, and the
-/// tick words used by its configured quoter. The reviewed Base/Optimism pools
-/// subsequently keep that search surface current from `Swap`, `Mint`, `Burn`,
-/// and `Collect` events without reconstruction. This program does not itself
-/// grant capability to an unreviewed pool or claim position, token, reward, or
-/// gauge-accounting parity.
+/// Slipstream uses [`V3SyncSpec::slipstream`] as an exact **quote/replay
+/// surface** bootstrap: it loads slot0, active liquidity, the full bitmap
+/// range, and all six tick words required to translate reviewed `Swap`, `Mint`,
+/// `Burn`, and `Collect` events without reconstruction. This program does not
+/// itself grant capability to an unreviewed pool or claim position, token,
+/// reward, or gauge-accounting parity.
 #[cfg(feature = "uniswap-v3")]
 fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     use super::ProtocolMetadata;
@@ -793,7 +793,7 @@ fn v3_sync_spec(pool: &PoolRegistration) -> Option<V3SyncSpec> {
     Some(match family {
         0 => V3SyncSpec::uniswap(layout),
         1 => V3SyncSpec::pancake(layout),
-        _ => V3SyncSpec::core(layout),
+        _ => V3SyncSpec::slipstream(layout),
     })
 }
 
@@ -1081,7 +1081,10 @@ pub(crate) async fn prepare_fast_pool<P>(
 where
     P: alloy_provider::Provider<alloy_network::AnyNetwork>,
 {
-    if registry.adapter(pool.protocol()).is_none() || !fast_metadata_complete(&pool) {
+    let Some(adapter) = registry.adapter(pool.protocol()).cloned() else {
+        return Ok(None);
+    };
+    if !fast_metadata_complete(&pool) || !adapter.verified_storage_targets(&pool).is_empty() {
         return Ok(None);
     }
     let Some(kind) = hydration_kind(&pool) else {
@@ -1104,9 +1107,6 @@ where
         return Ok(None);
     };
     record_v3_prepared_slots(&mut pool, &entries);
-    let adapter = registry.adapter(pool.protocol()).ok_or_else(|| {
-        PreparedColdStartError::Unsupported(UnsupportedReason::Protocol(pool.protocol()))
-    })?;
     let accounts = prepare_code_seeds(
         adapter.as_ref(),
         &pool,
@@ -1905,14 +1905,82 @@ impl AdapterRegistry {
             }
         }
 
-        // Step 4: finalize every fallback pool through the normal cold-start.
+        // Step 4: the one-shot pool program can read only the target pool's own
+        // storage. Hydrate any reviewed external quote-runtime cells in one
+        // additional bounded batch, still at the exact cold-start pin. A
+        // missing cell moves that pool through the ordinary fail-closed planner.
+        let mut external_by_pool = vec![Vec::new(); pools.len()];
+        let mut external_targets = BTreeSet::new();
+        for (index, _) in &fast {
+            if outcomes[*index].is_none() {
+                continue;
+            }
+            let Some(adapter) = self.adapter(pools[*index].protocol()) else {
+                continue;
+            };
+            let targets = adapter.verified_storage_targets(&pools[*index]);
+            external_targets.extend(targets.iter().copied());
+            external_by_pool[*index] = targets;
+        }
+        if !external_targets.is_empty() {
+            let targets: Vec<_> = external_targets.into_iter().collect();
+            let prior: Vec<_> = targets
+                .iter()
+                .map(|(address, slot)| {
+                    (
+                        (*address, *slot),
+                        cache.cached_storage_value(*address, *slot),
+                    )
+                })
+                .collect();
+            let warmed = cache.prewarm_slots(&targets);
+            let failed: BTreeSet<_> = warmed
+                .failed
+                .iter()
+                .map(|(address, slot, _)| (*address, *slot))
+                .collect();
+            let malformed = warmed.loaded + warmed.failed.len() != targets.len();
+            for (index, pool_targets) in external_by_pool.iter().enumerate() {
+                if pool_targets.is_empty() || outcomes[index].is_none() {
+                    continue;
+                }
+                if malformed || pool_targets.iter().any(|target| failed.contains(target)) {
+                    is_fallback[index] = true;
+                    outcomes[index] = None;
+                    continue;
+                }
+                let Some(ColdStartOutcome::Ready(report)) = outcomes[index].as_mut() else {
+                    continue;
+                };
+                report.verified_slots.extend(pool_targets.iter().copied());
+                for (address, slot) in pool_targets {
+                    let old = prior
+                        .iter()
+                        .find_map(|(target, value)| {
+                            (*target == (*address, *slot)).then_some(*value)
+                        })
+                        .flatten()
+                        .unwrap_or(U256::ZERO);
+                    let new = cache
+                        .cached_storage_value(*address, *slot)
+                        .unwrap_or(U256::ZERO);
+                    if old != new {
+                        report
+                            .changed_slots
+                            .push(SlotChange::new(*address, *slot, old, new));
+                    }
+                }
+            }
+        }
+
+        // Step 5: finalize every fallback pool through the normal cold-start.
         for (index, pool) in pools.iter_mut().enumerate() {
             if is_fallback[index] {
                 outcomes[index] = Some(self.cold_start(pool, cache, policy)?);
             }
         }
 
-        // Step 5: under an eager policy, pre-warm the canonical quote
+        // Step 6: under an eager policy, pre-warm the canonical quote
         // entrypoints' bytecode (QuoterV2 / Router02 / vault) so the first
         // `simulate_swap` against each pool runs offline instead of paying a lazy
         // `eth_getCode` on the hot path. Runs after fallback finalization so every
@@ -1927,7 +1995,7 @@ impl AdapterRegistry {
             }
         }
 
-        // Step 6: every slot is now populated (fast success or fallback).
+        // Step 7: every slot is now populated (fast success or fallback).
         Ok(outcomes
             .into_iter()
             .map(|outcome| outcome.expect("every pool is fast-hydrated or fell back"))
@@ -2108,8 +2176,7 @@ mod tests {
     }
 
     /// PancakeSwap V3 uses its verified shifted full layout. Slipstream uses a
-    /// full-range layout-only quote surface without acquiring exact transition
-    /// authority over its six-word ticks or reward/gauge state.
+    /// full-range six-word tick surface without acquiring reward/gauge state.
     #[test]
     fn pancake_and_slipstream_use_family_appropriate_full_range_specs() {
         let pancake_layout = V3StorageLayout::pancake(10);
@@ -2131,7 +2198,10 @@ mod tests {
                     .with_tick_spacing(100)
                     .with_storage_layout(slip_layout),
             ));
-        assert_eq!(v3_sync_spec(&slip), Some(V3SyncSpec::core(slip_layout)));
+        assert_eq!(
+            v3_sync_spec(&slip),
+            Some(V3SyncSpec::slipstream(slip_layout))
+        );
         assert!(supports_one_shot_hydration(&slip));
         assert!(
             fast_metadata_complete(&slip),

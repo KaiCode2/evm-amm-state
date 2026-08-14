@@ -514,16 +514,23 @@ fn validate_one(
     request: &QuoteWarmup,
 ) -> Result<SwapQuote, QuoteWarmupError> {
     let mut offline = OfflineSnapshotCache::new(snapshot);
-    let quote = adapter
-        .simulate_swap(
-            pool,
-            &mut offline,
-            request.token_in,
-            request.token_out,
-            request.amount_in,
-            config,
-        )
-        .map_err(|error| simulation_error(request, error))?;
+    let quote = match adapter.simulate_swap(
+        pool,
+        &mut offline,
+        request.token_in,
+        request.token_out,
+        request.amount_in,
+        config,
+    ) {
+        Ok(quote) => quote,
+        Err(_) if !offline.missing_state().is_empty() => {
+            return Err(QuoteWarmupError::IncompleteSnapshot {
+                request: Box::new(request.clone()),
+                missing: Box::new(offline.missing_state().clone()),
+            });
+        }
+        Err(error) => return Err(simulation_error(request, error)),
+    };
     if offline.missing_state().is_empty() {
         Ok(quote)
     } else {

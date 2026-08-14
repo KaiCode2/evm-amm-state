@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, B256, Bytes, U256, hex};
+use alloy_primitives::{Address, B256, Bytes, U256, address, hex};
 use alloy_provider::{RootProvider, network::AnyNetwork};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
@@ -539,9 +539,9 @@ async fn slipstream_exact_cold_start_warms_extended_surface_and_six_word_ticks()
     );
     let tick_info =
         slipstream_tick_info_storage_keys_with_base(initialized_tick, layout.ticks_base_slot);
-    // observationIndex=0, cardinality=1, cardinalityNext=1, unlocked=true at
+    // observationIndex=0, cardinality=3, cardinalityNext=3, unlocked=true at
     // Slipstream slot0 bit 232 (48 relative to the obs-index high word).
-    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 48);
+    let slot0_high = (U256::from(3) << 16) | (U256::from(3) << 32) | (U256::from(1) << 48);
     let mut values = HashMap::from([
         (
             (pool, layout.slot0_slot),
@@ -553,6 +553,8 @@ async fn slipstream_exact_cold_start_warms_extended_surface_and_six_word_ticks()
             v3_bit(initialized_tick, layout.tick_spacing),
         ),
         ((pool, U256::from(20)), U256::from(1_u64) << 248),
+        ((pool, U256::from(21)), U256::from(2_u64) << 248),
+        ((pool, U256::from(22)), U256::from(3_u64) << 248),
     ]);
     for (index, slot) in tick_info.into_iter().enumerate() {
         values.insert((pool, slot), U256::from(100 + index));
@@ -586,6 +588,8 @@ async fn slipstream_exact_cold_start_warms_extended_surface_and_six_word_ticks()
         U256::from(14),
         U256::from(15),
         U256::from(20),
+        U256::from(21),
+        U256::from(22),
         bitmap,
     ] {
         assert!(
@@ -599,6 +603,129 @@ async fn slipstream_exact_cold_start_warms_extended_surface_and_six_word_ticks()
             "all six Slipstream Tick.Info words must be warm"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reviewed_slipstream_cold_start_persists_external_fee_runtime_slots() -> Result<()> {
+    let pool = address!("b378137c90444bbcecd44a1f766851fbf53d2a9e");
+    let factory = address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a");
+    let voter = address!("16613524e02ad97edfef371bc883f2f5d6c480a5");
+    let gauge = address!("6e415053aacdddc8b678a806a5279a8dcdd4f6f1");
+    let module = address!("0ad08370c76ff426f534bb2affd9b5555338ee68");
+    let gauges_slot = U256::from_str_radix(
+        "2c357d6b8eee73fcbf431d119deb6fded94ba981611871c061d4193bf635e395",
+        16,
+    )?;
+    let alive_slot = U256::from_str_radix(
+        "26d2008aad5cd7780c6e560aa1e7e1054ccb24643649352436a611d54815ba93",
+        16,
+    )?;
+    let module_override_slot = U256::from_str_radix(
+        "707f2cfc78bc8be54b690665d3f2f2bb05af27f12957c41c89fb4d16323dd012",
+        16,
+    )?;
+    let external = [
+        (factory, U256::from(4), token_slot_word(module)),
+        (voter, gauges_slot, token_slot_word(gauge)),
+        (voter, alive_slot, U256::from(1)),
+        (module, module_override_slot, U256::from(100)),
+    ];
+    let layout = V3StorageLayout::slipstream(200);
+    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 48);
+    let mut values = HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(99_u64), 0, slot0_high),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(5_u64)),
+        ((pool, U256::from(20)), U256::from(1_u64) << 248),
+    ]);
+    values.extend(
+        external
+            .iter()
+            .map(|(address, slot, value)| ((*address, *slot), *value)),
+    );
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(values, Vec::new()));
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Slipstream(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(200)
+                .with_warm_word_radius(0),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert!(
+        matches!(outcome, ColdStartOutcome::Ready(_)),
+        "got {outcome:?}"
+    );
+    for (address, slot, value) in external {
+        assert_eq!(
+            cache.cached_storage_value(address, slot),
+            Some(value),
+            "reviewed fee-runtime cell {address}:{slot:#x} must be canonical"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reviewed_slipstream_cold_start_fails_closed_on_missing_external_fee_cell() -> Result<()> {
+    let pool = address!("b378137c90444bbcecd44a1f766851fbf53d2a9e");
+    let factory = address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a");
+    let voter = address!("16613524e02ad97edfef371bc883f2f5d6c480a5");
+    let gauge = address!("6e415053aacdddc8b678a806a5279a8dcdd4f6f1");
+    let module = address!("0ad08370c76ff426f534bb2affd9b5555338ee68");
+    let gauges_slot = U256::from_str_radix(
+        "2c357d6b8eee73fcbf431d119deb6fded94ba981611871c061d4193bf635e395",
+        16,
+    )?;
+    let alive_slot = U256::from_str_radix(
+        "26d2008aad5cd7780c6e560aa1e7e1054ccb24643649352436a611d54815ba93",
+        16,
+    )?;
+    let module_override_slot = U256::from_str_radix(
+        "707f2cfc78bc8be54b690665d3f2f2bb05af27f12957c41c89fb4d16323dd012",
+        16,
+    )?;
+    let missing = (factory, U256::from(4));
+    let layout = V3StorageLayout::slipstream(200);
+    let slot0_high = (U256::from(1) << 16) | (U256::from(1) << 32) | (U256::from(1) << 48);
+    let values = HashMap::from([
+        (
+            (pool, layout.slot0_slot),
+            v3_slot0_word(U256::from(99_u64), 0, slot0_high),
+        ),
+        ((pool, layout.liquidity_slot), U256::from(5_u64)),
+        ((pool, U256::from(20)), U256::from(1_u64) << 248),
+        ((voter, gauges_slot), token_slot_word(gauge)),
+        ((voter, alive_slot), U256::from(1)),
+        ((module, module_override_slot), U256::from(100)),
+    ]);
+    let mut cache = setup_cache().await?;
+    cache.set_storage_batch_fetcher(fetcher_with_failures(values, vec![missing]));
+    let registry = v3_registry();
+    let mut registration = PoolRegistration::new(PoolKey::Slipstream(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_storage_layout(layout)
+                .with_tick_spacing(200)
+                .with_warm_word_radius(0),
+        ));
+
+    let outcome = registry.cold_start(&mut registration, &mut cache, ColdStartPolicy::Eager)?;
+
+    assert_eq!(registration.status, PoolStatus::Degraded);
+    assert!(
+        matches!(repair_of(&outcome), Some(RepairAction::VerifySlots(slots)) if slots == &vec![missing]),
+        "missing reviewed fee-runtime state must name the exact repair cell: {outcome:?}",
+    );
     Ok(())
 }
 

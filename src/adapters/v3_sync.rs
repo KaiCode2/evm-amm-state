@@ -10,8 +10,9 @@
 //! state in a single round trip:
 //!
 //! - the static slots (`slot0`, fee growth, protocol fees, global liquidity),
-//! - every initialized tick over the full tick range — index plus all four
-//!   `Tick.Info` words — discovered by scanning the bitmap in-program, and
+//! - every initialized tick over the full tick range — index plus the
+//!   protocol-specific `Tick.Info` words — discovered by scanning the bitmap
+//!   in-program, and
 //! - the full observation ring, sized by the cardinality read out of `slot0`
 //!   in-program.
 //!
@@ -89,6 +90,7 @@ const PANCAKE_FEE_GROWTH_0_SLOT: u64 = 2;
 const PANCAKE_FEE_GROWTH_1_SLOT: u64 = 3;
 const PANCAKE_PROTOCOL_FEES_SLOT: u64 = 4;
 const PANCAKE_OBSERVATIONS_SLOT: u64 = 9;
+const SLIPSTREAM_OBSERVATIONS_SLOT: u64 = 20;
 
 // ---------------------------------------------------------------------------
 // Sync spec
@@ -120,9 +122,10 @@ impl V3ObservationsSpec {
 /// the storage layout (slots + tick spacing), which static slots to emit,
 /// the bitmap word range, and (optionally) the observation ring.
 ///
-/// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::pancake`], [`V3SyncSpec::core`], or
-/// [`V3SyncSpec::new`] — the struct is `#[non_exhaustive]` so fields can be
-/// added for further V3-family variants without a breaking release.
+/// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::pancake`],
+/// [`V3SyncSpec::slipstream`], [`V3SyncSpec::core`], or [`V3SyncSpec::new`] —
+/// the struct is `#[non_exhaustive]` so fields can be added for further
+/// V3-family variants without a breaking release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct V3SyncSpec {
@@ -138,6 +141,8 @@ pub struct V3SyncSpec {
     pub min_word: i16,
     /// Last tick-bitmap word of the full scan (inclusive).
     pub max_word: i16,
+    /// Consecutive storage words occupied by one initialized tick.
+    tick_info_words: u8,
 }
 
 /// The full bitmap word range reachable by a pool with this tick spacing.
@@ -175,6 +180,7 @@ impl V3SyncSpec {
             min_word,
             max_word,
             layout,
+            tick_info_words: 4,
         }
     }
 
@@ -208,6 +214,7 @@ impl V3SyncSpec {
             min_word,
             max_word,
             layout,
+            tick_info_words: 4,
         }
     }
 
@@ -237,6 +244,27 @@ impl V3SyncSpec {
             min_word,
             max_word,
             layout,
+            tick_info_words: 4,
+        }
+    }
+
+    /// Slipstream quote/replay spec: statics `slot0` + `liquidity`, the complete
+    /// observation ring at slot 20, and all six consecutive words of every
+    /// initialized tick. The final two words hold Slipstream-specific
+    /// reward-growth and packed oracle/initialization fields that exact event
+    /// replay must read and preserve or update.
+    pub fn slipstream(layout: V3StorageLayout) -> Self {
+        let (min_word, max_word) = full_word_range(layout.tick_spacing);
+        Self {
+            static_slots: vec![layout.slot0_slot, layout.liquidity_slot],
+            observations: Some(V3ObservationsSpec {
+                array_slot: U256::from(SLIPSTREAM_OBSERVATIONS_SLOT),
+                cardinality_shift: UNISWAP_CARDINALITY_SHIFT,
+            }),
+            min_word,
+            max_word,
+            layout,
+            tick_info_words: 6,
         }
     }
 
@@ -252,7 +280,13 @@ impl V3SyncSpec {
             min_word,
             max_word,
             layout,
+            tick_info_words: 4,
         }
+    }
+
+    /// Number of consecutive storage words emitted for each initialized tick.
+    pub const fn tick_info_words(&self) -> usize {
+        self.tick_info_words as usize
     }
 }
 
@@ -388,8 +422,8 @@ impl Asm {
 // Program generation
 // ---------------------------------------------------------------------------
 
-/// Emit one initialized-tick record: `[tick, info0, info1, info2, info3]` at
-/// the output cursor, advancing it and incrementing the count word.
+/// Emit one initialized-tick record: `[tick, info0, ..., infoN]` at the output
+/// cursor, advancing it and incrementing the count word.
 ///
 /// Entry stack: empty. Exit stack: empty. Reads `WORD`/`BIT` scratch.
 fn emit_tick_record(asm: &mut Asm, spec: &V3SyncSpec, count_addr: u64) {
@@ -405,7 +439,7 @@ fn emit_tick_record(asm: &mut Asm, spec: &V3SyncSpec, count_addr: u64) {
     asm.mstore_at(KEY0); // []
     asm.push_u256(spec.layout.ticks_base_slot).mstore_at(KEY1);
     asm.push_u64(64).push_u64(0).op(SHA3); // [base]
-    for i in 0..4u64 {
+    for i in 0..spec.tick_info_words as u64 {
         asm.op(DUP1); // [base, base]
         if i > 0 {
             asm.push_u64(i).op(ADD); // [base+i, base]
@@ -414,7 +448,10 @@ fn emit_tick_record(asm: &mut Asm, spec: &V3SyncSpec, count_addr: u64) {
         asm.mload(OUT_PTR).push_u64(32 * (i + 1)).op(ADD).op(MSTORE); // [base]
     }
     asm.op(POP); // []
-    asm.mload(OUT_PTR).push_u64(160).op(ADD).mstore_at(OUT_PTR);
+    asm.mload(OUT_PTR)
+        .push_u64(32 * (1 + spec.tick_info_words as u64))
+        .op(ADD)
+        .mstore_at(OUT_PTR);
     asm.mload(count_addr)
         .push_u64(1)
         .op(ADD)
@@ -460,9 +497,12 @@ fn emit_return(asm: &mut Asm) {
 /// ```text
 /// [0 .. S)          static slot values, in spec order (S = static_slots.len())
 /// [S]               N — number of initialized ticks found
-/// [S+1 .. S+1+5N)   N records of [tick(int256), info0, info1, info2, info3]
-/// [S+1+5N ..)       the observation ring (cardinality words), when enabled
+/// [S+1 .. S+1+RN)   N records of [tick(int256), info0, ..., infoW]
+/// [S+1+RN ..)       the observation ring (cardinality words), when enabled
 /// ```
+///
+/// `R = 1 + spec.tick_info_words()` (five for canonical V3, seven for
+/// Slipstream).
 pub fn build_full_sync_program(spec: &V3SyncSpec) -> Bytes {
     let statics = &spec.static_slots;
     let count_addr = OUT_BASE + 32 * statics.len() as u64;
@@ -527,8 +567,10 @@ pub fn build_full_sync_program(spec: &V3SyncSpec) -> Bytes {
 ///
 /// ```text
 /// [0]            N — number of initialized ticks found across the words
-/// [1 .. 1+5N)    N records of [tick(int256), info0, info1, info2, info3]
+/// [1 .. 1+RN)    N records of [tick(int256), info0, ..., infoW]
 /// ```
+///
+/// `R = 1 + spec.tick_info_words()`.
 ///
 /// No statics and no observations — this variant exists to refresh tick
 /// ranges (a planner window, a Mint/Burn repair span, a dense pool loaded in
@@ -607,7 +649,8 @@ impl std::error::Error for V3SyncError {
     }
 }
 
-/// One initialized tick: its index and the four raw `Tick.Info` words.
+/// One initialized tick: its index, the four canonical raw `Tick.Info` words,
+/// and any protocol-specific trailing words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct V3TickSnapshot {
@@ -617,12 +660,40 @@ pub struct V3TickSnapshot {
     /// (`liquidityGross|liquidityNet`, `feeGrowthOutside0X128`,
     /// `feeGrowthOutside1X128`, the packed seconds/initialized word).
     pub info: [U256; 4],
+    /// Protocol-specific consecutive words after the canonical four.
+    /// Slipstream carries two; canonical Uniswap and Pancake carry none.
+    pub extra_info: Vec<U256>,
 }
 
 impl V3TickSnapshot {
     /// Build a tick snapshot from its index and raw `Tick.Info` words.
     pub const fn new(tick: i32, info: [U256; 4]) -> Self {
-        Self { tick, info }
+        Self {
+            tick,
+            info,
+            extra_info: Vec::new(),
+        }
+    }
+
+    fn from_storage_words(tick: i32, words: &[U256]) -> Result<Self, V3SyncError> {
+        let info: [U256; 4] = words
+            .get(..4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| {
+                V3SyncError::Malformed(format!("tick {tick} has fewer than four info words"))
+            })?;
+        Ok(Self {
+            tick,
+            info,
+            extra_info: words[4..].to_vec(),
+        })
+    }
+
+    fn storage_words(&self) -> impl Iterator<Item = U256> + '_ {
+        self.info
+            .iter()
+            .copied()
+            .chain(self.extra_info.iter().copied())
     }
 }
 
@@ -682,13 +753,23 @@ fn decode_tick_word(word: U256) -> Result<i32, V3SyncError> {
     Ok(if negative { -value } else { value })
 }
 
-fn decode_tick_records(words: &[U256], count: usize) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
+fn decode_tick_records(
+    words: &[U256],
+    count: usize,
+    info_words: usize,
+) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
+    if info_words < 4 {
+        return Err(V3SyncError::Malformed(format!(
+            "tick record declares {info_words} info words, need at least four"
+        )));
+    }
+    let record_words = info_words + 1;
     let mut ticks = Vec::with_capacity(count);
-    for record in words.chunks_exact(5).take(count) {
-        ticks.push(V3TickSnapshot {
-            tick: decode_tick_word(record[0])?,
-            info: [record[1], record[2], record[3], record[4]],
-        });
+    for record in words.chunks_exact(record_words).take(count) {
+        ticks.push(V3TickSnapshot::from_storage_words(
+            decode_tick_word(record[0])?,
+            &record[1..],
+        )?);
     }
     Ok(ticks)
 }
@@ -714,14 +795,22 @@ pub fn decode_full_sync(spec: &V3SyncSpec, output: &[u8]) -> Result<V3PoolSnapsh
     let count = usize::try_from(words[statics_len])
         .map_err(|_| V3SyncError::Malformed("tick count overflows usize".into()))?;
     let ticks_start = statics_len + 1;
-    let ticks_end = ticks_start + count * 5;
+    let record_words = 1 + spec.tick_info_words();
+    let ticks_end = count
+        .checked_mul(record_words)
+        .and_then(|tick_words| ticks_start.checked_add(tick_words))
+        .ok_or_else(|| V3SyncError::Malformed("tick records overflow usize".into()))?;
     if words.len() < ticks_end {
         return Err(V3SyncError::Malformed(format!(
             "output has {} words, {count} tick records need {ticks_end}",
             words.len()
         )));
     }
-    let ticks = decode_tick_records(&words[ticks_start..ticks_end], count)?;
+    let ticks = decode_tick_records(
+        &words[ticks_start..ticks_end],
+        count,
+        spec.tick_info_words(),
+    )?;
 
     let observations = words[ticks_end..].to_vec();
     match &spec.observations {
@@ -765,20 +854,42 @@ pub fn decode_full_sync(spec: &V3SyncSpec, output: &[u8]) -> Result<V3PoolSnapsh
 
 /// Decode [`build_partial_sync_program`] output.
 pub fn decode_partial_sync(output: &[u8]) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
+    decode_partial_sync_with_info_words(output, 4)
+}
+
+/// Decode [`build_partial_sync_program`] output using the record width carried
+/// by `spec`. Use this for protocol variants such as Slipstream whose tick
+/// records extend beyond canonical V3's four storage words.
+pub fn decode_partial_sync_for_spec(
+    spec: &V3SyncSpec,
+    output: &[u8],
+) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
+    decode_partial_sync_with_info_words(output, spec.tick_info_words())
+}
+
+fn decode_partial_sync_with_info_words(
+    output: &[u8],
+    info_words: usize,
+) -> Result<Vec<V3TickSnapshot>, V3SyncError> {
     let words = words_of(output)?;
     if words.is_empty() {
         return Err(V3SyncError::Malformed("empty partial-sync output".into()));
     }
     let count = usize::try_from(words[0])
         .map_err(|_| V3SyncError::Malformed("tick count overflows usize".into()))?;
-    if words.len() != 1 + count * 5 {
+    let record_words = 1 + info_words;
+    let expected = count
+        .checked_mul(record_words)
+        .and_then(|tick_words| 1usize.checked_add(tick_words))
+        .ok_or_else(|| V3SyncError::Malformed("partial tick records overflow usize".into()))?;
+    if words.len() != expected {
         return Err(V3SyncError::Malformed(format!(
             "partial output has {} words, {count} tick records need {}",
             words.len(),
-            1 + count * 5
+            expected
         )));
     }
-    decode_tick_records(&words[1..], count)
+    decode_tick_records(&words[1..], count, info_words)
 }
 
 /// Reconstruct the tick-bitmap words implied by a set of initialized ticks.
@@ -802,21 +913,27 @@ fn reconstruct_bitmap_words(
 
 impl V3PoolSnapshot {
     /// Materialize the snapshot into raw `(slot, value)` pairs for cache
-    /// injection: statics, all four words of every tick, the **entire**
+    /// injection: statics, all configured words of every tick, the **entire**
     /// bitmap word range (empty words explicitly zero, so the cache knows
     /// them without RPC), and the observation ring.
     pub fn storage_entries(&self, spec: &V3SyncSpec) -> Vec<(U256, U256)> {
         let bitmap = reconstruct_bitmap_words(&self.ticks, spec.layout.tick_spacing);
         let mut entries = Vec::with_capacity(
             self.statics.len()
-                + self.ticks.len() * 4
+                + self.ticks.len() * spec.tick_info_words()
                 + (spec.max_word as i32 - spec.min_word as i32 + 1) as usize
                 + self.observations.len(),
         );
         entries.extend(self.statics.iter().copied());
         for tick in &self.ticks {
-            let keys = v3_tick_info_storage_keys_with_base(tick.tick, spec.layout.ticks_base_slot);
-            entries.extend(keys.into_iter().zip(tick.info));
+            let base =
+                v3_tick_info_storage_keys_with_base(tick.tick, spec.layout.ticks_base_slot)[0];
+            entries.extend(
+                tick.storage_words()
+                    .take(spec.tick_info_words())
+                    .enumerate()
+                    .map(|(offset, value)| (base + U256::from(offset), value)),
+            );
         }
         for word in spec.min_word..=spec.max_word {
             let key = v3_tick_bitmap_storage_key_with_base(word, spec.layout.tick_bitmap_base_slot);
@@ -852,10 +969,16 @@ pub fn partial_storage_entries(
     spec: &V3SyncSpec,
 ) -> Vec<(U256, U256)> {
     let bitmap = reconstruct_bitmap_words(ticks, spec.layout.tick_spacing);
-    let mut entries = Vec::with_capacity(ticks.len() * 4 + scanned_words.len());
+    let mut entries =
+        Vec::with_capacity(ticks.len() * spec.tick_info_words() + scanned_words.len());
     for tick in ticks {
-        let keys = v3_tick_info_storage_keys_with_base(tick.tick, spec.layout.ticks_base_slot);
-        entries.extend(keys.into_iter().zip(tick.info));
+        let base = v3_tick_info_storage_keys_with_base(tick.tick, spec.layout.ticks_base_slot)[0];
+        entries.extend(
+            tick.storage_words()
+                .take(spec.tick_info_words())
+                .enumerate()
+                .map(|(offset, value)| (base + U256::from(offset), value)),
+        );
     }
     for word in scanned_words {
         let key = v3_tick_bitmap_storage_key_with_base(*word, spec.layout.tick_bitmap_base_slot);
@@ -910,7 +1033,7 @@ pub async fn run_partial_sync<P: Provider<AnyNetwork>>(
     let output = run_storage_program(provider, block, &partial_sync_program(pool, spec, words))
         .await
         .map_err(|err| V3SyncError::Program(Box::new(err)))?;
-    decode_partial_sync(&output)
+    decode_partial_sync_for_spec(spec, &output)
 }
 
 #[cfg(test)]
@@ -986,19 +1109,10 @@ mod tests {
     #[test]
     fn bitmap_reconstruction_matches_contract_positions() {
         let ticks = vec![
-            V3TickSnapshot {
-                // spacing 10: compressed -88727 = -347*256 + 105 → word -347, bit 105
-                tick: -887270,
-                info: [U256::ZERO; 4],
-            },
-            V3TickSnapshot {
-                tick: 0,
-                info: [U256::ZERO; 4],
-            },
-            V3TickSnapshot {
-                tick: 10, // compressed 1 → word 0, bit 1
-                info: [U256::ZERO; 4],
-            },
+            // spacing 10: compressed -88727 = -347*256 + 105 → word -347, bit 105
+            V3TickSnapshot::new(-887270, [U256::ZERO; 4]),
+            V3TickSnapshot::new(0, [U256::ZERO; 4]),
+            V3TickSnapshot::new(10, [U256::ZERO; 4]), // compressed 1 → word 0, bit 1
         ];
         let words = reconstruct_bitmap_words(&ticks, 10);
         assert_eq!(words[&0], U256::from(0b11u64));

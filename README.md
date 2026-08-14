@@ -44,7 +44,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.7", default-features = false, features = [
+evm-amm-state = { version = "0.3.0-alpha.8", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -248,7 +248,11 @@ account-fields call, hydrates them through a single bundled `run_storage_program
 `eth_call` (V3 full-sync / V2 flat-slot / Balancer or **Curve** discovered
 read-set), and finalizes them `Ready`, falling back per pool to the conservative
 per-pool `cold_start` for anything without a one-shot program or whose hydration
-fails. `supports_one_shot_hydration` reports which pools take the fast path — a
+fails. Reviewed Slipstream pools add one bounded, exact-pin batch for the four
+external fee-runtime cells that their quote path can read (deduplicated across
+the pool set); those cells remain in the published snapshot, so event-time
+quotes do not fetch them.
+`supports_one_shot_hydration` reports which pools take the fast path — a
 Curve pool qualifies once its `discovered_slots` read-set is known (from a prior
 discovery, a trace, or a registry), joining V2/V3 in the same bundled call. Combined with token-basket discovery,
 the happy path is `find(PoolQuery::basket(..)) → cold_start_many → register`,
