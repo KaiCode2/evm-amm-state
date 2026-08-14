@@ -119,6 +119,17 @@ pub trait AmmAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Exact external storage cells needed by a reviewed snapshot-only quote
+    /// path. These cells are hydrated during cold start and retained in the
+    /// canonical cache; event-time simulation never fetches them lazily.
+    ///
+    /// The default is empty. Implementations should return only address-bound,
+    /// layout-reviewed cells whose keys can be derived deterministically from
+    /// the pool registration.
+    fn verified_storage_targets(&self, _pool: &PoolRegistration) -> Vec<(Address, U256)> {
+        Vec::new()
+    }
+
     /// Decode a routed log into a semantic event with its cache updates.
     /// Defaults to [`AdapterEventResult::ignored`]; a malformed watched log
     /// should return [`AdapterEventResult::error`] (it is isolated per-log, not

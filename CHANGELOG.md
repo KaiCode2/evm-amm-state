@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-alpha.8] - 2026-08-14
+
+### Fixed
+
+- Extended Slipstream's generated full-range and partial bulk-sync records from
+  four to all six deployed `Tick.Info` storage words. The optimized
+  `cold_start_many` path now publishes the same exact liquidity-event parent
+  surface as the resumable single-pool planner, so reviewed `Mint`, `Burn`, and
+  tick-crossing `Swap` events remain provider-free after batched startup.
+- Retained the complete initialized Slipstream observation ring across
+  canonical block advancement and hydrated the reviewed Base/Optimism fee
+  runtime's pool, implementation, factory, voter, module, and four exact
+  external storage cells during cold start. The cells are declared as
+  generation-scoped state dependencies, keeping background installation and
+  post-event quote/search evaluation snapshot-only even when dynamic fee
+  branches are selected.
+- Classified a reverted offline quote with recorded missing reads as an
+  `IncompleteSnapshot` rather than a generic simulation error, preserving the
+  exact repair surface for callers.
+- Added offline full/partial generated-bytecode regressions that round-trip all
+  six words, the full observation ring, and reviewed external fee cells through
+  cache materialization while preserving the canonical four-word Uniswap and
+  Pancake record format. A production-shaped Base Mint replay also proves both
+  post-event quotes complete with no provider calls or reconstruction.
+
 ## [0.3.0-alpha.7] - 2026-08-14
 
 ### Added
@@ -633,7 +658,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.8...HEAD
+[0.3.0-alpha.8]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...v0.3.0-alpha.8
 [0.3.0-alpha.7]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.6...v0.3.0-alpha.7
 [0.3.0-alpha.6]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...v0.3.0-alpha.6
 [0.3.0-alpha.5]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.4...v0.3.0-alpha.5

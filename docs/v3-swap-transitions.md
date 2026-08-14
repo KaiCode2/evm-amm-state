@@ -1,10 +1,13 @@
 # Exact V3 swap transitions
 
-`evm-amm-state 0.3.0-alpha.7` can replay a canonical Uniswap V3 `Swap` and the
+`evm-amm-state 0.3.0-alpha.8` can replay a canonical Uniswap V3 `Swap` and the
 reviewed Base/Optimism Slipstream `Swap`, `Mint`, `Burn`, and `Collect` events
 without a provider read. Exactness is deliberately narrower than “V3-like”:
 it is granted only to a proven runtime family, deployment, and declared state
-surface.
+surface. Cold start retains the reviewed quote runtime's external fee cells,
+the complete initialized observation ring, and all six Slipstream tick words so
+the resulting event transition can be searched and simulated without repair or
+RPC reconstruction.
 
 ## Exactness contract
 

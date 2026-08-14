@@ -18,8 +18,8 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
 use evm_amm_state::adapters::storage::{
-    V3StorageLayout, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
-    v3_word_position,
+    V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use evm_amm_state::adapters::v3_sync::{
     V3PoolSnapshot, V3SyncSpec, V3TickSnapshot, build_full_sync_program,
@@ -295,8 +295,9 @@ async fn core_spec_can_use_pancake_tick_slot_bases() -> Result<()> {
 
     let tick = 120i32; // compressed 2 → word 0, bit 2
     let info: [U256; 4] = std::array::from_fn(|k| U256::from(5_000 + k as u64));
+    let slot0 = U256::from(9u64);
     let mut seeds = vec![
-        (layout.slot0_slot, U256::from(9u64)),
+        (layout.slot0_slot, slot0),
         (layout.liquidity_slot, U256::from(4_242u64)),
         (
             v3_tick_bitmap_storage_key_with_base(0, layout.tick_bitmap_base_slot),
@@ -320,5 +321,69 @@ async fn core_spec_can_use_pancake_tick_slot_bases() -> Result<()> {
     );
     assert_eq!(snapshot.ticks, vec![V3TickSnapshot::new(tick, info)]);
     assert!(snapshot.observations.is_empty(), "core spec has no ring");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slipstream_sync_round_trips_all_six_tick_words() -> Result<()> {
+    let layout = V3StorageLayout::slipstream(100);
+    let spec = V3SyncSpec::slipstream(layout);
+    let tick = 34_800i32;
+    let tick_words: [U256; 6] = std::array::from_fn(|index| U256::from(7_000 + index as u64));
+    let observations = [U256::from(8_001u64), U256::from(8_002u64)];
+    let slot0 = U256::from(9u64) | (U256::from(2u64) << 200_usize);
+    let tick_keys = slipstream_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+    let mut seeds = vec![
+        (layout.slot0_slot, slot0),
+        (layout.liquidity_slot, U256::from(4_242u64)),
+        (U256::from(20), observations[0]),
+        (U256::from(21), observations[1]),
+        (
+            v3_tick_bitmap_storage_key_with_base(
+                v3_word_position(tick, layout.tick_spacing),
+                layout.tick_bitmap_base_slot,
+            ),
+            U256::from(1u64) << (tick.div_euclid(layout.tick_spacing).rem_euclid(256) as usize),
+        ),
+    ];
+    seeds.extend(tick_keys.into_iter().zip(tick_words));
+
+    let mut cache = mock_cache().await;
+    install(&mut cache, POOL, build_full_sync_program(&spec), &seeds);
+
+    let output = run(&mut cache, POOL, Bytes::new())?;
+    let snapshot = decode_full_sync(&spec, &output)?;
+    let entries = snapshot.storage_entries(&spec);
+    for (slot, value) in tick_keys.into_iter().zip(tick_words) {
+        assert_eq!(
+            entries.iter().find(|(candidate, _)| *candidate == slot),
+            Some(&(slot, value)),
+            "Slipstream fast sync must materialize tick storage word {slot:#x}",
+        );
+    }
+    for (offset, value) in observations.into_iter().enumerate() {
+        let slot = U256::from(20 + offset);
+        assert_eq!(
+            entries.iter().find(|(candidate, _)| *candidate == slot),
+            Some(&(slot, value)),
+            "Slipstream fast sync must materialize observation {offset}",
+        );
+    }
+
+    install(&mut cache, POOL, build_partial_sync_program(&spec), &seeds);
+    let scanned_words = [v3_word_position(tick, layout.tick_spacing)];
+    let partial_output = run(&mut cache, POOL, partial_sync_calldata(&scanned_words))?;
+    let partial_ticks =
+        evm_amm_state::adapters::v3_sync::decode_partial_sync_for_spec(&spec, &partial_output)?;
+    let partial_entries = partial_storage_entries(&partial_ticks, &scanned_words, &spec);
+    for (slot, value) in tick_keys.into_iter().zip(tick_words) {
+        assert_eq!(
+            partial_entries
+                .iter()
+                .find(|(candidate, _)| *candidate == slot),
+            Some(&(slot, value)),
+            "Slipstream partial sync must materialize tick storage word {slot:#x}",
+        );
+    }
     Ok(())
 }

@@ -157,9 +157,18 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         {
             slots.extend([layout.slot0_slot, layout.liquidity_slot]);
         }
+        let external_slots = self
+            .verified_storage_targets(pool)
+            .into_iter()
+            .map(|(address, slot)| StateSlot::new(address, slot));
         PoolStateDependencies::default()
             .with_associated_addresses([address])
-            .with_slots(slots.into_iter().map(|slot| StateSlot::new(address, slot)))
+            .with_slots(
+                slots
+                    .into_iter()
+                    .map(|slot| StateSlot::new(address, slot))
+                    .chain(external_slots),
+            )
     }
 
     fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
@@ -216,6 +225,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             policy,
             radius,
             exact_surface,
+            self.verified_storage_targets(pool),
         )))
     }
 
@@ -239,14 +249,37 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     }
 
     fn verified_code_targets(&self, pool: &PoolRegistration) -> Vec<Address> {
-        if matches!(
-            pool.protocol(),
-            ProtocolId::PancakeV3 | ProtocolId::Slipstream
-        ) {
-            pool.key.address().into_iter().collect()
-        } else {
-            Vec::new()
+        let Some(address) = pool.key.address() else {
+            return Vec::new();
+        };
+        match pool.protocol() {
+            ProtocolId::PancakeV3 => vec![address],
+            ProtocolId::Slipstream => {
+                let Some(reviewed) = reviewed_slipstream_fee_runtime_for_pool(address) else {
+                    return vec![address];
+                };
+                vec![
+                    address,
+                    reviewed.implementation,
+                    reviewed.factory,
+                    reviewed.voter,
+                    reviewed.module,
+                ]
+            }
+            _ => Vec::new(),
         }
+    }
+
+    fn verified_storage_targets(&self, pool: &PoolRegistration) -> Vec<(Address, U256)> {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return Vec::new();
+        }
+        let Some(address) = pool.key.address() else {
+            return Vec::new();
+        };
+        reviewed_slipstream_fee_runtime_for_pool(address)
+            .map(reviewed_slipstream_fee_storage_targets)
+            .unwrap_or_default()
     }
 
     fn decode_event(
@@ -573,6 +606,41 @@ struct ReviewedSlipstreamFeeRuntime {
     module_runtime_code_hash: B256,
 }
 
+const SLIPSTREAM_VOTER_GAUGES_SLOT: u64 = 8;
+const SLIPSTREAM_VOTER_IS_ALIVE_SLOT: u64 = 20;
+const SLIPSTREAM_FACTORY_UNSTAKED_FEE_MODULE_SLOT: u64 = 4;
+const SLIPSTREAM_FEE_MODULE_OVERRIDES_SLOT: u64 = 1;
+
+fn solidity_address_mapping_key(key: Address, mapping_slot: u64) -> U256 {
+    let mut preimage = [0_u8; 64];
+    preimage[12..32].copy_from_slice(key.as_slice());
+    preimage[32..].copy_from_slice(&U256::from(mapping_slot).to_be_bytes::<32>());
+    U256::from_be_slice(keccak256(preimage).as_slice())
+}
+
+fn reviewed_slipstream_fee_storage_targets(
+    reviewed: ReviewedSlipstreamFeeRuntime,
+) -> Vec<(Address, U256)> {
+    vec![
+        (
+            reviewed.factory,
+            U256::from(SLIPSTREAM_FACTORY_UNSTAKED_FEE_MODULE_SLOT),
+        ),
+        (
+            reviewed.voter,
+            solidity_address_mapping_key(reviewed.pool, SLIPSTREAM_VOTER_GAUGES_SLOT),
+        ),
+        (
+            reviewed.voter,
+            solidity_address_mapping_key(reviewed.gauge, SLIPSTREAM_VOTER_IS_ALIVE_SLOT),
+        ),
+        (
+            reviewed.module,
+            solidity_address_mapping_key(reviewed.pool, SLIPSTREAM_FEE_MODULE_OVERRIDES_SLOT),
+        ),
+    ]
+}
+
 fn reviewed_slipstream_fee_runtime(
     family: SlipstreamRuntimeFamily,
 ) -> ReviewedSlipstreamFeeRuntime {
@@ -626,6 +694,16 @@ fn reviewed_slipstream_fee_runtime(
             ),
         },
     }
+}
+
+fn reviewed_slipstream_fee_runtime_for_pool(pool: Address) -> Option<ReviewedSlipstreamFeeRuntime> {
+    [
+        SlipstreamRuntimeFamily::AerodromeBaseBifi,
+        SlipstreamRuntimeFamily::VelodromeOptimismBifi,
+    ]
+    .into_iter()
+    .map(reviewed_slipstream_fee_runtime)
+    .find(|reviewed| reviewed.pool == pool)
 }
 
 fn validate_snapshot_identity(
@@ -1292,8 +1370,9 @@ impl ConcentratedLiquidityAdapter {
 ///   resolved.
 /// - Round 2 (`Strict`/`Eager` only) verifies **all** window bitmap words in one
 ///   round.
-/// - Round 3 (`Strict`/`Eager` only) verifies all four `Tick.Info` words of
-///   every tick initialized across the whole window in one round.
+/// - Round 3 (`Strict`/`Eager` only) verifies every required `Tick.Info` word of
+///   each initialized tick across the whole window in one round: four for
+///   canonical Uniswap, six for reviewed Slipstream.
 ///
 /// `HotSlotsOnly` stops after round 1 (slot0 + liquidity — no bitmap/tick
 /// warming). `Lazy` stops after round 1 and defers the **window** of bitmap
@@ -1309,6 +1388,8 @@ struct UniswapV3ColdStartPlanner {
     /// Independently proven state surface that must be complete before the
     /// planner can leave a pool quote-ready for event-only swaps.
     exact_surface: V3ColdStartExactSurface,
+    /// Address-bound external cells required by the reviewed quote runtime.
+    external_exact_slots: Vec<(Address, U256)>,
     phase: V3Phase,
     /// The cold-start window: each `(word, bitmap_key)` pair in
     /// `[W0 - R, W0 + R]` clamped to the valid V3 word range, resolved from the
@@ -1319,10 +1400,10 @@ struct UniswapV3ColdStartPlanner {
     /// Exact canonical cells fetched as genuine zero during this run. They are
     /// materialized explicitly so `StateView::storage(None)` remains unknown,
     /// never an implicit zero assumption.
-    proven_zero_slots: Vec<U256>,
+    proven_zero_slots: Vec<(Address, U256)>,
     /// Exact canonical cells that could not be fetched. A planner carrying any
     /// such cell cannot mark the pool ready for event-only transitions.
-    failed_exact_slots: Vec<U256>,
+    failed_exact_slots: Vec<(Address, U256)>,
     deferred: Vec<DeferredWork>,
     /// `true` once round 1 found `slot0` cold (unfetchable / genuine zero).
     slot0_cold: bool,
@@ -1354,6 +1435,7 @@ impl UniswapV3ColdStartPlanner {
         policy: ColdStartPolicy,
         radius: i16,
         exact_surface: V3ColdStartExactSurface,
+        external_exact_slots: Vec<(Address, U256)>,
     ) -> Self {
         Self {
             address,
@@ -1361,6 +1443,7 @@ impl UniswapV3ColdStartPlanner {
             policy,
             radius,
             exact_surface,
+            external_exact_slots,
             phase: V3Phase::Slot0Liquidity,
             window: Vec::new(),
             verified_slots: Vec::new(),
@@ -1370,6 +1453,11 @@ impl UniswapV3ColdStartPlanner {
             deferred: Vec::new(),
             slot0_cold: false,
         }
+    }
+
+    fn is_exact_slot(&self, address: Address, slot: U256) -> bool {
+        self.exact_surface != V3ColdStartExactSurface::None
+            && (address == self.address || self.external_exact_slots.contains(&(address, slot)))
     }
 
     /// Resolve the bounded window of bitmap words `[W0 - R, W0 + R]` around the
@@ -1435,6 +1523,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
             ]),
             V3ColdStartExactSurface::None => {}
         }
+        verify.extend(self.external_exact_slots.iter().copied());
         self.verified_slots.extend_from_slice(&verify);
         ColdStartPlan {
             verify,
@@ -1445,22 +1534,31 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
     fn on_results(&mut self, results: &ColdStartResults, state: &dyn StateView) -> ColdStartStep {
         self.changed_slots.extend(results.verified.iter().cloned());
         if self.exact_surface != V3ColdStartExactSurface::None {
-            self.proven_zero_slots
-                .extend(results.fetched.iter().filter_map(|outcome| {
-                    (outcome.address == self.address && matches!(outcome.fetch, SlotFetch::Zero))
-                        .then_some(outcome.slot)
-                }));
+            let proven_zero_slots: Vec<_> = results
+                .fetched
+                .iter()
+                .filter_map(|outcome| {
+                    (self.is_exact_slot(outcome.address, outcome.slot)
+                        && matches!(outcome.fetch, SlotFetch::Zero))
+                    .then_some((outcome.address, outcome.slot))
+                })
+                .collect();
+            self.proven_zero_slots.extend(proven_zero_slots);
             self.proven_zero_slots.sort_unstable();
             self.proven_zero_slots.dedup();
-            self.failed_exact_slots
-                .extend(results.fetched.iter().filter_map(|outcome| {
-                    (outcome.address == self.address
+            let failed_exact_slots: Vec<_> = results
+                .fetched
+                .iter()
+                .filter_map(|outcome| {
+                    (self.is_exact_slot(outcome.address, outcome.slot)
                         && matches!(
                             outcome.fetch,
                             SlotFetch::FetchFailed { .. } | SlotFetch::NotAttempted
                         ))
-                    .then_some(outcome.slot)
-                }));
+                    .then_some((outcome.address, outcome.slot))
+                })
+                .collect();
+            self.failed_exact_slots.extend(failed_exact_slots);
             self.failed_exact_slots.sort_unstable();
             self.failed_exact_slots.dedup();
         }
@@ -1506,15 +1604,20 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                         if self.exact_surface != V3ColdStartExactSurface::None {
                             let observation_index =
                                 ((slot0 >> 184_usize) & U256::from(u16::MAX)).to::<u16>();
-                            let observations_base = match self.exact_surface {
-                                V3ColdStartExactSurface::CanonicalUniswap => 8,
-                                V3ColdStartExactSurface::Slipstream => 20,
+                            match self.exact_surface {
+                                V3ColdStartExactSurface::CanonicalUniswap => verify.push((
+                                    self.address,
+                                    U256::from(8) + U256::from(observation_index),
+                                )),
+                                V3ColdStartExactSurface::Slipstream => {
+                                    let observation_cardinality =
+                                        ((slot0 >> 200_usize) & U256::from(u16::MAX)).to::<u16>();
+                                    verify.extend((0..observation_cardinality).map(|index| {
+                                        (self.address, U256::from(20) + U256::from(index))
+                                    }));
+                                }
                                 V3ColdStartExactSurface::None => unreachable!(),
-                            };
-                            verify.push((
-                                self.address,
-                                U256::from(observations_base) + U256::from(observation_index),
-                            ));
+                            }
                         }
                         self.verified_slots.extend_from_slice(&verify);
                         ColdStartStep::Continue(ColdStartPlan {
@@ -1539,15 +1642,10 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 if !self.failed_exact_slots.is_empty() {
                     return ColdStartStep::Done;
                 }
-                // Round 3: warm ALL FOUR `Tick.Info` words of every tick
-                // initialized across the whole window. A tick-crossing swap quote
-                // reads the full struct — `liquidityGross`/`liquidityNet` (word 0),
-                // both `feeGrowthOutside{0,1}X128` (words 1/2), and the packed
-                // `tickCumulative`/`secondsPerLiquidity`/`secondsOutside`/
-                // `initialized` (word 3) — so warming only {0, 3} left a hard
-                // tick-crossing quote lazily fetching words 1/2 (correct online,
-                // but not fully offline). Warming all four matches the one-shot
-                // full-sync program. Each window word's bitmap is extracted
+                // Round 3: warm every `Tick.Info` word of each initialized tick
+                // across the whole window. Canonical Uniswap reads four; the
+                // reviewed Slipstream layout reads all six. This matches the
+                // respective one-shot full-sync program. Each window word's bitmap is extracted
                 // adapter-locally: bit `i` set => tick `(word * 256 + i) *
                 // tick_spacing`, skipping any tick outside [MIN_TICK, MAX_TICK].
                 let mut tick_slots: Vec<(Address, U256)> = Vec::new();
@@ -1565,7 +1663,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                         })
                         .or_else(|| state.storage(self.address, *bitmap_key));
                     let Some(bitmap) = bitmap else {
-                        self.failed_exact_slots.push(*bitmap_key);
+                        self.failed_exact_slots.push((self.address, *bitmap_key));
                         continue;
                     };
                     for bit in 0..256u32 {
@@ -1615,7 +1713,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
         }
         self.proven_zero_slots
             .iter()
-            .map(|slot| StateUpdate::slot(self.address, *slot, U256::ZERO))
+            .map(|(address, slot)| StateUpdate::slot(*address, *slot, U256::ZERO))
             .collect()
     }
 
@@ -1640,12 +1738,7 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
         if !self.failed_exact_slots.is_empty() {
             report.status = PoolStatus::Degraded;
             pool.status = PoolStatus::Degraded;
-            let slots = self
-                .failed_exact_slots
-                .iter()
-                .copied()
-                .map(|slot| (self.address, slot))
-                .collect();
+            let slots = self.failed_exact_slots.clone();
             return ColdStartOutcome::NeedsRepair(report, RepairAction::VerifySlots(slots));
         }
 
@@ -1883,6 +1976,60 @@ mod tests {
             panic!("metadata changed protocol");
         };
         assert_eq!(metadata.warmed_slots, vec![U256::ZERO, U256::from(4)]);
+    }
+
+    #[test]
+    fn reviewed_slipstream_warms_the_complete_quote_runtime_path() {
+        for family in [
+            SlipstreamRuntimeFamily::AerodromeBaseBifi,
+            SlipstreamRuntimeFamily::VelodromeOptimismBifi,
+        ] {
+            let reviewed = reviewed_slipstream_fee_runtime(family);
+            let pool = PoolRegistration::new(PoolKey::Slipstream(reviewed.pool));
+            let adapter = ConcentratedLiquidityAdapter::default();
+            assert_eq!(
+                adapter.verified_code_targets(&pool),
+                vec![
+                    reviewed.pool,
+                    reviewed.implementation,
+                    reviewed.factory,
+                    reviewed.voter,
+                    reviewed.module,
+                ]
+            );
+            assert_eq!(
+                adapter.verified_storage_targets(&pool),
+                vec![
+                    (reviewed.factory, U256::from(4)),
+                    (
+                        reviewed.voter,
+                        solidity_address_mapping_key(reviewed.pool, 8),
+                    ),
+                    (
+                        reviewed.voter,
+                        solidity_address_mapping_key(reviewed.gauge, 20),
+                    ),
+                    (
+                        reviewed.module,
+                        solidity_address_mapping_key(reviewed.pool, 1),
+                    ),
+                ]
+            );
+            let dependencies = adapter.state_dependencies(&pool);
+            for (address, slot) in adapter.verified_storage_targets(&pool) {
+                assert!(
+                    dependencies
+                        .slots()
+                        .contains(&StateSlot::new(address, slot)),
+                    "reviewed external fee-runtime cell must be owned by the pool generation",
+                );
+            }
+            let wrong_family = PoolRegistration::new(PoolKey::UniswapV3(reviewed.pool));
+            assert!(
+                adapter.verified_storage_targets(&wrong_family).is_empty(),
+                "an address match cannot grant Slipstream state authority to another family",
+            );
+        }
     }
 
     #[test]
