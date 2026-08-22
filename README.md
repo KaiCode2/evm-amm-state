@@ -111,8 +111,8 @@ for the Curve adapter in depth.
 > constructor enforces strict position order and the live actor rejects an exact
 > duplicate committed block; users of the stateless direct driver must enforce
 > those invariants themselves. Missing or contradictory evidence atomically
-> purges the stale pool snapshot and exposes a typed failure. See [V3 swap
-> transitions](docs/v3-swap-transitions.md).
+> purges the stale pool snapshot and exposes a typed failure. See [V3 event
+> transitions](docs/v3-event-transitions.md).
 
 > **Slipstream exactness boundary.** For the two reviewed deployments, ordinary
 > `Swap` replay infers the unique effective fee from event amounts and updates

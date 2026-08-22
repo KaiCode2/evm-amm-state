@@ -4,10 +4,16 @@
 //! This module retains the generic `RepairAction::V3TickRange` lowering used by
 //! custom/legacy callers: it produces a targeted, hash-pinned [`ResyncRequest`]
 //! over the quote-facing boundary-tick surface while preserving the
-//! observability `Hook`. It is not a complete canonical `Mint`/`Burn` parent
-//! rebuild and the built-in V3-family adapter does not use it to authorize exact
-//! Swap replay; built-in non-Swap mutations whole-storage purge instead. When a
-//! pool has no resolvable [`V3StorageLayout`], lowering also degrades to a
+//! observability `Hook`. It is a fixed 10-11 slot set covering both boundary
+//! ticks whether or not either is actually unknown.
+//!
+//! The built-in canonical Uniswap V3 adapter no longer routes through it.
+//! `Mint`, `Burn`, `Collect`, and the accounting events replay exactly, and when
+//! a single boundary tick sits outside the warmed bitmap radius the adapter
+//! names just that boundary's cells with `RepairAction::VerifySlots` while the
+//! rest of the pool stays exact. Unproven V3 families still whole-storage purge.
+//!
+//! When a pool has no resolvable [`V3StorageLayout`], lowering degrades to a
 //! conservative whole-storage invalidation rather than being silently dropped.
 
 use alloy_primitives::U256;

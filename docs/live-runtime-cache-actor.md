@@ -142,13 +142,73 @@ fails, reaches end-of-stream, or is stopped independently likewise marks the
 attached runtime untrusted; runtime shutdown itself does not wait on a wedged
 driver task.
 
-For global canonical completeness, the driver does not trust stream arrival
-order. On each header it issues hash-pinned `eth_getLogs` reconciliation,
-deduplicates exact log identities, and only then submits the block. Per-pool
-filters are safely broadened and combined: addresses are chunked (256 by
-default), topic-zero sets are unioned, and indexed-topic constraints are
-dropped for reconciliation so filter cross-products cannot create false
-negatives. Pool handlers recheck their exact matchers locally.
+### Global canonical completeness
+
+The driver used to re-fetch every block's logs with a hash-pinned `eth_getLogs`,
+on the reasoning that it could not trust stream arrival order. That conflated two
+concerns. *Ordering* never needed a network call: subscription logs carry their
+block identity, transaction index, and global log index, so ordering is restored
+locally. *Completeness* was the real gap — and the concrete mechanism was that
+`alloy-pubsub` discarded a lagged or undecodable notification silently, leaving a
+punctured stream indistinguishable from a whole one.
+
+`evm-fork-cache` now surfaces that loss and repairs it, and attests the result
+through `ChainControl::LogCoverage`: no notification loss went unhealed at or
+below the named block. The attestation is a *negative* guarantee by construction,
+because no source can prove from its own log stream that every matching log
+arrived — a filter that matched nothing for a hundred blocks looks exactly like
+one whose notifications were dropped.
+
+The driver combines that attestation with its own ordering evidence. A block is
+submitted from the subscription once three things hold:
+
+1. the subscriber has attested log coverage at or above it,
+2. its header has arrived, and
+3. its log set is *provably* closed, by one of exactly two proofs.
+
+The two proofs, and why only these two:
+
+- **A log delivered for a strictly later block.** A single log subscription
+  delivers in canonical order, so a log for block N+1 puts block N behind the
+  write head and nothing further can arrive for it.
+- **The block's `logsBloom` excludes every registered interest.** A bloom admits
+  false positives and never false negatives, so exclusion is a positive proof
+  that no matching log exists to wait for. This is the common case by a wide
+  margin — a pool trades on a small fraction of blocks — and it is what keeps a
+  quiet pool off the provider entirely.
+
+Anything else reconciles. In particular a **header** for a later block is not a
+proof: `newHeads` and `logs` are independent subscriptions, so a header
+establishes only that the header stream advanced, never that an earlier block's
+logs have been delivered. Nor is a timer. An earlier revision of this driver
+accepted both, which published blocks carrying incomplete log sets and dropped
+the late-arriving logs with no counter moving — the same silent loss this work
+exists to remove, one layer up. The straggler window remains, but it now only
+bounds how long the driver waits for a proof before falling back to a hash-pinned
+reconciliation.
+
+The successor rule is the steady-state path; the grace window covers a quiet
+tail. `AmmSubscriberDriverStats` reports which rule sealed each block, so a
+deployment can tell whether the window is doing work the successor rule should be
+doing.
+
+**Correctness does not depend on the stream having been whole.** Any block that
+is not attested still takes the reconciliation path unchanged: a detected gap, a
+reconnect, or a block the parent-lineage walk had to fill during a reorg. A reorg
+additionally discards buffered logs and the attestation outright, because the
+watermark described the branch that was canonical when it was issued. The fetch
+stopped being unconditional and became exact.
+
+Reconciliation itself is unchanged when it runs. Per-pool filters are safely
+broadened and combined: addresses are chunked (256 by default), topic-zero sets
+are unioned, and indexed-topic constraints are dropped so filter cross-products
+cannot create false negatives. Pool handlers recheck their exact matchers
+locally.
+
+`CanonicalLogSource::Reconcile` restores the previous behaviour in one line.
+Against an `evm-fork-cache` that does not attest log coverage, no block is ever
+attested, so every block reconciles and behaviour is unchanged rather than
+unsound.
 
 Stage 4's dynamic installation seam accepts only a pool already coherent at the
 actor's current point. `Ready` metadata alone is insufficient: all declared

@@ -1072,6 +1072,26 @@ pub enum V3SwapTransitionCapability {
     Unsupported,
 }
 
+/// Evidence-backed event-only `Mint`/`Burn` transition capability for a
+/// V3-family pool.
+///
+/// Tracked separately from [`V3SwapTransitionCapability`] because the two rest
+/// on different evidence: a swap replays price and fee accounting, while a
+/// liquidity change replays `Tick.update`/`Tick.clear`, the bitmap, and the
+/// oracle. A family can be proven for one and not the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum V3LiquidityTransitionCapability {
+    /// Exact parent state plus ordered event context can reproduce the pool's
+    /// complete `Mint`/`Burn` pricing surface without provider reads.
+    ///
+    /// Position ownership and tokens-owed accounting are excluded by design:
+    /// `swap` never reads `positions`, so they fall outside the search surface.
+    Exact,
+    /// This release has no independent parity proof for the registered family
+    /// or layout, so callers must hold/rebuild rather than claim exactness.
+    Unsupported,
+}
+
 impl V3Metadata {
     /// Set the pool's `token0` address.
     pub fn with_token0(mut self, token0: Address) -> Self {

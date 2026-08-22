@@ -5,7 +5,148 @@ All notable changes to `evm-amm-state` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0-alpha.9] - 2026-08-22
+
+### Fixed
+
+- **Subscription-sourced logs no longer seal a block on header evidence.**
+  `AmmSubscriberDriver` accepted two things as proof that a block's log set was
+  complete: an observation from the *header* stream, and expiry of the straggler
+  window. Neither is proof. `newHeads` and `logs` are independent
+  subscriptions, so a header for block N+1 establishes nothing about whether
+  block N's logs have been delivered, and a timer establishes nothing at all.
+  The driver therefore published blocks carrying incomplete — sometimes empty —
+  log sets, and the logs that arrived afterwards were dropped with no counter
+  moving. Measured against the published alpha on a 70-minute three-chain
+  dry-run, this produced 8 downstream quote-canary rejections and 8 state
+  rebuilds versus 1 and 2 on the baseline.
+
+  Sealing now requires one of exactly two proofs: a log delivered on the log
+  subscription for a strictly later block, or the block's `logsBloom` excluding
+  every registered interest (a bloom has no false negatives, so exclusion
+  positively proves there is no matching log to wait for). Everything else
+  falls back to hash-pinned reconciliation. The straggler window is retained
+  but now only bounds how long the driver waits for a proof.
+
+  `SealReason::Grace` is replaced by `SealReason::BloomAbsent`, and
+  `AmmSubscriberDriverStats::blocks_sealed_by_grace` by
+  `blocks_sealed_by_bloom_absence`. The RPC saving is preserved: a pool trades
+  on a small fraction of blocks, so bloom exclusion covers the overwhelming
+  majority of them without a request.
+
+
+### Migration checklist
+
+- Canonical Uniswap V3 `Mint`, `Burn`, `Collect`, `Flash`, `SetFeeProtocol`,
+  `CollectProtocol`, and `IncreaseObservationCardinalityNext` no longer purge the
+  pool's storage. Callers that relied on a purge-then-cold-start cycle to refresh
+  unrelated cells no longer get one. `Initialize` still requests a cold start.
+- `ConcentratedLiquidityAdapter::liquidity_transition_capability` and
+  `liquidity_transition_capability_with_context` report the new capability, keyed
+  by the new `V3LiquidityTransitionCapability` enum. Swap capability is unchanged
+  and still reported through `V3SwapTransitionCapability`.
+- A canonical `Mint`/`Burn`/`Collect` now emits a `StateUpdate::Purge` over the
+  four `positions` words of the position it names. Code that assumed a canonical
+  V3 liquidity event emits only `StateUpdate::Slot` writes must handle it.
+- `docs/v3-swap-transitions.md` is now `docs/v3-event-transitions.md`.
+- Canonical logs now come from the subscriber's live stream by default. The
+  previous behaviour — re-fetching every block's logs with a hash-pinned
+  `eth_getLogs` — is available as
+  `AmmSubscriberDriverConfig::with_canonical_log_source(CanonicalLogSource::Reconcile)`.
+- The driver requires an `evm-fork-cache` that attests log coverage. Against an
+  older subscriber no block is ever attested, so every block takes the
+  reconciliation path and behaviour is unchanged rather than unsound.
+
+### Added
+
+- Canonical Uniswap V3 `Mint` and `Burn` replay as exact state transitions
+  instead of purging the pool. The transition reproduces `_modifyPosition` over
+  the pricing surface: both boundary ticks through `Tick.update`/`Tick.clear`,
+  the bitmap words they flip, the oracle entry an in-range change writes, and
+  active liquidity.
+
+  A previous release derived the same events into `liquidityGross`/`liquidityNet`
+  and the bitmap only. That is enough to quote correctly forever —
+  `SwapMath.computeSwapStep` never reads a tick's outside accumulators — and
+  diverges the moment a committed swap crosses that tick, because `Tick.cross`
+  both reads and writes `feeGrowthOutside{0,1}X128`. The initialization
+  convention that fills those words is asymmetric (a new tick at or below the
+  current one inherits both global fee accumulators and the current oracle
+  reading; one above it gets only its flag), and `Tick.clear` zeroes all four
+  words rather than just the first. Quote-readiness and simulation-readiness are
+  not the same property; the declared surface is now the second one.
+
+- Canonical `Collect` is an exact transition with no writes — it moves position
+  `tokensOwed` and ERC-20 balances and touches no pricing cell. Nearly every
+  `Burn` through the position manager is followed by a `Collect`, so this is what
+  keeps a `Burn` that replayed exactly from being re-purged immediately after.
+
+- Canonical `Flash`, `SetFeeProtocol`, `CollectProtocol`, and
+  `IncreaseObservationCardinalityNext` replay exactly. Each validates a
+  postcondition against the parent — the fee split the event reports, the
+  reservation it grows from, the balance it debits — so a foreign or replayed
+  event fails closed rather than being applied.
+
+- A boundary tick's `Tick.Info` words are read only when its bitmap bit is set.
+  A clear bit proves the struct zero (`flipTick` runs precisely on a flip and
+  `Tick.clear` zeroes the whole struct), so a mint opening a brand-new position
+  needs no tick read — the case cold start leaves unwarmed, because it warms
+  bitmap words but not empty ticks. The inference is cross-checked in both
+  directions whenever the parent holds the word anyway, and a disagreement fails
+  closed.
+
+- `V3LiquidityTransitionCapability`, tracked separately from
+  `V3SwapTransitionCapability` because the two rest on different evidence.
+
+- Added `CanonicalLogSource` and
+  `AmmSubscriberDriverConfig::with_canonical_log_source` /
+  `canonical_log_source`.
+- Extended `AmmSubscriberDriverStats` with `subscription_logs_applied`,
+  `blocks_sealed_from_subscription`, `blocks_sealed_by_successor`,
+  `blocks_sealed_by_grace`, and `blocks_reconciled`, so it is visible whether
+  blocks are actually sealing from the stream and which rule closed them. A
+  climbing `blocks_sealed_by_grace` means the window is doing work the successor
+  rule should be doing; a climbing `blocks_reconciled` means the fetch is not
+  being avoided.
+
+- Added `AmmSubscriberDriverHandle::stats` and `AmmSubscriberDriverStats`,
+  reporting the canonical-delivery work the subscriber driver does on its own
+  initiative: headers ingested, blocks delivered, hash-pinned `eth_getLogs`
+  reconciliation requests and the logs they returned, reorg-lineage parent
+  fetches, and — the number that explains the rest —
+  `subscription_logs_discarded`, the canonical logs the live stream already
+  delivered before the driver dropped them in favour of reconciliation. The
+  driver re-fetches every block's logs over HTTP while an
+  `eth_subscribe("logs")` subscription is delivering the same data; that cost is
+  now measurable in-process instead of only on a provider invoice.
+
+### Changed
+
+- A boundary tick outside the warmed bitmap radius no longer purges the pool.
+  Price, active liquidity, the oracle, and any resolvable boundary are still
+  established exactly, and only the unresolvable boundaries' `Tick.Info` words
+  plus their bitmap words are dropped and re-read through
+  `RepairAction::VerifySlots` — five slots per boundary. An unknown cell costs a
+  handful of slots; a contradicted parent still costs the pool.
+
+- The subscriber driver assembles canonical blocks from the logs the
+  subscription already delivered, instead of discarding them and re-fetching the
+  same data over HTTP. A block is submitted once three things hold: the
+  subscriber has attested that no notification loss went unhealed at or below it,
+  its header has arrived, and its log set is provably closed — proven either by
+  an observation from a strictly later block (the steady-state path, since a
+  single log subscription delivers in canonical order) or by a bounded grace
+  window elapsing, which covers a quiet tail.
+
+  Correctness does not depend on the stream having been whole. Any block that is
+  not attested — a detected gap, a reconnect, or a block the parent-lineage walk
+  had to fill during a reorg — still takes the untouched hash-pinned
+  reconciliation path, and a reorg discards buffered logs and the attestation
+  outright, because the watermark described the branch that was canonical when it
+  was issued. The fetch stops being unconditional and becomes exact.
+
+  In steady state this removes one `eth_getLogs` per canonical block, and with it
+  one HTTP round-trip from every block's critical path.
 
 ## [0.3.0-alpha.8] - 2026-08-14
 

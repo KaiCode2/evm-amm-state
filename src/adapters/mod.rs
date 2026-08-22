@@ -150,7 +150,8 @@ pub use snapshot::{
 #[cfg(feature = "live-runtime")]
 pub use subscriber_driver::{
     AmmPreconfirmationRejectionPolicy, AmmSubscriberDriverConfig, AmmSubscriberDriverError,
-    AmmSubscriberDriverHandle, AmmSubscriberDriverState,
+    AmmSubscriberDriverHandle, AmmSubscriberDriverState, AmmSubscriberDriverStats,
+    CanonicalLogSource,
 };
 // Both layout types are always compiled (`storage` is feature-neutral); export
 // them unconditionally — `V3StorageLayout` is the field type of the
@@ -179,7 +180,8 @@ pub use types::{
     SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence, SlipstreamUnstakedFeeEvaluation,
     SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof,
     SlipstreamUnstakedFeeProofKind, SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason,
-    UpdateQuality, V3Metadata, V3SwapTransitionCapability, V3TransitionError,
+    UpdateQuality, V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
+    V3TransitionError,
 };
 
 #[cfg(feature = "balancer-v2")]

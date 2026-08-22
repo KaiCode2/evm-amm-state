@@ -734,7 +734,12 @@ fn words_of(output: &[u8]) -> Result<Vec<U256>, V3SyncError> {
             output.len()
         )));
     }
-    Ok(output.chunks_exact(32).map(U256::from_be_slice).collect())
+    Ok(output
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|chunk| U256::from_be_slice(chunk))
+        .collect())
 }
 
 /// Decode a two's-complement tick word, validating it against the V3 range.
