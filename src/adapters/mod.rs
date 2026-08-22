@@ -176,12 +176,12 @@ pub use types::{
     AdapterEventResult, BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome,
     ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant, CustomPoolKey, DeferredOutcome,
     DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId,
-    ProtocolMetadata, RepairAction, SlipstreamFeeEvidenceError, SlipstreamRuntimeFamily,
-    SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence, SlipstreamUnstakedFeeEvaluation,
-    SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof,
-    SlipstreamUnstakedFeeProofKind, SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason,
-    UpdateQuality, V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
-    V3TransitionError,
+    ProtocolMetadata, ProtocolMismatch, RepairAction, SlipstreamFeeEvidenceError,
+    SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence,
+    SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError,
+    SlipstreamUnstakedFeeProof, SlipstreamUnstakedFeeProofKind, SolidlyV2Metadata,
+    UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3LiquidityTransitionCapability,
+    V3Metadata, V3SwapTransitionCapability, V3TransitionError,
 };
 
 #[cfg(feature = "balancer-v2")]

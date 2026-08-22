@@ -5,6 +5,48 @@ All notable changes to `evm-amm-state` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A registration naming two different venues is now refused instead of
+  silently mis-quoted.** A `PoolRegistration` names its protocol twice, and the
+  two names were never checked against each other. The `PoolKey` variant is what
+  `PoolRegistration::protocol` reports, so it is what every adapter dispatches
+  on; the `ProtocolMetadata` variant is what `storage::layout_for` matches on to
+  resolve a storage layout. A `PoolKey::UniswapV3` carrying
+  `ProtocolMetadata::Slipstream` was therefore accepted everywhere, cold-started
+  against Slipstream's slots (`slot0` at 6, `liquidity` at 16), and then quoted
+  as canonical Uniswap: `simulate_swap` encoded a `uint24 fee`
+  `quoteExactInputSingle` for a quoter whose ABI expects an `int24 tickSpacing`.
+  The result was a revert or — when the metadata also carried a fee — a
+  plausible-but-wrong quote, surfacing far from the registration that caused it.
+
+  The rule is now enforced where a caller can still act on it.
+  `AdapterRegistry::register_pool` rejects a cross-venue registration with the
+  new `RegistryError::ProtocolMismatch`, leaving the registry untouched, and
+  `AmmSyncEngine`'s pool-addition path rejects it during preparation, before any
+  handler or state dependency is derived from the mismatched pair. The
+  registration is never repaired: which of the two venues the caller meant is
+  not knowable, so guessing would hide the caller's bug. This is the same rule
+  the registration archive already enforced when serializing a registration,
+  hoisted from the persistence boundary to the registration boundary.
+
+  New API: `ProtocolMetadata::protocol_id`,
+  `PoolRegistration::check_protocol_agreement`,
+  `PoolRegistration::try_with_metadata` (the checked counterpart of
+  `with_metadata`), the `ProtocolMismatch` error, and
+  `RegistryError::ProtocolMismatch`. The V3-family adapter also fails closed on
+  its own, for callers holding an adapter without a registry.
+
+  Deliberately still permitted, because none of these names two venues:
+  `ProtocolMetadata::Unknown` on any key (the pre-cold-start default); an
+  explicit `V3Metadata::storage_layout` that differs from the family default,
+  including one built from another family's preset — a fork's slots supplied
+  under the matching family variant is a documented override; and the
+  `ProtocolId::Custom` / `ProtocolMetadata::Custom` third-party hatch, whose
+  payload the crate cannot read and so cannot contradict.
+
 ## [0.3.0-alpha.9] - 2026-08-22
 
 ### Fixed
@@ -799,7 +841,8 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.8...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.9...HEAD
+[0.3.0-alpha.9]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.8...v0.3.0-alpha.9
 [0.3.0-alpha.8]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...v0.3.0-alpha.8
 [0.3.0-alpha.7]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.6...v0.3.0-alpha.7
 [0.3.0-alpha.6]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.5...v0.3.0-alpha.6

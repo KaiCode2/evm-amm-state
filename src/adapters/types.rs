@@ -796,6 +796,58 @@ impl PoolRegistration {
         self.key.protocol()
     }
 
+    /// Fail closed when the [`key`](Self::key) and the
+    /// [`metadata`](Self::metadata) name **different venues**.
+    ///
+    /// A registration names its venue twice: once in the `PoolKey` variant
+    /// (which is what [`protocol`](Self::protocol) reports, and therefore what
+    /// every adapter dispatches on) and once in the `ProtocolMetadata` variant
+    /// (which is what the crate's V3 storage-layout resolver dispatches on to
+    /// pick a slot layout). Nothing forces those two to agree, and when they
+    /// disagree the pool is read through one venue's storage layout and quoted
+    /// through another's ABI. A `PoolKey::UniswapV3` carrying
+    /// `ProtocolMetadata::Slipstream` is the sharp case: cold-start reads the
+    /// Slipstream slots while `simulate_swap` sends canonical Uniswap
+    /// `quoteExactInputSingle` calldata (a `uint24 fee`) to a quoter that expects
+    /// an `int24 tickSpacing`. That reverts, or returns a plausible-but-wrong
+    /// quote, a long way from its cause.
+    ///
+    /// The check is deliberately narrow — a *venue* disagreement, not a layout
+    /// difference. It permits, by design:
+    ///
+    /// - [`ProtocolMetadata::Unknown`] against any key (the
+    ///   [`new`](Self::new) default, before cold-start fills metadata in).
+    /// - [`ProtocolMetadata::Custom`] against any key, and any metadata against
+    ///   a [`PoolKey::Custom`] naming the same protocol — the third-party
+    ///   extension hatch, whose payload the crate cannot read.
+    /// - An explicit [`V3Metadata::storage_layout`] that differs from the
+    ///   family default. Supplying a fork's slots under the matching family
+    ///   variant is a deliberate, documented act; it names one venue, not two.
+    ///
+    /// This is the same rule the registration archive already enforces when it
+    /// serializes a registration (see
+    /// [`AmmRegistrationPersistenceError`](super::AmmRegistrationPersistenceError)),
+    /// hoisted to the point where a caller can still be told.
+    ///
+    /// [`AdapterRegistry::register_pool`](super::AdapterRegistry::register_pool)
+    /// runs this check on every registration, so a mismatch can never enter a
+    /// registry. Call it directly when you build a registration by hand and want
+    /// the error before then — or use
+    /// [`try_with_metadata`](Self::try_with_metadata), which checks as it sets.
+    ///
+    /// [`V3Metadata::storage_layout`]: V3Metadata::storage_layout
+    pub fn check_protocol_agreement(&self) -> Result<(), ProtocolMismatch> {
+        let key_protocol = self.key.protocol();
+        match self.metadata.protocol_id() {
+            Some(metadata_protocol) if metadata_protocol != key_protocol => Err(ProtocolMismatch {
+                key: self.key.clone(),
+                key_protocol,
+                metadata_protocol,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// The complete token set this pool trades, or `None` when it is not (yet)
     /// known — see [`ProtocolMetadata::tokens`].
     pub fn tokens(&self) -> Option<Vec<Address>> {
@@ -835,9 +887,53 @@ impl PoolRegistration {
     }
 
     /// Set the protocol metadata.
+    ///
+    /// Infallible, and therefore **unchecked**: it will happily attach metadata
+    /// naming a different venue than [`key`](Self::key). Prefer
+    /// [`try_with_metadata`](Self::try_with_metadata) when the metadata variant
+    /// is chosen dynamically. Either way the mismatch cannot reach a registry —
+    /// [`AdapterRegistry::register_pool`](super::AdapterRegistry::register_pool)
+    /// rejects it (see
+    /// [`check_protocol_agreement`](Self::check_protocol_agreement)).
     pub fn with_metadata(mut self, metadata: ProtocolMetadata) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Set the protocol metadata, rejecting a variant that names a different
+    /// venue than [`key`](Self::key).
+    ///
+    /// The checked counterpart of [`with_metadata`](Self::with_metadata): it
+    /// fails at the point of the caller's mistake instead of deferring to
+    /// registration. See
+    /// [`check_protocol_agreement`](Self::check_protocol_agreement) for exactly
+    /// what counts as a different venue, and for what stays permitted.
+    ///
+    /// ```
+    /// use evm_amm_state::adapters::{
+    ///     PoolKey, PoolRegistration, ProtocolMetadata, V3Metadata,
+    /// };
+    /// use alloy_primitives::Address;
+    ///
+    /// let key = PoolKey::UniswapV3(Address::repeat_byte(0x11));
+    /// let slipstream = ProtocolMetadata::Slipstream(V3Metadata::default());
+    /// // A Uniswap V3 key cannot carry Slipstream metadata.
+    /// assert!(
+    ///     PoolRegistration::new(key.clone())
+    ///         .try_with_metadata(slipstream)
+    ///         .is_err()
+    /// );
+    ///
+    /// let uniswap = ProtocolMetadata::UniswapV3(V3Metadata::default());
+    /// assert!(PoolRegistration::new(key).try_with_metadata(uniswap).is_ok());
+    /// ```
+    pub fn try_with_metadata(
+        mut self,
+        metadata: ProtocolMetadata,
+    ) -> Result<Self, ProtocolMismatch> {
+        self.metadata = metadata;
+        self.check_protocol_agreement()?;
+        Ok(self)
     }
 
     /// Set the lifecycle status.
@@ -846,6 +942,43 @@ impl PoolRegistration {
         self
     }
 }
+
+/// A [`PoolRegistration`] whose [`PoolKey`] and [`ProtocolMetadata`] name
+/// different venues.
+///
+/// Raised by [`PoolRegistration::check_protocol_agreement`] and
+/// [`PoolRegistration::try_with_metadata`], and carried by
+/// [`RegistryError::ProtocolMismatch`](super::RegistryError::ProtocolMismatch)
+/// when a registry rejects the registration.
+///
+/// This is always a caller bug: the two fields disagree about which protocol the
+/// pool belongs to, and no repair the crate could apply would be more than a
+/// guess at which one was meant. It is reported rather than silently normalized
+/// for exactly that reason.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolMismatch {
+    /// The offending pool key.
+    pub key: PoolKey,
+    /// The venue named by the [`key`](Self::key) variant — what
+    /// [`PoolRegistration::protocol`] reports and every adapter dispatches on.
+    pub key_protocol: ProtocolId,
+    /// The venue named by the [`ProtocolMetadata`] variant — what the storage
+    /// layout is resolved from.
+    pub metadata_protocol: ProtocolId,
+}
+
+impl fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pool key names {:?} but its protocol metadata names {:?}: {:?}",
+            self.key_protocol, self.metadata_protocol, self.key
+        )
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
 
 /// Protocol metadata known for a tracked pool.
 #[non_exhaustive]
@@ -889,6 +1022,37 @@ impl fmt::Debug for ProtocolMetadata {
 }
 
 impl ProtocolMetadata {
+    /// The venue this metadata names, or `None` when it names none.
+    ///
+    /// A built-in variant names exactly one venue, so this is the protocol whose
+    /// storage layout and quote ABI the payload describes. Two variants of the
+    /// V3 family ([`UniswapV3`](Self::UniswapV3), [`PancakeV3`](Self::PancakeV3),
+    /// [`Slipstream`](Self::Slipstream)) share the [`V3Metadata`] *shape* while
+    /// naming different venues — that is precisely why the variant, not the
+    /// payload type, is the venue signal.
+    ///
+    /// `None` is returned for the two variants that name no venue, and it is
+    /// deliberately not treated as a mismatch by
+    /// [`PoolRegistration::check_protocol_agreement`]:
+    ///
+    /// - [`Unknown`](Self::Unknown) — the pre-cold-start default. It is valid
+    ///   against every key.
+    /// - [`Custom`](Self::Custom) — an opaque `dyn Any` payload only its own
+    ///   adapter can downcast. The crate cannot read a venue out of it, so it
+    ///   cannot claim a contradiction either.
+    pub fn protocol_id(&self) -> Option<ProtocolId> {
+        match self {
+            Self::UniswapV2(_) => Some(ProtocolId::UniswapV2),
+            Self::UniswapV3(_) => Some(ProtocolId::UniswapV3),
+            Self::PancakeV3(_) => Some(ProtocolId::PancakeV3),
+            Self::Slipstream(_) => Some(ProtocolId::Slipstream),
+            Self::SolidlyV2(_) => Some(ProtocolId::SolidlyV2),
+            Self::BalancerV2(_) => Some(ProtocolId::BalancerV2),
+            Self::Curve(_) => Some(ProtocolId::Curve),
+            Self::Unknown | Self::Custom(_) => None,
+        }
+    }
+
     /// The complete set of token addresses this pool trades, in the pool's
     /// native token order — or `None` when that set is not (yet) known.
     ///
@@ -2215,5 +2379,310 @@ mod tests {
         let left = RepairAction::VerifySlots(vec![(addr(0x11), U256::from(1))]);
         let right = RepairAction::PurgeStorage(addr(0x44));
         assert_eq!(left.combine(right.clone()), right);
+    }
+
+    // --- cross-venue registration (key vs metadata) ---
+
+    /// Every built-in metadata variant names exactly the venue whose payload it
+    /// carries. The three V3-family variants share `V3Metadata`, so the variant
+    /// — not the payload type — has to be the signal.
+    #[test]
+    fn metadata_protocol_id_names_one_venue_per_builtin_variant() {
+        let cases = [
+            (
+                ProtocolMetadata::UniswapV2(UniswapV2Metadata::default()),
+                ProtocolId::UniswapV2,
+            ),
+            (
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+                ProtocolId::UniswapV3,
+            ),
+            (
+                ProtocolMetadata::PancakeV3(V3Metadata::default()),
+                ProtocolId::PancakeV3,
+            ),
+            (
+                ProtocolMetadata::Slipstream(V3Metadata::default()),
+                ProtocolId::Slipstream,
+            ),
+            (
+                ProtocolMetadata::SolidlyV2(SolidlyV2Metadata::default()),
+                ProtocolId::SolidlyV2,
+            ),
+            (
+                ProtocolMetadata::BalancerV2(BalancerV2Metadata::default()),
+                ProtocolId::BalancerV2,
+            ),
+            (
+                ProtocolMetadata::Curve(CurveMetadata::default()),
+                ProtocolId::Curve,
+            ),
+        ];
+        for (metadata, expected) in cases {
+            assert_eq!(metadata.protocol_id(), Some(expected));
+        }
+    }
+
+    /// The two variants that name no venue. Both must stay `None` so
+    /// `check_protocol_agreement` cannot manufacture a contradiction out of
+    /// metadata it is unable to read.
+    #[test]
+    fn metadata_protocol_id_is_none_for_unknown_and_custom() {
+        assert_eq!(ProtocolMetadata::Unknown.protocol_id(), None);
+        assert_eq!(
+            ProtocolMetadata::Custom(Arc::new(0u8)).protocol_id(),
+            None,
+            "an opaque third-party payload names no venue the crate can read",
+        );
+    }
+
+    /// The reported hazard and its neighbours: a V3-family key carrying another
+    /// family's metadata. The adapter dispatches on the key while the storage
+    /// layout resolves from the metadata, so these pair one venue's ABI with
+    /// another venue's slots.
+    #[test]
+    fn v3_family_rejects_a_sibling_familys_metadata() {
+        let pool = addr(0x11);
+        let cases = [
+            // The reported incident: Uniswap calldata to a Slipstream quoter.
+            (
+                PoolKey::UniswapV3(pool),
+                ProtocolMetadata::Slipstream(V3Metadata::default()),
+                ProtocolId::UniswapV3,
+                ProtocolId::Slipstream,
+            ),
+            // The reverse: tickSpacing calldata against canonical Uniswap slots.
+            (
+                PoolKey::Slipstream(pool),
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+                ProtocolId::Slipstream,
+                ProtocolId::UniswapV3,
+            ),
+            // Same quote ABI, different liquidity/ticks/bitmap base slots.
+            (
+                PoolKey::UniswapV3(pool),
+                ProtocolMetadata::PancakeV3(V3Metadata::default()),
+                ProtocolId::UniswapV3,
+                ProtocolId::PancakeV3,
+            ),
+            (
+                PoolKey::PancakeV3(pool),
+                ProtocolMetadata::Slipstream(V3Metadata::default()),
+                ProtocolId::PancakeV3,
+                ProtocolId::Slipstream,
+            ),
+        ];
+        for (key, metadata, key_protocol, metadata_protocol) in cases {
+            let registration = PoolRegistration::new(key.clone()).with_metadata(metadata);
+            let mismatch = registration
+                .check_protocol_agreement()
+                .expect_err("a V3-family key must reject a sibling family's metadata");
+            assert_eq!(mismatch.key, key);
+            assert_eq!(mismatch.key_protocol, key_protocol);
+            assert_eq!(mismatch.metadata_protocol, metadata_protocol);
+        }
+    }
+
+    /// Cross-family pairs, including a `PoolKey::Custom` whose third-party
+    /// protocol name cannot be the venue a built-in metadata variant describes.
+    #[test]
+    fn cross_family_pairs_are_rejected() {
+        let cases = [
+            (
+                PoolKey::UniswapV2(addr(0x21)),
+                ProtocolMetadata::Curve(CurveMetadata::default()),
+            ),
+            (
+                PoolKey::Curve(addr(0x22)),
+                ProtocolMetadata::UniswapV2(UniswapV2Metadata::default()),
+            ),
+            (
+                PoolKey::SolidlyV2(addr(0x23)),
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+            ),
+            (
+                PoolKey::BalancerV2(B256::repeat_byte(0x24)),
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+            ),
+            (
+                PoolKey::Custom(CustomPoolKey::Address {
+                    protocol: "acme-v1",
+                    address: addr(0x25),
+                }),
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+            ),
+        ];
+        for (key, metadata) in cases {
+            assert!(
+                PoolRegistration::new(key.clone())
+                    .with_metadata(metadata)
+                    .check_protocol_agreement()
+                    .is_err(),
+                "{key:?} must not carry another venue's metadata",
+            );
+        }
+    }
+
+    /// `Unknown` is the `PoolRegistration::new` default and the state every pool
+    /// sits in before cold-start fills metadata in. It must stay valid against
+    /// every key, or registration would break before it could ever succeed.
+    #[test]
+    fn unknown_metadata_is_valid_against_every_key() {
+        let keys = [
+            PoolKey::UniswapV2(addr(0x31)),
+            PoolKey::UniswapV3(addr(0x32)),
+            PoolKey::PancakeV3(addr(0x33)),
+            PoolKey::Slipstream(addr(0x34)),
+            PoolKey::SolidlyV2(addr(0x35)),
+            PoolKey::BalancerV2(B256::repeat_byte(0x36)),
+            PoolKey::Curve(addr(0x37)),
+            PoolKey::Custom(CustomPoolKey::Address {
+                protocol: "acme-v1",
+                address: addr(0x38),
+            }),
+        ];
+        for key in keys {
+            assert!(
+                PoolRegistration::new(key)
+                    .check_protocol_agreement()
+                    .is_ok()
+            );
+        }
+    }
+
+    /// Matching pairs, one per built-in family, must keep working.
+    #[test]
+    fn matching_key_and_metadata_are_permitted() {
+        let pool = addr(0x41);
+        let cases = [
+            (
+                PoolKey::UniswapV3(pool),
+                ProtocolMetadata::UniswapV3(V3Metadata::default()),
+            ),
+            (
+                PoolKey::PancakeV3(pool),
+                ProtocolMetadata::PancakeV3(V3Metadata::default()),
+            ),
+            (
+                PoolKey::Slipstream(pool),
+                ProtocolMetadata::Slipstream(V3Metadata::default()),
+            ),
+            (
+                PoolKey::UniswapV2(pool),
+                ProtocolMetadata::UniswapV2(UniswapV2Metadata::default()),
+            ),
+            (
+                PoolKey::SolidlyV2(pool),
+                ProtocolMetadata::SolidlyV2(SolidlyV2Metadata::default()),
+            ),
+            (
+                PoolKey::Curve(pool),
+                ProtocolMetadata::Curve(CurveMetadata::default()),
+            ),
+            (
+                PoolKey::BalancerV2(B256::repeat_byte(0x42)),
+                ProtocolMetadata::BalancerV2(BalancerV2Metadata::default()),
+            ),
+        ];
+        for (key, metadata) in cases {
+            assert!(
+                PoolRegistration::new(key.clone())
+                    .with_metadata(metadata)
+                    .check_protocol_agreement()
+                    .is_ok(),
+                "{key:?} must accept its own family's metadata",
+            );
+        }
+    }
+
+    /// The legitimate use the check must not catch: a caller deliberately
+    /// supplying a non-default `storage_layout` for a fork whose slots differ
+    /// from the family default. That names ONE venue and overrides its slots —
+    /// it is not two venues, so it stays permitted even when the slots it
+    /// supplies are literally another family's.
+    #[test]
+    fn explicit_non_default_storage_layout_stays_permitted() {
+        let key = PoolKey::UniswapV3(addr(0x51));
+        let fork_layout = V3Metadata::default()
+            .with_tick_spacing(100)
+            .with_storage_layout(V3StorageLayout::slipstream(100));
+        let registration =
+            PoolRegistration::new(key).with_metadata(ProtocolMetadata::UniswapV3(fork_layout));
+        assert!(
+            registration.check_protocol_agreement().is_ok(),
+            "an explicit fork layout under the matching family variant is a \
+             deliberate override, not a cross-venue registration",
+        );
+
+        // Hand-built slots that match no preset are equally fine.
+        let bespoke = V3Metadata::default()
+            .with_tick_spacing(7)
+            .with_storage_layout(V3StorageLayout::new(
+                U256::from(31),
+                U256::from(32),
+                U256::from(33),
+                U256::from(34),
+                7,
+            ));
+        assert!(
+            PoolRegistration::new(PoolKey::UniswapV3(addr(0x52)))
+                .with_metadata(ProtocolMetadata::UniswapV3(bespoke))
+                .check_protocol_agreement()
+                .is_ok()
+        );
+    }
+
+    /// `Custom` metadata is opaque, so it names no venue and is permitted on any
+    /// key — including a built-in one. The crate cannot read the payload, so it
+    /// cannot claim a contradiction; the V3 adapter's own `v3_metadata` read
+    /// returns `None` for it and fails closed on its own.
+    #[test]
+    fn custom_metadata_is_permitted_on_any_key() {
+        let custom_key = PoolKey::Custom(CustomPoolKey::Address {
+            protocol: "acme-v1",
+            address: addr(0x61),
+        });
+        // The `tests/custom_adapter.rs` pairing.
+        assert!(
+            PoolRegistration::new(custom_key)
+                .with_metadata(ProtocolMetadata::Custom(Arc::new(0u8)))
+                .check_protocol_agreement()
+                .is_ok()
+        );
+        assert!(
+            PoolRegistration::new(PoolKey::UniswapV3(addr(0x62)))
+                .with_metadata(ProtocolMetadata::Custom(Arc::new(0u8)))
+                .check_protocol_agreement()
+                .is_ok(),
+        );
+    }
+
+    #[test]
+    fn try_with_metadata_checks_as_it_sets() {
+        let key = PoolKey::UniswapV3(addr(0x71));
+        let error = PoolRegistration::new(key.clone())
+            .try_with_metadata(ProtocolMetadata::Slipstream(V3Metadata::default()))
+            .expect_err("a checked setter must reject a cross-venue variant");
+        assert_eq!(error.key_protocol, ProtocolId::UniswapV3);
+        assert_eq!(error.metadata_protocol, ProtocolId::Slipstream);
+
+        let accepted = PoolRegistration::new(key)
+            .try_with_metadata(ProtocolMetadata::UniswapV3(
+                V3Metadata::default().with_fee(500),
+            ))
+            .expect("a matching variant must be accepted");
+        assert_eq!(accepted.metadata.protocol_id(), Some(ProtocolId::UniswapV3));
+    }
+
+    /// The message has to name both venues; the whole point is that the failure
+    /// otherwise surfaces far from its cause.
+    #[test]
+    fn mismatch_display_names_both_venues() {
+        let error = PoolRegistration::new(PoolKey::UniswapV3(addr(0x81)))
+            .try_with_metadata(ProtocolMetadata::Slipstream(V3Metadata::default()))
+            .expect_err("mismatch");
+        let rendered = error.to_string();
+        assert!(rendered.contains("UniswapV3"), "{rendered}");
+        assert!(rendered.contains("Slipstream"), "{rendered}");
     }
 }

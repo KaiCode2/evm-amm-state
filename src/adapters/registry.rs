@@ -7,7 +7,7 @@ use alloy_primitives::{Address, B256, Log};
 use super::quote_warmup::{QuoteReadSetLimits, QuoteWarmup};
 use super::{
     AdapterCache, AmmAdapter, CacheError, DeferredOutcome, DeferredWork, EventRoute, EventSource,
-    PoolKey, PoolRegistration, ProtocolId, RepairAction, SimConfig,
+    PoolKey, PoolRegistration, ProtocolId, ProtocolMismatch, RepairAction, SimConfig,
 };
 use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
 
@@ -117,12 +117,24 @@ impl AdapterRegistry {
         !self.quote_read_sets.is_empty()
     }
 
-    /// Register a pool. Errors [`RegistryError::DuplicatePool`] if its key is
-    /// already registered.
+    /// Register a pool.
+    ///
+    /// Fails closed on two conditions, neither of which mutates the registry:
+    ///
+    /// - [`RegistryError::DuplicatePool`] if its key is already registered.
+    /// - [`RegistryError::ProtocolMismatch`] if its [`PoolKey`] and
+    ///   [`ProtocolMetadata`](super::ProtocolMetadata) name different venues —
+    ///   see [`PoolRegistration::check_protocol_agreement`]. This is the gate
+    ///   that keeps a cross-venue registration out of the system: adapters
+    ///   dispatch on the key while storage layouts resolve from the metadata, so
+    ///   admitting one would quote a pool through one venue's ABI against
+    ///   another venue's storage. The registration is rejected, never repaired —
+    ///   which of the two venues the caller meant is not knowable here.
     pub fn register_pool(&mut self, registration: PoolRegistration) -> Result<(), RegistryError> {
         if self.pools.contains_key(&registration.key) {
             return Err(RegistryError::DuplicatePool(registration.key));
         }
+        registration.check_protocol_agreement()?;
 
         self.pools.insert(registration.key.clone(), registration);
         Ok(())
@@ -469,6 +481,15 @@ pub enum RegistryError {
         /// One of the pools still dispatching to the adapter.
         pool: PoolKey,
     },
+    /// The registration's pool key and protocol metadata name different venues
+    /// — see [`PoolRegistration::check_protocol_agreement`].
+    ProtocolMismatch(ProtocolMismatch),
+}
+
+impl From<ProtocolMismatch> for RegistryError {
+    fn from(mismatch: ProtocolMismatch) -> Self {
+        Self::ProtocolMismatch(mismatch)
+    }
 }
 
 impl fmt::Display for RegistryError {
@@ -481,8 +502,152 @@ impl fmt::Display for RegistryError {
             Self::AdapterInUse { protocol, pool } => {
                 write!(f, "adapter for {protocol:?} still serves pool {pool:?}")
             }
+            Self::ProtocolMismatch(mismatch) => write!(f, "{mismatch}"),
         }
     }
 }
 
-impl std::error::Error for RegistryError {}
+impl std::error::Error for RegistryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ProtocolMismatch(mismatch) => Some(mismatch),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::storage::V3StorageLayout;
+    use crate::adapters::{CustomPoolKey, ProtocolMetadata, V3Metadata};
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    /// The gate: a cross-venue registration is refused, and the registry is left
+    /// exactly as it was. Rejecting without inserting is the whole point —
+    /// admitting the pool is what let the wrong-ABI quote happen downstream.
+    #[test]
+    fn register_pool_rejects_a_cross_venue_registration_without_inserting() {
+        let key = PoolKey::UniswapV3(addr(0x11));
+        let registration = PoolRegistration::new(key.clone()).with_metadata(
+            ProtocolMetadata::Slipstream(V3Metadata::default().with_tick_spacing(100)),
+        );
+
+        let mut registry = AdapterRegistry::new();
+        let error = registry
+            .register_pool(registration)
+            .expect_err("a Uniswap V3 key carrying Slipstream metadata must be refused");
+
+        match error {
+            RegistryError::ProtocolMismatch(mismatch) => {
+                assert_eq!(mismatch.key, key);
+                assert_eq!(mismatch.key_protocol, ProtocolId::UniswapV3);
+                assert_eq!(mismatch.metadata_protocol, ProtocolId::Slipstream);
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+
+        assert!(registry.pool(&key).is_none(), "rejection must not insert");
+        assert!(registry.is_empty());
+    }
+
+    /// A rejected registration must not disturb one already tracked, and must not
+    /// consume the key.
+    #[test]
+    fn rejection_leaves_an_existing_registration_intact() {
+        let good_key = PoolKey::Slipstream(addr(0x21));
+        let good = PoolRegistration::new(good_key.clone()).with_metadata(
+            ProtocolMetadata::Slipstream(V3Metadata::default().with_tick_spacing(100)),
+        );
+        let mut registry = AdapterRegistry::new();
+        registry.register_pool(good).expect("valid registration");
+
+        let bad_key = PoolKey::UniswapV3(addr(0x22));
+        assert!(
+            registry
+                .register_pool(
+                    PoolRegistration::new(bad_key.clone())
+                        .with_metadata(ProtocolMetadata::PancakeV3(V3Metadata::default()))
+                )
+                .is_err()
+        );
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.pool(&good_key).is_some());
+        assert!(registry.pool(&bad_key).is_none());
+
+        // The key is still free: the caller can fix the metadata and retry.
+        registry
+            .register_pool(
+                PoolRegistration::new(bad_key.clone())
+                    .with_metadata(ProtocolMetadata::UniswapV3(V3Metadata::default())),
+            )
+            .expect("the corrected registration must be accepted");
+        assert!(registry.pool(&bad_key).is_some());
+    }
+
+    /// Registrations that must keep registering: the pre-cold-start `Unknown`
+    /// default, a matching family pair, a deliberate non-default storage layout,
+    /// and the third-party `Custom` hatch.
+    #[test]
+    fn legitimate_registrations_still_register() {
+        let mut registry = AdapterRegistry::new();
+
+        registry
+            .register_pool(PoolRegistration::new(PoolKey::UniswapV3(addr(0x31))))
+            .expect("the `new` default carries Unknown metadata");
+
+        registry
+            .register_pool(
+                PoolRegistration::new(PoolKey::Slipstream(addr(0x32))).with_metadata(
+                    ProtocolMetadata::Slipstream(V3Metadata::default().with_tick_spacing(200)),
+                ),
+            )
+            .expect("a matching family pair");
+
+        registry
+            .register_pool(
+                PoolRegistration::new(PoolKey::UniswapV3(addr(0x33))).with_metadata(
+                    ProtocolMetadata::UniswapV3(
+                        V3Metadata::default()
+                            .with_tick_spacing(100)
+                            // A fork's own slots, deliberately supplied under the
+                            // matching family variant.
+                            .with_storage_layout(V3StorageLayout::slipstream(100)),
+                    ),
+                ),
+            )
+            .expect("an explicit non-default storage layout is a legitimate override");
+
+        registry
+            .register_pool(
+                PoolRegistration::new(PoolKey::Custom(CustomPoolKey::Address {
+                    protocol: "acme-v1",
+                    address: addr(0x34),
+                }))
+                .with_metadata(ProtocolMetadata::Custom(std::sync::Arc::new(0u8))),
+            )
+            .expect("the third-party extension hatch");
+
+        assert_eq!(registry.len(), 4);
+    }
+
+    /// A duplicate key is still reported as a duplicate, not misreported as a
+    /// mismatch.
+    #[test]
+    fn duplicate_detection_is_unchanged() {
+        let key = PoolKey::UniswapV3(addr(0x41));
+        let mut registry = AdapterRegistry::new();
+        registry
+            .register_pool(PoolRegistration::new(key.clone()))
+            .expect("first registration");
+
+        assert_eq!(
+            registry.register_pool(PoolRegistration::new(key.clone())),
+            Err(RegistryError::DuplicatePool(key)),
+        );
+    }
+}

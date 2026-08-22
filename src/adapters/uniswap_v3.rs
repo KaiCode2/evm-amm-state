@@ -396,6 +396,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         amount_in: U256,
         config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
+        // Fail closed before encoding: the two lines below read the venue from
+        // *different* places — `v3_metadata` accepts any V3-family metadata
+        // variant, while the calldata shape is chosen from the pool key. A
+        // registration naming two venues would therefore pair one family's
+        // metadata with another family's ABI (Uniswap's `uint24 fee` struct
+        // against a Slipstream quoter, or the reverse), and its storage was
+        // already warmed through `layout_for`'s metadata-derived layout. A
+        // registry rejects such a pool up front; this guard covers a caller
+        // holding the adapter directly.
+        pool.check_protocol_agreement()
+            .map_err(|mismatch| SimError::Custom(mismatch.to_string()))?;
         // Same resolver `ProtocolMetadata::quote_code_targets` uses, so the quoter
         // we call is always the one an eager cold-start pre-warmed.
         let quoter = v3_metadata(pool).map_or(config.v3_quoter, |m| m.quote_target(config));
