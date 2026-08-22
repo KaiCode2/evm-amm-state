@@ -1431,6 +1431,15 @@ impl AmmSyncEngine {
         registration: PoolRegistration,
         instance: PoolInstanceId,
     ) -> Result<PreparedPoolAddition, AmmSyncError> {
+        // Reject a cross-venue registration before anything is derived from it.
+        // `AdapterRegistry::register_pool` would catch it at commit, but the
+        // adapter lookup, state-dependency derivation, and handler built below
+        // all read the mismatched pair — and `preview_reserved_pool_subscription`
+        // reaches this without ever committing, so a caller previewing a
+        // reservation gets told here too.
+        registration
+            .check_protocol_agreement()
+            .map_err(RegistryError::from)?;
         let adapter = self
             .registry
             .adapter(registration.protocol())
