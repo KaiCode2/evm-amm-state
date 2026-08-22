@@ -366,7 +366,13 @@ pub fn decode_storage_sync(
         .slots
         .iter()
         .copied()
-        .zip(output.chunks_exact(32).map(U256::from_be_slice))
+        .zip(
+            output
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|chunk| U256::from_be_slice(chunk)),
+        )
         .collect();
     Ok(StorageSyncSnapshot {
         target: spec.target,

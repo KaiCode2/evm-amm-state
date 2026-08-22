@@ -2,16 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use alloy_network::{Ethereum, primitives::BlockResponse as _};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, Header as RpcHeader, Log as RpcLog};
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockInterest, BlockRef, ChainStatus, EventSubscriber, HandlerId, InputSource,
-    PreconfirmationMode, ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
-    ReactiveInterest, SubscriberDriverPoll, SubscriberMode, SubscriberOwnerEpoch,
-    SubscriberOwnerError, SubscriberOwnerStart, SubscriberOwnerState,
+    AlloySubscriber, BlockInterest, BlockRef, ChainControl, ChainStatus, EventSubscriber,
+    HandlerId, InputSource, PreconfirmationMode, ReactiveContext, ReactiveInput,
+    ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, SubscriberDriverPoll,
+    SubscriberMode, SubscriberOwnerEpoch, SubscriberOwnerError, SubscriberOwnerStart,
+    SubscriberOwnerState,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -39,12 +42,60 @@ pub enum AmmPreconfirmationRejectionPolicy {
     ContinueCanonical,
 }
 
+/// Where canonical log data comes from.
+///
+/// The subscriber already delivers every matching log over its subscription.
+/// Historically the driver discarded them and re-fetched each block's logs with
+/// a hash-pinned `eth_getLogs`, because it could not tell a complete stream from
+/// a punctured one. It can now: the subscriber attests through
+/// [`ChainControl::LogCoverage`](evm_fork_cache::reactive::ChainControl) that no
+/// notification loss went unhealed at or below a block, and any block that is
+/// *not* attested still takes the reconciliation path. The fetch stops being
+/// unconditional and becomes exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalLogSource {
+    /// Assemble blocks from the subscription, reconciling only what is not
+    /// attested.
+    ///
+    /// A block is submitted once its logs are attested complete, its header has
+    /// arrived, and its log set is known closed — proven either by an
+    /// observation from a strictly later block, or by `grace` elapsing with no
+    /// such observation. The grace window is a quiet-tail fallback, not the
+    /// steady-state path.
+    Subscription {
+        /// How long to wait for stragglers before sealing a block whose
+        /// successor has not been observed.
+        grace: Duration,
+    },
+    /// Re-fetch every canonical block's logs with a hash-pinned `eth_getLogs`.
+    ///
+    /// The historical behaviour, retained as a one-line opt-out.
+    Reconcile,
+}
+
+impl CanonicalLogSource {
+    /// Default straggler window for subscription-sourced assembly.
+    ///
+    /// Chosen to be short relative to any supported block time: the later-block
+    /// observation normally seals first, so this bounds only the tail.
+    pub const DEFAULT_GRACE: Duration = Duration::from_millis(40);
+}
+
+impl Default for CanonicalLogSource {
+    fn default() -> Self {
+        Self::Subscription {
+            grace: Self::DEFAULT_GRACE,
+        }
+    }
+}
+
 /// Configuration for the Alloy subscriber driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmmSubscriberDriverConfig {
     control_capacity: usize,
     max_addresses_per_get_logs: usize,
     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
+    canonical_log_source: CanonicalLogSource,
 }
 
 impl Default for AmmSubscriberDriverConfig {
@@ -53,6 +104,7 @@ impl Default for AmmSubscriberDriverConfig {
             control_capacity: 32,
             max_addresses_per_get_logs: 256,
             preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
+            canonical_log_source: CanonicalLogSource::default(),
         }
     }
 }
@@ -87,6 +139,17 @@ impl AmmSubscriberDriverConfig {
     ) -> Self {
         self.preconfirmation_rejection_policy = policy;
         self
+    }
+
+    /// Choose where canonical log data comes from.
+    pub const fn with_canonical_log_source(mut self, source: CanonicalLogSource) -> Self {
+        self.canonical_log_source = source;
+        self
+    }
+
+    /// Configured canonical log source.
+    pub const fn canonical_log_source(&self) -> CanonicalLogSource {
+        self.canonical_log_source
     }
 
     /// Active rejected-preview policy.
@@ -246,11 +309,157 @@ impl From<AmmCanonicalBatchError> for AmmSubscriberDriverError {
     }
 }
 
+/// Canonical-delivery accounting for one attached subscriber driver.
+///
+/// The driver is the layer that decides *where* canonical log data comes from,
+/// so this is where the cost of that decision is visible. Today every canonical
+/// header triggers a hash-pinned `eth_getLogs` reconciliation while the logs the
+/// WebSocket already delivered are discarded; `subscription_logs_discarded`
+/// beside `reconciliation_requests` reports exactly that, from inside the
+/// process, without reading a provider invoice.
+///
+/// Counts are cumulative for the driver task's lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AmmSubscriberDriverStats {
+    canonical_headers_ingested: u64,
+    canonical_blocks_delivered: u64,
+    reconciliation_requests: u64,
+    reconciliation_logs_fetched: u64,
+    subscription_logs_discarded: u64,
+    subscription_logs_applied: u64,
+    blocks_sealed_from_subscription: u64,
+    blocks_sealed_by_successor: u64,
+    blocks_sealed_by_bloom_absence: u64,
+    blocks_reconciled: u64,
+    lineage_parent_requests: u64,
+}
+
+impl AmmSubscriberDriverStats {
+    /// Canonical headers accepted from the subscriber, before lineage expansion
+    /// and before the no-op check against the runtime's current point.
+    pub const fn canonical_headers_ingested(self) -> u64 {
+        self.canonical_headers_ingested
+    }
+
+    /// Canonical blocks reconciled and submitted to the runtime. Exceeds
+    /// [`canonical_headers_ingested`](Self::canonical_headers_ingested) when a
+    /// reorg or header gap expands one header into a lineage.
+    pub const fn canonical_blocks_delivered(self) -> u64 {
+        self.canonical_blocks_delivered
+    }
+
+    /// Hash-pinned `eth_getLogs` requests issued for canonical reconciliation.
+    ///
+    /// One per address-chunked filter per delivered block, so this scales with
+    /// block rate times
+    /// [`max_addresses_per_get_logs`](AmmSubscriberDriverConfig::max_addresses_per_get_logs)
+    /// chunks — not with pool activity.
+    pub const fn reconciliation_requests(self) -> u64 {
+        self.reconciliation_requests
+    }
+
+    /// Logs returned by those reconciliation requests.
+    pub const fn reconciliation_logs_fetched(self) -> u64 {
+        self.reconciliation_logs_fetched
+    }
+
+    /// Canonical logs delivered over the subscriber's live stream and then
+    /// dropped, because canonical log data is sourced from reconciliation
+    /// instead. Every one of these was already paid for.
+    ///
+    /// Under [`CanonicalLogSource::Subscription`] this counts only logs a
+    /// reconciled block superseded; a steadily climbing value means blocks are
+    /// failing to seal from the stream and the fetch is not actually being
+    /// avoided.
+    pub const fn subscription_logs_discarded(self) -> u64 {
+        self.subscription_logs_discarded
+    }
+
+    /// Canonical logs applied straight from the subscription, costing no
+    /// provider request.
+    pub const fn subscription_logs_applied(self) -> u64 {
+        self.subscription_logs_applied
+    }
+
+    /// Blocks assembled from the subscription instead of being re-fetched.
+    pub const fn blocks_sealed_from_subscription(self) -> u64 {
+        self.blocks_sealed_from_subscription
+    }
+
+    /// Blocks sealed because a strictly later block was observed, proving the
+    /// earlier block's log set closed. The steady-state path.
+    pub const fn blocks_sealed_by_successor(self) -> u64 {
+        self.blocks_sealed_by_successor
+    }
+
+    /// Blocks sealed because the grace window elapsed with no successor
+    /// observed. Expected only on a quiet tail; a high proportion here means
+    /// the window is doing work the successor rule should be doing.
+    pub const fn blocks_sealed_by_bloom_absence(self) -> u64 {
+        self.blocks_sealed_by_bloom_absence
+    }
+
+    /// Blocks that took the hash-pinned reconciliation path because their logs
+    /// were not attested complete.
+    pub const fn blocks_reconciled(self) -> u64 {
+        self.blocks_reconciled
+    }
+
+    /// `eth_getBlockByHash` requests walking a replacement branch back to
+    /// retained canonical lineage. Non-zero only on a reorg or header gap.
+    pub const fn lineage_parent_requests(self) -> u64 {
+        self.lineage_parent_requests
+    }
+}
+
+/// Interior-mutable counters behind [`AmmSubscriberDriverStats`].
+///
+/// Shared with every [`AmmSubscriberDriverHandle`] clone so a caller can read
+/// the driver's accounting without a round trip through its control channel.
+#[derive(Debug, Default)]
+struct AmmSubscriberDriverCounters {
+    canonical_headers_ingested: AtomicU64,
+    canonical_blocks_delivered: AtomicU64,
+    reconciliation_requests: AtomicU64,
+    reconciliation_logs_fetched: AtomicU64,
+    subscription_logs_discarded: AtomicU64,
+    subscription_logs_applied: AtomicU64,
+    blocks_sealed_from_subscription: AtomicU64,
+    blocks_sealed_by_successor: AtomicU64,
+    blocks_sealed_by_bloom_absence: AtomicU64,
+    blocks_reconciled: AtomicU64,
+    lineage_parent_requests: AtomicU64,
+}
+
+impl AmmSubscriberDriverCounters {
+    fn add(counter: &AtomicU64, amount: u64) {
+        counter.fetch_add(amount, AtomicOrdering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AmmSubscriberDriverStats {
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        AmmSubscriberDriverStats {
+            canonical_headers_ingested: load(&self.canonical_headers_ingested),
+            canonical_blocks_delivered: load(&self.canonical_blocks_delivered),
+            reconciliation_requests: load(&self.reconciliation_requests),
+            reconciliation_logs_fetched: load(&self.reconciliation_logs_fetched),
+            subscription_logs_discarded: load(&self.subscription_logs_discarded),
+            subscription_logs_applied: load(&self.subscription_logs_applied),
+            blocks_sealed_from_subscription: load(&self.blocks_sealed_from_subscription),
+            blocks_sealed_by_successor: load(&self.blocks_sealed_by_successor),
+            blocks_sealed_by_bloom_absence: load(&self.blocks_sealed_by_bloom_absence),
+            blocks_reconciled: load(&self.blocks_reconciled),
+            lineage_parent_requests: load(&self.lineage_parent_requests),
+        }
+    }
+}
+
 /// Public status/shutdown handle for an attached subscriber task.
 #[derive(Clone)]
 pub struct AmmSubscriberDriverHandle {
     control: AmmSubscriberControl,
     state: watch::Receiver<AmmSubscriberDriverState>,
+    stats: Arc<AmmSubscriberDriverCounters>,
 }
 
 impl AmmSubscriberDriverHandle {
@@ -262,6 +471,12 @@ impl AmmSubscriberDriverHandle {
     /// Subscribe to recoverable latest-value driver state changes.
     pub fn subscribe_state(&self) -> watch::Receiver<AmmSubscriberDriverState> {
         self.state.clone()
+    }
+
+    /// Canonical-delivery accounting for the attached driver, including the
+    /// provider requests it issues on its own initiative.
+    pub fn stats(&self) -> AmmSubscriberDriverStats {
+        self.stats.snapshot()
     }
 
     /// Subscribe first, then reconcile every canonical block through `header`.
@@ -570,6 +785,7 @@ where
     }
     let (command_tx, command_rx) = mpsc::channel(config.control_capacity);
     let (state_tx, state_rx) = watch::channel(AmmSubscriberDriverState::Paused);
+    let stats = Arc::new(AmmSubscriberDriverCounters::default());
     let canonical_lineage = initial_canonical_lineage(runtime.latest_snapshot().point());
     let control = AmmSubscriberControl {
         commands: command_tx,
@@ -589,7 +805,13 @@ where
         preconfirmation_rejection_policy: config.preconfirmation_rejection_policy,
         report_stop: true,
         stop_requested: false,
+        stats: Arc::clone(&stats),
         canonical_lineage,
+        canonical_log_source: config.canonical_log_source,
+        attested_log_coverage: None,
+        buffered_logs: BTreeMap::new(),
+        pending_headers: BTreeMap::new(),
+        highest_observed_block: None,
     };
     tokio::spawn(actor.run());
     Ok((
@@ -597,6 +819,7 @@ where
         AmmSubscriberDriverHandle {
             control,
             state: state_rx,
+            stats,
         },
     ))
 }
@@ -616,7 +839,22 @@ struct AlloyAmmSubscriberDriver<P> {
     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
     report_stop: bool,
     stop_requested: bool,
+    stats: Arc<AmmSubscriberDriverCounters>,
     canonical_lineage: BTreeMap<u64, alloy_primitives::B256>,
+    canonical_log_source: CanonicalLogSource,
+    /// Highest block the subscriber has attested carries no unhealed log loss.
+    /// Reset on any reorg, because the watermark describes the branch that was
+    /// canonical when it was issued.
+    attested_log_coverage: Option<u64>,
+    /// Logs delivered by the subscription, keyed by their block identity and
+    /// then by global log index so ordering is restored locally.
+    buffered_logs: BTreeMap<(u64, alloy_primitives::B256), BTreeMap<u64, RpcLog>>,
+    /// Canonical headers waiting for their log set to be provably closed, with
+    /// the instant each started waiting.
+    pending_headers: BTreeMap<u64, (RpcHeader, Instant)>,
+    /// Highest block number observed from any log or header. An observation
+    /// strictly above a pending block proves that block's log set is closed.
+    highest_observed_block: Option<u64>,
 }
 
 const RETAINED_CANONICAL_LINEAGE: usize = 65;
@@ -691,12 +929,39 @@ where
                 continue;
             }
 
-            let mut control = Box::pin(self.commands.recv());
-            let outcome = self
-                .subscriber
-                .next_scoped_batch_or(control.as_mut())
-                .await?;
-            drop(control);
+            // A block waiting on stragglers needs the loop to wake when its
+            // grace window expires, not only when the next batch arrives.
+            // `next_batch` is documented cancellation-safe — dropping it while
+            // pending must not discard a complete input — so racing it against
+            // a deadline cannot lose delivery.
+            let outcome = match self.next_seal_deadline() {
+                Some(deadline) => {
+                    let mut control = Box::pin(self.commands.recv());
+                    let polled = tokio::time::timeout_at(
+                        deadline.into(),
+                        self.subscriber.next_scoped_batch_or(control.as_mut()),
+                    )
+                    .await;
+                    drop(control);
+                    match polled {
+                        Ok(outcome) => outcome?,
+                        Err(_elapsed) => {
+                            let now = Instant::now();
+                            self.drain_sealable(now, Duration::ZERO).await?;
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    let mut control = Box::pin(self.commands.recv());
+                    let outcome = self
+                        .subscriber
+                        .next_scoped_batch_or(control.as_mut())
+                        .await?;
+                    drop(control);
+                    outcome
+                }
+            };
             match outcome {
                 SubscriberDriverPoll::Control(Some(command)) => {
                     if self.handle_control(command).await? {
@@ -1100,25 +1365,290 @@ where
             )?;
             return Ok(());
         }
+        // An attestation names the branch that was canonical when it was
+        // issued, so record it before consuming the batch's records.
+        self.note_log_coverage(batch.chain_controls());
+
         let mut headers = Vec::new();
+        let mut discarded_logs = 0u64;
         for scoped in batch.into_records() {
             if !scoped.scope().is_canonical() {
                 return Err(AmmSubscriberDriverError::OwnerCatchupRequiresStaging);
             }
             match scoped.into_record().input {
                 ReactiveInput::BlockHeader(header) => headers.push(header),
-                ReactiveInput::Log(_)
-                | ReactiveInput::FullBlock(_)
+                ReactiveInput::Log(log) => {
+                    if self.buffers_subscription_logs() {
+                        self.buffer_subscription_log(log)?;
+                    } else {
+                        // Reconcile mode sources canonical logs from
+                        // `eth_getLogs`, so the delivered copy is redundant.
+                        // Counting it keeps the duplicated cost visible.
+                        discarded_logs = discarded_logs.saturating_add(1);
+                    }
+                }
+                ReactiveInput::FullBlock(_)
                 | ReactiveInput::PendingTxHash(_)
                 | ReactiveInput::PendingTx(_) => {}
             }
         }
+        AmmSubscriberDriverCounters::add(&self.stats.subscription_logs_discarded, discarded_logs);
+        AmmSubscriberDriverCounters::add(
+            &self.stats.canonical_headers_ingested,
+            headers.len() as u64,
+        );
         headers.sort_by_key(|header| header.inner.number);
+        if !self.buffers_subscription_logs() {
+            for header in headers {
+                self.deliver_through_with_timing(header, source_ingress, decoded_after_ingress)
+                    .await?;
+            }
+            return Ok(());
+        }
         for header in headers {
-            self.deliver_through_with_timing(header, source_ingress, decoded_after_ingress)
+            let number = header.inner.number;
+            // Deliberately NOT note_observed_block: a header proves only that
+            // the header stream advanced, never that an earlier block's logs
+            // have all been delivered.
+            self.pending_headers
+                .insert(number, (header, Instant::now()));
+        }
+        self.drain_sealable(source_ingress, decoded_after_ingress)
+            .await
+    }
+
+    /// Deliver every pending block whose log set is provably closed.
+    ///
+    /// Stops at the first block that must still wait, so delivery stays in
+    /// canonical order. A block whose grace window elapsed without an
+    /// attestation falls back to reconciliation rather than stalling: the point
+    /// is to avoid the fetch when it is unnecessary, never to withhold state.
+    async fn drain_sealable(
+        &mut self,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+    ) -> Result<(), AmmSubscriberDriverError> {
+        loop {
+            let Some((&number, (pending, waiting_since))) = self.pending_headers.iter().next()
+            else {
+                return Ok(());
+            };
+            let waiting_since = *waiting_since;
+            let sealable = self.subscription_seal_reason(number, pending);
+            // The straggler window no longer authorises publishing a buffer; it
+            // only bounds how long we wait for one of the two proofs before
+            // falling back to a hash-pinned reconciliation.
+            if sealable.is_none() && waiting_since.elapsed() < self.seal_grace() {
+                return Ok(());
+            }
+            let Some((header, _)) = self.pending_headers.remove(&number) else {
+                return Ok(());
+            };
+            self.deliver_through_sealed(header, source_ingress, decoded_after_ingress, sealable)
                 .await?;
+            if self.stop_requested {
+                return Ok(());
+            }
+        }
+    }
+
+    /// When the oldest pending block's grace window expires, if one is waiting.
+    fn next_seal_deadline(&self) -> Option<Instant> {
+        if !self.buffers_subscription_logs() {
+            return None;
+        }
+        self.pending_headers
+            .values()
+            .map(|(_, since)| *since + self.seal_grace())
+            .min()
+    }
+
+    /// Whether canonical logs are assembled from the subscription.
+    const fn buffers_subscription_logs(&self) -> bool {
+        matches!(
+            self.canonical_log_source,
+            CanonicalLogSource::Subscription { .. }
+        )
+    }
+
+    /// Straggler window before a block with no observed successor is sealed.
+    const fn seal_grace(&self) -> Duration {
+        match self.canonical_log_source {
+            CanonicalLogSource::Subscription { grace } => grace,
+            CanonicalLogSource::Reconcile => Duration::ZERO,
+        }
+    }
+
+    /// Record the subscriber's log-coverage attestation.
+    ///
+    /// The watermark is the only evidence that the delivered log set is whole;
+    /// without one at or above a block, that block is reconciled.
+    fn note_log_coverage(&mut self, controls: &[ChainControl]) {
+        for control in controls {
+            if let ChainControl::LogCoverage(block) = control {
+                let advances = self
+                    .attested_log_coverage
+                    .is_none_or(|current| block.number > current);
+                if advances {
+                    self.attested_log_coverage = Some(block.number);
+                }
+            }
+        }
+    }
+
+    /// Buffer one canonical log under its own block identity.
+    ///
+    /// Ordering is restored locally from the global log index, so out-of-order
+    /// arrival costs nothing. A log missing its block identity cannot be placed
+    /// and is rejected rather than guessed at.
+    fn buffer_subscription_log(&mut self, log: RpcLog) -> Result<(), AmmSubscriberDriverError> {
+        let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
+            return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
+                "canonical log is missing its block identity",
+            ));
+        };
+        self.note_observed_block(number);
+        let key = global_log_key(&log)?;
+        match self
+            .buffered_logs
+            .entry((number, hash))
+            .or_default()
+            .entry(key)
+        {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(log);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &log => {
+                return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
+                    "conflicting logs share one global log index",
+                ));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
         }
         Ok(())
+    }
+
+    /// Note the highest block observed **on the log subscription**.
+    ///
+    /// An observation strictly above a pending block is what proves that
+    /// block's log set closed: a single log subscription delivers in canonical
+    /// order, so nothing further can arrive for an earlier block.
+    ///
+    /// The premise is specific to the log stream. `newHeads` is an independent
+    /// subscription and a header for a later block proves nothing about whether
+    /// an earlier block's logs have been delivered, so headers must never reach
+    /// this. Feeding it from both is how a block came to be sealed carrying an
+    /// empty log set while its logs were still in flight.
+    fn note_observed_block(&mut self, number: u64) {
+        let advances = self
+            .highest_observed_block
+            .is_none_or(|current| number > current);
+        if advances {
+            self.highest_observed_block = Some(number);
+        }
+    }
+
+    /// Whether `block` can be submitted straight from the subscription.
+    ///
+    /// Two proofs are accepted, and only two. Both establish that the buffered
+    /// set for `number` is the complete set; a timer does not, which is why the
+    /// straggler window now leads to reconciliation rather than to publishing
+    /// whatever happens to have arrived.
+    fn subscription_seal_reason(&self, number: u64, header: &RpcHeader) -> Option<SealReason> {
+        if !self.buffers_subscription_logs() {
+            return None;
+        }
+        // Necessary but not sufficient: this attests that no notification loss
+        // went unhealed at or below `number`, not that delivery has reached it.
+        if self
+            .attested_log_coverage
+            .is_none_or(|attested| attested < number)
+        {
+            return None;
+        }
+        // Proof 1: the log subscription itself delivered something for a later
+        // block, so in-order delivery puts `number` behind the write head.
+        if self
+            .highest_observed_block
+            .is_some_and(|observed| observed > number)
+        {
+            return Some(SealReason::Successor);
+        }
+        // Proof 2: the block's own `logsBloom` excludes every registered
+        // interest. A bloom admits false positives and never false negatives,
+        // so exclusion is a positive proof that no matching log exists to wait
+        // for. This is what keeps a quiet pool off the provider: the vast
+        // majority of blocks touch none of our addresses.
+        if self.bloom_excludes_every_interest(&header.inner.logs_bloom) {
+            return Some(SealReason::BloomAbsent);
+        }
+        None
+    }
+
+    /// Whether `bloom` proves no registered log interest can match this block.
+    ///
+    /// A log matches an interest only if the bloom carries *both* its address
+    /// and its `topic0`, so either being absent excludes the interest. Testing
+    /// both matters: measured against live headers, the address alone leaves
+    /// about half of Ethereum blocks unprovable because a saturated bloom admits
+    /// it by false positive, and the topic check recovers a third of those.
+    ///
+    /// Conservative in the only direction that matters: a wildcard, or an
+    /// interest the bloom admits on both counts, yields `false` and the caller
+    /// waits for a log observation or reconciles.
+    fn bloom_excludes_every_interest(&self, bloom: &alloy_primitives::Bloom) -> bool {
+        let admits = |value: &[u8]| bloom.contains_input(alloy_primitives::BloomInput::Raw(value));
+        let mut saw_log_interest = false;
+        for interest in self.subscriber.registered_interests() {
+            let ReactiveInterest::Logs(logs) = interest else {
+                continue;
+            };
+            saw_log_interest = true;
+            let filter = &logs.provider_filter;
+            if filter.address.is_empty() {
+                // An address wildcard could match anything in the bloom.
+                return false;
+            }
+            if !filter
+                .address
+                .iter()
+                .any(|address| admits(address.as_slice()))
+            {
+                // No address of this interest can appear, so it cannot match.
+                continue;
+            }
+            // The address is admitted; a declared `topic0` set gives a second,
+            // independent chance to exclude. An empty set is a wildcard.
+            if !filter.topics[0].is_empty()
+                && !filter.topics[0]
+                    .iter()
+                    .any(|topic| admits(topic.as_slice()))
+            {
+                continue;
+            }
+            return false;
+        }
+        // With no log interest registered there is nothing to wait for either,
+        // but say so only when at least one interest was examined.
+        saw_log_interest
+    }
+
+    /// Discard assembly state whose branch is no longer canonical.
+    ///
+    /// A reorg invalidates both the buffered logs and the attestation: the
+    /// watermark described the branch that was canonical when it was issued, so
+    /// carrying it across a replacement would vouch for blocks on a branch the
+    /// subscriber never attested.
+    fn reset_subscription_assembly(&mut self) {
+        self.buffered_logs.clear();
+        self.pending_headers.clear();
+        self.attested_log_coverage = None;
+    }
+
+    /// Drop buffered logs for blocks already delivered.
+    fn retire_buffered_logs_through(&mut self, number: u64) {
+        self.buffered_logs.retain(|(block, _), _| *block > number);
+        self.pending_headers.retain(|block, _| *block > number);
     }
 
     async fn deliver_through(&mut self, header: RpcHeader) -> Result<(), AmmSubscriberDriverError> {
@@ -1133,17 +1663,136 @@ where
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
+        self.deliver_through_sealed(header, source_ingress, decoded_after_ingress, None)
+            .await
+    }
+
+    /// Deliver `header`, optionally with a seal decision already made.
+    ///
+    /// `drain_sealable` removes a block from the pending map before delivering
+    /// it, so the instant it started waiting — and therefore whether its grace
+    /// window elapsed — cannot be recovered here. The decision travels with the
+    /// header instead of being recomputed against a map it has already left.
+    async fn deliver_through_sealed(
+        &mut self,
+        header: RpcHeader,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+        precomputed: Option<SealReason>,
+    ) -> Result<(), AmmSubscriberDriverError> {
         let current = self.runtime.latest_snapshot().point();
         if header.inner.number == current.block_number() && header.hash == current.block_hash() {
             return Ok(());
         }
-        for header in self.delivery_lineage(header).await? {
+        let lineage = self.delivery_lineage(header).await?;
+        // More than one block means the parent walk had to fill a gap or a
+        // replacement branch: those blocks were not canonical while the
+        // subscription was delivering, so no buffered set describes them and
+        // the attestation named a different branch.
+        if lineage.len() > 1 {
+            self.reset_subscription_assembly();
+        }
+        let last = lineage.len().saturating_sub(1);
+        for (index, header) in lineage.into_iter().enumerate() {
             let number = header.inner.number;
             let hash = header.hash;
-            self.reconcile_and_deliver_with_timing(header, source_ingress, decoded_after_ingress)
-                .await?;
+            // Only the straight-line head of the walk can be subscription
+            // sourced; everything behind it is a reconciled fill.
+            // Only the straight-line head of the walk may use a seal decision;
+            // everything behind it was filled by the parent walk.
+            let sealable = if index == last { precomputed } else { None };
+            match sealable {
+                Some(reason) => {
+                    self.seal_from_subscription(
+                        header,
+                        reason,
+                        source_ingress,
+                        decoded_after_ingress,
+                    )
+                    .await?;
+                }
+                None => {
+                    self.reconcile_and_deliver_with_timing(
+                        header,
+                        source_ingress,
+                        decoded_after_ingress,
+                    )
+                    .await?;
+                    AmmSubscriberDriverCounters::add(&self.stats.blocks_reconciled, 1);
+                }
+            }
             self.record_canonical_block(number, hash);
+            self.retire_buffered_logs_through(number);
         }
+        Ok(())
+    }
+
+    /// Submit a block whose log set the subscription already delivered whole.
+    ///
+    /// Costs no provider request: the logs were paid for when they arrived.
+    async fn seal_from_subscription(
+        &mut self,
+        header: RpcHeader,
+        reason: SealReason,
+        source_ingress: Instant,
+        decoded_after_ingress: Duration,
+    ) -> Result<(), AmmSubscriberDriverError> {
+        let point = self.runtime.latest_snapshot().point();
+        let block = BlockRef {
+            number: header.inner.number,
+            hash: header.hash,
+            parent_hash: Some(header.inner.parent_hash),
+            timestamp: Some(header.inner.timestamp),
+        };
+        let buffered = self
+            .buffered_logs
+            .remove(&(block.number, block.hash))
+            .unwrap_or_default();
+        let mut records = Vec::with_capacity(buffered.len());
+        for log in buffered.into_values() {
+            // Re-run the same identity checks reconciliation applies, so a
+            // subscription-sourced block is held to the identical standard.
+            let _ = validated_log_key(&log, &block)?;
+            let context = ReactiveContext {
+                chain_id: Some(point.chain_id()),
+                source: InputSource::Subscription,
+                chain_status: ChainStatus::Included {
+                    block,
+                    confirmations: 0,
+                },
+                block: Some(block),
+                transaction_index: log.transaction_index,
+                log_index: log.log_index,
+            };
+            records.push(ReactiveInputRecord::new(ReactiveInput::Log(log), context));
+        }
+        AmmSubscriberDriverCounters::add(
+            &self.stats.subscription_logs_applied,
+            records.len() as u64,
+        );
+        let batch = AmmCanonicalBatch::from_verified_block_with_timing(
+            point.chain_id(),
+            header,
+            self.interest_revision,
+            ReactiveInputBatch::new(records),
+            source_ingress,
+            decoded_after_ingress,
+        )?;
+        self.ingest_while_servicing_controls(batch).await?;
+        AmmSubscriberDriverCounters::add(&self.stats.canonical_blocks_delivered, 1);
+        AmmSubscriberDriverCounters::add(&self.stats.blocks_sealed_from_subscription, 1);
+        match reason {
+            SealReason::Successor => {
+                AmmSubscriberDriverCounters::add(&self.stats.blocks_sealed_by_successor, 1);
+            }
+            SealReason::BloomAbsent => {
+                AmmSubscriberDriverCounters::add(&self.stats.blocks_sealed_by_bloom_absence, 1);
+            }
+        }
+        if self.stop_requested {
+            return Ok(());
+        }
+        self.publish_running(self.runtime.latest_snapshot().point());
         Ok(())
     }
 
@@ -1181,6 +1830,7 @@ where
                     replacement,
                 });
             }
+            AmmSubscriberDriverCounters::add(&self.stats.lineage_parent_requests, 1);
             let parent = self
                 .subscriber
                 .provider()
@@ -1249,13 +1899,18 @@ where
         let filters = reconciliation_filters(&interests, self.max_addresses_per_get_logs);
         let mut logs = BTreeMap::new();
         for filter in filters {
-            for log in self
+            AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 1);
+            let fetched = self
                 .subscriber
                 .provider()
                 .get_logs(&filter.at_block_hash(block.hash))
                 .await
-                .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?
-            {
+                .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
+            AmmSubscriberDriverCounters::add(
+                &self.stats.reconciliation_logs_fetched,
+                fetched.len() as u64,
+            );
+            for log in fetched {
                 let key = validated_log_key(&log, &block)?;
                 match logs.entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1296,6 +1951,9 @@ where
             decoded_after_ingress,
         )?;
         self.ingest_while_servicing_controls(batch).await?;
+        // Counted only after the runtime accepted the envelope, so a failed
+        // ingest is never reported as a delivered block.
+        AmmSubscriberDriverCounters::add(&self.stats.canonical_blocks_delivered, 1);
         if self.stop_requested {
             return Ok(());
         }
@@ -1341,6 +1999,29 @@ fn state_point_block(point: AmmStatePoint) -> BlockRef {
         parent_hash: None,
         timestamp: None,
     }
+}
+
+/// Why a block's log set was treated as closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SealReason {
+    /// A strictly later block was seen **on the log subscription**, proving
+    /// in-order delivery has moved past this block.
+    Successor,
+    /// The block's `logsBloom` excludes every registered interest, proving
+    /// there is no matching log to wait for.
+    BloomAbsent,
+}
+
+/// Global ordering key for a log within its block.
+///
+/// Identical to the key [`validated_log_key`] derives, but without the
+/// cross-block checks, which are applied at seal time once the block's header
+/// proves its identity.
+fn global_log_key(log: &RpcLog) -> Result<u64, AmmSubscriberDriverError> {
+    log.log_index
+        .ok_or(AmmSubscriberDriverError::InvalidCanonicalLog(
+            "canonical log is missing its global log index",
+        ))
 }
 
 fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscriberDriverError> {
@@ -1413,6 +2094,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use super::SealReason;
     use alloy_consensus::Header as ConsensusHeader;
     use alloy_network::Ethereum;
     use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
@@ -1425,22 +2107,24 @@ mod tests {
     use anyhow::Result;
     use evm_fork_cache::cache::EvmCache;
     use evm_fork_cache::reactive::{
-        AlloySubscriber, BlockRef, ChainStatus, InputSource, ReactiveContext, ReactiveInput,
-        ReactiveInputBatch, ReactiveInputRecord, SubscriberConfig, SubscriberMode,
+        AlloySubscriber, BlockRef, ChainControl, ChainStatus, EventSubscriber, InputSource,
+        LogInterest, ReactiveContext, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
+        ReactiveInterest, SubscriberConfig, SubscriberMode,
     };
     use tokio::sync::{mpsc, watch};
 
     use super::{
         AlloyAmmSubscriberDriver, AmmPreconfirmationRejectionPolicy, AmmSubscriberControl,
-        AmmSubscriberDriverConfig, AmmSubscriberDriverState, AmmSubscriberOwnerPlan,
-        SubscriberControlCommand, SubscriberTransaction, handle_preconfirmation_result,
-        initial_canonical_lineage, reconciliation_filters,
+        AmmSubscriberDriverConfig, AmmSubscriberDriverCounters, AmmSubscriberDriverState,
+        AmmSubscriberOwnerPlan, BTreeMap, CanonicalLogSource, SubscriberControlCommand,
+        SubscriberTransaction, handle_preconfirmation_result, initial_canonical_lineage,
+        reconciliation_filters,
     };
     use crate::adapters::{
         AdapterRegistry, AmmAdapter, AmmCanonicalBatch, AmmColdStartWorkerConfig,
         AmmFactoryWatcherRegistration, AmmRuntime, AmmRuntimeBaseline, AmmRuntimeCommandError,
-        AmmRuntimeConfig, AmmRuntimeEventKind, CustomPoolKey, DiscoveryOwnerKey, EventSource,
-        FactoryConfig, PoolDiscovery, PoolKey, PoolRegistration, PoolRuntimeState,
+        AmmRuntimeConfig, AmmRuntimeEventKind, AmmRuntimeHandle, CustomPoolKey, DiscoveryOwnerKey,
+        EventSource, FactoryConfig, PoolDiscovery, PoolKey, PoolRegistration, PoolRuntimeState,
         PoolStateDependencies, PoolStatus, ProtocolId, UniswapV2Adapter,
         uniswap_v2_pair_runtime_code_hash,
     };
@@ -1522,7 +2206,13 @@ mod tests {
                     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
+                    stats: Arc::new(AmmSubscriberDriverCounters::default()),
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                    canonical_log_source: CanonicalLogSource::default(),
+                    attested_log_coverage: None,
+                    buffered_logs: BTreeMap::new(),
+                    pending_headers: BTreeMap::new(),
+                    highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
                 tokio::pin!(attach);
@@ -2101,7 +2791,13 @@ mod tests {
                     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
+                    stats: Arc::new(AmmSubscriberDriverCounters::default()),
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                    canonical_log_source: CanonicalLogSource::default(),
+                    attested_log_coverage: None,
+                    buffered_logs: BTreeMap::new(),
+                    pending_headers: BTreeMap::new(),
+                    highest_observed_block: None,
                 };
 
                 let attach = runtime.attach_subscriber_control(control);
@@ -2183,7 +2879,13 @@ mod tests {
                     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
+                    stats: Arc::new(AmmSubscriberDriverCounters::default()),
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                    canonical_log_source: CanonicalLogSource::default(),
+                    attested_log_coverage: None,
+                    buffered_logs: BTreeMap::new(),
+                    pending_headers: BTreeMap::new(),
+                    highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
                 tokio::pin!(attach);
@@ -2267,7 +2969,13 @@ mod tests {
                     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
                     report_stop: true,
                     stop_requested: false,
+                    stats: Arc::new(AmmSubscriberDriverCounters::default()),
                     canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                    canonical_log_source: CanonicalLogSource::default(),
+                    attested_log_coverage: None,
+                    buffered_logs: BTreeMap::new(),
+                    pending_headers: BTreeMap::new(),
+                    highest_observed_block: None,
                 };
 
                 driver.deliver_through(old_501).await?;
@@ -2350,5 +3058,754 @@ mod tests {
         assert_eq!(reconciled.len(), 1);
         assert!(reconciled[0].address.is_empty());
         assert!(reconciled[0].topics[0].is_empty());
+    }
+
+    /// Phase 0 exit criterion, measured from inside the process: the WebSocket
+    /// delivers canonical logs, the driver discards every one of them, and then
+    /// re-fetches the same block's logs with a hash-pinned `eth_getLogs`.
+    ///
+    /// Both halves are asserted against the same two logs, so this pins the
+    /// duplication itself rather than either side of it in isolation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_delivery_discards_stream_logs_then_refetches_them() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+                let stream_logs = vec![
+                    reconciled_log(pool, topic, &delivered, 0),
+                    reconciled_log(pool, topic, &delivered, 1),
+                ];
+
+                let asserter = Asserter::new();
+                // Stream install, chain identity, then the live log poll.
+                asserter.push_success(&U256::from(1));
+                asserter.push_success(&U256::from(1));
+                asserter.push_success(&stream_logs);
+                // The reconciliation fetch for the very same logs.
+                asserter.push_success(&stream_logs);
+
+                let mut cache = setup_cache().await;
+                cache.advance_block(&baseline_header)?;
+                let runtime = AmmRuntime::spawn(
+                    cache,
+                    AdapterRegistry::new(),
+                    AmmRuntimeBaseline::from_verified_header(1, baseline_header.clone())?,
+                    AmmRuntimeConfig::default(),
+                )?;
+                let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+                let mut subscriber = AlloySubscriber::new(
+                    provider,
+                    SubscriberMode::Polling,
+                    SubscriberConfig::default(),
+                );
+                subscriber
+                    .register_interests(&[ReactiveInterest::Logs(LogInterest {
+                        provider_filter: Filter::new().address(pool).event_signature(topic),
+                        local_matcher: None,
+                        route_key: None,
+                    })])
+                    .await?;
+
+                let (command_tx, command_rx) = mpsc::channel(4);
+                let (state, _) = watch::channel(AmmSubscriberDriverState::Paused);
+                let control = AmmSubscriberControl {
+                    commands: command_tx,
+                };
+                let stats = Arc::new(AmmSubscriberDriverCounters::default());
+                let mut driver = AlloyAmmSubscriberDriver {
+                    runtime: runtime.clone(),
+                    subscriber,
+                    initial_interests: Vec::new(),
+                    commands: command_rx,
+                    state,
+                    paused: true,
+                    interest_revision: 0,
+                    owners: HashMap::new(),
+                    pending: None,
+                    next_transaction: 0,
+                    max_addresses_per_get_logs: 256,
+                    preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
+                    report_stop: true,
+                    stop_requested: false,
+                    stats: Arc::clone(&stats),
+                    canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+                    canonical_log_source: CanonicalLogSource::default(),
+                    attested_log_coverage: None,
+                    buffered_logs: BTreeMap::new(),
+                    pending_headers: BTreeMap::new(),
+                    highest_observed_block: None,
+                };
+                let attach = runtime.attach_subscriber_control(control);
+                tokio::pin!(attach);
+                tokio::select! {
+                    result = &mut attach => result?,
+                    command = driver.commands.recv() => {
+                        driver.handle_control(command.expect("adoption command")).await?;
+                        attach.await?;
+                    }
+                }
+
+                // Half one: the live stream hands the driver both logs for free.
+                let batch = driver
+                    .subscriber
+                    .next_scoped_batch()
+                    .await?
+                    .expect("polling source must deliver its canonical logs");
+                // This documents the `Reconcile` opt-out, which was the default
+                // before subscription-sourced assembly landed.
+                driver.canonical_log_source = CanonicalLogSource::Reconcile;
+                assert_eq!(batch.records().len(), 2);
+                driver.handle_batch(batch).await?;
+
+                let after_stream = stats.snapshot();
+                assert_eq!(
+                    after_stream.subscription_logs_discarded(),
+                    2,
+                    "both delivered logs must be counted as discarded"
+                );
+                assert_eq!(after_stream.canonical_headers_ingested(), 0);
+                assert_eq!(
+                    after_stream.reconciliation_requests(),
+                    0,
+                    "a log-only batch must not trigger reconciliation on its own"
+                );
+
+                // Half two: the same logs are bought again, once, per block.
+                let _commits = runtime.subscribe_changes().await?;
+                driver.reconcile_and_deliver(delivered).await?;
+
+                let after_reconcile = stats.snapshot();
+                assert_eq!(
+                    after_reconcile.reconciliation_requests(),
+                    1,
+                    "one hash-pinned eth_getLogs per delivered block per filter chunk"
+                );
+                assert_eq!(
+                    after_reconcile.reconciliation_logs_fetched(),
+                    after_reconcile.subscription_logs_discarded(),
+                    "reconciliation re-fetches exactly the logs the stream already delivered"
+                );
+                assert_eq!(after_reconcile.canonical_blocks_delivered(), 1);
+                assert_eq!(
+                    after_reconcile.lineage_parent_requests(),
+                    0,
+                    "a straight-line successor needs no parent walk"
+                );
+                assert!(
+                    asserter.read_q().is_empty(),
+                    "the mocked transport must have served every queued response"
+                );
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A header observation must not be accepted as proof that an earlier
+    /// block's log set closed.
+    ///
+    /// `newHeads` and `logs` are independent subscriptions. A header for 502
+    /// says nothing about whether 501's logs have been delivered. Before the
+    /// fix this sealed 501 carrying an empty log set and silently dropped the
+    /// logs that arrived afterwards -- the exact silent loss this work exists
+    /// to remove, reintroduced one layer up.
+    ///
+    /// The block here has a bloom that DOES admit the interest, so neither
+    /// proof holds and the only correct outcome is to keep waiting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_alone_never_seals_a_block_whose_logs_have_not_arrived() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                // The bloom admits the pool, so absence cannot be proven.
+                let delivered = header_admitting(501, baseline_header.hash, pool);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, _stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                let _commits = runtime.subscribe_changes().await?;
+
+                // Coverage is attested (fork-cache derives it from the header
+                // stream), and a later HEADER has arrived. Neither is proof
+                // that 501's logs were delivered.
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                driver
+                    .pending_headers
+                    .insert(block.number, (delivered.clone(), Instant::now()));
+
+                assert!(
+                    driver
+                        .subscription_seal_reason(block.number, &delivered)
+                        .is_none(),
+                    "an attested block whose logs have not arrived must not be sealable"
+                );
+
+                // A log for a LATER block is the sound proof, and only it flips
+                // the decision.
+                let successor = header(502, delivered.hash);
+                driver.buffer_subscription_log(reconciled_log(pool, topic, &successor, 0))?;
+                assert_eq!(
+                    driver.subscription_seal_reason(block.number, &delivered),
+                    Some(SealReason::Successor),
+                    "a log observed on the log stream above 501 closes 501's set"
+                );
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The quiet-block path: a bloom that excludes every registered interest is
+    /// a positive proof that no matching log exists, so the block seals with no
+    /// provider request and without waiting for the straggler window. This is
+    /// what keeps an idle pool off the provider now that a timer no longer
+    /// authorises publishing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bloom_excluding_every_interest_seals_immediately() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                // Default bloom is empty, so it excludes the registered pool.
+                let delivered = header(501, baseline_header.hash);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                let _commits = runtime.subscribe_changes().await?;
+
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                driver
+                    .pending_headers
+                    .insert(block.number, (delivered.clone(), Instant::now()));
+                assert_eq!(
+                    driver.subscription_seal_reason(block.number, &delivered),
+                    Some(SealReason::BloomAbsent),
+                    "an empty bloom proves there is no matching log to wait for"
+                );
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+                let sealed = stats.snapshot();
+                assert_eq!(sealed.blocks_sealed_from_subscription(), 1);
+                assert_eq!(sealed.blocks_sealed_by_bloom_absence(), 1);
+                assert_eq!(sealed.reconciliation_requests(), 0);
+                assert!(
+                    asserter.read_q().is_empty(),
+                    "the quiet path must touch no provider"
+                );
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The headline property of Phase 3: a block whose logs the subscription
+    /// already delivered, and whose completeness the subscriber attested, is
+    /// submitted without touching the provider. The mocked transport is left
+    /// with its queue untouched, which is the assertion — not an absence of
+    /// mocks, but proof that none were consumed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attested_block_is_sealed_from_the_subscription_with_zero_requests() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                let _commits = runtime.subscribe_changes().await?;
+
+                // The subscription delivers the block's logs and the subscriber
+                // attests that nothing was lost at or below it.
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                driver.buffer_subscription_log(reconciled_log(pool, topic, &delivered, 0))?;
+                driver.buffer_subscription_log(reconciled_log(pool, topic, &delivered, 1))?;
+                driver
+                    .pending_headers
+                    .insert(block.number, (delivered, Instant::now()));
+                // A strictly later observation proves 501's log set is closed.
+                driver.note_observed_block(502);
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+
+                let stats = stats.snapshot();
+                assert_eq!(stats.blocks_sealed_from_subscription(), 1);
+                assert_eq!(stats.blocks_sealed_by_successor(), 1);
+                assert_eq!(stats.blocks_sealed_by_bloom_absence(), 0);
+                assert_eq!(stats.subscription_logs_applied(), 2);
+                assert_eq!(
+                    stats.blocks_reconciled(),
+                    0,
+                    "an attested block must not be re-fetched"
+                );
+                assert_eq!(stats.canonical_blocks_delivered(), 1);
+                assert!(
+                    asserter.read_q().is_empty(),
+                    "sealing from the subscription must issue no provider request"
+                );
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Without an attestation covering it, the delivered set is unproven, so the
+    /// block still takes the hash-pinned path. This is what keeps correctness
+    /// independent of whether the stream happened to be whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unattested_block_falls_back_to_reconciliation() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                // The reconciliation fetch the fallback is expected to issue.
+                asserter.push_success(&vec![reconciled_log(pool, topic, &delivered, 0)]);
+                let _commits = runtime.subscribe_changes().await?;
+
+                // Logs arrive, but no attestation does.
+                driver.buffer_subscription_log(reconciled_log(pool, topic, &delivered, 0))?;
+                driver
+                    .pending_headers
+                    .insert(501, (delivered, Instant::now() - Duration::from_secs(1)));
+                driver.note_observed_block(502);
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+                let stats = stats.snapshot();
+                assert_eq!(
+                    stats.blocks_sealed_from_subscription(),
+                    0,
+                    "an unattested block must never be sealed from the stream"
+                );
+                assert_eq!(stats.blocks_reconciled(), 1);
+                assert_eq!(stats.reconciliation_requests(), 1);
+                assert!(asserter.read_q().is_empty());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A quiet tail still makes progress with no successor observed -- but on
+    /// the strength of the block's own empty bloom, not a timer. Renamed from
+    /// `grace_window_seals_...` when the timer stopped authorising publication;
+    /// the body always exercised the empty-bloom path, because the test header
+    /// carries no accrued bloom.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quiet_tail_seals_on_its_empty_bloom_not_on_a_timer() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                let _commits = runtime.subscribe_changes().await?;
+
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                // No later block observed; the window has already elapsed.
+                driver
+                    .pending_headers
+                    .insert(501, (delivered, Instant::now() - Duration::from_secs(1)));
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+
+                let stats = stats.snapshot();
+                assert_eq!(stats.blocks_sealed_by_bloom_absence(), 1);
+                assert_eq!(stats.blocks_sealed_by_successor(), 0);
+                assert_eq!(stats.blocks_reconciled(), 0);
+                assert!(asserter.read_q().is_empty());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The second exclusion path: the bloom admits the interest's ADDRESS by
+    /// false positive but carries none of its topics, so no matching log can
+    /// exist and the block still seals without a request. This is the half of
+    /// the test that recovers the busy-chain blocks an address-only check
+    /// leaves unprovable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bloom_admitting_only_the_address_still_excludes_on_topics() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                // Address present, registered topic absent.
+                let delivered = header_admitting(501, baseline_header.hash, pool);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                // The interest declares a topic, which is what makes the second
+                // exclusion path reachable at all.
+                let (mut driver, runtime, stats) = subscription_driver_with_filter(
+                    asserter.clone(),
+                    baseline_header.clone(),
+                    Filter::new()
+                        .address(pool)
+                        .event_signature(keccak256(b"Swap()")),
+                )
+                .await?;
+                let _commits = runtime.subscribe_changes().await?;
+
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                driver
+                    .pending_headers
+                    .insert(block.number, (delivered.clone(), Instant::now()));
+
+                assert_eq!(
+                    driver.subscription_seal_reason(block.number, &delivered),
+                    Some(SealReason::BloomAbsent),
+                    "an admitted address with no admitted topic still proves absence"
+                );
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+                let sealed = stats.snapshot();
+                assert_eq!(sealed.blocks_sealed_by_bloom_absence(), 1);
+                assert_eq!(sealed.reconciliation_requests(), 0);
+                assert!(asserter.read_q().is_empty(), "no provider request");
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The behaviour change that makes sealing sound: when the bloom ADMITS an
+    /// interest and the log stream has not moved past the block, an expired
+    /// straggler window must reconcile rather than publish whatever happens to
+    /// be buffered. Before the fix this published a partial set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_window_reconciles_rather_than_publishing_a_partial_buffer() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                // The bloom admits the pool, so absence cannot be proven and
+                // the only sound proof would be a later log.
+                let delivered = header_admitting(501, baseline_header.hash, pool);
+                let block = BlockRef {
+                    number: delivered.inner.number,
+                    hash: delivered.hash,
+                    parent_hash: Some(delivered.inner.parent_hash),
+                    timestamp: Some(delivered.inner.timestamp),
+                };
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                let _commits = runtime.subscribe_changes().await?;
+                // One reconciliation response for the fetch we expect it to make.
+                asserter.push_success(&Vec::<RpcLog>::new());
+
+                driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+                // Only a partial set has arrived -- log index 0 of two.
+                driver.buffer_subscription_log(reconciled_log(pool, topic, &delivered, 0))?;
+                driver.pending_headers.insert(
+                    block.number,
+                    (delivered, Instant::now() - Duration::from_secs(3600)),
+                );
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+
+                let sealed = stats.snapshot();
+                assert_eq!(
+                    sealed.blocks_sealed_from_subscription(),
+                    0,
+                    "an expired window must not publish the partial buffer"
+                );
+                assert_eq!(
+                    sealed.blocks_reconciled(),
+                    1,
+                    "it must fall back to a hash-pinned reconciliation instead"
+                );
+                assert!(
+                    sealed.reconciliation_requests() >= 1,
+                    "and that reconciliation must actually reach the provider"
+                );
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A block that is neither attested nor past its window waits, rather than
+    /// being reconciled prematurely — otherwise the fetch would never actually
+    /// be avoided when the header simply arrives before its logs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_still_inside_its_window_waits_instead_of_reconciling() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+
+                driver
+                    .pending_headers
+                    .insert(501, (delivered, Instant::now()));
+
+                driver
+                    .drain_sealable(Instant::now(), Duration::ZERO)
+                    .await?;
+
+                let stats = stats.snapshot();
+                assert_eq!(stats.blocks_reconciled(), 0);
+                assert_eq!(stats.blocks_sealed_from_subscription(), 0);
+                assert!(
+                    driver.pending_headers.contains_key(&501),
+                    "the block must remain pending until its log set is provably closed"
+                );
+                assert!(driver.next_seal_deadline().is_some());
+                assert!(asserter.read_q().is_empty());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// `Reconcile` is the documented opt-out and must behave exactly as before:
+    /// logs are discarded and every block is re-fetched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_mode_still_discards_and_refetches() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let pool = Address::repeat_byte(0x77);
+                let topic = keccak256(b"Swap()");
+                let baseline_header = header(500, B256::repeat_byte(0x49));
+                let delivered = header(501, baseline_header.hash);
+
+                let asserter = Asserter::new();
+                let (mut driver, runtime, stats) =
+                    subscription_driver(asserter.clone(), baseline_header.clone()).await?;
+                driver.canonical_log_source = CanonicalLogSource::Reconcile;
+                asserter.push_success(&vec![reconciled_log(pool, topic, &delivered, 0)]);
+                let _commits = runtime.subscribe_changes().await?;
+
+                assert!(!driver.buffers_subscription_logs());
+                assert!(driver.next_seal_deadline().is_none());
+
+                driver
+                    .deliver_through_with_timing(delivered, Instant::now(), Duration::ZERO)
+                    .await?;
+
+                let stats = stats.snapshot();
+                assert_eq!(stats.reconciliation_requests(), 1);
+                assert_eq!(stats.blocks_sealed_from_subscription(), 0);
+                assert!(asserter.read_q().is_empty());
+
+                runtime.shutdown().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Driver wired for subscription-sourced assembly, attached to a live
+    /// runtime, with its counters exposed for assertions.
+    #[allow(clippy::type_complexity)]
+    /// Harness with an explicit provider filter, so a test can exercise the
+    /// topic-exclusion path that an address-only filter cannot reach.
+    async fn subscription_driver_with_filter(
+        asserter: Asserter,
+        baseline_header: RpcHeader,
+        provider_filter: Filter,
+    ) -> Result<(
+        AlloyAmmSubscriberDriver<impl alloy_provider::Provider<Ethereum> + Clone + 'static>,
+        AmmRuntimeHandle,
+        Arc<AmmSubscriberDriverCounters>,
+    )> {
+        subscription_driver_inner(asserter, baseline_header, provider_filter).await
+    }
+
+    async fn subscription_driver(
+        asserter: Asserter,
+        baseline_header: RpcHeader,
+    ) -> Result<(
+        AlloyAmmSubscriberDriver<impl alloy_provider::Provider<Ethereum> + Clone + 'static>,
+        AmmRuntimeHandle,
+        Arc<AmmSubscriberDriverCounters>,
+    )> {
+        subscription_driver_inner(
+            asserter,
+            baseline_header,
+            Filter::new().address(Address::repeat_byte(0x77)),
+        )
+        .await
+    }
+
+    async fn subscription_driver_inner(
+        asserter: Asserter,
+        baseline_header: RpcHeader,
+        provider_filter: Filter,
+    ) -> Result<(
+        AlloyAmmSubscriberDriver<impl alloy_provider::Provider<Ethereum> + Clone + 'static>,
+        AmmRuntimeHandle,
+        Arc<AmmSubscriberDriverCounters>,
+    )> {
+        // Registering an interest resolves chain identity; streams install
+        // lazily on first poll, which these tests never reach. Seed it before
+        // anything a test queues, because the asserter is FIFO.
+        asserter.push_success(&U256::from(1));
+        let mut cache = setup_cache().await;
+        cache.advance_block(&baseline_header)?;
+        let runtime = AmmRuntime::spawn(
+            cache,
+            AdapterRegistry::new(),
+            AmmRuntimeBaseline::from_verified_header(1, baseline_header.clone())?,
+            AmmRuntimeConfig::default(),
+        )?;
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig::default(),
+        );
+        // Reconciliation derives its filters from registered interests; without
+        // one it would issue no request and the fallback would look free.
+        subscriber
+            .register_interests(&[ReactiveInterest::Logs(LogInterest {
+                provider_filter,
+                local_matcher: None,
+                route_key: None,
+            })])
+            .await?;
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (state, _) = watch::channel(AmmSubscriberDriverState::Paused);
+        let control = AmmSubscriberControl {
+            commands: command_tx,
+        };
+        let stats = Arc::new(AmmSubscriberDriverCounters::default());
+        let mut driver = AlloyAmmSubscriberDriver {
+            runtime: runtime.clone(),
+            subscriber,
+            initial_interests: Vec::new(),
+            commands: command_rx,
+            state,
+            paused: true,
+            interest_revision: 0,
+            owners: HashMap::new(),
+            pending: None,
+            next_transaction: 0,
+            max_addresses_per_get_logs: 256,
+            preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
+            report_stop: true,
+            stop_requested: false,
+            stats: Arc::clone(&stats),
+            canonical_lineage: initial_canonical_lineage(runtime.latest_snapshot().point()),
+            canonical_log_source: CanonicalLogSource::default(),
+            attested_log_coverage: None,
+            buffered_logs: BTreeMap::new(),
+            pending_headers: BTreeMap::new(),
+            highest_observed_block: None,
+        };
+        {
+            let attach = runtime.attach_subscriber_control(control);
+            tokio::pin!(attach);
+            tokio::select! {
+                result = &mut attach => result?,
+                command = driver.commands.recv() => {
+                    driver.handle_control(command.expect("adoption command")).await?;
+                    attach.await?;
+                }
+            }
+        }
+        Ok((driver, runtime, stats))
+    }
+
+    /// A header whose `logsBloom` admits `address`, built before the hash is
+    /// computed so the advertised hash stays consistent with the contents.
+    fn header_admitting(number: u64, parent_hash: B256, address: Address) -> RpcHeader {
+        let mut inner = ConsensusHeader {
+            parent_hash,
+            number,
+            timestamp: 1_700_000_000 + number,
+            base_fee_per_gas: Some(100 + number),
+            beneficiary: Address::repeat_byte(0xcb),
+            gas_limit: 30_000_000,
+            mix_hash: B256::repeat_byte(0xab),
+            ..ConsensusHeader::default()
+        };
+        inner
+            .logs_bloom
+            .accrue(alloy_primitives::BloomInput::Raw(address.as_slice()));
+        RpcHeader::new(inner)
+    }
+
+    fn reconciled_log(address: Address, topic: B256, block: &RpcHeader, log_index: u64) -> RpcLog {
+        RpcLog {
+            inner: PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new()),
+            block_hash: Some(block.hash),
+            block_number: Some(block.inner.number),
+            block_timestamp: Some(block.inner.timestamp),
+            transaction_hash: Some(B256::repeat_byte(0x30 + log_index as u8)),
+            transaction_index: Some(log_index),
+            log_index: Some(log_index),
+            removed: false,
+        }
     }
 }

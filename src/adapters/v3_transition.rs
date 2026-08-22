@@ -14,7 +14,7 @@ use alloy_primitives::{Address, U256, address, aliases::U512, b256};
 
 use super::storage::{
     V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use super::{
     AdapterEventContext, AdapterEventError, SlipstreamRuntimeFamily, SlipstreamSwapFeeEvidence,
@@ -617,6 +617,674 @@ pub(super) fn derive_uniswap_v3_swap(
     }
     updates.extend(tick_updates);
     Ok(updates)
+}
+
+/// One canonical `Tick.Info` boundary update: the four storage keys it
+/// occupies, the words to write, and how its initialization state changed.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalTickUpdate {
+    keys: [U256; 4],
+    words: [U256; 4],
+    was_initialized: bool,
+    is_initialized: bool,
+}
+
+/// Replay canonical `Tick.update` — and `Tick.clear` when the tick empties —
+/// for one boundary tick of a `Mint`/`Burn`.
+///
+/// The event carries only the liquidity delta, so the accumulator writes come
+/// from the exact parent instead: on first initialization Uniswap assumes all
+/// growth so far happened *below* the tick, which writes the two global fee
+/// accumulators and the current oracle reading into the outside words — but
+/// only for a tick at or below the current one. A tick above the current one is
+/// initialized with nothing but its flag. Getting that asymmetry wrong is
+/// invisible to a quote and corrupts every later `getFeeGrowthInside`.
+#[allow(clippy::too_many_arguments)]
+fn update_canonical_liquidity_tick(
+    address: Address,
+    layout: V3StorageLayout,
+    tick: i32,
+    current_tick: i32,
+    amount: i128,
+    is_mint: bool,
+    upper: bool,
+    bitmap_indicates_initialized: bool,
+    max_liquidity_per_tick: U256,
+    fee_growth_0: U256,
+    fee_growth_1: U256,
+    oracle_now: Observation,
+    timestamp: u32,
+    state: &dyn StateView,
+) -> Result<CanonicalTickUpdate, AdapterEventError> {
+    let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+    let mut words = [U256::ZERO; 4];
+    // A tick is initialized exactly when its bitmap bit is set: `flipTick` is
+    // called precisely on a flip, and `Tick.clear` zeroes the whole struct. So a
+    // clear bit *proves* all four words are zero and they need not be read at
+    // all -- which is what lets a mint opening a brand-new position stay fully
+    // offline, since cold start warms bitmap words but not empty ticks.
+    if bitmap_indicates_initialized {
+        for (word, key) in words.iter_mut().zip(keys) {
+            *word = required(state, address, key)?;
+        }
+    } else if state
+        .storage(address, keys[0])
+        .is_some_and(|word| !(word & WORD_128_MASK).is_zero())
+    {
+        // Skipping the read means a clear bit over a live tick would otherwise
+        // pass silently. It costs nothing to catch when the parent happens to
+        // hold the word regardless.
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::InitializedTick {
+                tick,
+                reason: "bitmap bit is clear for a tick holding liquidity",
+            },
+        ));
+    }
+    let old_gross = words[0] & WORD_128_MASK;
+    let old_net = ((words[0] >> 128_usize) & WORD_128_MASK).to::<u128>() as i128;
+    let was_initialized = !old_gross.is_zero();
+    let initialized_flag = ((words[3] >> 248_usize) & U256::from(u8::MAX)).to::<u8>() == 1;
+    if was_initialized != initialized_flag {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::InitializedTick {
+                tick,
+                reason: "Tick.Info initialized flag disagrees with liquidityGross",
+            },
+        ));
+    }
+    // `Tick.clear` zeroes the whole struct, so a tick that is uninitialized in
+    // the parent cannot carry residue. Nonzero residue means the parent was
+    // assembled from something other than canonical history.
+    if !was_initialized && words.iter().any(|word| !word.is_zero()) {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::InitializedTick {
+                tick,
+                reason: "uninitialized Tick.Info contains nonzero state",
+            },
+        ));
+    }
+    let amount_u256 = U256::from(amount as u128);
+    let new_gross = if is_mint {
+        old_gross
+            .checked_add(amount_u256)
+            .ok_or_else(|| arithmetic("tick liquidityGross overflow"))?
+    } else {
+        old_gross
+            .checked_sub(amount_u256)
+            .ok_or_else(|| arithmetic("tick liquidityGross underflow"))?
+    };
+    if new_gross > max_liquidity_per_tick {
+        return Err(arithmetic(
+            "tick liquidityGross exceeds maxLiquidityPerTick",
+        ));
+    }
+    let delta = if is_mint { amount } else { -amount };
+    let net_delta = if upper { -delta } else { delta };
+    let new_net = old_net
+        .checked_add(net_delta)
+        .ok_or_else(|| arithmetic("tick liquidityNet overflow"))?;
+    let is_initialized = !new_gross.is_zero();
+
+    if !was_initialized && is_initialized {
+        if tick <= current_tick {
+            words[1] = fee_growth_0;
+            words[2] = fee_growth_1;
+            words[3] = unsigned_bits(oracle_now.tick_cumulative, 56)
+                | ((oracle_now.seconds_per_liquidity_cumulative_x128 & WORD_160_MASK) << 56_usize)
+                | (U256::from(timestamp) << 216_usize)
+                | (U256::from(1) << 248_usize);
+        } else {
+            words[3] = U256::from(1) << 248_usize;
+        }
+    }
+    words[0] = new_gross | (U256::from(new_net as u128) << 128_usize);
+    if !is_initialized {
+        words = [U256::ZERO; 4];
+    }
+    Ok(CanonicalTickUpdate {
+        keys,
+        words,
+        was_initialized,
+        is_initialized,
+    })
+}
+
+/// Derive the complete canonical Uniswap V3 `Mint`/`Burn` transition.
+///
+/// This reproduces `_modifyPosition` over the pool's pricing surface: both
+/// boundary ticks through `Tick.update`/`Tick.clear`, the bitmap words they
+/// flip, the oracle entry an in-range change writes, and active liquidity.
+///
+/// Position ownership and tokens-owed accounting sit outside the adapter's
+/// declared search surface — `swap` never reads `positions` — so they are not
+/// reconstructed here. The caller invalidates those slots rather than leaving a
+/// warm one stale. Missing parent cells fail closed; an absent cache value is
+/// never read as an EVM zero.
+pub(super) struct CanonicalLiquidityTransition {
+    /// Writes derived exactly from the parent. Always safe to apply.
+    pub updates: Vec<StateUpdate>,
+    /// Boundary cells the parent could not supply, so their post-event values
+    /// are unknown. Empty means the transition is exact. Otherwise these — and
+    /// only these — must be dropped and re-read authoritatively; the rest of the
+    /// pool stays exact and quotable.
+    pub cold_slots: Vec<U256>,
+}
+
+pub(super) fn derive_uniswap_v3_liquidity(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedLiquidity,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<CanonicalLiquidityTransition, AdapterEventError> {
+    let surface = UNISWAP_V3_SURFACE;
+    validate_context(context)?;
+    if layout != V3StorageLayout::uniswap(layout.tick_spacing) {
+        return Err(contradiction(
+            "exact Uniswap V3 transition requires the canonical storage layout",
+        ));
+    }
+    if layout.tick_spacing <= 0 {
+        return Err(contradiction("Uniswap V3 tick spacing must be positive"));
+    }
+    // `checkTicks` bounds the range; `tickBitmap.flipTick` rejects a tick that
+    // is not spacing-aligned, and a tick can only become initialized through a
+    // flip, so every real boundary tick is aligned.
+    if event.tick_lower < -887_272
+        || event.tick_upper > 887_272
+        || event.tick_lower >= event.tick_upper
+        || event.tick_lower.rem_euclid(layout.tick_spacing) != 0
+        || event.tick_upper.rem_euclid(layout.tick_spacing) != 0
+    {
+        return Err(contradiction(
+            "Uniswap V3 liquidity range is invalid or not spacing-aligned",
+        ));
+    }
+    if event.amount == 0 {
+        if event.is_mint {
+            return Err(contradiction("Uniswap V3 Mint liquidity must be positive"));
+        }
+        // A zero-amount Burn is a position fee poke: `_modifyPosition` guards
+        // every tick, bitmap, oracle, and liquidity write on a nonzero delta,
+        // so only position accounting moves.
+        return Ok(CanonicalLiquidityTransition {
+            updates: Vec::new(),
+            cold_slots: Vec::new(),
+        });
+    }
+    let signed_amount =
+        i128::try_from(event.amount).map_err(|_| arithmetic("liquidity amount exceeds int128"))?;
+
+    let slot0_raw = required(state, address, layout.slot0_slot)?;
+    let slot0 = Slot0::decode(slot0_raw);
+    if ((slot0.raw >> 240_usize) & U256::from(u8::MAX)).to::<u8>() != 1 {
+        return Err(contradiction("parent slot0 is locked"));
+    }
+    validate_parent_slot0(slot0)?;
+    let active_liquidity = required(state, address, layout.liquidity_slot)?;
+    if active_liquidity > WORD_128_MASK {
+        return Err(contradiction("parent V3 liquidity exceeds uint128"));
+    }
+    // Canonical Uniswap holds `maxLiquidityPerTick` as a constructor immutable
+    // in the runtime, not in storage, so it is derived from tick spacing by the
+    // same formula the deployed bytecode was built with.
+    let max_liquidity_per_tick = super::uniswap_v3_max_liquidity_per_tick(layout.tick_spacing)
+        .ok_or_else(|| contradiction("no canonical maxLiquidityPerTick for this tick spacing"))?;
+
+    // `_updatePosition` reads the oracle for *any* nonzero delta, in range or
+    // not, because a newly initialized tick at or below the current one seeds
+    // its outside accumulators from it. The resulting ring write is applied
+    // only in range.
+    let (observation_index, observation_cardinality, oracle_write, oracle_now) =
+        advance_oracle(address, surface, slot0, active_liquidity, state, context)?;
+    let fee_growth_0 = required(state, address, surface.fee_growth_0_slot)?;
+    let fee_growth_1 = required(state, address, surface.fee_growth_1_slot)?;
+    let timestamp = context.block_timestamp.expect("validated") as u32;
+
+    // The bitmap is loaded first because it decides whether each boundary tick
+    // has to be read at all. Both ticks can share a word, and `flipTick` XORs,
+    // so flips are merged per word rather than written twice.
+    //
+    // Every cell read above is mandatory cold-start state and is warm on any
+    // usable pool. A boundary tick, by contrast, can sit outside the warmed
+    // bitmap radius — an LP is free to open a position anywhere. That case is
+    // resolved per boundary rather than failing the whole event, so a distant
+    // mint costs a handful of slots instead of the pool's entire storage.
+    let mut bitmap_values = std::collections::BTreeMap::<U256, Option<U256>>::new();
+    let mut boundary_positions = Vec::with_capacity(2);
+    for (tick, upper) in [(event.tick_lower, false), (event.tick_upper, true)] {
+        let word = v3_word_position(tick, layout.tick_spacing);
+        let slot = v3_tick_bitmap_storage_key_with_base(word, layout.tick_bitmap_base_slot);
+        let value = *bitmap_values
+            .entry(slot)
+            .or_insert_with(|| state.storage(address, slot));
+        let mask = U256::from(1) << (tick.div_euclid(layout.tick_spacing).rem_euclid(256) as usize);
+        boundary_positions.push((tick, upper, slot, mask, value));
+    }
+
+    let mut boundaries = Vec::with_capacity(2);
+    for (tick, upper, _, mask, bitmap) in &boundary_positions {
+        let Some(bitmap) = bitmap else {
+            boundaries.push(None);
+            continue;
+        };
+        let was_initialized = !(*bitmap & *mask).is_zero();
+        match update_canonical_liquidity_tick(
+            address,
+            layout,
+            *tick,
+            slot0.tick,
+            signed_amount,
+            event.is_mint,
+            *upper,
+            was_initialized,
+            max_liquidity_per_tick,
+            fee_growth_0,
+            fee_growth_1,
+            oracle_now,
+            timestamp,
+            state,
+        ) {
+            Ok(update) => boundaries.push(Some(update)),
+            // An absent tick word is unknown state, not bad state. Anything
+            // else means the parent contradicts canonical history and must
+            // fail closed for the whole pool.
+            Err(AdapterEventError::MissingState { .. }) => boundaries.push(None),
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut cold_slots = Vec::new();
+    let mut updates = Vec::with_capacity(16);
+    for (boundary, (tick, _, bitmap_slot, _, _)) in boundaries.iter().zip(&boundary_positions) {
+        match boundary {
+            Some(update) => updates.extend(
+                update
+                    .keys
+                    .into_iter()
+                    .zip(update.words)
+                    .map(|(slot, value)| StateUpdate::slot(address, slot, value)),
+            ),
+            None => {
+                cold_slots.extend(v3_tick_info_storage_keys_with_base(
+                    *tick,
+                    layout.ticks_base_slot,
+                ));
+                // Whether an unresolved boundary flips its bit is unknown, so
+                // the word it lives in is unknown too.
+                cold_slots.push(*bitmap_slot);
+            }
+        }
+    }
+
+    let mut changed_bitmaps = std::collections::BTreeSet::<U256>::new();
+    for (boundary, (tick, _, slot, mask, _)) in boundaries.iter().zip(&boundary_positions) {
+        let Some(update) = boundary else {
+            continue;
+        };
+        let bitmap = bitmap_values
+            .get_mut(slot)
+            .expect("seeded above")
+            .as_mut()
+            .expect("a resolved boundary read its bitmap word");
+        // Compared against the tick's own `liquidityGross`, not against the bit
+        // the read was gated on. A set bit over an empty tick means the parent
+        // was assembled from something other than canonical history, and the
+        // empty-tick inference above would then be unsound.
+        let bitmap_is_set = !(*bitmap & *mask).is_zero();
+        if bitmap_is_set != update.was_initialized {
+            return Err(AdapterEventError::V3Transition(
+                V3TransitionError::InitializedTick {
+                    tick: *tick,
+                    reason: "bitmap disagrees with parent Tick.Info initialization",
+                },
+            ));
+        }
+        if update.was_initialized != update.is_initialized {
+            *bitmap ^= *mask;
+            changed_bitmaps.insert(*slot);
+        }
+    }
+    // A word shared with an unresolved boundary cannot be written: the other
+    // boundary's flip would be missing from the merged value.
+    let cold_bitmaps: std::collections::BTreeSet<U256> = cold_slots.iter().copied().collect();
+    updates.extend(
+        bitmap_values
+            .into_iter()
+            .filter(|(slot, _)| changed_bitmaps.contains(slot) && !cold_bitmaps.contains(slot))
+            .filter_map(|(slot, value)| value.map(|value| StateUpdate::slot(address, slot, value))),
+    );
+
+    if slot0.tick >= event.tick_lower && slot0.tick < event.tick_upper {
+        let next_liquidity = if event.is_mint {
+            active_liquidity
+                .checked_add(U256::from(event.amount))
+                .ok_or_else(|| arithmetic("active liquidity overflow"))?
+        } else {
+            active_liquidity
+                .checked_sub(U256::from(event.amount))
+                .ok_or_else(|| arithmetic("active liquidity underflow"))?
+        };
+        if next_liquidity > WORD_128_MASK {
+            return Err(arithmetic("active liquidity exceeds uint128"));
+        }
+        if let Some((slot, value)) = oracle_write {
+            updates.push(StateUpdate::slot(address, slot, value));
+            updates.push(StateUpdate::slot(
+                address,
+                layout.slot0_slot,
+                slot0.encode_final(
+                    slot0.sqrt_price_x96,
+                    slot0.tick,
+                    observation_index,
+                    observation_cardinality,
+                ),
+            ));
+        }
+        updates.push(StateUpdate::slot(
+            address,
+            layout.liquidity_slot,
+            next_liquidity,
+        ));
+    }
+    cold_slots.sort_unstable();
+    cold_slots.dedup();
+    Ok(CanonicalLiquidityTransition {
+        updates,
+        cold_slots,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedFlash {
+    pub amount0: U256,
+    pub amount1: U256,
+    pub paid0: U256,
+    pub paid1: U256,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedFeeProtocol {
+    pub old0: u8,
+    pub old1: u8,
+    pub new0: u8,
+    pub new1: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedCollectProtocol {
+    pub amount0: U256,
+    pub amount1: U256,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodedObservationGrowth {
+    pub old: u16,
+    pub new: u16,
+}
+
+/// Common preamble for the canonical accounting transitions: ordered context and
+/// a provably canonical storage layout.
+fn validate_canonical_accounting(
+    layout: V3StorageLayout,
+    context: &AdapterEventContext,
+) -> Result<(), AdapterEventError> {
+    validate_context(context)?;
+    if layout != V3StorageLayout::uniswap(layout.tick_spacing) {
+        return Err(contradiction(
+            "exact Uniswap V3 transition requires the canonical storage layout",
+        ));
+    }
+    if layout.tick_spacing <= 0 {
+        return Err(contradiction("Uniswap V3 tick spacing must be positive"));
+    }
+    Ok(())
+}
+
+/// Derive the complete canonical Uniswap V3 `Flash` transition.
+///
+/// A flash loan moves no price and no liquidity: it only credits the fee it was
+/// paid. The event carries the amounts actually paid, and the split between LP
+/// growth and protocol fees follows from `slot0.feeProtocol` and active
+/// liquidity, so nothing has to be read back from the chain.
+pub(super) fn derive_uniswap_v3_flash(
+    address: Address,
+    layout: V3StorageLayout,
+    fee: u32,
+    flash: DecodedFlash,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    let surface = UNISWAP_V3_SURFACE;
+    validate_canonical_accounting(layout, context)?;
+    if fee >= FEE_DENOMINATOR as u32 {
+        return Err(contradiction("invalid Uniswap V3 fee"));
+    }
+    let slot0 = Slot0::decode(required(state, address, layout.slot0_slot)?);
+    let liquidity = required(state, address, layout.liquidity_slot)?;
+    if liquidity.is_zero() {
+        return Err(contradiction("flash requires nonzero active liquidity"));
+    }
+    if liquidity > WORD_128_MASK {
+        return Err(contradiction("parent V3 liquidity exceeds uint128"));
+    }
+    let mut fee_growth_0 = required(state, address, surface.fee_growth_0_slot)?;
+    let mut fee_growth_1 = required(state, address, surface.fee_growth_1_slot)?;
+    let mut protocol_fees = required(state, address, surface.protocol_fees_slot)?;
+
+    // `flash` reverts unless it is repaid at least the quoted fee, so a payment
+    // below it cannot describe a canonical flash on this pool.
+    let denominator = U256::from(FEE_DENOMINATOR);
+    let quoted_fee_0 = mul_div_round_up(flash.amount0, U256::from(fee), denominator)?;
+    let quoted_fee_1 = mul_div_round_up(flash.amount1, U256::from(fee), denominator)?;
+    if flash.paid0 < quoted_fee_0 {
+        return Err(final_mismatch("flash paid0", flash.paid0, quoted_fee_0));
+    }
+    if flash.paid1 < quoted_fee_1 {
+        return Err(final_mismatch("flash paid1", flash.paid1, quoted_fee_1));
+    }
+
+    for (paid, protocol_share, is_token0) in [
+        (flash.paid0, slot0.fee_protocol % 16, true),
+        (flash.paid1, slot0.fee_protocol >> 4, false),
+    ] {
+        if paid.is_zero() {
+            continue;
+        }
+        let protocol_fee = if protocol_share == 0 {
+            U256::ZERO
+        } else {
+            paid / U256::from(protocol_share)
+        };
+        // Canonical Uniswap V3 is Solidity 0.7.6: the uint128 cast truncates and
+        // the accumulator addition wraps.
+        let truncated = protocol_fee & WORD_128_MASK;
+        if !truncated.is_zero() {
+            if is_token0 {
+                let token0 =
+                    (protocol_fees & WORD_128_MASK).wrapping_add(truncated) & WORD_128_MASK;
+                protocol_fees = (protocol_fees & (WORD_128_MASK << 128_usize)) | token0;
+            } else {
+                let token1 = ((protocol_fees >> 128_usize) & WORD_128_MASK).wrapping_add(truncated)
+                    & WORD_128_MASK;
+                protocol_fees = (protocol_fees & WORD_128_MASK) | (token1 << 128_usize);
+            }
+        }
+        let lp_share = paid
+            .checked_sub(protocol_fee)
+            .ok_or_else(|| arithmetic("flash protocol fee exceeds the amount paid"))?;
+        let growth = mul_div(lp_share, Q128, liquidity)?;
+        if is_token0 {
+            fee_growth_0 = fee_growth_0.wrapping_add(growth);
+        } else {
+            fee_growth_1 = fee_growth_1.wrapping_add(growth);
+        }
+    }
+
+    Ok(vec![
+        StateUpdate::slot(address, surface.fee_growth_0_slot, fee_growth_0),
+        StateUpdate::slot(address, surface.fee_growth_1_slot, fee_growth_1),
+        StateUpdate::slot(address, surface.protocol_fees_slot, protocol_fees),
+    ])
+}
+
+/// Derive the complete canonical Uniswap V3 `SetFeeProtocol` transition.
+///
+/// The event carries both the old and the new split, so the parent's own byte is
+/// a checkable postcondition rather than an assumption.
+pub(super) fn derive_uniswap_v3_set_fee_protocol(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedFeeProtocol,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    validate_canonical_accounting(layout, context)?;
+    // `setFeeProtocol` accepts only zero or a denominator in 4..=10, and packs
+    // the pair into one byte, so each half must also fit in a nibble.
+    for value in [event.new0, event.new1] {
+        if value != 0 && !(4..=10).contains(&value) {
+            return Err(contradiction(
+                "fee protocol denominator outside the canonical range",
+            ));
+        }
+    }
+    let slot0_raw = required(state, address, layout.slot0_slot)?;
+    let current = ((slot0_raw >> 232_usize) & U256::from(u8::MAX)).to::<u8>();
+    let expected = event.old0 | (event.old1 << 4);
+    if current != expected {
+        return Err(final_mismatch(
+            "slot0 feeProtocol",
+            U256::from(current),
+            U256::from(expected),
+        ));
+    }
+    let packed = event.new0 | (event.new1 << 4);
+    let mask = U256::from(u8::MAX) << 232_usize;
+    Ok(vec![StateUpdate::slot(
+        address,
+        layout.slot0_slot,
+        (slot0_raw & !mask) | (U256::from(packed) << 232_usize),
+    )])
+}
+
+/// Derive the complete canonical Uniswap V3 `CollectProtocol` transition.
+///
+/// The event reports the amounts actually transferred, including the deliberate
+/// one-wei remainder canonical Uniswap leaves behind to keep the slot warm, so
+/// the new accumulator is an exact subtraction.
+pub(super) fn derive_uniswap_v3_collect_protocol(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedCollectProtocol,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    let surface = UNISWAP_V3_SURFACE;
+    validate_canonical_accounting(layout, context)?;
+    if event.amount0 > WORD_128_MASK || event.amount1 > WORD_128_MASK {
+        return Err(AdapterEventError::MalformedLog(
+            "CollectProtocol amount exceeds its ABI width",
+        ));
+    }
+    let protocol_fees = required(state, address, surface.protocol_fees_slot)?;
+    let token0 = (protocol_fees & WORD_128_MASK)
+        .checked_sub(event.amount0)
+        .ok_or_else(|| arithmetic("collected protocol fee exceeds the accrued token0 balance"))?;
+    let token1 = ((protocol_fees >> 128_usize) & WORD_128_MASK)
+        .checked_sub(event.amount1)
+        .ok_or_else(|| arithmetic("collected protocol fee exceeds the accrued token1 balance"))?;
+    Ok(vec![StateUpdate::slot(
+        address,
+        surface.protocol_fees_slot,
+        token0 | (token1 << 128_usize),
+    )])
+}
+
+/// Derive the complete canonical Uniswap V3
+/// `IncreaseObservationCardinalityNext` transition.
+///
+/// `Oracle.grow` stamps `blockTimestamp = 1` across every newly reserved slot to
+/// pay their storage cost up front. Those slots need no read: `write` never
+/// reaches an index at or above `observationCardinalityNext`, and a previous
+/// `grow` stopped exactly at the parent's value, so the whole written range is
+/// provably untouched and the resulting word is exactly one.
+pub(super) fn derive_uniswap_v3_observation_growth(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedObservationGrowth,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    let surface = UNISWAP_V3_SURFACE;
+    validate_canonical_accounting(layout, context)?;
+    if event.new <= event.old {
+        return Err(contradiction(
+            "observation cardinality growth must increase the reservation",
+        ));
+    }
+    let slot0_raw = required(state, address, layout.slot0_slot)?;
+    let slot0 = Slot0::decode(slot0_raw);
+    if slot0.observation_cardinality == 0 {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::Observation("observation cardinality is zero"),
+        ));
+    }
+    if slot0.observation_cardinality_next != event.old {
+        return Err(final_mismatch(
+            "slot0 observationCardinalityNext",
+            U256::from(slot0.observation_cardinality_next),
+            U256::from(event.old),
+        ));
+    }
+    let mut updates = Vec::with_capacity(usize::from(event.new - event.old) + 1);
+    for index in event.old..event.new {
+        updates.push(StateUpdate::slot(
+            address,
+            surface.observations_base_slot + U256::from(index),
+            U256::from(1),
+        ));
+    }
+    let mask = U256::from(u16::MAX) << 216_usize;
+    updates.push(StateUpdate::slot(
+        address,
+        layout.slot0_slot,
+        (slot0_raw & !mask) | (U256::from(event.new) << 216_usize),
+    ));
+    Ok(updates)
+}
+
+/// Base slot of canonical Uniswap V3's `positions` mapping.
+const UNISWAP_V3_POSITIONS_SLOT: u8 = 7;
+
+/// The four storage words of `positions[keccak256(owner, tickLower, tickUpper)]`
+/// for a canonical Uniswap V3 pool.
+///
+/// The transition does not reconstruct these — `swap` never reads `positions`,
+/// so they sit outside the pool's pricing surface — but a `Mint`/`Burn` does
+/// change them, so a caller that may hold them warm invalidates them instead of
+/// letting a stale value survive.
+pub(super) fn uniswap_v3_position_slots(
+    owner: Address,
+    tick_lower: i32,
+    tick_upper: i32,
+) -> [U256; 4] {
+    let mut packed = Vec::with_capacity(26);
+    packed.extend_from_slice(owner.as_slice());
+    packed.extend_from_slice(&tick_lower.to_be_bytes()[1..]);
+    packed.extend_from_slice(&tick_upper.to_be_bytes()[1..]);
+    let key = alloy_primitives::keccak256(packed);
+    let mut encoded = [0_u8; 64];
+    encoded[..32].copy_from_slice(key.as_slice());
+    encoded[63] = UNISWAP_V3_POSITIONS_SLOT;
+    let base = U256::from_be_slice(alloy_primitives::keccak256(encoded).as_slice());
+    [
+        base,
+        base + U256::from(1),
+        base + U256::from(2),
+        base + U256::from(3),
+    ]
 }
 
 /// Derive the complete swap-induced update batch for one reviewed deployed

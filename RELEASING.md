@@ -1,15 +1,20 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.7`. Publish its prerequisites in
+The current release candidate is `0.3.0-alpha.9`. Publish its prerequisites in
 this order:
 
 1. `alloy-transport-balancer 0.3.0-alpha.2`;
-2. `evm-fork-cache 0.4.0-alpha.4`;
-3. publish `evm-amm-state 0.3.0-alpha.7` after the gates below pass.
+2. `evm-fork-cache 0.4.0-alpha.5`;
+3. regenerate this crate's `Cargo.lock` against the published
+   `evm-fork-cache 0.4.0-alpha.5` (`cargo update -p evm-fork-cache`), which
+   cannot resolve until step 2 lands;
+4. publish `evm-amm-state 0.3.0-alpha.9` after the gates below pass.
 
-The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.4`.
+The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.5`.
 Treat any failure to resolve that published version as a release blocker rather
-than bypassing registry verification.
+than bypassing registry verification. Step 3 is why the committed lock names
+alpha.4 until fork-cache is published: the pin is deliberately ahead of the lock
+rather than the lock carrying an unpublishable path entry.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
 hydration, exact equality between the canonical warm-up quote and its immediate
@@ -41,7 +46,7 @@ crossed canonical four-word tick record, then validates the event poststate
 before atomically applying any write. Missing or contradictory evidence purges
 the stale pool and requests repair. Pancake V3 and Slipstream remain explicitly
 unsupported for exact swap replay; neither may be promoted from storage-layout
-similarity. See `docs/v3-swap-transitions.md` for the capability and evidence
+similarity. See `docs/v3-event-transitions.md` for the capability and evidence
 boundary.
 
 Alpha.5 depends on alpha.4's immutable `EvmSnapshot` current block-hash and

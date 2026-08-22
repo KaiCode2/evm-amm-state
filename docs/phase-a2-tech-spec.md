@@ -33,6 +33,15 @@ gap by lowering state-affecting repairs into executable `ReactiveEffect`s.
 2. **V3 liquidity-event repair is a targeted hash-pinned resync**, not manual
    slot injection. Events do not carry prior gross/net or fee-growth, so
    authoritative re-read is both simpler and exact, and is reorg-safe.
+
+   *Superseded for canonical Uniswap V3.* The premise — that the event does not
+   carry the prior state — was right but incomplete: the *exact parent* carries
+   it, and `_modifyPosition` reads nothing else. Canonical `Mint`/`Burn` now
+   replay locally against that parent, proven against deployed bytecode; see
+   `docs/v3-event-transitions.md`. The targeted resync survives as the fallback
+   for a boundary tick outside the warmed bitmap radius, which is the one input
+   the parent genuinely cannot supply, and remains the whole story for V3
+   families this release has not proven.
 3. **Balancer V2 stays the A1 routing proof.** Real vault balance-slot repair
    needs the storage mapping, scheduled for A3. A2 does not add a Balancer
    fallback purge (the only available scope is too broad).

@@ -1,4 +1,7 @@
-use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError, v3_code_seed_from_metadata};
+use super::bytecode::{
+    AdapterCodeSeed, BytecodeTemplateError, uniswap_v3_max_liquidity_per_tick,
+    v3_code_seed_from_metadata,
+};
 use super::cold_start::{
     AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
     SlotFetch,
@@ -10,8 +13,12 @@ use super::sim::{
     quoteExactInputSingleCall,
 };
 use super::v3_transition::{
-    DecodedLiquidity, DecodedSwap, derive_slipstream_liquidity, derive_slipstream_swap,
-    derive_uniswap_v3_swap, infer_slipstream_swap_fee, validate_reviewed_slipstream_event,
+    DecodedCollectProtocol, DecodedFeeProtocol, DecodedFlash, DecodedLiquidity,
+    DecodedObservationGrowth, DecodedSwap, derive_slipstream_liquidity, derive_slipstream_swap,
+    derive_uniswap_v3_collect_protocol, derive_uniswap_v3_flash, derive_uniswap_v3_liquidity,
+    derive_uniswap_v3_observation_growth, derive_uniswap_v3_set_fee_protocol,
+    derive_uniswap_v3_swap, infer_slipstream_swap_fee, uniswap_v3_position_slots,
+    validate_reviewed_slipstream_event,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind,
@@ -20,8 +27,8 @@ use super::{
     ProtocolMetadata, PurgeScope, RepairAction, SlipstreamRuntimeFamily,
     SlipstreamSnapshotIdentity, SlipstreamUnstakedFeeEvaluation,
     SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof, SlotChange, StateDiff,
-    StateSlot, StateUpdate, StateView, UnsupportedReason, UpdateQuality, V3Metadata,
-    V3SwapTransitionCapability,
+    StateSlot, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
+    V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
 };
 use crate::adapters::storage::{
     V3StorageLayout, layout_for, slipstream_tick_info_storage_keys_with_base,
@@ -332,6 +339,8 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             self.decode_liquidity_event_with_context(pool, log, view, false, context)
         } else if topic0 == Collect::SIGNATURE_HASH {
             self.decode_collect_with_context(pool, log, context)
+        } else if canonical_v3_accounting_topics().contains(&topic0) {
+            self.decode_canonical_accounting_event(pool, log, view, topic0, context)
         } else {
             self.decode_event(pool, log, view)
         }
@@ -952,6 +961,59 @@ impl ConcentratedLiquidityAdapter {
         V3SwapTransitionCapability::Exact
     }
 
+    /// Return the independently proven event-only `Mint`/`Burn` capability for a
+    /// concrete V3-family registration.
+    ///
+    /// Unlike [`swap_transition_capability`](Self::swap_transition_capability)
+    /// this does not require a fee: a liquidity change replays
+    /// `Tick.update`/`Tick.clear`, the bitmap, the oracle, and active
+    /// liquidity, none of which consult the pool fee. It does require a tick
+    /// spacing the canonical `maxLiquidityPerTick` immutable is defined for,
+    /// because `Tick.update` bounds `liquidityGross` against it.
+    pub fn liquidity_transition_capability(
+        pool: &PoolRegistration,
+    ) -> V3LiquidityTransitionCapability {
+        let Some(layout) = layout_for(pool) else {
+            return V3LiquidityTransitionCapability::Unsupported;
+        };
+        if pool.protocol() == ProtocolId::UniswapV3
+            && layout == V3StorageLayout::uniswap(layout.tick_spacing)
+            && layout.tick_spacing > 0
+            && uniswap_v3_max_liquidity_per_tick(layout.tick_spacing).is_some()
+        {
+            V3LiquidityTransitionCapability::Exact
+        } else {
+            V3LiquidityTransitionCapability::Unsupported
+        }
+    }
+
+    /// Return the event-scoped exact `Mint`/`Burn` capability.
+    ///
+    /// Canonical Uniswap V3 inherits its registration-scoped capability.
+    /// Reviewed Slipstream deployments additionally qualify once the event
+    /// context pins them to a proven chain and pool identity.
+    pub fn liquidity_transition_capability_with_context(
+        pool: &PoolRegistration,
+        context: &AdapterEventContext,
+    ) -> V3LiquidityTransitionCapability {
+        let registration_capability = Self::liquidity_transition_capability(pool);
+        if registration_capability == V3LiquidityTransitionCapability::Exact {
+            return registration_capability;
+        }
+        let Some(layout) = layout_for(pool) else {
+            return V3LiquidityTransitionCapability::Unsupported;
+        };
+        let Some(address) = pool.key.address() else {
+            return V3LiquidityTransitionCapability::Unsupported;
+        };
+        if pool.protocol() != ProtocolId::Slipstream
+            || validate_reviewed_slipstream_event(address, layout, context).is_err()
+        {
+            return V3LiquidityTransitionCapability::Unsupported;
+        }
+        V3LiquidityTransitionCapability::Exact
+    }
+
     /// Evaluate the reviewed Slipstream unstaked-liquidity fee against an
     /// immutable, provider-free transaction-parent snapshot.
     ///
@@ -1196,12 +1258,20 @@ impl ConcentratedLiquidityAdapter {
         )
     }
 
-    /// Decode a Uniswap V3 `Mint`/`Burn` conservatively.
+    /// Decode a Uniswap V3 `Mint`/`Burn` conservatively, for callers with no
+    /// event context.
     ///
-    /// The event carries a liquidity delta and boundary ticks, but not every
-    /// canonical Tick.Info and position-accounting write needed by a later exact
-    /// Swap. Even a fully warm cache is therefore purged after the log is
-    /// validated; no partial state is computed or briefly applied.
+    /// `_modifyPosition` reads the oracle for any nonzero liquidity delta, and a
+    /// newly initialized tick at or below the current one seeds its outside
+    /// accumulators from that reading. Without the block timestamp an
+    /// [`AdapterEventContext`] carries, that reading cannot be reproduced, so no
+    /// exact transition exists — and a partial one would leave the pool
+    /// quote-ready on state a later swap would diverge from. Even a fully warm
+    /// cache is therefore purged after the log is validated; no partial state is
+    /// computed or briefly applied.
+    ///
+    /// Callers on the context-aware path get the exact transition instead; see
+    /// [`decode_canonical_liquidity_exact`](Self::decode_canonical_liquidity_exact).
     fn decode_liquidity_event(
         &self,
         pool: &PoolRegistration,
@@ -1234,6 +1304,237 @@ impl ConcentratedLiquidityAdapter {
         self.decode_non_swap_mutation(pool, log, topic0)
     }
 
+    /// Replay one of the canonical Uniswap V3 accounting events — `Flash`,
+    /// `SetFeeProtocol`, `CollectProtocol`, or
+    /// `IncreaseObservationCardinalityNext` — against an exact parent.
+    ///
+    /// None of these move price, liquidity, or a tick, and every one of them is
+    /// fully determined by the event plus warm parent cells. Treating them as
+    /// unknown mutations meant a governance call or a single flash loan discarded
+    /// a pool's entire storage.
+    fn decode_canonical_accounting_event(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        topic0: B256,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        let Some((address, layout)) = canonical_accounting_layout(pool) else {
+            return self.decode_non_swap_mutation(pool, log, topic0);
+        };
+
+        let derived = if topic0 == Flash::SIGNATURE_HASH {
+            match v3_fee(pool) {
+                Some(fee) => decode_flash_body(log).and_then(|flash| {
+                    derive_uniswap_v3_flash(address, layout, fee, flash, view, context)
+                }),
+                None => Err(AdapterEventError::Unsupported(
+                    UnsupportedReason::MissingMetadata("V3 fee"),
+                )),
+            }
+        } else if topic0 == SetFeeProtocol::SIGNATURE_HASH {
+            decode_fee_protocol_body(log).and_then(|event| {
+                derive_uniswap_v3_set_fee_protocol(address, layout, event, view, context)
+            })
+        } else if topic0 == CollectProtocol::SIGNATURE_HASH {
+            decode_collect_protocol_body(log).and_then(|event| {
+                derive_uniswap_v3_collect_protocol(address, layout, event, view, context)
+            })
+        } else if topic0 == IncreaseObservationCardinalityNext::SIGNATURE_HASH {
+            decode_observation_growth_body(log).and_then(|event| {
+                derive_uniswap_v3_observation_growth(address, layout, event, view, context)
+            })
+        } else {
+            return self.decode_non_swap_mutation(pool, log, topic0);
+        };
+
+        match derived {
+            Ok(updates) => AdapterEventResult::event(AdapterEvent {
+                pool: pool.key.clone(),
+                emitter: log.address,
+                topic0,
+                kind: AdapterEventKind::Unknown,
+                updates,
+                quality: UpdateQuality::Exact,
+                repair: RepairAction::None,
+            }),
+            Err(error) => AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                error,
+            ),
+        }
+    }
+
+    /// A canonical `Collect` moves position `tokensOwed` and ERC-20 balances and
+    /// nothing else: it never touches slot0, liquidity, a tick, the bitmap, or
+    /// the oracle. It is therefore an exact transition over the pool's pricing
+    /// surface with no writes at all — only the collecting position is dropped.
+    ///
+    /// This matters out of proportion to its simplicity. Nearly every `Burn`
+    /// through the position manager is followed by a `Collect`, so treating it
+    /// as an unknown mutation would re-purge the pool immediately after a
+    /// `Burn` was replayed exactly.
+    fn decode_canonical_collect(&self, pool: &PoolRegistration, log: &Log) -> AdapterEventResult {
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "V3 pool key is not address-keyed",
+            ));
+        };
+        if Collect::decode_log_data_validate(&log.data).is_err() {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
+                AdapterEventError::MalformedLog("malformed V3 Collect log"),
+            );
+        }
+        let (Some(owner), Some(tick_lower), Some(tick_upper)) = (
+            topic_address(log, 1),
+            log.topics()
+                .get(2)
+                .map(|topic| int24_from_word((*topic).into())),
+            log.topics()
+                .get(3)
+                .map(|topic| int24_from_word((*topic).into())),
+        ) else {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
+                AdapterEventError::MalformedLog("V3 Collect is missing indexed position topics"),
+            );
+        };
+        AdapterEventResult::event(AdapterEvent {
+            pool: pool.key.clone(),
+            emitter: log.address,
+            topic0: Collect::SIGNATURE_HASH,
+            kind: AdapterEventKind::Unknown,
+            updates: vec![StateUpdate::purge(
+                address,
+                PurgeScope::Slots(
+                    uniswap_v3_position_slots(owner, tick_lower, tick_upper).to_vec(),
+                ),
+            )],
+            quality: UpdateQuality::Exact,
+            repair: RepairAction::None,
+        })
+    }
+
+    /// Replay a canonical Uniswap V3 `Mint`/`Burn` against an exact parent.
+    ///
+    /// Falls back to the conservative invalidation whenever the registration is
+    /// not provably canonical, so a fork family can never reach replay merely
+    /// because its event ABI matches.
+    fn decode_canonical_liquidity_exact(
+        &self,
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        is_mint: bool,
+        context: &AdapterEventContext,
+    ) -> AdapterEventResult {
+        if Self::liquidity_transition_capability(pool) != V3LiquidityTransitionCapability::Exact {
+            return self.decode_liquidity_event(pool, log, view, is_mint);
+        }
+        let topic0 = if is_mint {
+            Mint::SIGNATURE_HASH
+        } else {
+            Burn::SIGNATURE_HASH
+        };
+        let Some(address) = pool.key.address() else {
+            return AdapterEventResult::error(AdapterEventError::MalformedLog(
+                "V3 pool key is not address-keyed",
+            ));
+        };
+        let Some(layout) = layout_for(pool) else {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::Unsupported(UnsupportedReason::MissingMetadata(
+                    "V3 storage layout",
+                )),
+            );
+        };
+        let decode_ok = if is_mint {
+            Mint::decode_log_data_validate(&log.data).is_ok()
+        } else {
+            Burn::decode_log_data_validate(&log.data).is_ok()
+        };
+        if !decode_ok {
+            return AdapterEventResult::event_with_error(
+                non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                AdapterEventError::MalformedLog("malformed V3 liquidity log"),
+            );
+        }
+        let decoded = match decode_liquidity_body(log, is_mint) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                    error,
+                );
+            }
+        };
+        let transition = match derive_uniswap_v3_liquidity(address, layout, decoded, view, context)
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                return AdapterEventResult::event_with_error(
+                    non_swap_mutation_invalidation(pool, log.address, topic0, address),
+                    error,
+                );
+            }
+        };
+        let kind = if is_mint {
+            AdapterEventKind::LiquidityAdded
+        } else {
+            AdapterEventKind::LiquidityRemoved
+        };
+        let mut updates = transition.updates;
+        // The transition reconstructs the pricing surface, not the position the
+        // event belongs to. Dropping that position's cells keeps a warm one from
+        // going stale and costs nothing on a pool that never warmed them.
+        if let Some(owner) = topic_address(log, 1) {
+            updates.push(StateUpdate::purge(
+                address,
+                PurgeScope::Slots(
+                    uniswap_v3_position_slots(owner, decoded.tick_lower, decoded.tick_upper)
+                        .to_vec(),
+                ),
+            ));
+        }
+        if transition.cold_slots.is_empty() {
+            return AdapterEventResult::event(AdapterEvent {
+                pool: pool.key.clone(),
+                emitter: log.address,
+                topic0,
+                kind,
+                updates,
+                quality: UpdateQuality::Exact,
+                repair: RepairAction::None,
+            });
+        }
+        // A boundary tick outside the warmed bitmap radius leaves only that
+        // boundary unknown. Drop exactly those cells and re-read them, rather
+        // than discarding a pool whose price, liquidity, and oracle this
+        // transition just established exactly.
+        updates.push(StateUpdate::purge(
+            address,
+            PurgeScope::Slots(transition.cold_slots.clone()),
+        ));
+        AdapterEventResult::event(AdapterEvent {
+            pool: pool.key.clone(),
+            emitter: log.address,
+            topic0,
+            kind,
+            updates,
+            quality: UpdateQuality::RequiresRepair,
+            repair: RepairAction::VerifySlots(
+                transition
+                    .cold_slots
+                    .into_iter()
+                    .map(|slot| (address, slot))
+                    .collect(),
+            ),
+        })
+    }
+
     fn decode_liquidity_event_with_context(
         &self,
         pool: &PoolRegistration,
@@ -1242,8 +1543,12 @@ impl ConcentratedLiquidityAdapter {
         is_mint: bool,
         context: &AdapterEventContext,
     ) -> AdapterEventResult {
-        if pool.protocol() != ProtocolId::Slipstream {
-            return self.decode_liquidity_event(pool, log, view, is_mint);
+        match pool.protocol() {
+            ProtocolId::UniswapV3 => {
+                return self.decode_canonical_liquidity_exact(pool, log, view, is_mint, context);
+            }
+            ProtocolId::Slipstream => {}
+            _ => return self.decode_liquidity_event(pool, log, view, is_mint),
         }
         let topic0 = if is_mint {
             Mint::SIGNATURE_HASH
@@ -1313,6 +1618,11 @@ impl ConcentratedLiquidityAdapter {
         log: &Log,
         context: &AdapterEventContext,
     ) -> AdapterEventResult {
+        if pool.protocol() == ProtocolId::UniswapV3
+            && Self::liquidity_transition_capability(pool) == V3LiquidityTransitionCapability::Exact
+        {
+            return self.decode_canonical_collect(pool, log);
+        }
         if pool.protocol() != ProtocolId::Slipstream {
             return self.decode_non_swap_mutation(pool, log, Collect::SIGNATURE_HASH);
         }
@@ -1777,6 +2087,119 @@ fn record_v3_warmed_slots(
         }
         _ => {}
     }
+}
+
+/// The shared gate for every canonical accounting transition: this pool must be
+/// a provably canonical Uniswap V3 deployment, not merely a V3-shaped one.
+fn canonical_accounting_layout(pool: &PoolRegistration) -> Option<(Address, V3StorageLayout)> {
+    if pool.protocol() != ProtocolId::UniswapV3 {
+        return None;
+    }
+    let layout = layout_for(pool)?;
+    if layout != V3StorageLayout::uniswap(layout.tick_spacing) || layout.tick_spacing <= 0 {
+        return None;
+    }
+    Some((pool.key.address()?, layout))
+}
+
+/// The canonical accounting events: pool mutations that move fee, protocol-fee,
+/// or oracle-reservation state without touching price, liquidity, or any tick.
+fn canonical_v3_accounting_topics() -> [B256; 4] {
+    [
+        Flash::SIGNATURE_HASH,
+        SetFeeProtocol::SIGNATURE_HASH,
+        CollectProtocol::SIGNATURE_HASH,
+        IncreaseObservationCardinalityNext::SIGNATURE_HASH,
+    ]
+}
+
+/// Read a non-indexed word that the ABI narrows to `u8`.
+fn narrow_u8(log: &Log, index: usize, what: &'static str) -> Result<u8, AdapterEventError> {
+    let word = data_word(log, index).ok_or(AdapterEventError::MalformedLog(what))?;
+    if word > U256::from(u8::MAX) {
+        return Err(AdapterEventError::MalformedLog(what));
+    }
+    Ok(word.to::<u8>())
+}
+
+/// Read a non-indexed word that the ABI narrows to `u16`.
+fn narrow_u16(log: &Log, index: usize, what: &'static str) -> Result<u16, AdapterEventError> {
+    let word = data_word(log, index).ok_or(AdapterEventError::MalformedLog(what))?;
+    if word > U256::from(u16::MAX) {
+        return Err(AdapterEventError::MalformedLog(what));
+    }
+    Ok(word.to::<u16>())
+}
+
+fn decode_flash_body(log: &Log) -> Result<DecodedFlash, AdapterEventError> {
+    if Flash::decode_log_data_validate(&log.data).is_err() {
+        return Err(AdapterEventError::MalformedLog("malformed V3 Flash log"));
+    }
+    const WHAT: &str = "missing V3 Flash data word";
+    let (Some(amount0), Some(amount1), Some(paid0), Some(paid1)) = (
+        data_word(log, 0),
+        data_word(log, 1),
+        data_word(log, 2),
+        data_word(log, 3),
+    ) else {
+        return Err(AdapterEventError::MalformedLog(WHAT));
+    };
+    Ok(DecodedFlash {
+        amount0,
+        amount1,
+        paid0,
+        paid1,
+    })
+}
+
+fn decode_fee_protocol_body(log: &Log) -> Result<DecodedFeeProtocol, AdapterEventError> {
+    if SetFeeProtocol::decode_log_data_validate(&log.data).is_err() {
+        return Err(AdapterEventError::MalformedLog(
+            "malformed V3 SetFeeProtocol log",
+        ));
+    }
+    const WHAT: &str = "missing V3 SetFeeProtocol data word";
+    Ok(DecodedFeeProtocol {
+        old0: narrow_u8(log, 0, WHAT)?,
+        old1: narrow_u8(log, 1, WHAT)?,
+        new0: narrow_u8(log, 2, WHAT)?,
+        new1: narrow_u8(log, 3, WHAT)?,
+    })
+}
+
+fn decode_collect_protocol_body(log: &Log) -> Result<DecodedCollectProtocol, AdapterEventError> {
+    if CollectProtocol::decode_log_data_validate(&log.data).is_err() {
+        return Err(AdapterEventError::MalformedLog(
+            "malformed V3 CollectProtocol log",
+        ));
+    }
+    const WHAT: &str = "missing V3 CollectProtocol data word";
+    let (Some(amount0), Some(amount1)) = (data_word(log, 0), data_word(log, 1)) else {
+        return Err(AdapterEventError::MalformedLog(WHAT));
+    };
+    Ok(DecodedCollectProtocol { amount0, amount1 })
+}
+
+fn decode_observation_growth_body(
+    log: &Log,
+) -> Result<DecodedObservationGrowth, AdapterEventError> {
+    if IncreaseObservationCardinalityNext::decode_log_data_validate(&log.data).is_err() {
+        return Err(AdapterEventError::MalformedLog(
+            "malformed V3 IncreaseObservationCardinalityNext log",
+        ));
+    }
+    const WHAT: &str = "missing V3 IncreaseObservationCardinalityNext data word";
+    Ok(DecodedObservationGrowth {
+        old: narrow_u16(log, 0, WHAT)?,
+        new: narrow_u16(log, 1, WHAT)?,
+    })
+}
+
+/// Read an indexed `address` topic (right-aligned in its 32-byte word).
+fn topic_address(log: &Log, index: usize) -> Option<Address> {
+    log.topics()
+        .get(index)
+        .map(|topic| Address::from_slice(&topic.as_slice()[12..]))
 }
 
 fn data_word(log: &Log, index: usize) -> Option<U256> {
