@@ -5,6 +5,29 @@ All notable changes to `evm-amm-state` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-09-05
+
+### Changed
+
+- Promotes the current alpha AMM surface, including validated protocol
+  registrations, scoped canonical event replay, quote-read-set hydration, and
+  isolated preconfirmation views. Uses `evm-fork-cache 0.4.0`. Flashblocks
+  integration remains opt-in and in development: current live completeness and
+  latency checks have not passed, and this release makes no readiness or speed
+  claim for that integration.
+
+### Fixed
+
+- Updates the offline V3 Mint/Burn benchmark to supply complete parent storage
+  and exact block/order context required by canonical replay.
+- Migrate the live Flashblocks harness to a verified canonical baseline and
+  hash-pinned complete pool-log reconciliation, including empty blocks and
+  bounded catch-up. Keep independent cache state while sharing immutable proof
+  responses, and report proof-fetch time separately from the old cache-only
+  benchmark boundary.
+
 ## [0.3.0-alpha.10] - 2026-08-22
 
 ### Fixed
@@ -841,7 +864,7 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.9...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0...HEAD
 [0.3.0-alpha.9]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.8...v0.3.0-alpha.9
 [0.3.0-alpha.8]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...v0.3.0-alpha.8
 [0.3.0-alpha.7]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.6...v0.3.0-alpha.7
@@ -853,3 +876,5 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 [0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0
+
+[0.3.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.3.0

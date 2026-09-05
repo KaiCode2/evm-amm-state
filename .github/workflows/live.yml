@@ -9,11 +9,6 @@ concurrency:
   group: stage10-live
   cancel-in-progress: false
 
-env:
-  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
-  CACHE_REF: 2be88d15fa15b5c44188b318463aa4705bb75aef
-  SEARCH_REF: 564d3d9ccbe260fd4d6606359ea0ddb639350acf
-
 permissions:
   contents: read
 
@@ -30,25 +25,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-amm-state
-      - name: Check out exact search candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: KaiCode2/evm-amm-search
-          ref: ${{ env.SEARCH_REF }}
-          path: evm-amm-search
-      - name: Check out exact cache candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: KaiCode2/evm-fork-cache
-          ref: ${{ env.CACHE_REF }}
-          path: evm-fork-cache
-      - name: Check out exact transport candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: KaiCode2/alloy-transport-balancer
-          ref: ${{ env.TRANSPORT_REF }}
-          path: alloy-transport-balancer
-
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -59,10 +35,12 @@ jobs:
         with:
           workspaces: |
             evm-amm-state -> target
-            evm-amm-search -> target
+
+      - name: Install the released search TUI
+        run: cargo install evm-amm-search --version '=0.2.0' --locked --features live-runtime --bin amm-route-tui
 
       - name: Mainnet parity, WS health, and progressive route bootstrap
         env:
           E2E_RPC_URL: ${{ secrets.E2E_RPC_URL }}
           ETH_WS_URL: ${{ secrets.ETH_WS_URL }}
-        run: ./scripts/stage10-live-gates.sh
+        run: AMM_ROUTE_TUI_BIN="$(command -v amm-route-tui)" ./scripts/stage10-live-gates.sh

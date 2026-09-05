@@ -23,12 +23,10 @@ Every third-party workflow action is pinned to an immutable full commit:
 | [`dtolnay/rust-toolchain`](https://github.com/dtolnay/rust-toolchain/commit/4cda84d5c5c54efe2404f9d843567869ab1699d4) | `stable` | `4cda84d5c5c54efe2404f9d843567869ab1699d4` |
 | [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache/releases/tag/v2.9.1) | `v2.9.1` | `c19371144df3bb44fab255c43d04cbc2ab54d1c4` |
 
-Sibling repositories are checked out at exact candidate commits in every CI and
-live workflow. The transport candidate is
-`7868bea593dec5748ad7475d1909fc3a2de0d4ad`; the cache candidate is
-`2be88d15fa15b5c44188b318463aa4705bb75aef`; and the live search gate uses
-`564d3d9ccbe260fd4d6606359ea0ddb639350acf`. Any revision change requires
-rerunning the applicable locked release or paid-provider matrix.
+Library CI resolves the registry-only graph recorded in `Cargo.lock`. The live
+workflow installs the immutable `evm-amm-search 0.2.0` registry package with its
+locked dependency graph. Any dependency version change requires rerunning the
+applicable locked release and paid-provider matrix.
 
 The accepted advisory and unmaintained-dependency scopes are documented and
 machine-checked by `scripts/check-security-exceptions.sh`. New vulnerability
@@ -36,10 +34,10 @@ advisories remain release-blocking.
 
 The current graph has one ignored vulnerability advisory:
 
-- `RUSTSEC-2025-0055` affects `tracing-subscriber` 0.2.25. That version is an
-  unreachable lockfile entry. The scope check requires it to remain the only
-  affected locked version while every reachable version is patched at 0.3.20
-  or newer. Removing the inactive entry without removing the ignore also fails.
+- `RUSTSEC-2025-0055` affects `tracing-subscriber 0.2.25`. It is an
+  unreachable lockfile entry. The scope check requires that exact inactive
+  entry while every reachable version is patched at 0.3.20 or newer. Remove
+  the exception when the entry disappears; never permit it to become active.
 
 RustSec also reports four unmaintained crates. These are warnings rather than
 vulnerability advisories, and each accepted reachability boundary is checked:
@@ -56,3 +54,17 @@ vulnerability advisories, and each accepted reachability boundary is checked:
 
 Any change to these paths requires renewed review. Remove an exception as soon
 as its lock entry or upstream constraint disappears.
+
+## Alloy LRU advisory scope
+
+`RUSTSEC-2026-0253` concerns `lru::LruCache::pop` when a stored key's destructor
+panics and execution subsequently continues after catching that panic. The
+remaining `lru 0.16.4` copy comes only from `alloy-provider 1.6.3`. Its block
+stream uses `BlockNumber` (`u64`) keys and its cache layer uses `B256` keys;
+neither has a custom destructor. This dependency remains affected as a library,
+but the key-destructor trigger is absent from these selected Alloy uses.
+Reassess on an Alloy or key-type change. The fix is in lru 0.18.2, outside
+Alloy's 0.16 dependency range; no registry patch is hidden in this release.
+
+The TUI dependency set uses the patched `lru 0.18.2` where that version range
+is supported. Do not generalize the Alloy assessment to other lru consumers.

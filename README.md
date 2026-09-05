@@ -44,7 +44,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.8", default-features = false, features = [
+evm-amm-state = { version = "0.3.0", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -85,7 +85,7 @@ Each protocol is a single [`AmmAdapter`] implementation; the
 | Protocol | Feature | Quote entrypoint | Cold-start | Reactive |
 | --- | --- | --- | --- | --- |
 | Uniswap V2 | `uniswap-v2` | `Router02.getAmountsOut` | named slots | `Sync` → exact masked write |
-| Canonical Uniswap V3 | `uniswap-v3` | `QuoterV2.quoteExactInputSingle` | complete canonical swap surface + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | ordered/context-aware `Swap` → exact provider-free replay of slot0, liquidity, fees, oracle, and crossed ticks; every non-`Swap` pool mutation purges and repairs |
+| Canonical Uniswap V3 | `uniswap-v3` | `QuoterV2.quoteExactInputSingle` | complete canonical swap surface + multi-word tick scan (per-pool radius), or the one-shot full-range program sync (`v3_sync`) | ordered/context-aware pricing-state events (including `Swap`, `Mint`, and `Burn`) → exact provider-free replay over the declared canonical surface; `Initialize` requests cold start, and missing or contradictory evidence purges and repairs |
 | PancakeSwap V3 | `pancake-v3` | family-native `QuoterV2.quoteExactInputSingle` | family layout warm-up | `Swap` and non-`Swap` mutations invalidate and repair pending independent deployed-runtime parity |
 | Reviewed Slipstream / Aerodrome CL | `slipstream` | native tick-spacing-keyed `QuoterV2.quoteExactInputSingle` | full-range quote surface plus six-word initialized ticks and extended globals | Base BIFI and Optimism mooBIFI pools: ordered `Swap`, `Mint`, `Burn`, and `Collect` preserve exact quote/search state with no provider reads or repair; optional runtime-bound evidence also reproduces swap accounting writes |
 | Balancer V2 | `balancer-v2` | `Vault.queryBatchSwap` | discover → verify (`getPoolTokens`), verify-only once known | `Swap` → exact 112-bit cash writes where warm, resync fallback; `PoolBalanceChanged` → resync |
@@ -361,6 +361,12 @@ hash-pins a bounded union of `eth_getLogs` filters at every header. Reliable
 changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
+
+**Flashblocks support is in development.** The opt-in integration below is
+available for experimentation, but current live source completeness and latency
+checks have not passed. Version `0.3.0` does not qualify it for execution or claim
+a latency advantage. See the current findings in
+[`docs/flashblocks-latency.md`](docs/flashblocks-latency.md).
 
 The same attached subscriber can opt into Base or Optimism Flashblocks through
 `evm-fork-cache`. Base consumes native `newFlashblocks` plus `pendingLogs`;
