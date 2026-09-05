@@ -67,6 +67,54 @@ The OP adapter's default 250 ms interval and rolling 40-method/second ceiling
 bound request use below a 50-request/second provider plan. Applications remain
 free to disable preconfirmations or configure a different interval and budget.
 
+## Stable-release harness migration
+
+The September harness starts both caches at a verified block hash and supplies
+the complete EVM block environment. Canonical progress is certified by fetching
+all logs for this pool at each exact intervening block hash; a subscription
+notification alone does not prove log completeness. Empty blocks also advance
+the baseline. A speculative view is accepted only after its exact parent is
+covered. Reorgs or contradictory proof responses stop the probe.
+
+A bounded collector polls the subscriber independently from canonical proof
+RPC work and timestamps each batch when the subscriber yields it. Queue overflow
+rejects the run. The two caches share immutable canonical RPC evidence, while
+applying it independently. The canonical path advances after its own subscription notice;
+it never consumes speculative state. `canonical_reconcile_and_apply` includes
+any canonical proof fetch, so it must not be compared with the old cache-only
+apply interval. `canonical_proof_rpc` reports these additional requests
+separately from native Flashblocks subscription metrics. Canonical read-set
+hydration refreshes the dependencies invalidated by a changed block pin; its
+account and slot counts are reported separately. Warm quote validation still
+runs with provider reads disconnected.
+
+## September 5 revalidation: not qualified
+
+The paid QuickNode Base source did not pass the current native Flashblocks gate.
+A 120-second diagnostic produced 19 canonical swaps and 11 paired previews,
+below the required 20-swap activity floor and 95% pairing coverage. Subsequent
+runs rejected incomplete V3 transition sequences; no latency qualification is
+claimed from these attempts.
+
+At Base block `50919224`, the canonical parent slot0 exactly matched the live
+cache, but the preview delivered pool log `806` without earlier pool logs `254`
+and `447`. The adapter rejected the derived output mismatch and purged the
+speculative pool state. At an earlier failure, block `50918833`, independently
+replaying both canonical swaps (`58` and `525`) from its verified parent applied
+both exactly, with zero purges and passing offline quotes.
+
+A separate direct `pendingLogs` subscription and the crate subscriber on the
+same connection also lacked a canonical pool swap at block `50919481` during
+the 120-second capture, while both delivered a later preview at `50919493`.
+This small diagnostic does not establish a general provider failure rate or
+exclude all subscriber issues; it does show that the missing event was not
+observed on the direct subscription either. The configured source remains
+unqualified. Do not substitute the historical tables below for a passing check
+on the current source and crate versions.
+
+Set `FLASHBLOCKS_TRACE_TRANSITIONS=1` for local transition diagnostics. It prints
+public log data and cached slot0 values and should remain off for timing runs.
+
 ## Historical result
 
 Measured July 28, 2026, starting from Base block `49,234,041`:

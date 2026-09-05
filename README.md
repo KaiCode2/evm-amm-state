@@ -44,7 +44,7 @@ feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.8", default-features = false, features = [
+evm-amm-state = { version = "0.3.0", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver

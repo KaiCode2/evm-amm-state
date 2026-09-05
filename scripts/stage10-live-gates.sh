@@ -2,7 +2,7 @@
 set -euo pipefail
 
 state_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-search_dir="$(cd "$state_dir/../evm-amm-search" && pwd)"
+search_dir="$state_dir/../evm-amm-search"
 
 export E2E_RPC_URL="${E2E_RPC_URL:-${ETH_RPC_URL:-}}"
 
@@ -67,11 +67,16 @@ redact_stream() {
 )
 
 (
-  cd "$search_dir"
+  if [[ -n "${AMM_ROUTE_TUI_BIN:-}" ]]; then
+    tui_command=("$AMM_ROUTE_TUI_BIN")
+  else
+    cd "$search_dir"
+    tui_command=(cargo run --locked --release --features live-runtime --bin amm-route-tui)
+  fi
   AMM_ROUTE_TUI_BENCH=1 \
   AMM_ROUTE_TUI_BENCH_BOOTSTRAP_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_BOOTSTRAP_TIMEOUT_SECS:-120}" \
   AMM_ROUTE_TUI_BENCH_ROUTE_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_ROUTE_TIMEOUT_SECS:-120}" \
   AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS="${AMM_ROUTE_TUI_BENCH_IDLE_TIMEOUT_SECS:-0}" \
-    cargo run --locked --release --features live-runtime --bin amm-route-tui 2>&1 \
+    "${tui_command[@]}" 2>&1 \
       | redact_stream
 )

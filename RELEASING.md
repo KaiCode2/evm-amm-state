@@ -1,20 +1,19 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.9`. Publish its prerequisites in
+The current release candidate is `0.3.0`. Publish its prerequisites in
 this order:
 
-1. `alloy-transport-balancer 0.3.0-alpha.2`;
-2. `evm-fork-cache 0.4.0-alpha.5`;
+1. `alloy-transport-balancer 0.3.0`;
+2. `evm-fork-cache 0.4.0`;
 3. regenerate this crate's `Cargo.lock` against the published
-   `evm-fork-cache 0.4.0-alpha.5` (`cargo update -p evm-fork-cache`), which
+   `evm-fork-cache 0.4.0` (`cargo update -p evm-fork-cache`), which
    cannot resolve until step 2 lands;
-4. publish `evm-amm-state 0.3.0-alpha.9` after the gates below pass.
+4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
-The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.5`.
-Treat any failure to resolve that published version as a release blocker rather
-than bypassing registry verification. Step 3 is why the committed lock names
-alpha.4 until fork-cache is published: the pin is deliberately ahead of the lock
-rather than the lock carrying an unpublishable path entry.
+The final lockfile must resolve `evm-fork-cache 0.4.0` from crates.io.
+Candidate integration may use an external patch configuration; neither that
+configuration nor a path dependency may ship. A registry resolution failure
+remains a release blocker.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
 hydration, exact equality between the canonical warm-up quote and its immediate
@@ -99,8 +98,8 @@ cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' &&
   exit 1 || true
 ```
 
-Confirm every third-party workflow action and sibling checkout matches the full
-commit recorded in `SECURITY.md`. A tag, branch, or unresolved candidate
+Confirm every third-party workflow action and live integration checkout matches
+the full commit recorded in `SECURITY.md`. A tag, branch, or unresolved candidate
 placeholder is a release blocker.
 
 `RUSTSEC-2025-0055` is narrowly ignored because `ark-relations` records
@@ -168,7 +167,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0-alpha.4` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.0` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, live gates, downstream compatibility, changelog, and benchmark evidence
 pass.
