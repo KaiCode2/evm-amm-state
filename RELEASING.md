@@ -20,8 +20,13 @@ hydration, exact equality between the canonical warm-up quote and its immediate
 provider-read-free replay, and retention of generation-local lazy fills across
 cumulative overlay replacement. Historical paid QuickNode and Alchemy Base
 results, plus the current provider-specific revalidation status, are recorded
-in `docs/flashblocks-latency.md`; every release candidate must still repeat the
-documented paid-provider gate.
+in `docs/flashblocks-latency.md`. For `0.3.0`, Flashblocks remains an opt-in,
+in-development integration outside the qualified canonical release scope. The
+September 5 paid-provider checks did not pass. Preserve those results and label
+the feature consistently in the README, changelog, and release announcement;
+they do not block publication of the validated canonical stack. Before claiming
+Flashblocks readiness or a latency advantage in a future release, repeat and
+pass the documented paid-provider gates without relaxing their requirements.
 
 Alpha.3 is a targeted Slipstream correction: native quote calldata uses the
 protocol's signed `int24 tickSpacing` field rather than Uniswap V3's `uint24
@@ -169,8 +174,9 @@ cargo publish --dry-run --locked
 Warnings about excluded explicit test targets are expected. A dependency
 resolution failure for `evm-fork-cache 0.4.0` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
-builds, live gates, downstream compatibility, changelog, and benchmark evidence
-pass.
+builds, canonical live gates, downstream compatibility, changelog, and benchmark
+evidence pass. Flashblocks is governed by the explicit in-development scope
+above; its failed live checks must remain visible in the release material.
 
 Publishing and tag creation are external state changes and are never performed
 as part of an ordinary validation run.

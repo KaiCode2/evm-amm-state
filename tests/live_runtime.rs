@@ -3989,6 +3989,8 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                 )
                 .await?;
 
+            // This checks repair correctness, not a 250 ms scheduling guarantee on
+            // shared CI runners. Keep a bounded wait while the mock gates the repair.
             let mut snapshots = runtime.subscribe_snapshots();
             let log = PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new());
             let degraded = runtime
@@ -4005,7 +4007,7 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     .any(|change| change.pool() == &instance
                         && change.kind() == AmmPoolChangeKind::Degraded)
             );
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     let is_degraded = snapshots
                         .borrow()
@@ -4018,10 +4020,11 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     snapshots.changed().await.expect("runtime remains alive");
                 }
             })
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!("degraded publication timed out: {err}"))?;
             transport.release_one();
 
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while snapshots
                     .borrow()
                     .cache()
@@ -4031,7 +4034,8 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     snapshots.changed().await.expect("runtime remains alive");
                 }
             })
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!("automatic repair publication timed out: {err}"))?;
             let snapshot = runtime.latest_snapshot();
             assert_eq!(snapshot.registry().pool_instance(&key), Some(&instance));
             assert_eq!(

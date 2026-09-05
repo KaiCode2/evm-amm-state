@@ -362,6 +362,12 @@ changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
 
+**Flashblocks support is in development.** The opt-in integration below is
+available for experimentation, but current live source completeness and latency
+checks have not passed. Version `0.3.0` does not qualify it for execution or claim
+a latency advantage. See the current findings in
+[`docs/flashblocks-latency.md`](docs/flashblocks-latency.md).
+
 The same attached subscriber can opt into Base or Optimism Flashblocks through
 `evm-fork-cache`. Base consumes native `newFlashblocks` plus `pendingLogs`;
 Optimism uses the cache crate's bounded, generation-pinned pending-state

@@ -1,5 +1,11 @@
 # Flashblocks latency benchmark
 
+**Current status: in development, not qualified for live execution or a latency
+claim.** The `0.3.0` release includes the opt-in integration for experimentation.
+Its canonical AMM validation does not qualify Flashblocks. The September 5
+revalidation below did not pass; the historical results describe earlier source
+and crate versions.
+
 This benchmark measures when a Base or Optimism Uniswap V3 swap becomes usable
 in the EVM cache and AMM simulator through Flashblocks versus an ordinary
 canonical WebSocket subscription. It is a focused live acceptance test, not a

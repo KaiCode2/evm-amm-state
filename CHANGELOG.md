@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Promotes the current alpha AMM surface, including validated protocol
   registrations, scoped canonical event replay, quote-read-set hydration, and
-  isolated preconfirmation views. Uses `evm-fork-cache 0.4.0`.
+  isolated preconfirmation views. Uses `evm-fork-cache 0.4.0`. Flashblocks
+  integration remains opt-in and in development: current live completeness and
+  latency checks have not passed, and this release makes no readiness or speed
+  claim for that integration.
 
 ### Fixed
 
