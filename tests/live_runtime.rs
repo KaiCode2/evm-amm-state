@@ -3989,9 +3989,9 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                 )
                 .await?;
 
-            // This checks repair correctness, not a 250 ms scheduling guarantee on
-            // shared CI runners. Keep a bounded wait while the mock gates the repair.
-            let mut snapshots = runtime.subscribe_snapshots();
+            // Observe both commits reliably: a latest-value watch may coalesce
+            // the degraded snapshot with a subsequent repair publication.
+            let mut commits = runtime.subscribe_changes().await?;
             let log = PrimitiveLog::new_unchecked(address, vec![topic], Bytes::new());
             let degraded = runtime
                 .ingest_batch(canonical_primitive_log_batch(
@@ -4007,35 +4007,43 @@ async fn canonical_repair_is_automatically_scheduled_and_recovers_same_generatio
                     .any(|change| change.pool() == &instance
                         && change.kind() == AmmPoolChangeKind::Degraded)
             );
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let is_degraded = snapshots
-                        .borrow()
-                        .registry()
-                        .pool(&instance)
-                        .is_some_and(|pool| pool.status == PoolStatus::Degraded);
-                    if is_degraded {
-                        break;
-                    }
-                    snapshots.changed().await.expect("runtime remains alive");
-                }
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("degraded publication timed out: {err}"))?;
+            let degraded_commit =
+                tokio::time::timeout(std::time::Duration::from_secs(5), commits.next_commit())
+                    .await
+                    .map_err(|err| anyhow::anyhow!("degraded commit timed out: {err}"))?
+                    .expect("runtime remains alive");
+            assert_eq!(degraded_commit.changes().version(), degraded.version());
+            assert_eq!(
+                degraded_commit
+                    .snapshot()
+                    .registry()
+                    .pool(&instance)
+                    .expect("degraded generation remains registered")
+                    .status,
+                PoolStatus::Degraded,
+            );
             transport.release_one();
 
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while snapshots
-                    .borrow()
+            let repaired_commit =
+                tokio::time::timeout(std::time::Duration::from_secs(5), commits.next_commit())
+                    .await
+                    .map_err(|err| anyhow::anyhow!("automatic repair commit timed out: {err}"))?
+                    .expect("runtime remains alive");
+            assert_eq!(
+                repaired_commit
+                    .snapshot()
                     .cache()
-                    .storage_value(address, target.slot())
-                    != Some(U256::from(321))
-                {
-                    snapshots.changed().await.expect("runtime remains alive");
-                }
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("automatic repair publication timed out: {err}"))?;
+                    .storage_value(address, target.slot()),
+                Some(U256::from(321)),
+            );
+            assert!(
+                repaired_commit
+                    .changes()
+                    .pool_changes()
+                    .iter()
+                    .any(|change| change.pool() == &instance
+                        && change.kind() == AmmPoolChangeKind::Recovered)
+            );
             let snapshot = runtime.latest_snapshot();
             assert_eq!(snapshot.registry().pool_instance(&key), Some(&instance));
             assert_eq!(
