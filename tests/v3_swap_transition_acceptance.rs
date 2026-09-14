@@ -399,3 +399,33 @@ fn public_exact_path_rejects_adversarial_far_price_within_the_work_budget() {
         "bounded rejection took {elapsed:?}"
     );
 }
+
+#[test]
+#[ignore = "manual provider-free timing comparison; prints measurements, no wall-clock CI threshold"]
+fn offline_swap_replay_timing() {
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let registration = registration();
+    let parent = incident_parent();
+    let log = first_swap();
+    let context = context(FIRST_TRANSACTION_HASH, 1, 6);
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            let result = adapter.decode_event_with_context(
+                std::hint::black_box(&registration),
+                std::hint::black_box(&log),
+                std::hint::black_box(&parent),
+                std::hint::black_box(&context),
+            );
+            assert!(result.error.is_none());
+            std::hint::black_box(result);
+        }
+        samples.push(started.elapsed().as_nanos() / 10_000);
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "offline_swap_replay ns/event: min={} median={} max={} (7 x 10000)",
+        samples[0], samples[3], samples[6]
+    );
+}

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Replay valid Uniswap V3 and reviewed Slipstream swaps whose rounded final
+  price leaves exact-output cap slack or exact-input fee slack. Couple output
+  and fee validation to one consistent swap mode, including capped tick-boundary
+  endings, while retaining atomic rejection of contradictory events.
+- Include price-rounding slack in Slipstream's fee-inference bounds without
+  accepting ambiguous fees or changing its accounting-evidence requirements.
+
 ## [0.3.0] - 2026-09-05
 
 ### Changed
