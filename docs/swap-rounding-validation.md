@@ -1,6 +1,8 @@
 # V3 swap rounding validation
 
 Candidate base: `v0.3.0`, commit `e05945bc52f5ba145e5b423ca1c4a81f187eb185`.
+Prepared version: `0.3.1-alpha.1`. Rounding implementation commit:
+`623a48049ee13ddcffc6ee708f3e9d0d5aa12732`.
 The AMM manifest and lockfile retain the release dependency resolution, including
 `evm-fork-cache 0.4.0`. This change has not been published.
 

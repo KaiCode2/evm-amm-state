@@ -1,7 +1,25 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0`. Publish its prerequisites in
-this order:
+The current release candidate is `0.3.1-alpha.1`, based on the published
+`0.3.0` release. It contains only the V3 swap-rounding corrections and their
+regressions. `evm-fork-cache 0.4.0` is already published and remains unchanged;
+this candidate does not require another companion release or a dependency
+refresh. Keep all other lockfile entries fixed.
+
+The rounding-specific evidence, historical Plasma fixtures, downstream tests,
+and measured limitations are recorded in
+[`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
+Ownership, repair scheduling, beneficiary hydration, and TLS fixes are deferred.
+Preparing the alpha does not establish readiness for those paths or for
+Flashblocks.
+
+Consumers must explicitly select `=0.3.1-alpha.1`. After registry publication,
+remove any local path patch, resolve that exact version, and verify the package
+source and the unchanged cache version before rebuilding the service.
+
+## Stable baseline publication
+
+The `0.3.0` prerequisites were published in this order:
 
 1. `alloy-transport-balancer 0.3.0`;
 2. `evm-fork-cache 0.4.0`;
