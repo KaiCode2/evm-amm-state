@@ -11,7 +11,7 @@ other lockfile entries fixed.
 The rounding-specific evidence, historical Plasma fixtures, downstream tests,
 and measured limitations are recorded in
 [`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
-Ownership, repair scheduling, beneficiary hydration, and TLS fixes are deferred.
+Ownership, repair scheduling, beneficiary hydration, and TLS feature changes are deferred.
 Preparing the alpha does not establish readiness for those paths or for
 Flashblocks.
 

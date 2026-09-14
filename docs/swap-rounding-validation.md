@@ -183,6 +183,26 @@ Raw check logs, the live CSV, and the alternating timing records are retained in
 `validation-artifacts` alongside the isolated worktrees. The arithmetic fixtures
 and their provenance are checked into the test suite.
 
-Owner delivery, recovery scheduling, beneficiary hydration, and TLS changes remain
+Owner delivery, recovery scheduling, beneficiary hydration, and TLS feature changes remain
 outside this patch. A live interruption from those paths is recorded separately
 and cannot count as successful rounding coverage.
+
+## Alpha preparation recheck
+
+The alpha keeps the tested rounding implementation unchanged. Its security
+refresh passed the existing advisory-scope check and `cargo audit` without a new
+exception. All 595 all-feature tests and all eight downstream regression tests
+passed again with the patched Rustls dependency; downstream Clippy also passed.
+
+A fresh 120-second Plasma observation compared 324 pool states over 108 observed
+blocks containing 24 swaps, with no state mismatch and no pool state skipped
+under repair. It nevertheless rebuilt twice because the public provider returned
+`-32007` (25 requests per second exceeded) during subscriber reconciliation.
+The run had no published state for 13.1 seconds (10.9%) and ended with all three
+pools available. Its assertions passed, but it is not healthy-startup or sustained
+availability evidence. No retry or provider-limit workaround was used.
+
+Applications must update their own Rustls lock entry to at least `0.23.45` as
+well as selecting `=0.3.1-alpha.1`; the library's lockfile does not update an
+existing application lockfile. The isolated consumer checkout includes that
+patch and retains `evm-fork-cache = "=0.4.0"`.
