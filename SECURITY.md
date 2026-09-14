@@ -55,6 +55,15 @@ vulnerability advisories, and each accepted reachability boundary is checked:
 Any change to these paths requires renewed review. Remove an exception as soon
 as its lock entry or upstream constraint disappears.
 
+## Rustls handshake advisory
+
+The `0.3.1-alpha.1` release lockfile uses `rustls 0.23.45`, which fixes
+[`RUSTSEC-2026-0285`](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+The required `rustls-webpki` patch is `0.103.15`. No advisory exception is added.
+Applications consuming the library must update their own lockfile to a patched
+Rustls version; the library's lockfile does not constrain existing downstream
+lockfiles.
+
 ## Alloy LRU advisory scope
 
 `RUSTSEC-2026-0253` concerns `lru::LruCache::pop` when a stored key's destructor

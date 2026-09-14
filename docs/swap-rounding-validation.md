@@ -3,8 +3,11 @@
 Candidate base: `v0.3.0`, commit `e05945bc52f5ba145e5b423ca1c4a81f187eb185`.
 Prepared version: `0.3.1-alpha.1`. Rounding implementation commit:
 `623a48049ee13ddcffc6ee708f3e9d0d5aa12732`.
-The AMM manifest and lockfile retain the release dependency resolution, including
-`evm-fork-cache 0.4.0`. This change has not been published.
+The initial rounding validation below retained the baseline dependency
+resolution, including `evm-fork-cache 0.4.0`. Alpha preparation subsequently
+updated only `rustls` to `0.23.45` and its required `rustls-webpki` patch to
+`0.103.15`, addressing `RUSTSEC-2026-0285`, published on September 14. The cache
+version and rounding source are unchanged. This change has not been published.
 
 ## Arithmetic contract
 

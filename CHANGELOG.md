@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Include price-rounding slack in Slipstream's fee-inference bounds without
   accepting ambiguous fees or changing its accounting-evidence requirements.
 
+### Build
+
+- Refresh the release lockfile to `rustls 0.23.45` and `rustls-webpki 0.103.15`
+  for `RUSTSEC-2026-0285`. Applications must also update their own lockfile.
+
 ## [0.3.0] - 2026-09-05
 
 ### Changed
