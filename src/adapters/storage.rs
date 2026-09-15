@@ -40,6 +40,12 @@ pub const SLIPSTREAM_SLOT0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
 /// Storage slot for Slipstream CL global liquidity.
 pub const SLIPSTREAM_LIQUIDITY_SLOT: U256 = U256::from_limbs([16, 0, 0, 0]);
 
+/// Additional pool-local parent cells for reviewed Slipstream transitions:
+/// factory identity, fee/reward growth, reward timing, and staked liquidity.
+/// Keep bulk and windowed preparation on the same footprint, including zeros.
+#[cfg(feature = "uniswap-v3")]
+pub(super) const SLIPSTREAM_TRANSITION_GLOBAL_SLOTS: [u64; 9] = [0, 7, 8, 9, 10, 11, 12, 14, 15];
+
 /// Base storage slot for Slipstream CL `ticks` mapping.
 pub const SLIPSTREAM_TICKS_BASE_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
 

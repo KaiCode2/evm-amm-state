@@ -1,12 +1,13 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.1-alpha.1`, based on the published
-`0.3.0` release. It contains only the V3 swap-rounding corrections and their
-regressions. `evm-fork-cache 0.4.0` is already published and remains unchanged;
-this candidate does not require another companion release. Its only dependency
-refresh is `rustls 0.23.45` and the required `rustls-webpki 0.103.15` patch,
-addressing `RUSTSEC-2026-0285`, published during alpha preparation. Keep all
-other lockfile entries fixed.
+The current release candidate is `0.3.1-alpha.2`, based on the published
+`0.3.1-alpha.1` release. It adds Slipstream transition globals to the bulk
+storage program and shares their definition with windowed preparation.
+Its regressions execute the generated program, preserve zero-valued globals,
+replay successive liquidity changes on both reviewed families, and retain
+fail-closed rejection when parent state is missing.
+`evm-fork-cache 0.4.0` remains unchanged; this candidate does not require
+another companion release. Keep dependency lockfile entries fixed.
 
 The rounding-specific evidence, historical Plasma fixtures, downstream tests,
 and measured limitations are recorded in
@@ -15,7 +16,7 @@ Ownership, repair scheduling, beneficiary hydration, and TLS feature changes are
 Preparing the alpha does not establish readiness for those paths or for
 Flashblocks.
 
-Consumers must explicitly select `=0.3.1-alpha.1`. After registry publication,
+Consumers must explicitly select `=0.3.1-alpha.2`. After registry publication,
 remove any local path patch, resolve that exact version, and verify the package
 source and the unchanged cache version before rebuilding the service.
 Also update the consumer's own `rustls` lock entry to at least `0.23.45`;

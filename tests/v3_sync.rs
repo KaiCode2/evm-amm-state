@@ -325,6 +325,45 @@ async fn core_spec_can_use_pancake_tick_slot_bases() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slipstream_full_sync_prepares_event_globals() -> Result<()> {
+    let layout = V3StorageLayout::slipstream(200);
+    let spec = V3SyncSpec::slipstream(layout);
+    // The ordinary cold-start planner already loads these cells. A full sync
+    // must retain them even when representative quotes never read rewards.
+    for reward_growth in [U256::ZERO, U256::from(123_456_u64)] {
+        let globals = [
+            (U256::ZERO, U256::from(1_u64)),
+            (U256::from(7), U256::from(11_u64)),
+            (U256::from(8), U256::from(13_u64)),
+            (U256::from(9), reward_growth),
+            (U256::from(10), U256::from(17_u64)),
+            (U256::from(11), U256::from(19_u64)),
+            (U256::from(12), U256::from(23_u64)),
+            (U256::from(14), U256::from(29_u64)),
+            (U256::from(15), U256::from(31_u64)),
+        ];
+        let mut seeds = vec![
+            (layout.slot0_slot, U256::from(1_u64) << 96),
+            (layout.liquidity_slot, U256::from(1_000_u64)),
+        ];
+        seeds.extend(globals);
+        let mut cache = mock_cache().await;
+        install(&mut cache, POOL, build_full_sync_program(&spec), &seeds);
+        let output = run(&mut cache, POOL, Bytes::new())?;
+        let snapshot = decode_full_sync(&spec, &output)?;
+        let entries = snapshot.storage_entries(&spec);
+        for (slot, value) in globals {
+            assert_eq!(
+                entries.iter().find(|(candidate, _)| *candidate == slot),
+                Some(&(slot, value)),
+                "full sync omitted Slipstream event dependency {slot}; zero must be materialized too",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slipstream_sync_round_trips_all_six_tick_words() -> Result<()> {
     let layout = V3StorageLayout::slipstream(100);
     let spec = V3SyncSpec::slipstream(layout);

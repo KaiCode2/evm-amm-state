@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.2] - 2026-09-15
+
+### Fixed
+
+- Prepare Slipstream's pool-local transition globals during full-range bulk
+  synchronization, including zero-valued cells. Bulk and windowed cold starts
+  now share the same dependency list, so exact Mint/Burn replay does not depend
+  on incidental quote warmup reads to load reward growth. The existing storage
+  program returns nine additional words without adding a provider request.
+- Verify bulk preparation followed by successive Burns, Mints, tick clearing
+  and reinitialization on both reviewed Slipstream families. Missing required
+  parent state continues to reject the transition and request repair.
+
 ## [0.3.1-alpha.1] - 2026-09-14
 
 ### Fixed

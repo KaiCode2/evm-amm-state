@@ -31,8 +31,9 @@ use super::{
     V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
 };
 use crate::adapters::storage::{
-    V3StorageLayout, layout_for, slipstream_tick_info_storage_keys_with_base,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
+    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, V3StorageLayout, layout_for,
+    slipstream_tick_info_storage_keys_with_base, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, U256,
@@ -1829,19 +1830,9 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 (self.address, U256::from(2)),
                 (self.address, U256::from(3)),
             ]),
-            V3ColdStartExactSurface::Slipstream => verify.extend([
-                // Factory identity plus every non-mapping parent cell the
-                // reviewed swap transition can read or mutate.
-                (self.address, U256::ZERO),
-                (self.address, U256::from(7)),
-                (self.address, U256::from(8)),
-                (self.address, U256::from(9)),
-                (self.address, U256::from(10)),
-                (self.address, U256::from(11)),
-                (self.address, U256::from(12)),
-                (self.address, U256::from(14)),
-                (self.address, U256::from(15)),
-            ]),
+            V3ColdStartExactSurface::Slipstream => verify.extend(
+                SLIPSTREAM_TRANSITION_GLOBAL_SLOTS.map(|slot| (self.address, U256::from(slot))),
+            ),
             V3ColdStartExactSurface::None => {}
         }
         verify.extend(self.external_exact_slots.iter().copied());

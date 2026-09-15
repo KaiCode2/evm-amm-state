@@ -10,6 +10,9 @@ use evm_amm_state::adapters::{
     ProtocolMetadata, RepairAction, StateUpdate, StateView, UpdateQuality, V3Metadata,
 };
 
+#[path = "slipstream_liquidity_transition/bulk_preparation.rs"]
+mod bulk_preparation;
+
 const POOL: Address = address!("b378137c90444bbcecd44a1f766851fbf53d2a9e");
 const BLOCK_HASH: B256 = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 const PARENT_HASH: B256 = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
