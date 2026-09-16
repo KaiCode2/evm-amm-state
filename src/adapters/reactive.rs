@@ -110,6 +110,8 @@ impl std::error::Error for AmmPoolReactiveHandlerError {}
 #[derive(Clone)]
 pub struct AmmReactiveRoutingContext {
     registry: Arc<RwLock<Arc<AdapterRegistry>>>,
+    #[cfg(feature = "uniswap-v3")]
+    staking: Arc<RwLock<super::slipstream_staking::SlipstreamStakingBatch>>,
     slipstream_fee_evidence:
         Arc<RwLock<BTreeMap<SlipstreamFeeEvidenceKey, SlipstreamSwapFeeEvidence>>>,
 }
@@ -171,10 +173,28 @@ impl std::fmt::Debug for AmmReactiveRoutingContext {
 }
 
 impl AmmReactiveRoutingContext {
+    #[cfg(feature = "uniswap-v3")]
+    pub(crate) fn prepare_staking(
+        &self,
+        cache: &mut evm_fork_cache::EvmCache,
+        batch: &evm_fork_cache::reactive::ReactiveInputBatch,
+        ownership: &super::AmmOwnershipIndex,
+    ) {
+        *self.staking.write().unwrap_or_else(|e| e.into_inner()) =
+            super::slipstream_staking::prepare(cache, batch, ownership);
+    }
+
+    #[cfg(feature = "uniswap-v3")]
+    pub(crate) fn clear_staking(&self) {
+        *self.staking.write().unwrap_or_else(|e| e.into_inner()) = Default::default();
+    }
+
     /// Construct a routing context at `registry`.
     pub fn new(registry: Arc<AdapterRegistry>) -> Self {
         Self {
             registry: Arc::new(RwLock::new(registry)),
+            #[cfg(feature = "uniswap-v3")]
+            staking: Arc::new(RwLock::new(Default::default())),
             slipstream_fee_evidence: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -684,11 +704,23 @@ fn handle_routed_log(
         transaction_index: ctx.transaction_index,
         log_index: ctx.log_index,
         slipstream_fee_evidence: None,
+        #[cfg(feature = "uniswap-v3")]
+        slipstream_staking_evidence: None,
     };
     if let (Some(routing), Some(address)) = (routing, pool.key.address())
         && let Some(evidence) = routing.slipstream_fee_evidence(address, &event_context)
     {
         event_context.slipstream_fee_evidence = Some(evidence);
+    }
+    #[cfg(feature = "uniswap-v3")]
+    if let (Some(routing), Some(address)) = (routing, pool.key.address())
+        && super::slipstream_staking::supports_pool(address)
+    {
+        event_context.slipstream_staking_evidence = routing
+            .staking
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .evidence(address, &event_context);
     }
     let result = adapter.decode_event_with_context(pool, log, state, &event_context);
     let decode_error = result.error;
@@ -808,7 +840,7 @@ fn handle_routed_log(
     })
 }
 
-fn adapter_error_class(error: &AdapterEventError) -> &'static str {
+pub(crate) fn adapter_error_class(error: &AdapterEventError) -> &'static str {
     match error {
         AdapterEventError::MalformedLog(_) => "malformed_log",
         AdapterEventError::MissingState { .. } => "missing_state",
@@ -817,6 +849,9 @@ fn adapter_error_class(error: &AdapterEventError) -> &'static str {
             super::V3TransitionError::MissingContext(_) => "v3_missing_context",
             super::V3TransitionError::MissingSlipstreamFeeEvidence => {
                 "v3_missing_slipstream_fee_evidence"
+            }
+            super::V3TransitionError::SlipstreamStakingEvidence(_) => {
+                "v3_slipstream_staking_evidence"
             }
             super::V3TransitionError::SlipstreamFeeEvidence(_) => "v3_slipstream_fee_evidence",
             super::V3TransitionError::SlipstreamFeeInferenceNoMatch => "v3_slipstream_fee_no_match",

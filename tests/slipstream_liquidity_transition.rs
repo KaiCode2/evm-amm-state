@@ -13,6 +13,12 @@ use evm_amm_state::adapters::{
 #[path = "slipstream_liquidity_transition/bulk_preparation.rs"]
 mod bulk_preparation;
 
+#[path = "slipstream_liquidity_transition/staking.rs"]
+mod staking;
+
+#[path = "slipstream_liquidity_transition/staking_differential.rs"]
+mod staking_differential;
+
 const POOL: Address = address!("b378137c90444bbcecd44a1f766851fbf53d2a9e");
 const BLOCK_HASH: B256 = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 const PARENT_HASH: B256 = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");

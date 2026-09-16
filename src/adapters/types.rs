@@ -1642,6 +1642,9 @@ pub struct AdapterEventContext {
     pub log_index: Option<u64>,
     /// Exact effective fee evidence for a reviewed Slipstream runtime/event.
     pub slipstream_fee_evidence: Option<SlipstreamSwapFeeEvidence>,
+    /// Transaction-local staking evidence prepared by the canonical batch engine.
+    #[cfg(feature = "uniswap-v3")]
+    pub slipstream_staking_evidence: Option<super::slipstream_staking::SlipstreamStakingEvidence>,
 }
 
 impl AdapterEventContext {
@@ -1657,6 +1660,8 @@ impl AdapterEventContext {
             transaction_index: None,
             log_index: None,
             slipstream_fee_evidence: None,
+            #[cfg(feature = "uniswap-v3")]
+            slipstream_staking_evidence: None,
         }
     }
 
@@ -1853,6 +1858,8 @@ pub enum V3TransitionError {
     /// Full Slipstream accounting replay was requested without its runtime-bound
     /// effective-fee evidence.
     MissingSlipstreamFeeEvidence,
+    /// Missing or contradictory transaction-local staking evidence.
+    SlipstreamStakingEvidence(&'static str),
     /// Supplied Slipstream fee/runtime evidence did not match the exact event.
     SlipstreamFeeEvidence(&'static str),
     /// No effective fee in the deployed range can explain the event amounts.
@@ -1897,6 +1904,9 @@ impl fmt::Display for V3TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingContext(field) => write!(f, "missing event context field {field}"),
+            Self::SlipstreamStakingEvidence(reason) => {
+                write!(f, "Slipstream staking evidence: {reason}")
+            }
             Self::MissingSlipstreamFeeEvidence => {
                 write!(f, "missing effective Slipstream fee evidence")
             }

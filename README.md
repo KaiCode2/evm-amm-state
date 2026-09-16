@@ -39,11 +39,12 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
-The `0.3.1-alpha.2` candidate adds Slipstream transition-global preparation to
-bulk cold starts and retains the rounded exact-input and exact-output V3
-swap replay fixes. Opt in with an exact `=0.3.1-alpha.2` version requirement while
+The `0.3.1-alpha.3` candidate adds canonical staking continuity for the reviewed
+Optimism Slipstream deployment and bounded committed decoder diagnostics. It
+retains bulk transition-global preparation and rounded V3 swap replay fixes. Opt in with an exact `=0.3.1-alpha.3` version requirement while
 retaining the feature selection below. It uses the existing `evm-fork-cache
 0.4.0` companion; no cache prerelease is required. See the
+[staking continuity guide](docs/slipstream-staking.md) and
 [rounding validation report](docs/swap-rounding-validation.md) for coverage.
 
 All five protocol adapters are enabled by default; trim to what you use with

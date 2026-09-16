@@ -28,6 +28,14 @@ workflow installs the immutable `evm-amm-search 0.2.0` registry package with its
 locked dependency graph. Any dependency version change requires rerunning the
 applicable locked release and paid-provider matrix.
 
+The Base workflow also retains two immutable sibling checkouts. They do not
+override the registry dependencies in this crate's manifest or lockfile:
+
+| Repository | Pinned commit |
+| --- | --- |
+| `KaiCode2/evm-fork-cache` | `2be88d15fa15b5c44188b318463aa4705bb75aef` |
+| `KaiCode2/alloy-transport-balancer` | `7868bea593dec5748ad7475d1909fc3a2de0d4ad` |
+
 The accepted advisory and unmaintained-dependency scopes are documented and
 machine-checked by `scripts/check-security-exceptions.sh`. New vulnerability
 advisories remain release-blocking.

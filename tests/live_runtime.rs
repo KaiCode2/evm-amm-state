@@ -1,5 +1,8 @@
 #![cfg(feature = "live-runtime")]
 
+#[path = "live_runtime/diagnostics.rs"]
+mod diagnostics;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};

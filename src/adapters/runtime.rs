@@ -1001,11 +1001,27 @@ pub struct AmmChangeSet {
     quality: AmmStateQuality,
     pool_changes: Vec<AmmPoolChange>,
     event_refs: Vec<AmmEventRef>,
+    decode_diagnostics: super::diagnostics::AmmDecodeDiagnostics,
     incidents: Vec<AmmStateIncident>,
     requires_full_refresh: bool,
 }
 
 impl AmmChangeSet {
+    /// Attach bounded original decoder failures before committing this state.
+    #[must_use]
+    pub fn with_decode_diagnostics(
+        mut self,
+        diagnostics: super::diagnostics::AmmDecodeDiagnostics,
+    ) -> Self {
+        self.decode_diagnostics = diagnostics;
+        self
+    }
+
+    /// Original decode causes, retained even when an observer misses a notification.
+    pub const fn decode_diagnostics(&self) -> &super::diagnostics::AmmDecodeDiagnostics {
+        &self.decode_diagnostics
+    }
+
     /// Construct a committed change set and canonicalize pool-change ordering.
     pub fn new(
         version: AmmStateVersion,
@@ -1043,6 +1059,7 @@ impl AmmChangeSet {
             quality,
             pool_changes,
             event_refs: Vec::new(),
+            decode_diagnostics: Default::default(),
             incidents,
             requires_full_refresh,
         })

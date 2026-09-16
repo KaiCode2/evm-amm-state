@@ -6851,7 +6851,8 @@ impl AmmRuntimeActor {
                     incidents,
                     report.requires_full_refresh,
                 )?
-                .with_event_refs(event_refs),
+                .with_event_refs(event_refs)
+                .with_decode_diagnostics(report.decode_diagnostics()),
             );
             let registry_changed = report.requires_full_refresh
                 || !report.degraded_pools.is_empty()

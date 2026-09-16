@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.3] - 2026-09-16
+
+### Fixed
+
+- Maintain the reviewed Optimism Slipstream pool's active staked liquidity and
+  boundary staked-liquidity nets through canonical gauge deposits and withdrawals.
+  Correlate pool, NFT-manager, and gauge logs within the delivered transaction;
+  apply withdrawal changes before NFT receiver callbacks. Event application uses
+  cached state and performs no provider reads.
+- Qualify staking evidence with immutable runtime hashes, pool bindings, complete
+  event identity, recipient/custody checks, and delivery ownership. Missing or
+  conflicting evidence remains a typed, fail-closed repair.
+- Prepare gauge/NFT pool bindings in the existing storage program and add their
+  three runtime accounts to existing cold-start code preparation.
+
+### Added
+
+- Bounded original decoder causes on synchronous reports and committed change
+  sets, including pool generation, source input identity, stable error class,
+  and a count of omitted failures. Consumers can diagnose the transition that
+  invalidated state before a later quote reports missing storage.
+- Continuous staking/withdrawal/callback-swap, reorg, malformed-evidence and
+  deployed-pool bytecode parity regressions.
+
 ## [0.3.1-alpha.2] - 2026-09-15
 
 ### Fixed

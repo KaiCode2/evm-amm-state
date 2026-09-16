@@ -655,6 +655,11 @@ pub struct AmmSyncBatchReport {
 }
 
 impl AmmSyncBatchReport {
+    /// Bounded original decoder causes from this batch.
+    pub fn decode_diagnostics(&self) -> super::diagnostics::AmmDecodeDiagnostics {
+        super::diagnostics::AmmDecodeDiagnostics::from_report(&self.reactive)
+    }
+
     /// Flashblock provenance when this report describes speculative state.
     pub const fn preconfirmation(&self) -> Option<&FlashblockRef> {
         self.preconfirmation.as_ref()
@@ -1951,7 +1956,12 @@ impl AmmSyncEngine {
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<Ethereum>,
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
-        let reactive = match self.runtime.ingest_batch_with_resync(cache, batch) {
+        #[cfg(feature = "uniswap-v3")]
+        self.routing.prepare_staking(cache, &batch, &self.ownership);
+        let result = self.runtime.ingest_batch_with_resync(cache, batch);
+        #[cfg(feature = "uniswap-v3")]
+        self.routing.clear_staking();
+        let reactive = match result {
             Ok(reactive) => reactive,
             Err(error) => {
                 // Ingest can recover a reorg before a later record fails. Keep
@@ -1975,7 +1985,12 @@ impl AmmSyncEngine {
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<Ethereum>,
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
-        let reactive = match self.runtime.ingest_batch(cache, batch) {
+        #[cfg(feature = "uniswap-v3")]
+        self.routing.prepare_staking(cache, &batch, &self.ownership);
+        let result = self.runtime.ingest_batch(cache, batch);
+        #[cfg(feature = "uniswap-v3")]
+        self.routing.clear_staking();
+        let reactive = match result {
             Ok(reactive) => reactive,
             Err(error) => {
                 self.enforce_eviction_fences(cache);
