@@ -1,21 +1,22 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.1-alpha.3`, based on published
-`0.3.1-alpha.2`. It adds transaction-local staking continuity for the reviewed
-Optimism Slipstream deployment and bounded decoder diagnostics retained with
-committed state. See `docs/slipstream-staking.md` for the exact guarantee,
-preparation footprint, and consumer integration requirements.
+The current release candidate is `0.3.1-alpha.4`, based on published
+`0.3.1-alpha.3`. It avoids full pool repair only for proven event-free canonical
+replacements, compares subscription identity by typed event sources, and retains
+required repair intent across typed supersession. See `docs/reorg-repair.md` for
+proof boundaries and the required consumer recovery deadline.
+This is a prepared candidate, not a published or production-verified release.
 `evm-fork-cache` remains exactly pinned to `0.4.0`; no companion release is required.
 Keep other dependency lockfile entries fixed.
 
 The rounding-specific evidence, historical Plasma fixtures, downstream tests,
 and measured limitations are recorded in
 [`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
-Ownership, repair scheduling, beneficiary hydration, and TLS feature changes are deferred.
+Broader ownership/scheduling redesign, beneficiary hydration, and TLS feature changes remain deferred.
 Preparing the alpha does not establish readiness for those paths or for
 Flashblocks.
 
-Consumers must explicitly select `=0.3.1-alpha.3`. After registry publication,
+Consumers must explicitly select `=0.3.1-alpha.4`. After registry publication,
 remove any local path patch, resolve that exact version, and verify the package
 source and the unchanged cache version before rebuilding the service.
 Also update the consumer's own `rustls` lock entry to at least `0.23.45`;
