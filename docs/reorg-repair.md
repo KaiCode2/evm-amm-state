@@ -57,6 +57,9 @@ Unchanged source definitions do not start an unnecessary subscriber replacement.
   retained repair intent; cannot adopt a provider block or publish prepared state.
 - `tests/live_runtime/reorg.rs`: canonical actor and real background worker
   regressions; no network credentials or broadcast.
+- `subscriber_driver/tests/repair.rs`: injects the exact typed same-height
+  subscriber mismatch into a real required-refresh lifecycle; checks that the
+  conflicting hash is never adopted and only canonical progress resumes work.
 
 ## Validation scope
 
