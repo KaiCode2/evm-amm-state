@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve ready pool state across proven event-free canonical replacements,
+  retaining reorg notifications and conservative repair for event/state impact,
+  displaced hydration baselines, and missing history.
+- Compare pool subscription identity using typed event sources instead of debug
+  filter formatting, which includes irrelevant set order and bloom-cache state.
+- Distinguish superseded required repairs from terminal work failures. Discard
+  obsolete artifacts and wait for a fresh canonical target without publishing
+  mismatched state or retrying the same target in a loop.
+
+See [canonical reorg repair](docs/reorg-repair.md) for proof boundaries and
+consumer handling of `WorkSuperseded`.
+
 ## [0.3.1-alpha.3] - 2026-09-16
 
 ### Fixed
