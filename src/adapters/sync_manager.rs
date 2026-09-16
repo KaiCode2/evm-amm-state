@@ -33,6 +33,9 @@ use super::{
 };
 use super::{QuoteReadSetHydrationReport, QuoteReadinessReport, QuoteWarmupError};
 
+mod reorg;
+mod subscription;
+
 /// Error constructing or running [`AmmSyncEngine`].
 ///
 /// `#[non_exhaustive]`: variants track the upstream runtime's failure modes
@@ -341,9 +344,16 @@ pub struct AmmPreparedPoolRefresh {
     replacement_handler: Arc<AmmPoolReactiveHandler>,
     previous_subscription: AmmPoolSubscriptionPlan,
     replacement_subscription: AmmPoolSubscriptionPlan,
+    subscription_changed: bool,
 }
 
 impl AmmPreparedPoolRefresh {
+    /// Whether the pool's exact event emitters, topics, or routing changed.
+    /// Derived from typed source definitions, never formatted transport filters.
+    pub const fn subscription_changed(&self) -> bool {
+        self.subscription_changed
+    }
+
     /// Exact active generation this refresh may update.
     pub const fn instance(&self) -> &PoolInstanceId {
         &self.instance
@@ -1248,6 +1258,10 @@ impl AmmSyncEngine {
             ));
         }
         let sources = self.registry.event_sources_for(&replacement);
+        let subscription_changed = !subscription::same_event_sources(
+            &self.registry.event_sources_for(&previous_registration),
+            &sources,
+        );
         let replacement_ownership = PoolOwnership::new(
             instance.clone(),
             previous_ownership.adapter().clone(),
@@ -1286,6 +1300,7 @@ impl AmmSyncEngine {
             replacement_handler,
             previous_subscription,
             replacement_subscription,
+            subscription_changed,
         })
     }
 
@@ -1307,6 +1322,7 @@ impl AmmSyncEngine {
             replacement_handler,
             previous_subscription,
             replacement_subscription,
+            subscription_changed: _,
         } = prepared;
         if self.ownership.active_pool(instance.key()) != Some(&instance)
             || self.ownership.pool(&instance) != Some(&previous_ownership)
@@ -1971,7 +1987,7 @@ impl AmmSyncEngine {
                 return Err(error.into());
             }
         };
-        self.finish_ingest(cache, reactive, false)
+        self.finish_ingest(cache, reactive, false, &[])
     }
 
     /// Apply canonical input without performing provider I/O on the cache-owner thread.
@@ -1984,6 +2000,7 @@ impl AmmSyncEngine {
         &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<Ethereum>,
+        event_free_reorg: &[evm_fork_cache::reactive::BlockRef],
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
         #[cfg(feature = "uniswap-v3")]
         self.routing.prepare_staking(cache, &batch, &self.ownership);
@@ -1997,7 +2014,7 @@ impl AmmSyncEngine {
                 return Err(error.into());
             }
         };
-        self.finish_ingest(cache, reactive, true)
+        self.finish_ingest(cache, reactive, true, event_free_reorg)
     }
 
     fn finish_ingest(
@@ -2005,6 +2022,7 @@ impl AmmSyncEngine {
         cache: &mut EvmCache,
         reactive: ReactiveBatchReport<Ethereum>,
         defer_repairs: bool,
+        event_free_reorg: &[evm_fork_cache::reactive::BlockRef],
     ) -> Result<AmmSyncBatchReport, AmmSyncError> {
         if let Some(flashblock) = report_preconfirmation(&reactive) {
             let pool_changes = sync_pool_changes(&self.ownership, &reactive, &[], &[], &[]);
@@ -2058,11 +2076,11 @@ impl AmmSyncEngine {
         explicit_refresh_pools.extend(self.mark_ambiguous_purge_pools(&reactive));
         let incidents = sync_incidents(&reactive);
         explicit_refresh_pools.extend(self.mark_coverage_gap_pools(&incidents));
-        let requires_full_refresh = incidents.iter().any(|incident| {
-            matches!(
-                incident,
-                AmmSyncIncident::Reorg { .. } | AmmSyncIncident::Gap { .. }
-            )
+        let event_free_reorg_verified = reorg::verify_event_free_reorg(&reactive, event_free_reorg);
+        let requires_full_refresh = incidents.iter().any(|incident| match incident {
+            AmmSyncIncident::Reorg { .. } => !event_free_reorg_verified,
+            AmmSyncIncident::Gap { .. } => true,
+            _ => false,
         });
         if requires_full_refresh {
             explicit_refresh_pools.extend(self.mark_all_pools_degraded());
@@ -3328,6 +3346,10 @@ mod tests {
                     .with_status(PoolStatus::Ready),
             )
             .unwrap();
+        assert!(
+            !prepared.subscription_changed(),
+            "unchanged sources must skip subscriber reconciliation"
+        );
         engine.commit_pool_refresh(prepared).unwrap();
 
         assert!(!engine.degraded_targets.contains_key(&key));

@@ -87,6 +87,11 @@ jobs:
       - name: Benchmarks compile
         run: cargo bench --locked --no-run --all-features
 
+      - name: Canonical repair regressions (optimized)
+        run: >-
+          cargo test --locked --release --all-features --test live_runtime
+          reorg:: -- --nocapture
+
       - name: Package
         run: cargo package --locked
 

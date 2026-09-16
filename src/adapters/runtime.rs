@@ -1514,6 +1514,17 @@ pub enum AmmRuntimeEventKind {
         /// Completed work attempt.
         work: RuntimeWorkId,
     },
+    /// Required repair was discarded because its canonical target changed.
+    /// The pool remains degraded; replacement work waits for a fresh target.
+    WorkSuperseded {
+        /// Obsolete repair attempt.
+        work: RuntimeWorkId,
+        /// Block the discarded artifact targeted.
+        target: AmmStatePoint,
+        /// Conflicting provider observation or newer runtime point. This is
+        /// diagnostic evidence, not authority to adopt the reported block.
+        observed: AmmStatePoint,
+    },
     /// Work was cancelled or superseded.
     WorkCancelled {
         /// Cancelled work attempt.

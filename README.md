@@ -39,12 +39,14 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
-The `0.3.1-alpha.3` candidate adds canonical staking continuity for the reviewed
-Optimism Slipstream deployment and bounded committed decoder diagnostics. It
-retains bulk transition-global preparation and rounded V3 swap replay fixes. Opt in with an exact `=0.3.1-alpha.3` version requirement while
-retaining the feature selection below. It uses the existing `evm-fork-cache
-0.4.0` companion; no cache prerelease is required. See the
-[staking continuity guide](docs/slipstream-staking.md) and
+The prepared `0.3.1-alpha.4` candidate adds bounded event-free canonical reorg
+handling and typed required-repair supersession. It retains alpha.3's reviewed
+Optimism staking continuity, committed decoder diagnostics, bulk transition
+preparation and rounded V3 swap replay fixes. After publication, opt in with an
+exact `=0.3.1-alpha.4` requirement and retain the feature selection below.
+`evm-fork-cache` stays exactly pinned to `0.4.0`; no companion release is needed.
+See the [canonical repair guide](docs/reorg-repair.md),
+[staking continuity guide](docs/slipstream-staking.md), and
 [rounding validation report](docs/swap-rounding-validation.md) for coverage.
 
 All five protocol adapters are enabled by default; trim to what you use with

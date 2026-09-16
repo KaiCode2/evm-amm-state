@@ -3,6 +3,9 @@
 #[path = "live_runtime/diagnostics.rs"]
 mod diagnostics;
 
+#[path = "live_runtime/reorg.rs"]
+mod reorg;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};

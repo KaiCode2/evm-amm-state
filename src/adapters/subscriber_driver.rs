@@ -2090,6 +2090,8 @@ fn reconciliation_filters(filters: &[Filter], max_addresses: usize) -> Vec<Filte
 
 #[cfg(all(test, feature = "uniswap-v2"))]
 mod tests {
+    mod repair;
+
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};

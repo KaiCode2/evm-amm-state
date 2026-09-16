@@ -1,5 +1,8 @@
 //! Feature-gated asynchronous owner of canonical AMM cache state.
 
+mod reorg;
+mod repair_supersession;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -720,6 +723,17 @@ pub enum AmmRuntimeCommandError {
     InterestRevisionExhausted,
     /// Subscriber ownership/delivery coordination failed.
     Subscriber(String),
+    /// Subscriber reconciliation found a different canonical identity.
+    SubscriberTargetMismatch {
+        /// Requested block number.
+        expected_number: u64,
+        /// Requested block hash.
+        expected_hash: alloy_primitives::B256,
+        /// Provider-reported block number.
+        actual_number: u64,
+        /// Provider-reported block hash.
+        actual_hash: alloy_primitives::B256,
+    },
     /// A second live subscriber was attached to the same actor.
     SubscriberAlreadyAttached,
     /// A topology mutation attempted to overtake accepted canonical delivery.
@@ -855,6 +869,15 @@ impl fmt::Display for AmmRuntimeCommandError {
                 write!(f, "AMM subscriber interest revision is exhausted")
             }
             Self::Subscriber(message) => write!(f, "AMM subscriber transaction failed: {message}"),
+            Self::SubscriberTargetMismatch {
+                expected_number,
+                expected_hash,
+                actual_number,
+                actual_hash,
+            } => write!(
+                f,
+                "subscriber reconcile target mismatch: expected block {expected_number} {expected_hash}, got block {actual_number} {actual_hash}"
+            ),
             Self::SubscriberAlreadyAttached => {
                 write!(f, "an AMM subscriber driver is already attached")
             }
@@ -1220,6 +1243,8 @@ impl AmmRuntime {
             .collect();
         let actor = AmmRuntimeActor {
             runtime_id,
+            event_free_reorg_history: reorg::EventFreeReorgHistory::new(point),
+            repair_waiting_for_canonical: BTreeMap::new(),
             cache,
             engine,
             commands: command_rx,
@@ -2377,6 +2402,8 @@ enum AmmCanonicalOrigin {
 
 struct AmmRuntimeActor {
     runtime_id: super::AmmRuntimeId,
+    event_free_reorg_history: reorg::EventFreeReorgHistory,
+    repair_waiting_for_canonical: BTreeMap<super::PoolInstanceId, AmmStatePoint>,
     cache: EvmCache,
     engine: AmmSyncEngine,
     commands: mpsc::Receiver<AmmRuntimeCommand>,
@@ -2652,7 +2679,9 @@ impl AmmRuntimeActor {
                 let _ = response.send(self.commit_scheduled_discovery(work, owner, report).await);
             }
             AmmRuntimeCommand::CommitScheduledRefresh { prepared, response } => {
-                let _ = response.send(self.commit_scheduled_refresh(prepared).await);
+                let work = prepared.work().cloned();
+                let result = self.commit_scheduled_refresh(prepared).await;
+                let _ = response.send(self.resolve_repair_commit(work.as_ref(), result));
             }
             AmmRuntimeCommand::CommitScheduledSlotPatch {
                 work,
@@ -2661,10 +2690,10 @@ impl AmmRuntimeActor {
                 storage,
                 response,
             } => {
-                let _ = response.send(
-                    self.commit_scheduled_slot_patch(work, pool, baseline, storage)
-                        .await,
-                );
+                let result = self
+                    .commit_scheduled_slot_patch(work.clone(), pool, baseline, storage)
+                    .await;
+                let _ = response.send(self.resolve_repair_commit(Some(&work), result));
             }
             AmmRuntimeCommand::FailScheduledWork {
                 work,
@@ -2764,7 +2793,7 @@ impl AmmRuntimeActor {
                     self.handle_canonical(command).await;
                 }
                 result = &mut future => {
-                    return result.map_err(|error| AmmRuntimeCommandError::Subscriber(error.to_string()));
+                    return result.map_err(repair_supersession::subscriber_error);
                 }
                 _ = self.shutdown.changed() => return Err(AmmRuntimeCommandError::Closed),
             }
@@ -4306,8 +4335,13 @@ impl AmmRuntimeActor {
         for (pool, intent) in pending {
             if self.engine.ownership().active_pool(pool.key()) != Some(&pool) {
                 self.pending_followup_intents.remove(&pool);
+                self.repair_waiting_for_canonical.remove(&pool);
                 continue;
             }
+            if self.repair_waiting_for_canonical.get(&pool) == Some(&self.point) {
+                continue;
+            }
+            self.repair_waiting_for_canonical.remove(&pool);
             let result = match intent {
                 AmmPendingFollowUpIntent::Repair(action) => {
                     self.queue_repair(pool.clone(), action).map(Some)
@@ -4965,8 +4999,7 @@ impl AmmRuntimeActor {
                 "same-generation refresh changed its subscriber owner".to_owned(),
             ));
         }
-        let interests_changed = format!("{:?}", refresh.previous_subscription().interests())
-            != format!("{:?}", refresh.replacement_subscription().interests());
+        let interests_changed = refresh.subscription_changed();
         let next_interest_revision = if interests_changed {
             self.interest_revision
                 .checked_add(1)
@@ -6287,6 +6320,7 @@ impl AmmRuntimeActor {
             self.detach_scheduled_work(work);
         }
         self.pending_followup_intents.remove(&pool);
+        self.repair_waiting_for_canonical.remove(&pool);
         self.registration_evidence.remove(&pool);
         self.registration_revalidation.remove(&pool);
         self.pending_revalidations
@@ -6557,6 +6591,11 @@ impl AmmRuntimeActor {
         let version = changes.version();
         let point = changes.point();
         let quality = changes.quality();
+        if timing.is_none() {
+            // Prepared state and lifecycle mutations are not reversible through
+            // the event journal. A later reorg must not cross this new anchor.
+            self.event_free_reorg_history.reset(point);
+        }
         let snapshot = Arc::new(AmmStateSnapshot::new(
             self.runtime_id,
             version,
@@ -6622,7 +6661,7 @@ impl AmmRuntimeActor {
         self.preconfirmations.send_replace(None);
         let report = match self
             .engine
-            .ingest_batch_deferred_repairs(&mut self.cache, batch)
+            .ingest_batch_deferred_repairs(&mut self.cache, batch, &[])
         {
             Ok(report) => report,
             Err(error) => {
@@ -6726,6 +6765,10 @@ impl AmmRuntimeActor {
             parent_hash: Some(header.inner.parent_hash),
             timestamp: Some(header.inner.timestamp),
         };
+        let has_logs = !event_refs.is_empty();
+        let event_free_reorg = self
+            .event_free_reorg_history
+            .replacement_proof(&block, has_logs);
         let mut complete_records = Vec::with_capacity(records.records().len() + 1);
         complete_records.push(evm_fork_cache::reactive::ReactiveInputRecord::new(
             ReactiveInput::BlockHeader(header),
@@ -6745,6 +6788,7 @@ impl AmmRuntimeActor {
         let report = match self.engine.ingest_batch_deferred_repairs(
             &mut self.cache,
             ReactiveInputBatch::new(complete_records),
+            &event_free_reorg,
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -6907,6 +6951,8 @@ impl AmmRuntimeActor {
             observer_events,
             Some(transition_timing),
         );
+        self.event_free_reorg_history
+            .record(block, has_logs, next_point.chain_id());
         for (pool, action, revalidation) in reorg_actions {
             if self.engine.ownership().active_pool(pool.key()) != Some(&pool) {
                 continue;
