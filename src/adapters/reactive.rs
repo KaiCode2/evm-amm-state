@@ -875,6 +875,11 @@ fn log_interest(source: EventSource) -> LogInterest {
         provider_filter = provider_filter.event_signature(source.topics.clone());
     }
 
+    provider_filter = provider_filter
+        .topic1(source.indexed_topics[0].clone())
+        .topic2(source.indexed_topics[1].clone())
+        .topic3(source.indexed_topics[2].clone());
+
     LogInterest {
         provider_filter,
         local_matcher: None,
@@ -929,7 +934,7 @@ fn pool_source_matches(
     routing: &AmmReactiveRoutingContext,
     log: &alloy_primitives::Log,
 ) -> bool {
-    if source.emitter != log.address {
+    if source.emitter != log.address || !source.matches_indexed_topics(log.topics()) {
         return false;
     }
     if !source.topics.is_empty()

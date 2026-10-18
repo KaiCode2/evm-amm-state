@@ -587,7 +587,7 @@ async fn withdrawal_does_not_hide_an_invalid_parent_staking_balance() {
 }
 
 #[tokio::test]
-async fn staking_interests_keep_one_provider_filter_for_the_pool() {
+async fn staking_interests_exclude_shared_nft_manager_and_keep_precise_topics() {
     let (_, _, engine, _) = setup().await;
     let mut routes = evm_fork_cache::reactive::ReactiveRegistry::new();
     routes
@@ -598,14 +598,33 @@ async fn staking_interests_keep_one_provider_filter_for_the_pool() {
     let filters = routes.log_subscription_filters();
     assert_eq!(
         filters.len(),
-        1,
-        "staking coverage must not triple canonical log queries"
+        3,
+        "pool, gauge and gauge-custody transfers have distinct predicates"
     );
-    let addresses: std::collections::BTreeSet<_> = filters[0].address.iter().copied().collect();
+    let addresses: std::collections::BTreeSet<_> = filters
+        .iter()
+        .flat_map(|filter| filter.address.iter().copied())
+        .collect();
     assert_eq!(
         addresses,
         std::collections::BTreeSet::from([OP_POOL, GAUGE, NFT])
     );
+    let gauge = filters
+        .iter()
+        .find(|filter| filter.address.matches(&GAUGE))
+        .unwrap();
+    assert_eq!(gauge.topics[0].len(), 2);
+    assert!(gauge.topics[0].matches(&keccak256("Deposit(address,uint256,uint128)")));
+    assert!(gauge.topics[0].matches(&keccak256("Withdraw(address,uint256,uint128)")));
+    assert!(!gauge.topics[0].matches(&keccak256("Collect(uint256,address,uint256,uint256)")));
+    let nft = filters
+        .iter()
+        .find(|filter| filter.address.matches(&NFT))
+        .unwrap();
+    assert_eq!(nft.topics[0].len(), 1);
+    assert!(nft.topics[0].matches(&keccak256("Transfer(address,address,uint256)")));
+    assert_eq!(nft.topics[1].len(), 1);
+    assert!(nft.topics[1].matches(&GAUGE.into_word()));
 }
 
 #[tokio::test]
@@ -625,4 +644,55 @@ async fn noncanonical_staking_payloads_are_not_accepted_as_evidence() {
             "event {index}"
         );
     }
+}
+
+#[tokio::test]
+async fn recorded_unrelated_nft_block_produces_zero_subscription_matches() {
+    let (_, _, engine, _) = setup().await;
+    let handler = evm_amm_state::adapters::AmmReactiveHandler::new(engine.registry().clone());
+    let value: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/optimism_unrelated_nft_logs.json")).unwrap();
+    let logs: Vec<RpcLog> = serde_json::from_value(value["logs"].clone()).unwrap();
+    let old_topics = [
+        keccak256("Transfer(address,address,uint256)"),
+        keccak256("Collect(uint256,address,uint256,uint256)"),
+    ];
+    let old_count = logs
+        .iter()
+        .filter(|log| {
+            log.address() == NFT
+                && log
+                    .topics()
+                    .first()
+                    .is_some_and(|topic| old_topics.contains(topic))
+        })
+        .count();
+    assert!(old_count > 20, "production-shaped shared-manager traffic");
+    let filters: Vec<_> = handler
+        .interests()
+        .into_iter()
+        .filter_map(|interest| match interest {
+            evm_fork_cache::reactive::ReactiveInterest::Logs(logs) => Some(logs.provider_filter),
+            _ => None,
+        })
+        .collect();
+    let new_count = logs
+        .iter()
+        .filter(|log| {
+            filters.iter().any(|filter| {
+                filter.address.matches(&log.address())
+                    && filter.topics.iter().enumerate().all(|(index, topics)| {
+                        topics.is_empty()
+                            || log
+                                .topics()
+                                .get(index)
+                                .is_some_and(|topic| topics.matches(topic))
+                    })
+            })
+        })
+        .count();
+    assert_eq!(new_count, 0);
+    println!(
+        "recorded NFT block: old_pushes={old_count} narrowed_pushes={new_count}; no gauge event, zero NFT evidence requests"
+    );
 }

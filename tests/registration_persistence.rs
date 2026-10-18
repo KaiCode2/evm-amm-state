@@ -469,3 +469,38 @@ fn oversized_capture_is_rejected_before_replacing_an_old_archive() -> Result<()>
     assert!(AmmRegistrationArchive::load(&path, 1).is_ok());
     Ok(())
 }
+
+#[test]
+fn indexed_event_predicates_survive_restart_and_legacy_archives_load() -> Result<()> {
+    let pool = Address::repeat_byte(0x14);
+    let source = EventSource::direct(pool, vec![B256::repeat_byte(1)]).with_indexed_topics([
+        vec![B256::repeat_byte(2)],
+        vec![],
+        vec![B256::repeat_byte(3)],
+    ]);
+    let snapshot = snapshot_for([
+        PoolRegistration::new(PoolKey::Curve(pool)).with_event_source(source.clone())
+    ])?;
+    let path = temp_path("indexed_topics");
+    AmmRegistrationArchive::capture(10, &snapshot)?.save(&path)?;
+    assert_eq!(
+        AmmRegistrationArchive::load(&path, 10)?.registrations()[0].event_sources,
+        vec![source]
+    );
+    let bytes = std::fs::read(&path)?;
+    let mut payload: serde_json::Value = serde_json::from_slice(&bytes[PAYLOAD_OFFSET..])?;
+    payload["registrations"][0]["event_sources"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("indexed_topics");
+    let payload = serde_json::to_vec(&payload)?;
+    let mut legacy = bytes[..12].to_vec();
+    legacy.extend(alloy_primitives::keccak256(&payload).as_slice());
+    legacy.extend(payload);
+    std::fs::write(&path, legacy)?;
+    assert_eq!(
+        AmmRegistrationArchive::load(&path, 10)?.registrations()[0].event_sources[0].indexed_topics,
+        [Vec::<B256>::new(), Vec::new(), Vec::new()]
+    );
+    Ok(())
+}

@@ -1,6 +1,11 @@
 //! Alloy-specific subscriber owner and complete-block driver.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+mod filters;
+#[cfg(feature = "uniswap-v3")]
+mod staking;
+use filters::reconciliation_filters;
+
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -8,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use alloy_network::{Ethereum, primitives::BlockResponse as _};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::{Filter, Header as RpcHeader, Log as RpcLog};
+use alloy_rpc_types_eth::{Header as RpcHeader, Log as RpcLog};
 use evm_fork_cache::reactive::{
     AlloySubscriber, BlockInterest, BlockRef, ChainControl, ChainStatus, EventSubscriber,
     HandlerId, InputSource, PreconfirmationMode, ReactiveContext, ReactiveInput,
@@ -1588,7 +1593,7 @@ where
     /// Whether `bloom` proves no registered log interest can match this block.
     ///
     /// A log matches an interest only if the bloom carries *both* its address
-    /// and its `topic0`, so either being absent excludes the interest. Testing
+    /// and every constrained topic, so any absence excludes the interest. Testing
     /// both matters: measured against live headers, the address alone leaves
     /// about half of Ethereum blocks unprovable because a saturated bloom admits
     /// it by false positive, and the topic check recovers a third of those.
@@ -1617,13 +1622,11 @@ where
                 // No address of this interest can appear, so it cannot match.
                 continue;
             }
-            // The address is admitted; a declared `topic0` set gives a second,
-            // independent chance to exclude. An empty set is a wildcard.
-            if !filter.topics[0].is_empty()
-                && !filter.topics[0]
-                    .iter()
-                    .any(|topic| admits(topic.as_slice()))
-            {
+            // Every constrained topic slot must be present. This is only a
+            // negative proof: bloom membership cannot prove ordering or a log.
+            if filter.topics.iter().any(|topics| {
+                !topics.is_empty() && !topics.iter().any(|topic| admits(topic.as_slice()))
+            }) {
                 continue;
             }
             return false;
@@ -1729,7 +1732,8 @@ where
 
     /// Submit a block whose log set the subscription already delivered whole.
     ///
-    /// Costs no provider request: the logs were paid for when they arrived.
+    /// Pool/gauge logs cost no extra request. Relevant staking transitions
+    /// require bounded hash-pinned NFT evidence before publication.
     async fn seal_from_subscription(
         &mut self,
         header: RpcHeader,
@@ -1744,10 +1748,15 @@ where
             parent_hash: Some(header.inner.parent_hash),
             timestamp: Some(header.inner.timestamp),
         };
-        let buffered = self
+        #[cfg_attr(not(feature = "uniswap-v3"), allow(unused_mut))]
+        let mut buffered = self
             .buffered_logs
             .remove(&(block.number, block.hash))
             .unwrap_or_default();
+        let subscription_keys: std::collections::BTreeSet<_> = buffered.keys().copied().collect();
+        #[cfg(feature = "uniswap-v3")]
+        self.complete_staking_evidence(point.chain_id(), &block, &mut buffered)
+            .await?;
         let mut records = Vec::with_capacity(buffered.len());
         for log in buffered.into_values() {
             // Re-run the same identity checks reconciliation applies, so a
@@ -1755,7 +1764,11 @@ where
             let _ = validated_log_key(&log, &block)?;
             let context = ReactiveContext {
                 chain_id: Some(point.chain_id()),
-                source: InputSource::Subscription,
+                source: if subscription_keys.contains(&log.log_index.expect("validated index")) {
+                    InputSource::Subscription
+                } else {
+                    InputSource::Batch
+                },
                 chain_status: ChainStatus::Included {
                     block,
                     confirmations: 0,
@@ -1768,7 +1781,7 @@ where
         }
         AmmSubscriberDriverCounters::add(
             &self.stats.subscription_logs_applied,
-            records.len() as u64,
+            subscription_keys.len() as u64,
         );
         let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
@@ -1925,6 +1938,9 @@ where
                 }
             }
         }
+        #[cfg(feature = "uniswap-v3")]
+        self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
+            .await?;
         let records = logs
             .into_values()
             .map(|log| {
@@ -2049,48 +2065,11 @@ fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscribe
     Ok(log_index)
 }
 
-fn reconciliation_filters(filters: &[Filter], max_addresses: usize) -> Vec<Filter> {
-    if filters.is_empty() {
-        return Vec::new();
-    }
-    let address_wildcard = filters.iter().any(|filter| filter.address.is_empty());
-    let topic_wildcard = filters.iter().any(|filter| filter.topics[0].is_empty());
-    let addresses: BTreeSet<_> = filters
-        .iter()
-        .flat_map(|filter| filter.address.iter().copied())
-        .collect();
-    let topics: Vec<_> = filters
-        .iter()
-        .flat_map(|filter| filter.topics[0].iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    let build = |addresses: Option<Vec<alloy_primitives::Address>>| {
-        let mut filter = Filter::new();
-        if let Some(addresses) = addresses {
-            filter = filter.address(addresses);
-        }
-        if !topic_wildcard {
-            filter = filter.event_signature(topics.clone());
-        }
-        filter
-    };
-    if address_wildcard {
-        vec![build(None)]
-    } else {
-        addresses
-            .into_iter()
-            .collect::<Vec<_>>()
-            .chunks(max_addresses)
-            .map(|chunk| build(Some(chunk.to_vec())))
-            .collect()
-    }
-}
-
 #[cfg(all(test, feature = "uniswap-v2"))]
 mod tests {
     mod repair;
+    #[cfg(feature = "uniswap-v3")]
+    mod staking;
 
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2120,7 +2099,6 @@ mod tests {
         AmmSubscriberDriverConfig, AmmSubscriberDriverCounters, AmmSubscriberDriverState,
         AmmSubscriberOwnerPlan, BTreeMap, CanonicalLogSource, SubscriberControlCommand,
         SubscriberTransaction, handle_preconfirmation_result, initial_canonical_lineage,
-        reconciliation_filters,
     };
     use crate::adapters::{
         AdapterRegistry, AmmAdapter, AmmCanonicalBatch, AmmColdStartWorkerConfig,
@@ -2766,6 +2744,8 @@ mod tests {
                 let canonical_block: Block = Block::empty(header(501, baseline_header.hash));
                 reconciliation.push_success(&Some(canonical_block.clone()));
                 reconciliation.push_success(&Some(canonical_block));
+                // Factory and pool predicates remain separate (no cross product).
+                reconciliation.push_success(&Vec::<RpcLog>::new());
                 reconciliation.push_success(&Vec::<RpcLog>::new());
                 let provider = ProviderBuilder::new().connect_mocked_client(reconciliation);
                 let subscriber = AlloySubscriber::new(
@@ -3017,49 +2997,6 @@ mod tests {
                 Ok(())
             })
             .await
-    }
-
-    #[test]
-    fn complete_block_reconciliation_chunks_addresses_and_unions_topics() {
-        let filters: Vec<_> = (0..600u64)
-            .map(|index| {
-                let mut bytes = [0u8; 20];
-                bytes[12..].copy_from_slice(&index.to_be_bytes());
-                Filter::new()
-                    .address(Address::from(bytes))
-                    .event_signature(B256::repeat_byte((index % 3) as u8))
-                    .topic1(B256::repeat_byte(0xff))
-            })
-            .collect();
-
-        let reconciled = reconciliation_filters(&filters, 256);
-        assert_eq!(reconciled.len(), 3);
-        assert_eq!(
-            reconciled
-                .iter()
-                .map(|filter| filter.address.len())
-                .sum::<usize>(),
-            600
-        );
-        assert!(reconciled.iter().all(|filter| filter.topics[0].len() == 3));
-        assert!(
-            reconciled.iter().all(|filter| filter.topics[1].is_empty()),
-            "indexed-topic constraints are broadened to avoid cross-filter false negatives"
-        );
-    }
-
-    #[test]
-    fn any_wildcard_filter_keeps_the_reconciliation_union_broad() {
-        let filters = vec![
-            Filter::new(),
-            Filter::new()
-                .address(Address::repeat_byte(0x11))
-                .event_signature(B256::repeat_byte(0x22)),
-        ];
-        let reconciled = reconciliation_filters(&filters, 256);
-        assert_eq!(reconciled.len(), 1);
-        assert!(reconciled[0].address.is_empty());
-        assert!(reconciled[0].topics[0].is_empty());
     }
 
     /// Phase 0 exit criterion, measured from inside the process: the WebSocket

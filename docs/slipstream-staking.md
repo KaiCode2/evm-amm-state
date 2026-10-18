@@ -7,8 +7,9 @@ signed staked-liquidity net at each position boundary.
 
 ## Evidence and ordering
 
-The adapter adds the reviewed gauge's `Deposit`/`Withdraw` and the reviewed NFT
-manager's `Collect`/`Transfer` to its event sources. Within one complete delivered
+The adapter subscribes to the reviewed gauge's `Deposit`/`Withdraw` and NFT
+`Transfer` events whose indexed `from` is that gauge. The complete-block driver
+fetches NFT `Collect` and `Transfer` evidence only for gauge-event token IDs. Within one complete delivered
 transaction, it binds the pool `Collect` range to the manager's token ID and
 recipient, then checks custody and the gauge's indexed liquidity delta. The
 reviewed manager emits exactly one `MetadataUpdate` between the two Collect
@@ -55,13 +56,27 @@ accounting parent; staking quote updates do not establish that stronger parent.
 Other deployments, including Base staking transitions, are not qualified by
 this change. Preconfirmed staking batches fail closed.
 
-The pool, gauge and NFT sources share one topic union, so the subscriber
-consolidates them into **one provider log filter**, as before. Local decoding
-checks the qualified emitter and exact event. The response now includes the
-manager's Collect/Transfer activity, which increases log bytes even when those
-NFTs belong to other pools. There are no per-token receipt or position reads.
+Pool, gauge and gauge-outgoing NFT transfers use separate precise predicates.
+`EventSource::indexed_topics` preserves topic1..3 through subscription routing,
+registration persistence and exact-block reconciliation. Grouping is allowed
+only for identical topic tuples; bloom absence checks include all constrained
+slots. A bloom match is never used as positive evidence of a log.
 
-Event preparation and application make **zero provider requests**. Staking
+Before either subscription sealing or reconciliation ingestion, the driver
+fetches `Transfer` (topic3 token ID) and `Collect` (topic1 token ID) from the NFT
+manager at the canonical block hash. Up to 256 token IDs share each pair; the two
+queries run concurrently and count as TWO RPC elements. No gauge events means
+zero enrichment requests. Reorg/catch-up delivery uses the same boundary and
+rebuilds evidence for the replacement hash. Wrong-hash, removed, conflicting,
+out-of-filter or oversized evidence fails closed. Owner installation remains
+post-block at an authoritative hydrated baseline, with no pre-baseline replay.
+Custom `AmmRuntime`/`AmmSyncEngine` callers must still supply complete batches.
+
+The new readers live in `slipstream_staking/reads.rs`; the driver boundary is
+`subscriber_driver/staking.rs`, and predicate grouping is in
+`subscriber_driver/filters.rs`. They depend on protocol ABIs, canonical log types
+and the existing subscriber provider; they add no quote/simulation dependency.
+Event preparation and application remain provider-free. Staking
 batches obtain a local immutable cache view for runtime qualification; ordinary
 swap-only batches skip that extra view. Cold preparation adds two pool words
 (slots 3 and 4) to the existing bulk/windowed footprint and three code targets
