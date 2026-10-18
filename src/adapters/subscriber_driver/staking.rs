@@ -26,7 +26,7 @@ where
         // Two filters per bounded token chunk: issue the pair concurrently, so
         // a relevant staking block adds one provider round trip, not two.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        for pair in filters.chunks_exact(2) {
+        for pair in filters.as_chunks::<2>().0 {
             let transfer = pair[0].clone().at_block_hash(block.hash);
             let collect = pair[1].clone().at_block_hash(block.hash);
             AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 2);
