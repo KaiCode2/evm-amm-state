@@ -1520,6 +1520,8 @@ impl AmmRuntimeHandle {
         })
     }
 
+    // Keep the Rust 1.90 API; newer compilers renamed fetch_update to try_update.
+    #[allow(deprecated)]
     fn allocate_command_id(&self) -> Result<AmmCommandId, AmmRuntimeSubmitError> {
         self.next_command_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
