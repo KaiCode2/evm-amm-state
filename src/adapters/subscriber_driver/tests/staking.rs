@@ -128,18 +128,18 @@ async fn wrong_hash_conflicts_and_out_of_filter_evidence_are_rejected() -> Resul
                     _ => {}
                 }
                 if failure == "provider" {
-                    asserter.push_failure_msg("unavailable");
+                    asserter.push_failure_msg("private-provider-detail-must-not-escape");
                 } else {
                     asserter.push_success(&vec![transfer]);
                 }
                 asserter.push_success(&vec![collect]);
-                assert!(
-                    driver
-                        .complete_staking_evidence(10, &block, &mut logs)
-                        .await
-                        .is_err(),
-                    "{failure}"
-                );
+                let error = driver
+                    .complete_staking_evidence(10, &block, &mut logs)
+                    .await
+                    .expect_err(failure);
+                if failure == "provider" {
+                    assert!(!error.to_string().contains("private-provider-detail"));
+                }
                 runtime.shutdown().await?;
             }
             Ok(())
