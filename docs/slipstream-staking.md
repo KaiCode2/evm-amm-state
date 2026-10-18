@@ -149,3 +149,28 @@ reviewed deployments, with zero provider calls, invalidations or resyncs.
 Their p95 values were 0.893 ms (Base) and 1.690 ms (Optimism). Mandatory live
 Base parity/discovery checks passed through a paid QuickNode endpoint. This
 validates the existing Base quote path; it does not qualify Base staking.
+
+### NFT filtering qualification — 2026-10-18
+
+On an Apple M1 Pro / 16 GiB host with Rust 1.90.0 and optimized release builds,
+1,000 alternating deposit/withdraw cycles against 10,000 unrelated cache slots
+produced the following matched measurements (competing builds paused):
+
+| Tree | p50 ms | p95 ms | p99 ms | max ms | RPC elements / retries / fallbacks |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Published alpha.4 (`70c3141`) | 0.401542 | 0.488208 | 0.590417 | 1.823417 | 0 / 0 / 0 |
+| Narrow NFT predicates | 0.319625 | 0.398375 | 0.490166 | 1.346375 | 0 / 0 / 0 |
+
+This validates provider-free staking application without a measured regression;
+it is not a claim of faster provider I/O. An earlier shared-target candidate run
+was discarded after detecting baseline artifact reuse. The accepted candidate
+was rebuilt and verified to contain the new recorded-NFT regression (25 total
+suite tests versus 24 in the baseline). All 13 focused staking cases passed,
+including callback burn/swap ordering, malformed/missing proof, reorg replacement,
+and 32 old versus zero new NFT matches in recorded Optimism block 158365075.
+
+Read counts are distinct from application timing: ordinary blocks issue zero NFT
+evidence requests; each relevant group of up to 256 gauge token IDs issues two
+hash-pinned elements concurrently. Reconciliation preserves predicates and runs
+at most four reads concurrently. No quote/simulation I/O or automatic retry was
+added. Provider RTTs and deployed end-to-end p95 remain release/canary checks.

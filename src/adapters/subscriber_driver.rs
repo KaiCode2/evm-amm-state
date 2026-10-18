@@ -53,24 +53,23 @@ pub enum AmmPreconfirmationRejectionPolicy {
 /// The subscriber already delivers every matching log over its subscription.
 /// Historically the driver discarded them and re-fetched each block's logs with
 /// a hash-pinned `eth_getLogs`, because it could not tell a complete stream from
-/// a punctured one. It can now: the subscriber attests through
+/// a punctured one. The subscriber attests through
 /// [`ChainControl::LogCoverage`](evm_fork_cache::reactive::ChainControl) that no
-/// notification loss went unhealed at or below a block, and any block that is
-/// *not* attested still takes the reconciliation path. The fetch stops being
-/// unconditional and becomes exact.
+/// notification loss went unhealed at or below a block. That attestation alone
+/// does not close independent streams: closure also needs conservative bloom
+/// absence or a successor on the only registered log stream. Otherwise the
+/// driver reconciles after the bounded grace window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanonicalLogSource {
     /// Assemble blocks from the subscription, reconciling only what is not
     /// attested.
     ///
-    /// A block is submitted once its logs are attested complete, its header has
-    /// arrived, and its log set is known closed — proven either by an
-    /// observation from a strictly later block, or by `grace` elapsing with no
-    /// such observation. The grace window is a quiet-tail fallback, not the
-    /// steady-state path.
+    /// A block needs its header, loss-coverage attestation and a closure proof:
+    /// bloom absence for every interest, or a strictly later log when there is
+    /// only one log stream. Expiring `grace` authorizes exact-hash reconciliation,
+    /// never publication of an unproven partial subscription buffer.
     Subscription {
-        /// How long to wait for stragglers before sealing a block whose
-        /// successor has not been observed.
+        /// How long to wait for closure proof before reconciling the block.
         grace: Duration,
     },
     /// Re-fetch every canonical block's logs with a hash-pinned `eth_getLogs`.
@@ -82,8 +81,8 @@ pub enum CanonicalLogSource {
 impl CanonicalLogSource {
     /// Default straggler window for subscription-sourced assembly.
     ///
-    /// Chosen to be short relative to any supported block time: the later-block
-    /// observation normally seals first, so this bounds only the tail.
+    /// Bounds waiting for closure proof while remaining short relative to every
+    /// supported block time. Expiry falls back to canonical reconciliation.
     pub const DEFAULT_GRACE: Duration = Duration::from_millis(40);
 }
 
@@ -1477,7 +1476,7 @@ where
         )
     }
 
-    /// Straggler window before a block with no observed successor is sealed.
+    /// Straggler window before an unproven block is reconciled.
     const fn seal_grace(&self) -> Duration {
         match self.canonical_log_source {
             CanonicalLogSource::Subscription { grace } => grace,
@@ -1487,8 +1486,8 @@ where
 
     /// Record the subscriber's log-coverage attestation.
     ///
-    /// The watermark is the only evidence that the delivered log set is whole;
-    /// without one at or above a block, that block is reconciled.
+    /// The watermark rules out detected, unrepaired loss. Closure needs a
+    /// separate proof; without coverage at or above a block it is reconciled.
     fn note_log_coverage(&mut self, controls: &[ChainControl]) {
         for control in controls {
             if let ChainControl::LogCoverage(block) = control {
