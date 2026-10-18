@@ -2046,6 +2046,14 @@ fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscribe
             "log does not belong to the requested canonical block",
         ));
     }
+    if log
+        .block_timestamp
+        .is_some_and(|timestamp| block.timestamp != Some(timestamp))
+    {
+        return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
+            "log timestamp contradicts canonical header",
+        ));
+    }
     let transaction_index =
         log.transaction_index
             .ok_or(AmmSubscriberDriverError::InvalidCanonicalLog(

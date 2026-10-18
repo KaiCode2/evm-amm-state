@@ -65,7 +65,9 @@ slots. A bloom match is never used as positive evidence of a log.
 Before either subscription sealing or reconciliation ingestion, the driver
 fetches `Transfer` (topic3 token ID) and `Collect` (topic1 token ID) from the NFT
 manager at the canonical block hash. Up to 256 token IDs share each pair; the two
-queries run concurrently and count as TWO RPC elements. No gauge events means
+queries run concurrently and count as TWO RPC elements. One two-second deadline
+bounds the entire evidence fetch; timeout fails closed before publication. This
+is an outage ceiling, not a change to a consumer's latency operating targets. No gauge events means
 zero enrichment requests. Reorg/catch-up delivery uses the same boundary and
 rebuilds evidence for the replacement hash. Wrong-hash, removed, conflicting,
 out-of-filter or oversized evidence fails closed. Owner installation remains

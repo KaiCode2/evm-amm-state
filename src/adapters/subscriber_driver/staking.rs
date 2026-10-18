@@ -25,14 +25,18 @@ where
             super::super::slipstream_staking::reads::evidence_filters(chain, logs.values());
         // Two filters per bounded token chunk: issue the pair concurrently, so
         // a relevant staking block adds one provider round trip, not two.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         for pair in filters.chunks_exact(2) {
             let transfer = pair[0].clone().at_block_hash(block.hash);
             let collect = pair[1].clone().at_block_hash(block.hash);
             AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 2);
-            let (transfers, collects) = tokio::join!(
-                self.subscriber.provider().get_logs(&transfer),
-                self.subscriber.provider().get_logs(&collect),
-            );
+            let (transfers, collects) = evidence_deadline(deadline, async {
+                tokio::join!(
+                    self.subscriber.provider().get_logs(&transfer),
+                    self.subscriber.provider().get_logs(&collect),
+                )
+            })
+            .await?;
             for (filter, result) in [(transfer, transfers), (collect, collects)] {
                 let fetched = result
                     .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
@@ -56,12 +60,17 @@ where
                             "staking evidence violated requested filter",
                         ));
                     }
+                    // WS often omits blockTimestamp while getLogs includes it.
+                    // Both were checked against the header; optional metadata
+                    // presence must not turn the same canonical log into a conflict.
                     match logs.entry(key) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(log);
                         }
                         std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get() != &log =>
+                            if entry.get().inner != log.inner
+                                || entry.get().transaction_hash != log.transaction_hash
+                                || entry.get().transaction_index != log.transaction_index =>
                         {
                             return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
                                 "conflicting staking evidence at one log index",
@@ -78,5 +87,30 @@ where
             }
         }
         Ok(())
+    }
+}
+
+async fn evidence_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<F::Output, AmmSubscriberDriverError> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| {
+            AmmSubscriberDriverError::Provider("staking evidence deadline exceeded".to_owned())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_stalled_read_cannot_hold_publication_indefinitely() {
+        let result = evidence_deadline(
+            tokio::time::Instant::now() + Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(matches!(result, Err(AmmSubscriberDriverError::Provider(_))));
     }
 }

@@ -82,7 +82,9 @@ async fn evidence_is_bounded_exact_block_deduplicated_and_not_fetched_on_quiet_b
             logs.insert(5, gauge);
             // An already streamed transfer is identical evidence, not a second transition.
             logs.insert(4, transfer.clone());
-            asserter.push_success(&vec![transfer]);
+            let mut fetched_transfer = transfer;
+            fetched_transfer.block_timestamp = block.timestamp;
+            asserter.push_success(&vec![fetched_transfer]);
             asserter.push_success(&vec![collect]);
             driver
                 .complete_staking_evidence(10, &block, &mut logs)
@@ -101,7 +103,7 @@ async fn evidence_is_bounded_exact_block_deduplicated_and_not_fetched_on_quiet_b
 async fn wrong_hash_conflicts_and_out_of_filter_evidence_are_rejected() -> Result<()> {
     tokio::task::LocalSet::new()
         .run_until(async {
-            for failure in ["hash", "filter", "conflict", "provider"] {
+            for failure in ["hash", "timestamp", "filter", "conflict", "provider"] {
                 let asserter = Asserter::new();
                 let base = header(500, B256::repeat_byte(0x49));
                 let delivered = header(501, base.hash);
@@ -115,6 +117,7 @@ async fn wrong_hash_conflicts_and_out_of_filter_evidence_are_rejected() -> Resul
                 let (gauge, mut transfer, collect) = evidence(&delivered);
                 let mut logs = BTreeMap::from([(5, gauge)]);
                 match failure {
+                    "timestamp" => transfer.block_timestamp = Some(u64::MAX),
                     "hash" => transfer.block_hash = Some(B256::repeat_byte(0xaa)),
                     "filter" => transfer.inner.address = Address::repeat_byte(0x55),
                     "conflict" => {
