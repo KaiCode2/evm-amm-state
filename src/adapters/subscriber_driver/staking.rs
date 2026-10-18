@@ -30,11 +30,9 @@ where
             let transfer = pair[0].clone().at_block_hash(block.hash);
             let collect = pair[1].clone().at_block_hash(block.hash);
             AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 2);
+            let provider = self.subscriber.provider().clone();
             let (transfers, collects) = evidence_deadline(deadline, async {
-                tokio::join!(
-                    self.subscriber.provider().get_logs(&transfer),
-                    self.subscriber.provider().get_logs(&collect),
-                )
+                tokio::join!(provider.get_logs(&transfer), provider.get_logs(&collect),)
             })
             .await?;
             for (filter, result) in [(transfer, transfers), (collect, collects)] {
@@ -68,9 +66,7 @@ where
                             entry.insert(log);
                         }
                         std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get().inner != log.inner
-                                || entry.get().transaction_hash != log.transaction_hash
-                                || entry.get().transaction_index != log.transaction_index =>
+                            if !super::reconciliation::same_validated_log(entry.get(), &log) =>
                         {
                             return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
                                 "conflicting staking evidence at one log index",

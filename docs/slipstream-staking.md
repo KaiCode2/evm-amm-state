@@ -76,7 +76,11 @@ Custom `AmmRuntime`/`AmmSyncEngine` callers must still supply complete batches.
 
 The new readers live in `slipstream_staking/reads.rs`; the driver boundary is
 `subscriber_driver/staking.rs`, and predicate grouping is in
-`subscriber_driver/filters.rs`. They depend on protocol ABIs, canonical log types
+`subscriber_driver/filters.rs`. Reconciliation reads run at most four at a time
+through `subscriber_driver/reconciliation.rs`. A successor log can prove stream
+closure only for a single registered log interest; with multiple streams the
+driver uses bloom absence or exact-hash reconciliation after the existing grace
+window, never a watermark from a different stream. They depend on protocol ABIs, canonical log types
 and the existing subscriber provider; they add no quote/simulation dependency.
 Event preparation and application remain provider-free. Staking
 batches obtain a local immutable cache view for runtime qualification; ordinary

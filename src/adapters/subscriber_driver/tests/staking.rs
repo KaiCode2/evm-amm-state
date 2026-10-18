@@ -175,3 +175,42 @@ async fn unrelated_nft_transfer_bloom_does_not_force_reconciliation() -> Result<
         })
         .await
 }
+
+#[tokio::test]
+async fn a_successor_on_one_log_stream_cannot_seal_another_stream() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let address = Address::repeat_byte(0x77);
+            let base = header(500, B256::ZERO);
+            let delivered = header_admitting(501, base.hash, address);
+            let block = BlockRef {
+                number: 501,
+                hash: delivered.hash,
+                parent_hash: Some(base.hash),
+                timestamp: Some(delivered.inner.timestamp),
+            };
+            let (mut driver, runtime, _) = subscription_driver(Asserter::new(), base).await?;
+            let interests = [address, NFT].map(|address| {
+                ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(address),
+                    local_matcher: None,
+                    route_key: None,
+                })
+            });
+            driver.subscriber.register_interests(&interests).await?;
+            driver.note_log_coverage(&[ChainControl::LogCoverage(block)]);
+            driver.buffer_subscription_log(reconciled_log(
+                NFT,
+                keccak256("Transfer(address,address,uint256)"),
+                &header(502, delivered.hash),
+                0,
+            ))?;
+            assert!(
+                driver.subscription_seal_reason(501, &delivered).is_none(),
+                "a quiet second stream has no delivery watermark"
+            );
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}

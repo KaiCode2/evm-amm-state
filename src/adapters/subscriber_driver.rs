@@ -1,6 +1,7 @@
 //! Alloy-specific subscriber owner and complete-block driver.
 
 mod filters;
+mod reconciliation;
 #[cfg(feature = "uniswap-v3")]
 mod staking;
 use filters::reconciliation_filters;
@@ -1573,9 +1574,21 @@ where
         }
         // Proof 1: the log subscription itself delivered something for a later
         // block, so in-order delivery puts `number` behind the write head.
-        if self
-            .highest_observed_block
-            .is_some_and(|observed| observed > number)
+        // The subscriber's attestation proves no detected loss, not that every
+        // independent stream has advanced. Without per-stream watermarks only a
+        // single registered log interest can use a successor as closure proof.
+        let single_log_interest = self
+            .subscriber
+            .registered_interests()
+            .iter()
+            .filter(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+            .take(2)
+            .count()
+            == 1;
+        if single_log_interest
+            && self
+                .highest_observed_block
+                .is_some_and(|observed| observed > number)
         {
             return Some(SealReason::Successor);
         }
@@ -1910,34 +1923,7 @@ where
             })
             .collect();
         let filters = reconciliation_filters(&interests, self.max_addresses_per_get_logs);
-        let mut logs = BTreeMap::new();
-        for filter in filters {
-            AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 1);
-            let fetched = self
-                .subscriber
-                .provider()
-                .get_logs(&filter.at_block_hash(block.hash))
-                .await
-                .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
-            AmmSubscriberDriverCounters::add(
-                &self.stats.reconciliation_logs_fetched,
-                fetched.len() as u64,
-            );
-            for log in fetched {
-                let key = validated_log_key(&log, &block)?;
-                match logs.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(log);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &log => {
-                        return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
-                            "conflicting logs share one global log index",
-                        ));
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                }
-            }
-        }
+        let mut logs = self.fetch_reconciliation_logs(&block, filters).await?;
         #[cfg(feature = "uniswap-v3")]
         self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
             .await?;
