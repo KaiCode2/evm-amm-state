@@ -36,8 +36,9 @@ where
             })
             .await?;
             for (filter, result) in [(transfer, transfers), (collect, collects)] {
-                let fetched = result
-                    .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
+                let fetched = result.map_err(|_| {
+                    AmmSubscriberDriverError::Provider("staking evidence RPC failed".to_owned())
+                })?;
                 AmmSubscriberDriverCounters::add(
                     &self.stats.reconciliation_logs_fetched,
                     fetched.len() as u64,

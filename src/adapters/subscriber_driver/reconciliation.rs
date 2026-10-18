@@ -27,8 +27,11 @@ where
             .buffered(4);
         let mut logs = BTreeMap::new();
         while let Some(result) = reads.next().await {
-            let fetched =
-                result.map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
+            let fetched = result.map_err(|_| {
+                AmmSubscriberDriverError::Provider(
+                    "canonical log reconciliation RPC failed".to_owned(),
+                )
+            })?;
             AmmSubscriberDriverCounters::add(
                 &self.stats.reconciliation_logs_fetched,
                 fetched.len() as u64,
