@@ -17,6 +17,9 @@ use evm_fork_cache::reactive::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(feature = "live-runtime")]
+pub(crate) mod reads;
+
 mod abi {
     alloy_sol_types::sol! {
         event Deposit(address indexed user, uint256 indexed tokenId, uint128 indexed liquidityToStake);
@@ -381,23 +384,21 @@ mod pool_abi {
     }
 }
 
-pub(crate) fn sources(pool: &PoolRegistration, mut topics: Vec<B256>) -> Option<Vec<EventSource>> {
+pub(crate) fn sources(pool: &PoolRegistration, topics: Vec<B256>) -> Option<Vec<EventSource>> {
     if pool.key != PoolKey::Slipstream(POOL) {
         return None;
     }
-    // One shared topic set lets the subscriber consolidate all three emitters
-    // into one provider filter. Runtime-qualified emitters and local decoding
-    // retain the exact semantic boundary after this small provider superset.
-    topics.extend([
-        abi::Deposit::SIGNATURE_HASH,
-        abi::Withdraw::SIGNATURE_HASH,
-        abi::Collect::SIGNATURE_HASH,
-        abi::Transfer::SIGNATURE_HASH,
-    ]);
+    // NFT evidence is fetched by the complete-block driver only for token IDs
+    // named by this gauge. Retain only transfers FROM the gauge as a standing
+    // NFT interest: withdrawal state must apply before receiver callbacks.
     Some(vec![
-        EventSource::direct(POOL, topics.clone()),
-        EventSource::adapter_defined(GAUGE, topics.clone()),
-        EventSource::adapter_defined(NFT, topics),
+        EventSource::direct(POOL, topics),
+        EventSource::adapter_defined(
+            GAUGE,
+            vec![abi::Deposit::SIGNATURE_HASH, abi::Withdraw::SIGNATURE_HASH],
+        ),
+        EventSource::adapter_defined(NFT, vec![abi::Transfer::SIGNATURE_HASH])
+            .with_indexed_topics([vec![GAUGE.into_word()], Vec::new(), Vec::new()]),
     ])
 }
 

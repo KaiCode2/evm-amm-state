@@ -367,6 +367,12 @@ struct PersistedEventSource {
     emitter: Address,
     topics: Vec<B256>,
     route: PersistedEventRoute,
+    #[serde(default, skip_serializing_if = "indexed_topics_empty")]
+    indexed_topics: [Vec<B256>; 3],
+}
+
+fn indexed_topics_empty(topics: &[Vec<B256>; 3]) -> bool {
+    topics.iter().all(Vec::is_empty)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -756,6 +762,7 @@ impl TryFrom<&EventSource> for PersistedEventSource {
         Ok(Self {
             emitter: source.emitter,
             topics: source.topics.clone(),
+            indexed_topics: source.indexed_topics.clone(),
             route: match source.route {
                 EventRoute::Direct => PersistedEventRoute::Direct,
                 EventRoute::IndexedAddress { topic_index } => PersistedEventRoute::IndexedAddress {
@@ -783,6 +790,9 @@ impl TryFrom<PersistedEventSource> for EventSource {
 
     fn try_from(source: PersistedEventSource) -> Result<Self, Self::Error> {
         check_limit("event topics", source.topics.len(), MAX_EVENT_TOPICS)?;
+        for topics in &source.indexed_topics {
+            check_limit("indexed event topics", topics.len(), MAX_EVENT_TOPICS)?;
+        }
         let route = match source.route {
             PersistedEventRoute::Direct => EventRoute::Direct,
             PersistedEventRoute::IndexedAddress { topic_index } => EventRoute::IndexedAddress {
@@ -804,6 +814,7 @@ impl TryFrom<PersistedEventSource> for EventSource {
         Ok(EventSource {
             emitter: source.emitter,
             topics: source.topics,
+            indexed_topics: source.indexed_topics,
             route,
         })
     }
@@ -974,6 +985,9 @@ fn validate_registration_limits(
     )?;
     for source in &registration.event_sources {
         check_limit("event topics", source.topics.len(), MAX_EVENT_TOPICS)?;
+        for topics in &source.indexed_topics {
+            check_limit("indexed event topics", topics.len(), MAX_EVENT_TOPICS)?;
+        }
     }
     match &registration.metadata {
         ProtocolMetadata::BalancerV2(metadata) => {

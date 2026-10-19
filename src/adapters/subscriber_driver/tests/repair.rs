@@ -213,3 +213,99 @@ async fn same_height_subscriber_mismatch_waits_for_canonical_progress() -> Resul
         })
         .await
 }
+
+#[tokio::test]
+async fn a_header_gap_invalidates_a_precomputed_subscription_seal() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let pool = Address::repeat_byte(0x77);
+            let baseline = header(500, B256::ZERO);
+            let missed = header_admitting(501, baseline.hash, pool);
+            let delivered = header_admitting(502, missed.hash, pool);
+            let successor = header(503, delivered.hash);
+            let asserter = Asserter::new();
+            let (mut driver, runtime, stats) =
+                subscription_driver(asserter.clone(), baseline).await?;
+            let point = BlockRef {
+                number: 502,
+                hash: delivered.hash,
+                parent_hash: Some(missed.hash),
+                timestamp: Some(delivered.inner.timestamp),
+            };
+            let topic = keccak256("Swap()");
+            let delivered_log = reconciled_log(pool, topic, &delivered, 0);
+            driver.note_log_coverage(&[ChainControl::LogCoverage(point)]);
+            driver.buffer_subscription_log(delivered_log.clone())?;
+            driver.buffer_subscription_log(reconciled_log(pool, topic, &successor, 0))?;
+            let seal = driver.subscription_seal_reason(502, &delivered);
+            assert_eq!(seal, Some(SealReason::Successor));
+            let missed_block: Block = Block::empty(missed.clone());
+            asserter.push_success(&Some(missed_block));
+            asserter.push_success(&vec![reconciled_log(pool, topic, &missed, 0)]);
+            asserter.push_success(&vec![delivered_log]);
+            driver
+                .deliver_through_sealed(delivered.clone(), Instant::now(), Duration::ZERO, seal)
+                .await?;
+            let snapshot = stats.snapshot();
+            assert_eq!(
+                snapshot.blocks_reconciled(),
+                2,
+                "both blocks need fresh proof after clearing their buffers"
+            );
+            assert_eq!(snapshot.reconciliation_logs_fetched(), 2);
+            assert_eq!(snapshot.blocks_sealed_from_subscription(), 0);
+            assert_eq!(driver.highest_observed_block, None);
+            assert_eq!(
+                runtime.latest_snapshot().point().block_hash(),
+                delivered.hash
+            );
+            assert!(asserter.read_q().is_empty());
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn a_same_height_replacement_cannot_reuse_the_old_branch_successor() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let pool = Address::repeat_byte(0x77);
+            let baseline = header(500, B256::ZERO);
+            let old = header(501, baseline.hash);
+            let replacement = header_admitting(501, baseline.hash, pool);
+            let old_successor = header(502, old.hash);
+            let asserter = Asserter::new();
+            let (mut driver, runtime, stats) =
+                subscription_driver(asserter.clone(), baseline).await?;
+            asserter.push_success(&Vec::<RpcLog>::new());
+            driver.deliver_through(old.clone()).await?;
+            let topic = keccak256("Swap()");
+            driver.note_log_coverage(&[ChainControl::LogCoverage(BlockRef {
+                number: 501,
+                hash: old.hash,
+                parent_hash: Some(old.inner.parent_hash),
+                timestamp: Some(old.inner.timestamp),
+            })]);
+            driver.buffer_subscription_log(reconciled_log(pool, topic, &old_successor, 0))?;
+            let seal = driver.subscription_seal_reason(501, &replacement);
+            asserter.push_success(&vec![reconciled_log(pool, topic, &replacement, 0)]);
+            driver
+                .deliver_through_sealed(replacement.clone(), Instant::now(), Duration::ZERO, seal)
+                .await?;
+            let snapshot = stats.snapshot();
+            assert_eq!(
+                snapshot.blocks_reconciled(),
+                2,
+                "replacement requires hash-pinned reconciliation even for a one-block lineage"
+            );
+            assert_eq!(snapshot.reconciliation_logs_fetched(), 1);
+            assert_eq!(snapshot.blocks_sealed_from_subscription(), 0);
+            assert_eq!(driver.attested_log_coverage, None);
+            assert_eq!(driver.highest_observed_block, None);
+            assert!(asserter.read_q().is_empty());
+            runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}

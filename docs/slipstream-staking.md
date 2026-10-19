@@ -7,8 +7,9 @@ signed staked-liquidity net at each position boundary.
 
 ## Evidence and ordering
 
-The adapter adds the reviewed gauge's `Deposit`/`Withdraw` and the reviewed NFT
-manager's `Collect`/`Transfer` to its event sources. Within one complete delivered
+The adapter subscribes to the reviewed gauge's `Deposit`/`Withdraw` and NFT
+`Transfer` events whose indexed `from` is that gauge. The complete-block driver
+fetches NFT `Collect` and `Transfer` evidence only for gauge-event token IDs. Within one complete delivered
 transaction, it binds the pool `Collect` range to the manager's token ID and
 recipient, then checks custody and the gauge's indexed liquidity delta. The
 reviewed manager emits exactly one `MetadataUpdate` between the two Collect
@@ -55,13 +56,33 @@ accounting parent; staking quote updates do not establish that stronger parent.
 Other deployments, including Base staking transitions, are not qualified by
 this change. Preconfirmed staking batches fail closed.
 
-The pool, gauge and NFT sources share one topic union, so the subscriber
-consolidates them into **one provider log filter**, as before. Local decoding
-checks the qualified emitter and exact event. The response now includes the
-manager's Collect/Transfer activity, which increases log bytes even when those
-NFTs belong to other pools. There are no per-token receipt or position reads.
+Pool, gauge and gauge-outgoing NFT transfers use separate precise predicates.
+`EventSource::indexed_topics` preserves topic1..3 through subscription routing,
+registration persistence and exact-block reconciliation. Grouping is allowed
+only for identical topic tuples; bloom absence checks include all constrained
+slots. A bloom match is never used as positive evidence of a log.
 
-Event preparation and application make **zero provider requests**. Staking
+Before either subscription sealing or reconciliation ingestion, the driver
+fetches `Transfer` (topic3 token ID) and `Collect` (topic1 token ID) from the NFT
+manager at the canonical block hash. Up to 256 token IDs share each pair; the two
+queries run concurrently and count as TWO RPC elements. One two-second deadline
+bounds the entire evidence fetch; timeout fails closed before publication. This
+is an outage ceiling, not a change to a consumer's latency operating targets. No gauge events means
+zero enrichment requests. Reorg/catch-up delivery uses the same boundary and
+rebuilds evidence for the replacement hash. Wrong-hash, removed, conflicting,
+out-of-filter or oversized evidence fails closed. Owner installation remains
+post-block at an authoritative hydrated baseline, with no pre-baseline replay.
+Custom `AmmRuntime`/`AmmSyncEngine` callers must still supply complete batches.
+
+The new readers live in `slipstream_staking/reads.rs`; the driver boundary is
+`subscriber_driver/staking.rs`, and predicate grouping is in
+`subscriber_driver/filters.rs`. Reconciliation reads run at most four at a time
+through `subscriber_driver/reconciliation.rs`. A successor log can prove stream
+closure only for a single registered log interest; with multiple streams the
+driver uses bloom absence or exact-hash reconciliation after the existing grace
+window, never a watermark from a different stream. They depend on protocol ABIs, canonical log types
+and the existing subscriber provider; they add no quote/simulation dependency.
+Event preparation and application remain provider-free. Staking
 batches obtain a local immutable cache view for runtime qualification; ordinary
 swap-only batches skip that extra view. Cold preparation adds two pool words
 (slots 3 and 4) to the existing bulk/windowed footprint and three code targets
@@ -128,3 +149,53 @@ reviewed deployments, with zero provider calls, invalidations or resyncs.
 Their p95 values were 0.893 ms (Base) and 1.690 ms (Optimism). Mandatory live
 Base parity/discovery checks passed through a paid QuickNode endpoint. This
 validates the existing Base quote path; it does not qualify Base staking.
+
+### NFT filtering qualification — 2026-10-18
+
+On an Apple M1 Pro / 16 GiB host with Rust 1.90.0 and optimized release builds,
+1,000 alternating deposit/withdraw cycles against 10,000 unrelated cache slots
+produced the following matched measurements (competing builds paused):
+
+| Tree | p50 ms | p95 ms | p99 ms | max ms | RPC elements / retries / fallbacks |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Published alpha.4 (`70c3141`) | 0.401542 | 0.488208 | 0.590417 | 1.823417 | 0 / 0 / 0 |
+| Narrow NFT predicates | 0.319625 | 0.398375 | 0.490166 | 1.346375 | 0 / 0 / 0 |
+
+This validates provider-free staking application without a measured regression;
+it is not a claim of faster provider I/O. An earlier shared-target candidate run
+was discarded after detecting baseline artifact reuse. The accepted candidate
+was rebuilt and verified to contain the new recorded-NFT regression (25 total
+suite tests versus 24 in the baseline). All 13 focused staking cases passed,
+including callback burn/swap ordering, malformed/missing proof, reorg replacement,
+and 32 old versus zero new NFT matches in recorded Optimism block 158365075.
+
+Read counts are distinct from application timing: ordinary blocks issue zero NFT
+evidence requests; each relevant group of up to 256 gauge token IDs issues two
+hash-pinned elements concurrently. Reconciliation preserves predicates and runs
+at most four reads concurrently. No quote/simulation I/O or automatic retry was
+added. Provider RTTs and deployed end-to-end p95 remain release/canary checks.
+
+## Merge review: canonical assembly invalidation (2026-10-19)
+
+Review found two inherited assembly failures: a header gap cleared buffered logs
+but reused the precomputed seal for the final block; a same-height replacement
+could reuse the old branch's coverage and successor watermark. Both could
+publish a block without all its logs. New driver regressions reproduced both
+failures before the fix. Gap/replacement delivery now clears both watermarks and
+requires exact-hash reconciliation for the entire replacement lineage. A normal
+consecutive canonical block retains its existing seal path and request count.
+No quote, staking arithmetic, callback ordering or execution policy changed.
+
+All 33 subscriber-driver tests and 14 staking-related integration tests pass
+locally on Rust 1.90.0. The regressions explicitly count two reconciliations for
+the two-block gap, and one additional reconciliation for the same-height
+replacement, consuming the queued canonical logs instead of sealing an empty
+buffer. No paid provider is used. The prior final lock-only CI run
+[39144559218](https://github.com/KaiCode2/evm-amm-state/actions/runs/39144559218)
+passed every check, including security audit; the review fix requires a fresh
+complete CI run before merge.
+
+PR #43 is reviewed against the published alpha.4 source on PR #42. Merge into
+that stack does not publish a new crate or integrate the consumer. Publication,
+an exact bot registry-pin update and combined consumer release qualification
+remain separate promotion steps. Neither PR grants deployment authority.

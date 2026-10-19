@@ -65,9 +65,10 @@ experimental-protocols = []
 
 # Asynchronous cache-owner runtime. Tokio remains opt-in so providerless and
 # synchronous users keep the existing feature-neutral dependency surface.
-live-runtime = ["dep:tokio"]
+live-runtime = ["dep:tokio", "dep:futures"]
 
 [dependencies]
+futures = { version = "0.3", optional = true }
 # Companion crate. The subscription-sourced log path requires 0.4.0-alpha.5's
 # `ChainControl::LogCoverage` attestation and stream-gap detection, on top of
 # alpha.4's preconfirmed overlay, provider provenance, exact log-route index, and

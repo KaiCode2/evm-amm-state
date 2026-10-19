@@ -22,6 +22,8 @@ pub struct AmmRuntimeId(u64);
 
 impl AmmRuntimeId {
     #[cfg(feature = "live-runtime")]
+    // Keep the Rust 1.90 API; newer compilers renamed fetch_update to try_update.
+    #[allow(deprecated)]
     pub(crate) fn allocate() -> Self {
         let value = NEXT_AMM_RUNTIME_ID
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {

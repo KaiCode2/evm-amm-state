@@ -311,6 +311,8 @@ impl AmmColdStartWorkerControl {
             .map_err(|_| AmmColdStartWorkerError::Closed)
     }
 
+    // Keep the Rust 1.90 API; newer compilers renamed fetch_update to try_update.
+    #[allow(deprecated)]
     fn submit_command(&self, command: WorkerCommand) -> Result<(), AmmColdStartWorkerError> {
         let count = command.job_count();
         debug_assert!(

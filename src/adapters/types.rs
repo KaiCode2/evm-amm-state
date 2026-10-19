@@ -699,14 +699,35 @@ pub struct EventSource {
     pub topics: Vec<B256>,
     /// How a matched log is routed to a pool key.
     pub route: EventRoute,
+    /// Additional topic1..topic3 predicates (empty slot = wildcard).
+    pub indexed_topics: [Vec<B256>; 3],
 }
 
 impl EventSource {
+    /// Constrain indexed topics while retaining the source's routing semantics.
+    pub fn with_indexed_topics(mut self, topics: [Vec<B256>; 3]) -> Self {
+        self.indexed_topics = topics;
+        self
+    }
+
+    pub(crate) fn matches_indexed_topics(&self, topics: &[B256]) -> bool {
+        self.indexed_topics
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| {
+                expected.is_empty()
+                    || topics
+                        .get(index + 1)
+                        .is_some_and(|topic| expected.contains(topic))
+            })
+    }
+
     /// A source whose logs route directly by emitter address.
     pub fn direct(emitter: Address, topics: Vec<B256>) -> Self {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::Direct,
         }
     }
@@ -716,6 +737,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::IndexedAddress { topic_index },
         }
     }
@@ -725,6 +747,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::IndexedBytes32 { topic_index },
         }
     }
@@ -734,6 +757,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::AdapterDefined,
         }
     }

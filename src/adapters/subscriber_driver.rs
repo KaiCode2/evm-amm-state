@@ -1,6 +1,12 @@
 //! Alloy-specific subscriber owner and complete-block driver.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+mod filters;
+mod reconciliation;
+#[cfg(feature = "uniswap-v3")]
+mod staking;
+use filters::reconciliation_filters;
+
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -8,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use alloy_network::{Ethereum, primitives::BlockResponse as _};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::{Filter, Header as RpcHeader, Log as RpcLog};
+use alloy_rpc_types_eth::{Header as RpcHeader, Log as RpcLog};
 use evm_fork_cache::reactive::{
     AlloySubscriber, BlockInterest, BlockRef, ChainControl, ChainStatus, EventSubscriber,
     HandlerId, InputSource, PreconfirmationMode, ReactiveContext, ReactiveInput,
@@ -47,24 +53,23 @@ pub enum AmmPreconfirmationRejectionPolicy {
 /// The subscriber already delivers every matching log over its subscription.
 /// Historically the driver discarded them and re-fetched each block's logs with
 /// a hash-pinned `eth_getLogs`, because it could not tell a complete stream from
-/// a punctured one. It can now: the subscriber attests through
+/// a punctured one. The subscriber attests through
 /// [`ChainControl::LogCoverage`](evm_fork_cache::reactive::ChainControl) that no
-/// notification loss went unhealed at or below a block, and any block that is
-/// *not* attested still takes the reconciliation path. The fetch stops being
-/// unconditional and becomes exact.
+/// notification loss went unhealed at or below a block. That attestation alone
+/// does not close independent streams: closure also needs conservative bloom
+/// absence or a successor on the only registered log stream. Otherwise the
+/// driver reconciles after the bounded grace window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanonicalLogSource {
     /// Assemble blocks from the subscription, reconciling only what is not
     /// attested.
     ///
-    /// A block is submitted once its logs are attested complete, its header has
-    /// arrived, and its log set is known closed — proven either by an
-    /// observation from a strictly later block, or by `grace` elapsing with no
-    /// such observation. The grace window is a quiet-tail fallback, not the
-    /// steady-state path.
+    /// A block needs its header, loss-coverage attestation and a closure proof:
+    /// bloom absence for every interest, or a strictly later log when there is
+    /// only one log stream. Expiring `grace` authorizes exact-hash reconciliation,
+    /// never publication of an unproven partial subscription buffer.
     Subscription {
-        /// How long to wait for stragglers before sealing a block whose
-        /// successor has not been observed.
+        /// How long to wait for closure proof before reconciling the block.
         grace: Duration,
     },
     /// Re-fetch every canonical block's logs with a hash-pinned `eth_getLogs`.
@@ -76,8 +81,8 @@ pub enum CanonicalLogSource {
 impl CanonicalLogSource {
     /// Default straggler window for subscription-sourced assembly.
     ///
-    /// Chosen to be short relative to any supported block time: the later-block
-    /// observation normally seals first, so this bounds only the tail.
+    /// Bounds waiting for closure proof while remaining short relative to every
+    /// supported block time. Expiry falls back to canonical reconciliation.
     pub const DEFAULT_GRACE: Duration = Duration::from_millis(40);
 }
 
@@ -1471,7 +1476,7 @@ where
         )
     }
 
-    /// Straggler window before a block with no observed successor is sealed.
+    /// Straggler window before an unproven block is reconciled.
     const fn seal_grace(&self) -> Duration {
         match self.canonical_log_source {
             CanonicalLogSource::Subscription { grace } => grace,
@@ -1481,8 +1486,8 @@ where
 
     /// Record the subscriber's log-coverage attestation.
     ///
-    /// The watermark is the only evidence that the delivered log set is whole;
-    /// without one at or above a block, that block is reconciled.
+    /// The watermark rules out detected, unrepaired loss. Closure needs a
+    /// separate proof; without coverage at or above a block it is reconciled.
     fn note_log_coverage(&mut self, controls: &[ChainControl]) {
         for control in controls {
             if let ChainControl::LogCoverage(block) = control {
@@ -1568,9 +1573,21 @@ where
         }
         // Proof 1: the log subscription itself delivered something for a later
         // block, so in-order delivery puts `number` behind the write head.
-        if self
-            .highest_observed_block
-            .is_some_and(|observed| observed > number)
+        // The subscriber's attestation proves no detected loss, not that every
+        // independent stream has advanced. Without per-stream watermarks only a
+        // single registered log interest can use a successor as closure proof.
+        let single_log_interest = self
+            .subscriber
+            .registered_interests()
+            .iter()
+            .filter(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+            .take(2)
+            .count()
+            == 1;
+        if single_log_interest
+            && self
+                .highest_observed_block
+                .is_some_and(|observed| observed > number)
         {
             return Some(SealReason::Successor);
         }
@@ -1588,7 +1605,7 @@ where
     /// Whether `bloom` proves no registered log interest can match this block.
     ///
     /// A log matches an interest only if the bloom carries *both* its address
-    /// and its `topic0`, so either being absent excludes the interest. Testing
+    /// and every constrained topic, so any absence excludes the interest. Testing
     /// both matters: measured against live headers, the address alone leaves
     /// about half of Ethereum blocks unprovable because a saturated bloom admits
     /// it by false positive, and the topic check recovers a third of those.
@@ -1617,13 +1634,11 @@ where
                 // No address of this interest can appear, so it cannot match.
                 continue;
             }
-            // The address is admitted; a declared `topic0` set gives a second,
-            // independent chance to exclude. An empty set is a wildcard.
-            if !filter.topics[0].is_empty()
-                && !filter.topics[0]
-                    .iter()
-                    .any(|topic| admits(topic.as_slice()))
-            {
+            // Every constrained topic slot must be present. This is only a
+            // negative proof: bloom membership cannot prove ordering or a log.
+            if filter.topics.iter().any(|topics| {
+                !topics.is_empty() && !topics.iter().any(|topic| admits(topic.as_slice()))
+            }) {
                 continue;
             }
             return false;
@@ -1643,6 +1658,7 @@ where
         self.buffered_logs.clear();
         self.pending_headers.clear();
         self.attested_log_coverage = None;
+        self.highest_observed_block = None;
     }
 
     /// Drop buffered logs for blocks already delivered.
@@ -1684,23 +1700,26 @@ where
         if header.inner.number == current.block_number() && header.hash == current.block_hash() {
             return Ok(());
         }
+        let straight_line = current.block_number().checked_add(1) == Some(header.inner.number)
+            && header.inner.parent_hash == current.block_hash();
         let lineage = self.delivery_lineage(header).await?;
-        // More than one block means the parent walk had to fill a gap or a
-        // replacement branch: those blocks were not canonical while the
-        // subscription was delivering, so no buffered set describes them and
-        // the attestation named a different branch.
-        if lineage.len() > 1 {
+        // A gap or replacement invalidates the entire assembly proof, including
+        // a decision computed before the parent walk. A one-block same-height
+        // replacement also belongs here: old successor/coverage watermarks do
+        // not attest delivery on its branch.
+        if !straight_line {
             self.reset_subscription_assembly();
         }
         let last = lineage.len().saturating_sub(1);
         for (index, header) in lineage.into_iter().enumerate() {
             let number = header.inner.number;
             let hash = header.hash;
-            // Only the straight-line head of the walk can be subscription
-            // sourced; everything behind it is a reconciled fill.
-            // Only the straight-line head of the walk may use a seal decision;
-            // everything behind it was filled by the parent walk.
-            let sealable = if index == last { precomputed } else { None };
+            // Cleared buffers can never retain a precomputed seal decision.
+            let sealable = if straight_line && index == last {
+                precomputed
+            } else {
+                None
+            };
             match sealable {
                 Some(reason) => {
                     self.seal_from_subscription(
@@ -1729,7 +1748,8 @@ where
 
     /// Submit a block whose log set the subscription already delivered whole.
     ///
-    /// Costs no provider request: the logs were paid for when they arrived.
+    /// Pool/gauge logs cost no extra request. Relevant staking transitions
+    /// require bounded hash-pinned NFT evidence before publication.
     async fn seal_from_subscription(
         &mut self,
         header: RpcHeader,
@@ -1744,10 +1764,15 @@ where
             parent_hash: Some(header.inner.parent_hash),
             timestamp: Some(header.inner.timestamp),
         };
-        let buffered = self
+        #[cfg_attr(not(feature = "uniswap-v3"), allow(unused_mut))]
+        let mut buffered = self
             .buffered_logs
             .remove(&(block.number, block.hash))
             .unwrap_or_default();
+        let subscription_keys: std::collections::BTreeSet<_> = buffered.keys().copied().collect();
+        #[cfg(feature = "uniswap-v3")]
+        self.complete_staking_evidence(point.chain_id(), &block, &mut buffered)
+            .await?;
         let mut records = Vec::with_capacity(buffered.len());
         for log in buffered.into_values() {
             // Re-run the same identity checks reconciliation applies, so a
@@ -1755,7 +1780,11 @@ where
             let _ = validated_log_key(&log, &block)?;
             let context = ReactiveContext {
                 chain_id: Some(point.chain_id()),
-                source: InputSource::Subscription,
+                source: if subscription_keys.contains(&log.log_index.expect("validated index")) {
+                    InputSource::Subscription
+                } else {
+                    InputSource::Batch
+                },
                 chain_status: ChainStatus::Included {
                     block,
                     confirmations: 0,
@@ -1768,7 +1797,7 @@ where
         }
         AmmSubscriberDriverCounters::add(
             &self.stats.subscription_logs_applied,
-            records.len() as u64,
+            subscription_keys.len() as u64,
         );
         let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
@@ -1897,34 +1926,10 @@ where
             })
             .collect();
         let filters = reconciliation_filters(&interests, self.max_addresses_per_get_logs);
-        let mut logs = BTreeMap::new();
-        for filter in filters {
-            AmmSubscriberDriverCounters::add(&self.stats.reconciliation_requests, 1);
-            let fetched = self
-                .subscriber
-                .provider()
-                .get_logs(&filter.at_block_hash(block.hash))
-                .await
-                .map_err(|error| AmmSubscriberDriverError::Provider(error.to_string()))?;
-            AmmSubscriberDriverCounters::add(
-                &self.stats.reconciliation_logs_fetched,
-                fetched.len() as u64,
-            );
-            for log in fetched {
-                let key = validated_log_key(&log, &block)?;
-                match logs.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(log);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &log => {
-                        return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
-                            "conflicting logs share one global log index",
-                        ));
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                }
-            }
-        }
+        let mut logs = self.fetch_reconciliation_logs(&block, filters).await?;
+        #[cfg(feature = "uniswap-v3")]
+        self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
+            .await?;
         let records = logs
             .into_values()
             .map(|log| {
@@ -2030,6 +2035,14 @@ fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscribe
             "log does not belong to the requested canonical block",
         ));
     }
+    if log
+        .block_timestamp
+        .is_some_and(|timestamp| block.timestamp != Some(timestamp))
+    {
+        return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
+            "log timestamp contradicts canonical header",
+        ));
+    }
     let transaction_index =
         log.transaction_index
             .ok_or(AmmSubscriberDriverError::InvalidCanonicalLog(
@@ -2049,48 +2062,11 @@ fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscribe
     Ok(log_index)
 }
 
-fn reconciliation_filters(filters: &[Filter], max_addresses: usize) -> Vec<Filter> {
-    if filters.is_empty() {
-        return Vec::new();
-    }
-    let address_wildcard = filters.iter().any(|filter| filter.address.is_empty());
-    let topic_wildcard = filters.iter().any(|filter| filter.topics[0].is_empty());
-    let addresses: BTreeSet<_> = filters
-        .iter()
-        .flat_map(|filter| filter.address.iter().copied())
-        .collect();
-    let topics: Vec<_> = filters
-        .iter()
-        .flat_map(|filter| filter.topics[0].iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    let build = |addresses: Option<Vec<alloy_primitives::Address>>| {
-        let mut filter = Filter::new();
-        if let Some(addresses) = addresses {
-            filter = filter.address(addresses);
-        }
-        if !topic_wildcard {
-            filter = filter.event_signature(topics.clone());
-        }
-        filter
-    };
-    if address_wildcard {
-        vec![build(None)]
-    } else {
-        addresses
-            .into_iter()
-            .collect::<Vec<_>>()
-            .chunks(max_addresses)
-            .map(|chunk| build(Some(chunk.to_vec())))
-            .collect()
-    }
-}
-
 #[cfg(all(test, feature = "uniswap-v2"))]
 mod tests {
     mod repair;
+    #[cfg(feature = "uniswap-v3")]
+    mod staking;
 
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2120,7 +2096,6 @@ mod tests {
         AmmSubscriberDriverConfig, AmmSubscriberDriverCounters, AmmSubscriberDriverState,
         AmmSubscriberOwnerPlan, BTreeMap, CanonicalLogSource, SubscriberControlCommand,
         SubscriberTransaction, handle_preconfirmation_result, initial_canonical_lineage,
-        reconciliation_filters,
     };
     use crate::adapters::{
         AdapterRegistry, AmmAdapter, AmmCanonicalBatch, AmmColdStartWorkerConfig,
@@ -2766,6 +2741,8 @@ mod tests {
                 let canonical_block: Block = Block::empty(header(501, baseline_header.hash));
                 reconciliation.push_success(&Some(canonical_block.clone()));
                 reconciliation.push_success(&Some(canonical_block));
+                // Factory and pool predicates remain separate (no cross product).
+                reconciliation.push_success(&Vec::<RpcLog>::new());
                 reconciliation.push_success(&Vec::<RpcLog>::new());
                 let provider = ProviderBuilder::new().connect_mocked_client(reconciliation);
                 let subscriber = AlloySubscriber::new(
@@ -3017,49 +2994,6 @@ mod tests {
                 Ok(())
             })
             .await
-    }
-
-    #[test]
-    fn complete_block_reconciliation_chunks_addresses_and_unions_topics() {
-        let filters: Vec<_> = (0..600u64)
-            .map(|index| {
-                let mut bytes = [0u8; 20];
-                bytes[12..].copy_from_slice(&index.to_be_bytes());
-                Filter::new()
-                    .address(Address::from(bytes))
-                    .event_signature(B256::repeat_byte((index % 3) as u8))
-                    .topic1(B256::repeat_byte(0xff))
-            })
-            .collect();
-
-        let reconciled = reconciliation_filters(&filters, 256);
-        assert_eq!(reconciled.len(), 3);
-        assert_eq!(
-            reconciled
-                .iter()
-                .map(|filter| filter.address.len())
-                .sum::<usize>(),
-            600
-        );
-        assert!(reconciled.iter().all(|filter| filter.topics[0].len() == 3));
-        assert!(
-            reconciled.iter().all(|filter| filter.topics[1].is_empty()),
-            "indexed-topic constraints are broadened to avoid cross-filter false negatives"
-        );
-    }
-
-    #[test]
-    fn any_wildcard_filter_keeps_the_reconciliation_union_broad() {
-        let filters = vec![
-            Filter::new(),
-            Filter::new()
-                .address(Address::repeat_byte(0x11))
-                .event_signature(B256::repeat_byte(0x22)),
-        ];
-        let reconciled = reconciliation_filters(&filters, 256);
-        assert_eq!(reconciled.len(), 1);
-        assert!(reconciled[0].address.is_empty());
-        assert!(reconciled[0].topics[0].is_empty());
     }
 
     /// Phase 0 exit criterion, measured from inside the process: the WebSocket

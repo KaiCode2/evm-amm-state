@@ -435,7 +435,7 @@ impl SubscriptionSpec {
 /// This is the single source of truth used by both [`AdapterRegistry::route_log_generic`]
 /// and the reactive handler's adapter-derived fallback loop.
 pub(crate) fn event_source_matches(source: &EventSource, key: &PoolKey, log: &Log) -> bool {
-    if source.emitter != log.address {
+    if source.emitter != log.address || !source.matches_indexed_topics(log.topics()) {
         return false;
     }
 
