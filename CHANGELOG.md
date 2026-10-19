@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.1-alpha.4] - Unreleased candidate
+## [0.3.1-alpha.5] - 2026-10-19
+
+### Changed
+
+- Preserve indexed event-topic constraints through subscriptions, routing,
+  persistence, bloom absence checks and bounded parallel reconciliation.
+- Narrow reviewed Optimism Slipstream NFT traffic to gauge-outgoing custody
+  transfers; fetch hash-pinned Collect/Transfer proofs only for gauge-event
+  token IDs. Preserve withdrawal-before-callback ordering and fail closed on
+  incomplete evidence. No provider reads enter quote or event application.
+
+### Fixed
+
+- Require independent closure proof for independent subscription streams.
+- Discard buffered logs and completeness watermarks together across canonical
+  gaps and replacements, including same-height replacements.
+- Update the validation lock to patched Rustls 0.23.46 without new audit exceptions.
+
+See [staking qualification](docs/slipstream-staking.md). Consumers must select a
+fresh authoritative baseline instead of restoring old broad subscription
+interests. Existing archives without indexed constraints remain readable;
+older readers reject new constrained archives. Deployed latency and savings
+remain subject to consumer release/canary validation.
+
+## [0.3.1-alpha.4] - 2026-09-16
 
 ### Fixed
 

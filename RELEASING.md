@@ -1,13 +1,14 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.1-alpha.4`, based on published
-`0.3.1-alpha.3`. It avoids full pool repair only for proven event-free canonical
-replacements, compares subscription identity by typed event sources, and retains
-required repair intent across typed supersession. See `docs/reorg-repair.md` for
-proof boundaries and the required consumer recovery deadline.
-This is a prepared candidate, not a published or production-verified release.
+The current release candidate is `0.3.1-alpha.5`, based on published
+`0.3.1-alpha.4`. It narrows reviewed Slipstream NFT traffic, preserves indexed
+predicates and requires complete hash-pinned evidence before canonical
+publication. Gap/replacement delivery invalidates both buffered logs and their
+completeness proofs. See `docs/slipstream-staking.md` for correctness, RPC and
+optimized latency qualification. Publication is authorized for this candidate;
+production deployment and activation remain separate and unauthorized.
 `evm-fork-cache` remains exactly pinned to `0.4.0`; no companion release is required.
-Keep other dependency lockfile entries fixed.
+Keep unrelated dependency lockfile entries fixed. Rustls is locked to 0.23.46.
 
 The rounding-specific evidence, historical Plasma fixtures, downstream tests,
 and measured limitations are recorded in
@@ -16,10 +17,10 @@ Broader ownership/scheduling redesign, beneficiary hydration, and TLS feature ch
 Preparing the alpha does not establish readiness for those paths or for
 Flashblocks.
 
-Consumers must explicitly select `=0.3.1-alpha.4`. After registry publication,
+Consumers must explicitly select `=0.3.1-alpha.5`. After registry publication,
 remove any local path patch, resolve that exact version, and verify the package
 source and the unchanged cache version before rebuilding the service.
-Also update the consumer's own `rustls` lock entry to at least `0.23.45`;
+Also update the consumer's own `rustls` lock entry to at least `0.23.46`;
 a library package's lockfile does not replace the application's lockfile.
 
 ## Stable baseline publication
