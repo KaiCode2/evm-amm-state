@@ -115,8 +115,12 @@ in reward-growth initialization. A zero-amount `Burn` is an exact search no-op.
 `Collect` is also an exact empty search transition because it changes position
 and ERC-20 balance accounting, not pool pricing state.
 
+Canonical batches additionally preserve staking quote state for the reviewed
+Optimism deployment; see [staking continuity](slipstream-staking.md). This
+requires the complete pool/NFT/gauge subscription, not isolated pool logs.
+
 This is not byte parity for the whole Slipstream system. Position ownership,
-token transfers, silent gauge stake/unstake activity, gauges and rewards outside
+token transfers, unqualified gauge stake/unstake activity, gauges and rewards outside
 the pool search surface, administrative mutations, and arbitrary Slipstream
 deployments remain outside the capability. Their presence is not inferred from
 layout similarity.

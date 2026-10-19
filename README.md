@@ -39,12 +39,22 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
+The prepared `0.3.1-alpha.4` candidate adds bounded event-free canonical reorg
+handling and typed required-repair supersession. It retains alpha.3's reviewed
+Optimism staking continuity, committed decoder diagnostics, bulk transition
+preparation and rounded V3 swap replay fixes. After publication, opt in with an
+exact `=0.3.1-alpha.4` requirement and retain the feature selection below.
+`evm-fork-cache` stays exactly pinned to `0.4.0`; no companion release is needed.
+See the [canonical repair guide](docs/reorg-repair.md),
+[staking continuity guide](docs/slipstream-staking.md), and
+[rounding validation report](docs/swap-rounding-validation.md) for coverage.
+
 All five protocol adapters are enabled by default; trim to what you use with
 feature flags:
 
 ```toml
 [dependencies]
-evm-amm-state = { version = "0.3.0-alpha.8", default-features = false, features = [
+evm-amm-state = { version = "0.3.0", default-features = false, features = [
     "uniswap-v3",
     "curve",
     "live-runtime", # optional Tokio cache actor + Alloy subscriber driver
@@ -361,6 +371,12 @@ hash-pins a bounded union of `eth_getLogs` filters at every header. Reliable
 changes, latest snapshot/status watches, lossy diagnostics, bounded queues,
 typed backpressure, and prompt shutdown are described in
 [`docs/live-runtime-cache-actor.md`](docs/live-runtime-cache-actor.md).
+
+**Flashblocks support is in development.** The opt-in integration below is
+available for experimentation, but current live source completeness and latency
+checks have not passed. Version `0.3.0` does not qualify it for execution or claim
+a latency advantage. See the current findings in
+[`docs/flashblocks-latency.md`](docs/flashblocks-latency.md).
 
 The same attached subscriber can opt into Base or Optimism Flashblocks through
 `evm-fork-cache`. Base consumes native `newFlashblocks` plus `pendingLogs`;

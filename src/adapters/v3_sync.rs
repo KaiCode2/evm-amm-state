@@ -64,8 +64,8 @@ use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_program};
 use evm_fork_cache::cache::EvmCache;
 
 use super::storage::{
-    V3StorageLayout, v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
-    v3_word_position,
+    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, V3StorageLayout, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 
 /// The minimum/maximum tick a V3 pool can reach (`±887272`).
@@ -248,15 +248,17 @@ impl V3SyncSpec {
         }
     }
 
-    /// Slipstream quote/replay spec: statics `slot0` + `liquidity`, the complete
-    /// observation ring at slot 20, and all six consecutive words of every
-    /// initialized tick. The final two words hold Slipstream-specific
-    /// reward-growth and packed oracle/initialization fields that exact event
-    /// replay must read and preserve or update.
+    /// Slipstream quote/replay spec: `slot0`, `liquidity`, the additional
+    /// transition globals, the complete observation ring at slot 20, and all
+    /// six consecutive words of every initialized tick. The final two words
+    /// hold Slipstream-specific reward-growth and packed oracle/initialization
+    /// fields that exact event replay must read and preserve or update.
     pub fn slipstream(layout: V3StorageLayout) -> Self {
         let (min_word, max_word) = full_word_range(layout.tick_spacing);
+        let mut static_slots = vec![layout.slot0_slot, layout.liquidity_slot];
+        static_slots.extend(SLIPSTREAM_TRANSITION_GLOBAL_SLOTS.map(U256::from));
         Self {
-            static_slots: vec![layout.slot0_slot, layout.liquidity_slot],
+            static_slots,
             observations: Some(V3ObservationsSpec {
                 array_slot: U256::from(SLIPSTREAM_OBSERVATIONS_SLOT),
                 cardinality_shift: UNISWAP_CARDINALITY_SHIFT,

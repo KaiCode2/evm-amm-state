@@ -1,28 +1,56 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.0-alpha.9`. Publish its prerequisites in
-this order:
+The current release candidate is `0.3.1-alpha.5`, based on published
+`0.3.1-alpha.4`. It narrows reviewed Slipstream NFT traffic, preserves indexed
+predicates and requires complete hash-pinned evidence before canonical
+publication. Gap/replacement delivery invalidates both buffered logs and their
+completeness proofs. See `docs/slipstream-staking.md` for correctness, RPC and
+optimized latency qualification. Publication is authorized for this candidate;
+production deployment and activation remain separate and unauthorized.
+`evm-fork-cache` remains exactly pinned to `0.4.0`; no companion release is required.
+Keep unrelated dependency lockfile entries fixed. Rustls is locked to 0.23.46.
 
-1. `alloy-transport-balancer 0.3.0-alpha.2`;
-2. `evm-fork-cache 0.4.0-alpha.5`;
+The rounding-specific evidence, historical Plasma fixtures, downstream tests,
+and measured limitations are recorded in
+[`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
+Broader ownership/scheduling redesign, beneficiary hydration, and TLS feature changes remain deferred.
+Preparing the alpha does not establish readiness for those paths or for
+Flashblocks.
+
+Consumers must explicitly select `=0.3.1-alpha.5`. After registry publication,
+remove any local path patch, resolve that exact version, and verify the package
+source and the unchanged cache version before rebuilding the service.
+Also update the consumer's own `rustls` lock entry to at least `0.23.46`;
+a library package's lockfile does not replace the application's lockfile.
+
+## Stable baseline publication
+
+The `0.3.0` prerequisites were published in this order:
+
+1. `alloy-transport-balancer 0.3.0`;
+2. `evm-fork-cache 0.4.0`;
 3. regenerate this crate's `Cargo.lock` against the published
-   `evm-fork-cache 0.4.0-alpha.5` (`cargo update -p evm-fork-cache`), which
+   `evm-fork-cache 0.4.0` (`cargo update -p evm-fork-cache`), which
    cannot resolve until step 2 lands;
-4. publish `evm-amm-state 0.3.0-alpha.9` after the gates below pass.
+4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
-The state crate uses an exact registry pin for `evm-fork-cache 0.4.0-alpha.5`.
-Treat any failure to resolve that published version as a release blocker rather
-than bypassing registry verification. Step 3 is why the committed lock names
-alpha.4 until fork-cache is published: the pin is deliberately ahead of the lock
-rather than the lock carrying an unpublishable path entry.
+The final lockfile must resolve `evm-fork-cache 0.4.0` from crates.io.
+Candidate integration may use an external patch configuration; neither that
+configuration nor a path dependency may ship. A registry resolution failure
+remains a release blocker.
 
 Alpha.2 includes representative quote read-set learning, exact-canonical
 hydration, exact equality between the canonical warm-up quote and its immediate
 provider-read-free replay, and retention of generation-local lazy fills across
 cumulative overlay replacement. Historical paid QuickNode and Alchemy Base
 results, plus the current provider-specific revalidation status, are recorded
-in `docs/flashblocks-latency.md`; every release candidate must still repeat the
-documented paid-provider gate.
+in `docs/flashblocks-latency.md`. For `0.3.0`, Flashblocks remains an opt-in,
+in-development integration outside the qualified canonical release scope. The
+September 5 paid-provider checks did not pass. Preserve those results and label
+the feature consistently in the README, changelog, and release announcement;
+they do not block publication of the validated canonical stack. Before claiming
+Flashblocks readiness or a latency advantage in a future release, repeat and
+pass the documented paid-provider gates without relaxing their requirements.
 
 Alpha.3 is a targeted Slipstream correction: native quote calldata uses the
 protocol's signed `int24 tickSpacing` field rather than Uniswap V3's `uint24
@@ -99,8 +127,8 @@ cargo tree -e normal --all-features | grep -E '(amms|amm-math|rayon) v[0-9]' &&
   exit 1 || true
 ```
 
-Confirm every third-party workflow action and sibling checkout matches the full
-commit recorded in `SECURITY.md`. A tag, branch, or unresolved candidate
+Confirm every third-party workflow action and live integration checkout matches
+the full commit recorded in `SECURITY.md`. A tag, branch, or unresolved candidate
 placeholder is a release blocker.
 
 `RUSTSEC-2025-0055` is narrowly ignored because `ark-relations` records
@@ -168,10 +196,11 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0-alpha.4` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.0` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
-builds, live gates, downstream compatibility, changelog, and benchmark evidence
-pass.
+builds, canonical live gates, downstream compatibility, changelog, and benchmark
+evidence pass. Flashblocks is governed by the explicit in-development scope
+above; its failed live checks must remain visible in the release material.
 
 Publishing and tag creation are external state changes and are never performed
 as part of an ordinary validation run.

@@ -116,6 +116,7 @@ struct Case {
     exact_input: bool,
     fee: u32,
     partial_limit: bool,
+    parent_override: Option<(U256, i32, U256, i128)>,
 }
 
 async fn cache(chain_id: u64) -> EvmCache {
@@ -255,6 +256,31 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
         .iter()
         .map(|(slot, value)| (word(slot), word(value.as_str().unwrap())))
         .collect();
+    if let Some((sqrt, tick, liquidity, _)) = case.parent_override {
+        let slot0 = slots
+            .iter_mut()
+            .find(|(slot, _)| *slot == layout.slot0_slot)
+            .unwrap();
+        let mask = (U256::from(1) << 184_usize) - U256::from(1);
+        slot0.1 = (slot0.1 & !mask)
+            | sqrt
+            | ((signed_word(i128::from(tick)) & U256::from(0xffffff)) << 160_usize);
+        let value = slots
+            .iter_mut()
+            .find(|(slot, _)| *slot == layout.liquidity_slot)
+            .unwrap();
+        let mask = (U256::from(1) << 128_usize) - U256::from(1);
+        value.1 = (value.1 & !mask) | liquidity;
+        let word = tick.div_euclid(spacing).div_euclid(256) as i16;
+        for position in (word - 2)..=(word + 2) {
+            let key = evm_amm_state::adapters::storage::v3_tick_bitmap_storage_key_with_base(
+                position,
+                layout.tick_bitmap_base_slot,
+            );
+            slots.retain(|(slot, _)| *slot != key);
+            slots.push((key, U256::ZERO));
+        }
+    }
     let liquidity_word = slots
         .iter()
         .find(|(slot, _)| *slot == U256::from(16))
@@ -291,7 +317,9 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
         (10, false, false) => 1_000_000_i128,
         (_, _, _) => 10_000_000_000_000_000_i128,
     };
-    let magnitude = if case.partial_limit {
+    let magnitude = if let Some((_, _, _, amount)) = case.parent_override {
+        amount
+    } else if case.partial_limit {
         i128::MAX / 4
     } else {
         base_amount
@@ -621,14 +649,17 @@ async fn run_case(spec: FamilySpec, case: Case, sequence: u64) -> Result<()> {
             .any(|(address, _)| *address == spec.pool),
         "reference execution must independently enumerate pool storage",
     );
-    for (address, slot) in access
+    let compared = access
         .slots
         .iter()
+        .chain(derived.keys())
         .filter(|(address, _)| *address == spec.pool)
-    {
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (address, slot) in &compared {
         let expected = reference
             .cached_storage_value(*address, *slot)
-            .ok_or_else(|| anyhow!("reference omitted accessed pool slot {slot}"))?;
+            .unwrap_or_default();
         let actual = derived
             .get(&(*address, *slot))
             .copied()
@@ -1161,6 +1192,7 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
             exact_input: true,
             fee: 0,
             partial_limit: false,
+            parent_override: None,
         },
         Case {
             name: "discount exact-output zero-for-one",
@@ -1168,6 +1200,7 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
             exact_input: false,
             fee: 1_000,
             partial_limit: false,
+            parent_override: None,
         },
         Case {
             name: "standard exact-input one-for-zero",
@@ -1175,6 +1208,7 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
             exact_input: true,
             fee: 10_000,
             partial_limit: false,
+            parent_override: None,
         },
         Case {
             name: "high-fee exact-output one-for-zero",
@@ -1182,6 +1216,7 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
             exact_input: false,
             fee: 30_000,
             partial_limit: false,
+            parent_override: None,
         },
         Case {
             name: "price-limit partial exact-input",
@@ -1189,6 +1224,7 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
             exact_input: true,
             fee: 10_000,
             partial_limit: true,
+            parent_override: None,
         },
     ];
     let mut sequence = 1;
@@ -1205,6 +1241,63 @@ async fn deployed_base_and_optimism_runtimes_match_exact_transition_matrix() -> 
 async fn deployed_base_and_optimism_runtimes_match_liquidity_round_trip() -> Result<()> {
     for (index, spec) in specs().into_iter().enumerate() {
         run_liquidity_round_trip(spec, index as u64 + 1).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deployed_slipstream_exact_input_rounding() -> Result<()> {
+    for spec in specs() {
+        run_case(
+            spec,
+            Case {
+                name: "1037-wei input rounding slack",
+                zero_for_one: true,
+                exact_input: true,
+                fee: 500,
+                partial_limit: false,
+                parent_override: Some((
+                    word("22663668894434745395613"),
+                    -301357,
+                    U256::from(12941633377475003401_u64),
+                    86272922443841536,
+                )),
+            },
+            50,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deployed_slipstream_capped_output_rounding() -> Result<()> {
+    let q96 = U256::from(1) << 96_usize;
+    for spec in specs() {
+        for zero_for_one in [true, false] {
+            run_case(
+                spec,
+                Case {
+                    name: "capped output rounding with identifiable fee",
+                    zero_for_one,
+                    exact_input: false,
+                    fee: 500,
+                    partial_limit: false,
+                    parent_override: Some((
+                        if zero_for_one {
+                            q96 + U256::from(10_000_000)
+                        } else {
+                            q96 - U256::from(10_000_000)
+                        },
+                        if zero_for_one { 0 } else { -1 },
+                        q96 * U256::from(2),
+                        19_999_997,
+                    )),
+                },
+                51,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

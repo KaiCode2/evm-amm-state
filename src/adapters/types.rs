@@ -699,14 +699,35 @@ pub struct EventSource {
     pub topics: Vec<B256>,
     /// How a matched log is routed to a pool key.
     pub route: EventRoute,
+    /// Additional topic1..topic3 predicates (empty slot = wildcard).
+    pub indexed_topics: [Vec<B256>; 3],
 }
 
 impl EventSource {
+    /// Constrain indexed topics while retaining the source's routing semantics.
+    pub fn with_indexed_topics(mut self, topics: [Vec<B256>; 3]) -> Self {
+        self.indexed_topics = topics;
+        self
+    }
+
+    pub(crate) fn matches_indexed_topics(&self, topics: &[B256]) -> bool {
+        self.indexed_topics
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| {
+                expected.is_empty()
+                    || topics
+                        .get(index + 1)
+                        .is_some_and(|topic| expected.contains(topic))
+            })
+    }
+
     /// A source whose logs route directly by emitter address.
     pub fn direct(emitter: Address, topics: Vec<B256>) -> Self {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::Direct,
         }
     }
@@ -716,6 +737,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::IndexedAddress { topic_index },
         }
     }
@@ -725,6 +747,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::IndexedBytes32 { topic_index },
         }
     }
@@ -734,6 +757,7 @@ impl EventSource {
         Self {
             emitter,
             topics,
+            indexed_topics: Default::default(),
             route: EventRoute::AdapterDefined,
         }
     }
@@ -1642,6 +1666,9 @@ pub struct AdapterEventContext {
     pub log_index: Option<u64>,
     /// Exact effective fee evidence for a reviewed Slipstream runtime/event.
     pub slipstream_fee_evidence: Option<SlipstreamSwapFeeEvidence>,
+    /// Transaction-local staking evidence prepared by the canonical batch engine.
+    #[cfg(feature = "uniswap-v3")]
+    pub slipstream_staking_evidence: Option<super::slipstream_staking::SlipstreamStakingEvidence>,
 }
 
 impl AdapterEventContext {
@@ -1657,6 +1684,8 @@ impl AdapterEventContext {
             transaction_index: None,
             log_index: None,
             slipstream_fee_evidence: None,
+            #[cfg(feature = "uniswap-v3")]
+            slipstream_staking_evidence: None,
         }
     }
 
@@ -1853,6 +1882,8 @@ pub enum V3TransitionError {
     /// Full Slipstream accounting replay was requested without its runtime-bound
     /// effective-fee evidence.
     MissingSlipstreamFeeEvidence,
+    /// Missing or contradictory transaction-local staking evidence.
+    SlipstreamStakingEvidence(&'static str),
     /// Supplied Slipstream fee/runtime evidence did not match the exact event.
     SlipstreamFeeEvidence(&'static str),
     /// No effective fee in the deployed range can explain the event amounts.
@@ -1897,6 +1928,9 @@ impl fmt::Display for V3TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingContext(field) => write!(f, "missing event context field {field}"),
+            Self::SlipstreamStakingEvidence(reason) => {
+                write!(f, "Slipstream staking evidence: {reason}")
+            }
             Self::MissingSlipstreamFeeEvidence => {
                 write!(f, "missing effective Slipstream fee evidence")
             }

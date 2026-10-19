@@ -13,7 +13,7 @@
 //! 100 canonical swaps, whichever happens first.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,9 +23,9 @@ use alloy_network::{AnyNetwork, Ethereum};
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider, RootProvider};
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types_eth::Filter;
+use alloy_rpc_types_eth::{Filter, Header};
 use alloy_transport_http::Http;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use evm_amm_state::adapters::{
     AdapterRegistry, AmmSyncEngine, ColdStartOutcome, ColdStartPolicy,
     ConcentratedLiquidityAdapter, FactoryConfig, PoolDiscovery, PoolQuery, PoolRegistration,
@@ -36,8 +36,10 @@ use evm_fork_cache::{
     CacheSpeedMode,
     cache::EvmCache,
     reactive::{
-        AlloySubscriber, EventSubscriber, LogInterest, PreconfirmationMode, ProviderRef,
-        ReactiveInput, ReactiveInputBatch, ReactiveInterest, SubscriberConfig, SubscriberMode,
+        AlloySubscriber, BlockRef, ChainControl, ChainStatus, EventSubscriber, InputSource,
+        LogInterest, PreconfirmationMode, ProviderRef, ReactiveContext, ReactiveInput,
+        ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, SubscriberConfig,
+        SubscriberMode,
     },
 };
 use tokio::time::timeout;
@@ -153,13 +155,23 @@ async fn main() -> Result<()> {
         .get_block_number()
         .await
         .context("read benchmark head")?;
+    let canonical_provider = subscriber_http_provider(&http_url)?;
+    let baseline_header = canonical_provider
+        .get_block_by_number(BlockNumberOrTag::Number(pinned_block))
+        .await?
+        .context("canonical baseline unavailable")?
+        .header;
+    ensure!(
+        baseline_header.hash == baseline_header.inner.hash_slow(),
+        "invalid baseline header hash"
+    );
     let sim_config = SimConfig::default().with_v3_quoter(chain.quoter);
     let adapter = Arc::new(ConcentratedLiquidityAdapter::default());
     let mut registry = AdapterRegistry::new().with_sim_config(sim_config);
     registry.register_adapter(adapter.clone())?;
 
     let mut flash_cache = EvmCache::builder(rpc.clone())
-        .block(BlockId::number(pinned_block))
+        .block(BlockId::from((baseline_header.hash, Some(true))))
         .chain_id(chain.chain_id)
         .speed_mode(CacheSpeedMode::XSlow)
         .max_concurrent_proofs(1)
@@ -190,7 +202,7 @@ async fn main() -> Result<()> {
     pace_setup(setup_pause).await;
 
     let mut vanilla_cache = EvmCache::builder(rpc.clone())
-        .block(BlockId::number(pinned_block))
+        .block(BlockId::from((baseline_header.hash, Some(true))))
         .chain_id(chain.chain_id)
         .speed_mode(CacheSpeedMode::XSlow)
         .max_concurrent_proofs(1)
@@ -228,6 +240,21 @@ async fn main() -> Result<()> {
 
     let mut flash_engine = AmmSyncEngine::new(flash_registry)?;
     let mut vanilla_engine = AmmSyncEngine::new(vanilla_registry)?;
+    let mut flash_head = block_ref(&baseline_header);
+    let mut vanilla_head = flash_head;
+    let mut canonical_proofs = CanonicalProofs::default();
+    for (engine, cache) in [
+        (&mut flash_engine, &mut flash_cache),
+        (&mut vanilla_engine, &mut vanilla_cache),
+    ] {
+        set_header_context(cache, &baseline_header);
+        engine.ingest_batch(
+            cache,
+            ReactiveInputBatch::new(Vec::new())
+                .with_chain_id(chain.chain_id)
+                .with_chain_controls([ChainControl::CanonicalProgress(flash_head)]),
+        )?;
+    }
 
     let ws_connect_timeout = Duration::from_secs(env_u64("FLASHBLOCKS_CONNECT_SECONDS", 15));
     let ws = timeout(
@@ -243,10 +270,7 @@ async fn main() -> Result<()> {
         )
     })?
     .with_context(|| format!("connect {} WebSocket", chain.name))?;
-    let swap_topic = keccak256(b"Swap(address,address,int256,int256,uint160,uint128,int24)");
-    let filter = Filter::new()
-        .address(pool_address)
-        .event_signature(swap_topic);
+    let filter = Filter::new().address(pool_address);
     let state_provider = subscriber_http_provider(&http_url)?;
     let mut subscriber = AlloySubscriber::new(
         ws.erased(),
@@ -299,6 +323,37 @@ async fn main() -> Result<()> {
 
     let started = Instant::now();
     let deadline = Duration::from_secs(run_seconds);
+    // Poll the two subscription lanes continuously. Canonical proof RPC work
+    // must not delay pending-log correlation or become notification latency.
+    let (deliveries_tx, mut deliveries_rx) = tokio::sync::mpsc::channel(256);
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let collector =
+        tokio::spawn(async move {
+            loop {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                let next = tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    next = timeout(remaining, subscriber.next_scoped_batch()) => next,
+                };
+                match next {
+                    Ok(Ok(Some(batch))) => deliveries_tx
+                        .try_send((started.elapsed(), batch))
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "subscription collector queue unavailable; timing sample rejected"
+                            )
+                        })?,
+                    Ok(Ok(None)) | Err(_) => break,
+                    Ok(Err(error)) => {
+                        return Err(anyhow::anyhow!(error).context("receive subscriber batch"));
+                    }
+                }
+            }
+            Ok(subscriber.flashblocks_rpc_metrics())
+        });
     let mut flash = HashMap::<SwapKey, PathTiming>::new();
     let mut vanilla = HashMap::<SwapKey, PathTiming>::new();
     let mut flash_counters = PathCounters::default();
@@ -306,16 +361,10 @@ async fn main() -> Result<()> {
 
     while started.elapsed() < deadline && vanilla.len() < max_swaps {
         let remaining = deadline.saturating_sub(started.elapsed());
-        let batch = match timeout(remaining, subscriber.next_scoped_batch()).await {
-            Ok(Ok(Some(batch))) => batch,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                print_rpc_metrics(subscriber.flashblocks_rpc_metrics(), started.elapsed());
-                return Err(error).context("receive subscriber batch");
-            }
-            Err(_) => break,
+        let (received_at, batch) = match timeout(remaining, deliveries_rx.recv()).await {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) | Err(_) => break,
         };
-        let received_at = started.elapsed();
         if batch.preconfirmation_invalidated() {
             flash_engine.discard_preconfirmation(&mut flash_cache);
         }
@@ -331,12 +380,39 @@ async fn main() -> Result<()> {
             bail!("subscriber returned a mixed-scope batch");
         }
         let keys = swap_keys(batch.records().iter().map(|record| record.record()))?;
-        if keys.is_empty() {
+        if batch.records().is_empty() {
             continue;
         }
         let reactive = batch.into_reactive_batch();
 
         if is_preconfirmed {
+            let ChainStatus::Preconfirmed { flashblock } =
+                &reactive.records()[0].context.chain_status
+            else {
+                bail!("preconfirmed batch lacks exact lineage");
+            };
+            if flashblock.block_number <= flash_head.number {
+                continue; // A queued preview cannot replace a newer canonical baseline.
+            }
+            let parent = flashblock
+                .block_number
+                .checked_sub(1)
+                .context("invalid preview height")?;
+            reconcile_canonical_path(
+                &canonical_provider,
+                chain.chain_id,
+                pool_address,
+                parent,
+                &mut canonical_proofs,
+                &mut flash_head,
+                &mut flash_engine,
+                &mut flash_cache,
+            )
+            .await?;
+            ensure!(
+                flashblock.parent_hash == Some(flash_head.hash),
+                "preview parent disagrees with canonical proof"
+            );
             flash_counters.notices += keys.len();
             let timing = apply_and_quote(
                 "flashblock",
@@ -354,34 +430,78 @@ async fn main() -> Result<()> {
             }
         } else {
             vanilla_counters.notices += keys.len();
-            let flash_canonical = reactive.clone();
-            let timing = apply_and_quote(
-                "canonical",
-                started,
-                received_at,
+            let target = reactive
+                .records()
+                .iter()
+                .filter_map(|record| record.context.block.map(|block| block.number))
+                .max()
+                .context("canonical notice lacks a block")?;
+            let cache_started = Instant::now();
+            reconcile_canonical_path(
+                &canonical_provider,
+                chain.chain_id,
+                pool_address,
+                target,
+                &mut canonical_proofs,
+                &mut vanilla_head,
                 &mut vanilla_engine,
                 &mut vanilla_cache,
-                reactive,
-                &vanilla_registration.key,
-                &mut vanilla_counters,
             )
             .await?;
+            let cache_apply = cache_started.elapsed();
+            let cache_ready_at = started.elapsed();
+            let quote_started = Instant::now();
+            vanilla_engine
+                .validate_quote_read_sets(vanilla_cache.snapshot(), [&vanilla_registration.key])?;
+            let timing = PathTiming {
+                received_at,
+                cache_ready_at,
+                amm_ready_at: started.elapsed(),
+                cache_apply,
+                quote: quote_started.elapsed(),
+            };
+            vanilla_counters.cache_applied += 1;
+            vanilla_counters.quotes += 1;
             for key in keys {
                 vanilla.entry(key).or_insert(timing);
             }
-            flash_engine
-                .ingest_batch(&mut flash_cache, flash_canonical)
-                .context("converge Flashblock cache to canonical swap")?;
+            reconcile_canonical_path(
+                &canonical_provider,
+                chain.chain_id,
+                pool_address,
+                target,
+                &mut canonical_proofs,
+                &mut flash_head,
+                &mut flash_engine,
+                &mut flash_cache,
+            )
+            .await?;
+            let retained_from = flash_head.number.min(vanilla_head.number);
+            canonical_proofs
+                .blocks
+                .retain(|number, _| *number > retained_from);
         }
     }
 
+    println!(
+        "canonical_proof_rpc: verified_blocks={}, header_requests={}, hash_pinned_log_requests={}",
+        canonical_proofs.fetched, canonical_proofs.fetched, canonical_proofs.fetched
+    );
+    println!(
+        "canonical_quote_refresh: passes={}, accounts={}, slots={}",
+        canonical_proofs.hydration_passes,
+        canonical_proofs.hydrated_accounts,
+        canonical_proofs.hydrated_slots
+    );
     let elapsed = started.elapsed();
     let stop_reason = if vanilla.len() >= max_swaps {
         "swap_limit"
     } else {
         "time_limit"
     };
-    print_rpc_metrics(subscriber.flashblocks_rpc_metrics(), elapsed);
+    let _ = stop_tx.send(true);
+    let rpc_metrics = collector.await.context("join subscription collector")??;
+    print_rpc_metrics(rpc_metrics, elapsed);
     print_results(
         elapsed,
         stop_reason,
@@ -652,6 +772,18 @@ async fn apply_and_quote(
     pool: &evm_amm_state::adapters::PoolKey,
     counters: &mut PathCounters,
 ) -> Result<PathTiming> {
+    if std::env::var_os("FLASHBLOCKS_TRACE_TRANSITIONS").is_some() {
+        for record in batch.records() {
+            eprintln!(
+                "transition_input: path={path}, block={:?}, log_index={:?}, slot0={:?}, input={:?}",
+                record.context.block.map(|b| b.number),
+                record.context.log_index,
+                pool.address()
+                    .and_then(|a| cache.snapshot().storage_value(a, U256::ZERO)),
+                record.input
+            );
+        }
+    }
     let cache_started = Instant::now();
     let report = engine
         .ingest_batch(cache, batch)
@@ -665,7 +797,22 @@ async fn apply_and_quote(
     let quote_started = Instant::now();
     engine
         .validate_quote_read_sets(cache.snapshot(), [pool])
-        .with_context(|| format!("validate warmed quotes offline on {path} path"))?;
+        .map_err(|error| {
+            for applied in &report.reactive.applied {
+                for signal in &applied.hook_signals {
+                    if signal.kind == "amm.decode_error" {
+                        let payload = signal.payload.as_ref().and_then(|payload| {
+                            payload.downcast_ref::<evm_amm_state::adapters::AmmReactiveSignal>()
+                        });
+                        eprintln!(
+                            "transition_rejected: input={:?}, error={payload:?}",
+                            applied.input_ref
+                        );
+                    }
+                }
+            }
+            anyhow::anyhow!("validate warmed quotes offline on {path} path: {error:?}")
+        })?;
     let quote = quote_started.elapsed();
     let amm_ready_at = started.elapsed();
     counters.quotes += 1;
@@ -678,6 +825,145 @@ async fn apply_and_quote(
     })
 }
 
+fn block_ref(header: &Header) -> BlockRef {
+    BlockRef {
+        number: header.inner.number,
+        hash: header.hash,
+        parent_hash: Some(header.inner.parent_hash),
+        timestamp: Some(header.inner.timestamp),
+    }
+}
+
+fn set_header_context(cache: &mut EvmCache, header: &Header) {
+    cache.set_block(BlockId::from((header.hash, Some(true))));
+    cache.set_block_context(Some(header.inner.number), header.inner.base_fee_per_gas);
+    cache.set_coinbase(Some(header.inner.beneficiary));
+    cache.set_prevrandao(Some(header.inner.mix_hash));
+    cache.set_block_gas_limit(Some(header.inner.gas_limit));
+    cache.set_timestamp(Some(header.inner.timestamp));
+}
+
+#[derive(Default)]
+struct CanonicalProofs {
+    blocks: BTreeMap<u64, (Header, ReactiveInputBatch<Ethereum>)>,
+    fetched: u64,
+    hydrated_accounts: usize,
+    hydrated_slots: usize,
+    hydration_passes: usize,
+}
+
+// Subscription arrival is not proof that a block's complete log set arrived.
+// Reconcile every intervening block by hash, including blocks without pool logs,
+// before advancing the coverage baseline or accepting its speculative successor.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_canonical_path(
+    provider: &DynProvider<Ethereum>,
+    chain_id: u64,
+    pool: Address,
+    target: u64,
+    proofs: &mut CanonicalProofs,
+    head: &mut BlockRef,
+    engine: &mut AmmSyncEngine,
+    cache: &mut EvmCache,
+) -> Result<()> {
+    ensure!(
+        target.saturating_sub(head.number) <= 300,
+        "canonical catch-up exceeds bounded benchmark window"
+    );
+    let starting_number = head.number;
+    while head.number < target {
+        let number = head
+            .number
+            .checked_add(1)
+            .context("canonical block overflow")?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = proofs.blocks.entry(number) {
+            let header = provider
+                .get_block_by_number(BlockNumberOrTag::Number(number))
+                .await?
+                .context("canonical catch-up block unavailable")?
+                .header;
+            ensure!(
+                header.inner.number == number && header.hash == header.inner.hash_slow(),
+                "invalid canonical header"
+            );
+            ensure!(
+                header.inner.parent_hash == head.hash,
+                "canonical lineage changed; restart benchmark from a fresh snapshot"
+            );
+            let block = block_ref(&header);
+            let logs = provider
+                .get_logs(&Filter::new().address(pool).at_block_hash(block.hash))
+                .await?;
+            let mut previous = None;
+            let mut records = Vec::with_capacity(logs.len());
+            for log in logs {
+                ensure!(
+                    !log.removed
+                        && log.address() == pool
+                        && log.block_number == Some(number)
+                        && log.block_hash == Some(block.hash),
+                    "log response disagrees with requested canonical block"
+                );
+                let position = (
+                    log.transaction_index
+                        .context("missing transaction position")?,
+                    log.log_index.context("missing log position")?,
+                );
+                ensure!(
+                    log.transaction_hash.is_some() && previous.is_none_or(|last| last < position),
+                    "incomplete, duplicate, or unordered canonical log"
+                );
+                previous = Some(position);
+                records.push(ReactiveInputRecord::new(
+                    ReactiveInput::Log(log),
+                    ReactiveContext {
+                        chain_id: Some(chain_id),
+                        source: InputSource::Backfill,
+                        chain_status: ChainStatus::Included {
+                            block,
+                            confirmations: 0,
+                        },
+                        block: Some(block),
+                        transaction_index: Some(position.0),
+                        log_index: Some(position.1),
+                    },
+                ));
+            }
+            let batch = ReactiveInputBatch::new(records)
+                .with_chain_id(chain_id)
+                .with_chain_controls([ChainControl::CanonicalProgress(block)]);
+            entry.insert((header, batch));
+            proofs.fetched += 1;
+        }
+        let (header, batch) = &proofs.blocks[&number];
+        ensure!(
+            header.inner.parent_hash == head.hash,
+            "canonical lineage changed; restart benchmark from a fresh snapshot"
+        );
+        engine.ingest_batch(cache, batch.clone())?;
+        set_header_context(cache, header);
+        if std::env::var_os("FLASHBLOCKS_TRACE_TRANSITIONS").is_some() {
+            eprintln!(
+                "canonical_advance: block={}, slot0={:?}",
+                number,
+                cache.snapshot().storage_value(pool, U256::ZERO)
+            );
+        }
+        *head = block_ref(header);
+    }
+    if head.number != starting_number {
+        let refreshed = engine.hydrate_quote_read_sets(cache);
+        ensure!(
+            refreshed.is_complete(),
+            "canonical quote dependencies could not be refreshed: {refreshed:?}"
+        );
+        proofs.hydrated_accounts += refreshed.accounts_refreshed;
+        proofs.hydrated_slots += refreshed.slots_refreshed;
+        proofs.hydration_passes += 1;
+    }
+    Ok(())
+}
+
 fn swap_keys<'a>(
     records: impl Iterator<Item = &'a evm_fork_cache::reactive::ReactiveInputRecord<Ethereum>>,
 ) -> Result<Vec<SwapKey>> {
@@ -686,6 +972,13 @@ fn swap_keys<'a>(
         let ReactiveInput::Log(log) = &record.input else {
             bail!("swap subscriber emitted a non-log input");
         };
+        if log.topic0()
+            != Some(&keccak256(
+                b"Swap(address,address,int256,int256,uint160,uint128,int24)",
+            ))
+        {
+            continue;
+        }
         let transaction_hash = log
             .transaction_hash
             .context("swap log missing transaction hash")?;
@@ -750,7 +1043,7 @@ fn print_results(
     print_stats("cache_ready_lead", cache_lead);
     print_stats("amm_quote_ready_lead", amm_lead);
     print_stats("flash_cache_apply", flash_apply);
-    print_stats("canonical_cache_apply", vanilla_apply);
+    print_stats("canonical_reconcile_and_apply", vanilla_apply);
     print_stats("flash_quote", flash_quote);
     print_stats("canonical_quote", vanilla_quote);
 }
@@ -819,5 +1112,129 @@ fn env_usize(name: &str, default: usize) -> usize {
 async fn pace_setup(pause: Duration) {
     if !pause.is_zero() {
         tokio::time::sleep(pause).await;
+    }
+}
+
+#[cfg(test)]
+mod canonical_reconciliation_tests {
+    use super::*;
+    use alloy_rpc_types_eth::{Block, Log};
+    use alloy_transport::mock::Asserter;
+
+    async fn fixture() -> Result<(AmmSyncEngine, EvmCache, BlockRef, Header)> {
+        let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
+        let mut cache = EvmCache::new(Arc::new(provider)).await;
+        let head = BlockRef {
+            number: 100,
+            hash: B256::repeat_byte(1),
+            parent_hash: Some(B256::ZERO),
+            timestamp: Some(1_000),
+        };
+        cache.set_block(BlockId::from((head.hash, Some(true))));
+        cache.set_block_context(Some(head.number), None);
+        let mut engine = AmmSyncEngine::new(AdapterRegistry::new())?;
+        engine.ingest_batch(
+            &mut cache,
+            ReactiveInputBatch::new(Vec::new())
+                .with_chain_id(1)
+                .with_chain_controls([ChainControl::CanonicalProgress(head)]),
+        )?;
+        let inner = alloy_consensus::Header {
+            number: 101,
+            parent_hash: head.hash,
+            timestamp: 1_012,
+            ..Default::default()
+        };
+        let header = Header {
+            hash: inner.hash_slow(),
+            inner,
+            total_difficulty: None,
+            size: None,
+        };
+        Ok((engine, cache, head, header))
+    }
+
+    #[tokio::test]
+    async fn empty_hash_reconciled_block_advances_coverage() -> Result<()> {
+        let (mut engine, mut cache, mut head, header) = fixture().await?;
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(Block::<alloy_rpc_types_eth::Transaction>::empty(
+            header.clone(),
+        )));
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter)).erased();
+        reconcile_canonical_path(
+            &provider,
+            1,
+            Address::repeat_byte(2),
+            101,
+            &mut CanonicalProofs::default(),
+            &mut head,
+            &mut engine,
+            &mut cache,
+        )
+        .await?;
+        assert_eq!(head, block_ref(&header));
+        assert_eq!(engine.runtime().last_canonical_block(), Some(head));
+        assert_eq!(cache.block_number(), Some(101));
+        assert_eq!(cache.timestamp(), Some(1_012));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_parent_is_rejected_before_progress() -> Result<()> {
+        let (mut engine, mut cache, mut head, mut header) = fixture().await?;
+        header.inner.parent_hash = B256::repeat_byte(9);
+        header.hash = header.inner.hash_slow();
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(Block::<alloy_rpc_types_eth::Transaction>::empty(
+            header,
+        )));
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter)).erased();
+        assert!(
+            reconcile_canonical_path(
+                &provider,
+                1,
+                Address::repeat_byte(2),
+                101,
+                &mut CanonicalProofs::default(),
+                &mut head,
+                &mut engine,
+                &mut cache
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(head.number, 100);
+        assert_eq!(engine.runtime().last_canonical_block(), Some(head));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn log_from_another_block_is_rejected_before_progress() -> Result<()> {
+        let (mut engine, mut cache, mut head, header) = fixture().await?;
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(Block::<alloy_rpc_types_eth::Transaction>::empty(
+            header,
+        )));
+        asserter.push_success(&Vec::<Log>::from([Log::default()]));
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter)).erased();
+        assert!(
+            reconcile_canonical_path(
+                &provider,
+                1,
+                Address::repeat_byte(2),
+                101,
+                &mut CanonicalProofs::default(),
+                &mut head,
+                &mut engine,
+                &mut cache
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(head.number, 100);
+        assert_eq!(engine.runtime().last_canonical_block(), Some(head));
+        Ok(())
     }
 }

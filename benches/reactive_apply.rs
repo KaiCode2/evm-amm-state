@@ -13,9 +13,9 @@
 //! cargo bench --bench reactive_apply
 //! ```
 //!
-//! Each measured iteration is one `AdapterDriver::apply_log`: topic routing,
+//! Each measured iteration is one driver call (`apply_log_with_context` for V3): topic routing,
 //! ABI decode, packed-word arithmetic, and the cache write(s). Warm-path
-//! invariants (no resync scheduled) are asserted once before measuring, and
+//! invariants (exact state changes) are asserted once before measuring, and
 //! initial values leave enough headroom that millions of repeated applies stay
 //! on the warm path (a V3 burn never empties its tick, Balancer cash never
 //! under/overflows its 112-bit field).
@@ -29,12 +29,13 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use evm_amm_state::adapters::storage::{
-    V2_RESERVES_SLOT, V3StorageLayout, v3_tick_info_storage_keys_with_base,
+    V2_RESERVES_SLOT, V3StorageLayout, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base,
 };
 use evm_amm_state::adapters::{
-    AdapterDriver, AdapterRegistry, AmmAdapter, BalancerTokenBalance, BalancerV2Adapter,
-    BalancerV2Metadata, ConcentratedLiquidityAdapter, PoolKey, PoolRegistration, ProtocolMetadata,
-    UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
+    AdapterDriver, AdapterEventContext, AdapterRegistry, AmmAdapter, BalancerTokenBalance,
+    BalancerV2Adapter, BalancerV2Metadata, ConcentratedLiquidityAdapter, PoolKey, PoolRegistration,
+    ProtocolMetadata, UniswapV2Adapter, UniswapV2Metadata, V3Metadata,
 };
 use evm_fork_cache::StateUpdate;
 use evm_fork_cache::cache::EvmCache;
@@ -163,7 +164,7 @@ fn bench_v2_sync(c: &mut Criterion, rt: &Rt) {
 fn bench_v3_liquidity(c: &mut Criterion, rt: &Rt) {
     let pool = Address::repeat_byte(0x42);
     let layout = V3StorageLayout::uniswap(60);
-    let (tick_lower, tick_upper) = (60, 180); // current tick 120 in [60, 180)
+    let (tick_lower, tick_upper) = (-60, 60); // current tick 0 in [-60, 60)
     let lower_key = v3_tick_info_storage_keys_with_base(tick_lower, layout.ticks_base_slot)[0];
     let upper_key = v3_tick_info_storage_keys_with_base(tick_upper, layout.ticks_base_slot)[0];
 
@@ -171,17 +172,64 @@ fn bench_v3_liquidity(c: &mut Criterion, rt: &Rt) {
     let mut cache = mock_cache(rt);
     // Headroom so millions of repeated applies stay on the warm path: a burn
     // never empties its tick, a mint never overflows gross or global liquidity.
-    let headroom = u128::MAX / 2;
+    let headroom = 1_000_000_000_000_000_000_000_000_u128;
     cache.apply_updates(&[
         StateUpdate::slot(
             pool,
             layout.slot0_slot,
-            v3_slot0_word(U256::from(1_u64), 120),
+            v3_slot0_word(U256::from(1_u64) << 96, 0)
+                | (U256::from(1) << 200)
+                | (U256::from(1) << 216)
+                | (U256::from(1) << 240),
         ),
         StateUpdate::slot(pool, layout.liquidity_slot, U256::from(headroom)),
-        StateUpdate::slot(pool, lower_key, packed_tick_word0(headroom, 40)),
-        StateUpdate::slot(pool, upper_key, packed_tick_word0(headroom, -40)),
+        StateUpdate::slot(
+            pool,
+            lower_key,
+            packed_tick_word0(headroom, headroom as i128),
+        ),
+        StateUpdate::slot(
+            pool,
+            upper_key,
+            packed_tick_word0(headroom, -(headroom as i128)),
+        ),
     ]);
+
+    // Exact canonical replay also consumes fee accumulators, bitmap evidence,
+    // all Tick.Info words, and an initialized observation at the parent time.
+    cache.apply_updates(&[
+        StateUpdate::slot(pool, U256::from(1), U256::ZERO),
+        StateUpdate::slot(pool, U256::from(2), U256::ZERO),
+        StateUpdate::slot(pool, U256::from(3), U256::ZERO),
+        StateUpdate::slot(
+            pool,
+            U256::from(8),
+            U256::from(100) | (U256::from(1) << 248),
+        ),
+        StateUpdate::slot(
+            pool,
+            v3_tick_bitmap_storage_key_with_base(-1, layout.tick_bitmap_base_slot),
+            U256::from(1) << 255,
+        ),
+        StateUpdate::slot(
+            pool,
+            v3_tick_bitmap_storage_key_with_base(0, layout.tick_bitmap_base_slot),
+            U256::from(1) << 1,
+        ),
+    ]);
+    for tick in [tick_lower, tick_upper] {
+        let keys = v3_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+        cache.apply_updates(&[
+            StateUpdate::slot(pool, keys[1], U256::ZERO),
+            StateUpdate::slot(pool, keys[2], U256::ZERO),
+            StateUpdate::slot(pool, keys[3], U256::from(1) << 248),
+        ]);
+    }
+    let context = AdapterEventContext::for_block(100, B256::repeat_byte(0xaa), 110)
+        .with_chain_id(1)
+        .with_parent_hash(B256::repeat_byte(0xbb))
+        .with_transaction_hash(B256::repeat_byte(0xcc))
+        .with_event_order(0, 0);
 
     let mut reg = PoolRegistration::new(PoolKey::UniswapV3(pool))
         .with_state_address(pool)
@@ -232,7 +280,7 @@ fn bench_v3_liquidity(c: &mut Criterion, rt: &Rt) {
     // Pre-flight both directions: gross must move by ±7 (warm event-sourcing),
     // never a resync-only report.
     driver
-        .apply_log(&mut cache, &mint_log)
+        .apply_log_with_context(&mut cache, &mint_log, &context)
         .expect("apply ok")
         .expect("Mint must route + apply");
     let after_mint = cache.cached_storage_value(pool, lower_key).expect("warm");
@@ -241,7 +289,7 @@ fn bench_v3_liquidity(c: &mut Criterion, rt: &Rt) {
         U256::from(headroom + 7)
     );
     driver
-        .apply_log(&mut cache, &burn_log)
+        .apply_log_with_context(&mut cache, &burn_log, &context)
         .expect("apply ok")
         .expect("Burn must route + apply");
     let after_burn = cache.cached_storage_value(pool, lower_key).expect("warm");
@@ -252,13 +300,17 @@ fn bench_v3_liquidity(c: &mut Criterion, rt: &Rt) {
 
     c.bench_function("reactive_apply/v3_mint_warm", |b| {
         b.iter(|| {
-            let r = driver.apply_log(&mut cache, &mint_log).expect("apply ok");
+            let r = driver
+                .apply_log_with_context(&mut cache, &mint_log, &context)
+                .expect("apply ok");
             black_box(r)
         })
     });
     c.bench_function("reactive_apply/v3_burn_warm", |b| {
         b.iter(|| {
-            let r = driver.apply_log(&mut cache, &burn_log).expect("apply ok");
+            let r = driver
+                .apply_log_with_context(&mut cache, &burn_log, &context)
+                .expect("apply ok");
             black_box(r)
         })
     });

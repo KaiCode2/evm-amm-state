@@ -218,6 +218,8 @@ struct InitializedTick {
 
 #[derive(Clone, Copy, Debug)]
 struct Segment {
+    sqrt_start: U256,
+    sqrt_end: U256,
     liquidity: U256,
     amount_in: U256,
     amount_out: U256,
@@ -241,6 +243,8 @@ struct SlipstreamInitializedTick {
 
 #[derive(Clone, Copy, Debug)]
 struct SlipstreamSegment {
+    sqrt_start: U256,
+    sqrt_end: U256,
     liquidity: U256,
     staked_liquidity: U256,
     amount_in: U256,
@@ -380,6 +384,8 @@ pub(super) fn derive_uniswap_v3_swap(
                 })
                 .transpose()?;
             segments.push(Segment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
                 liquidity: current_liquidity,
                 amount_in: U256::ZERO,
                 amount_out: U256::ZERO,
@@ -416,6 +422,8 @@ pub(super) fn derive_uniswap_v3_swap(
             None
         };
         segments.push(Segment {
+            sqrt_start: current_sqrt,
+            sqrt_end: target,
             liquidity: current_liquidity,
             amount_in,
             amount_out,
@@ -445,6 +453,8 @@ pub(super) fn derive_uniswap_v3_swap(
     if segments.is_empty() {
         if unchanged_tiny_swap {
             segments.push(Segment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
                 liquidity: current_liquidity,
                 amount_in: U256::ZERO,
                 amount_out: U256::ZERO,
@@ -481,24 +491,42 @@ pub(super) fn derive_uniswap_v3_swap(
     };
     let principal_input = checked_sum(segments.iter().map(|segment| segment.amount_in))?;
     let derived_output = checked_sum(segments.iter().map(|segment| segment.amount_out))?;
-    if derived_output != actual_output {
-        return Err(final_mismatch(
-            "signed output",
-            derived_output,
-            actual_output,
-        ));
-    }
+    let last = segments.last().expect("validated nonempty path");
+    let capped_output = output_is_capped(
+        last.sqrt_start,
+        last.sqrt_end,
+        last.liquidity,
+        last.amount_out,
+        derived_output,
+        actual_output,
+        zero_for_one,
+    )?;
     let total_fee = actual_input
         .checked_sub(principal_input)
         .ok_or_else(|| final_mismatch("signed input principal", principal_input, actual_input))?;
 
-    // Exact-input can leave a tiny remainder after reaching a step target. If
-    // its after-fee amount rounds to zero, canonical SwapMath consumes it as a
-    // final fee-only partial step without moving price. Preserve that distinct
+    if capped_output
+        && total_fee
+            != checked_sum(
+                segments
+                    .iter()
+                    .map(|segment| fee_for_full_step(segment.amount_in, fee))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?
+    {
+        return Err(contradiction(
+            "capped output requires exact-output fee accounting",
+        ));
+    }
+
+    // Exact-input can leave a remainder after reaching a step target. If its
+    // after-fee budget cannot move the rounded price, SwapMath consumes it as a
+    // final fee-only partial step. Preserve that distinct
     // step so fee-growth rounding and protocol allocation remain exact.
-    if segments
-        .last()
-        .is_some_and(|segment| segment.reached_boundary)
+    if !capped_output
+        && segments
+            .last()
+            .is_some_and(|segment| segment.reached_boundary)
     {
         let full_step_fees = checked_sum(
             segments
@@ -508,9 +536,19 @@ pub(super) fn derive_uniswap_v3_swap(
         )?;
         if let Some(residual) = total_fee.checked_sub(full_step_fees)
             && !residual.is_zero()
-            && valid_partial_fee(U256::ZERO, residual, fee)?
+            && valid_final_step_fee(
+                current_sqrt,
+                current_sqrt,
+                current_liquidity,
+                U256::ZERO,
+                residual,
+                fee,
+                zero_for_one,
+            )?
         {
             segments.push(Segment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
                 liquidity: current_liquidity,
                 amount_in: U256::ZERO,
                 amount_out: U256::ZERO,
@@ -531,7 +569,15 @@ pub(super) fn derive_uniswap_v3_swap(
     for (segment_index, segment) in segments.iter().enumerate() {
         let is_partial_final = segment_index + 1 == segments.len() && !segment.reached_boundary;
         let fee_amount = if is_partial_final {
-            if !valid_partial_fee(segment.amount_in, remaining_fee, fee)? {
+            if !valid_final_step_fee(
+                segment.sqrt_start,
+                segment.sqrt_end,
+                segment.liquidity,
+                segment.amount_in,
+                remaining_fee,
+                fee,
+                zero_for_one,
+            )? {
                 return Err(contradiction(
                     "final-step fee does not match exact-input or exact-output semantics",
                 ));
@@ -1772,6 +1818,8 @@ fn derive_slipstream_swap_inner(
                 })
                 .transpose()?;
             segments.push(SlipstreamSegment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
                 liquidity: current_liquidity,
                 staked_liquidity: current_staked_liquidity,
                 amount_in: U256::ZERO,
@@ -1817,6 +1865,8 @@ fn derive_slipstream_swap_inner(
             None
         };
         segments.push(SlipstreamSegment {
+            sqrt_start: current_sqrt,
+            sqrt_end: target,
             liquidity: current_liquidity,
             staked_liquidity: current_staked_liquidity,
             amount_in,
@@ -1851,6 +1901,8 @@ fn derive_slipstream_swap_inner(
     if segments.is_empty() {
         if unchanged_tiny_swap {
             segments.push(SlipstreamSegment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
                 liquidity: current_liquidity,
                 staked_liquidity: current_staked_liquidity,
                 amount_in: U256::ZERO,
@@ -1902,17 +1954,98 @@ fn derive_slipstream_swap_inner(
     };
     let principal_input = checked_sum(segments.iter().map(|segment| segment.amount_in))?;
     let derived_output = checked_sum(segments.iter().map(|segment| segment.amount_out))?;
-    if derived_output != actual_output {
-        return Err(final_mismatch(
-            "signed output",
-            derived_output,
-            actual_output,
-        ));
-    }
+    let last = segments.last().expect("validated nonempty path");
+    let capped_output = output_is_capped(
+        last.sqrt_start,
+        last.sqrt_end,
+        last.liquidity,
+        last.amount_out,
+        derived_output,
+        actual_output,
+        zero_for_one,
+    )?;
     let total_fee = actual_input
         .checked_sub(principal_input)
         .ok_or_else(|| final_mismatch("signed input principal", principal_input, actual_input))?;
-    let fee = infer_slipstream_fee(&segments, total_fee)?;
+    let maximum_final_budget = if capped_output {
+        U256::ZERO
+    } else if last.reached_boundary {
+        maximum_input_budget(current_sqrt, current_sqrt, current_liquidity, zero_for_one)?
+    } else {
+        maximum_input_budget(last.sqrt_start, last.sqrt_end, last.liquidity, zero_for_one)?
+    };
+    let fee = infer_slipstream_fee(&segments, total_fee, maximum_final_budget, capped_output)?;
+
+    if !capped_output
+        && segments
+            .last()
+            .is_some_and(|segment| segment.reached_boundary)
+    {
+        let full_step_fees = checked_sum(
+            segments
+                .iter()
+                .map(|segment| fee_for_full_step(segment.amount_in, fee))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        if let Some(residual) = total_fee.checked_sub(full_step_fees)
+            && !residual.is_zero()
+            && valid_final_step_fee(
+                current_sqrt,
+                current_sqrt,
+                current_liquidity,
+                U256::ZERO,
+                residual,
+                fee,
+                zero_for_one,
+            )?
+        {
+            segments.push(SlipstreamSegment {
+                sqrt_start: current_sqrt,
+                sqrt_end: current_sqrt,
+                liquidity: current_liquidity,
+                staked_liquidity: current_staked_liquidity,
+                amount_in: U256::ZERO,
+                amount_out: U256::ZERO,
+                reached_boundary: false,
+                crossed_tick: None,
+            });
+        }
+    }
+
+    let mut remaining_fee = total_fee;
+    let mut step_fees = Vec::with_capacity(segments.len());
+    for (segment_index, segment) in segments.iter().enumerate() {
+        let is_partial_final = segment_index + 1 == segments.len() && !segment.reached_boundary;
+        let fee_amount = if is_partial_final {
+            if capped_output && remaining_fee != fee_for_full_step(segment.amount_in, fee)?
+                || !valid_final_step_fee(
+                    segment.sqrt_start,
+                    segment.sqrt_end,
+                    segment.liquidity,
+                    segment.amount_in,
+                    remaining_fee,
+                    fee,
+                    zero_for_one,
+                )?
+            {
+                return Err(contradiction(
+                    "final-step fee does not match exact-input or exact-output semantics",
+                ));
+            }
+            remaining_fee
+        } else {
+            fee_for_full_step(segment.amount_in, fee)?
+        };
+        remaining_fee = remaining_fee
+            .checked_sub(fee_amount)
+            .ok_or_else(|| contradiction("fee allocation contradicts event input"))?;
+        step_fees.push(fee_amount);
+    }
+    if !remaining_fee.is_zero() {
+        return Err(contradiction(
+            "fee allocation left an unexplained remainder",
+        ));
+    }
 
     // Search needs the exact price/liquidity traversal, observation state, and
     // staked-liquidity bound used by subsequent pool execution. Fee growth,
@@ -1943,53 +2076,13 @@ fn derive_slipstream_swap_inner(
         }
         return Ok((updates, fee));
     }
-    if segments
-        .last()
-        .is_some_and(|segment| segment.reached_boundary)
-    {
-        let full_step_fees = checked_sum(
-            segments
-                .iter()
-                .map(|segment| fee_for_full_step(segment.amount_in, fee))
-                .collect::<Result<Vec<_>, _>>()?,
-        )?;
-        if let Some(residual) = total_fee.checked_sub(full_step_fees)
-            && !residual.is_zero()
-            && valid_partial_fee(U256::ZERO, residual, fee)?
-        {
-            segments.push(SlipstreamSegment {
-                liquidity: current_liquidity,
-                staked_liquidity: current_staked_liquidity,
-                amount_in: U256::ZERO,
-                amount_out: U256::ZERO,
-                reached_boundary: false,
-                crossed_tick: None,
-            });
-        }
-    }
-
-    let mut remaining_fee = total_fee;
     let mut gauge_fee = U256::ZERO;
     let timestamp = context.block_timestamp.expect("validated") as u32;
     let mut tick_updates = Vec::with_capacity(ticks.len() * 4);
     let mut rewards_updated = false;
     let mut reward_reserve_update = None;
     let mut rollover_update = None;
-    for (segment_index, segment) in segments.iter().enumerate() {
-        let is_partial_final = segment_index + 1 == segments.len() && !segment.reached_boundary;
-        let fee_amount = if is_partial_final {
-            if !valid_partial_fee(segment.amount_in, remaining_fee, fee)? {
-                return Err(contradiction(
-                    "final-step fee does not match exact-input or exact-output semantics",
-                ));
-            }
-            remaining_fee
-        } else {
-            fee_for_full_step(segment.amount_in, fee)?
-        };
-        remaining_fee = remaining_fee
-            .checked_sub(fee_amount)
-            .ok_or_else(|| contradiction("fee allocation contradicts event input"))?;
+    for (segment, fee_amount) in segments.iter().zip(step_fees) {
         if !segment.liquidity.is_zero() {
             let (growth, step_gauge_fee) = slipstream_fee_growth(
                 fee_amount,
@@ -2038,11 +2131,6 @@ fn derive_slipstream_swap_inner(
                     .map(|(slot, value)| StateUpdate::slot(address, *slot, value)),
             );
         }
-    }
-    if !remaining_fee.is_zero() {
-        return Err(contradiction(
-            "fee allocation left an unexplained remainder",
-        ));
     }
 
     if zero_for_one {
@@ -2245,9 +2333,11 @@ fn slipstream_fee_growth(
 fn infer_slipstream_fee(
     segments: &[SlipstreamSegment],
     total_fee: U256,
+    maximum_final_budget: U256,
+    capped_output: bool,
 ) -> Result<u32, AdapterEventError> {
-    let first = binary_first_fee(segments, total_fee)?;
-    let last = binary_last_fee(segments, total_fee)?;
+    let first = binary_first_fee(segments, total_fee, maximum_final_budget, capped_output)?;
+    let last = binary_last_fee(segments, total_fee, maximum_final_budget, capped_output)?;
     let (Some(first), Some(last)) = (first, last) else {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeInferenceNoMatch,
@@ -2263,7 +2353,8 @@ fn infer_slipstream_fee(
             V3TransitionError::SlipstreamFeeInferenceAmbiguous { first, last },
         ));
     }
-    let (minimum, maximum) = slipstream_fee_interval(segments, first)?;
+    let (minimum, maximum) =
+        slipstream_fee_interval(segments, first, maximum_final_budget, capped_output)?;
     if total_fee < minimum || total_fee > maximum {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeInferenceNoMatch,
@@ -2275,44 +2366,52 @@ fn infer_slipstream_fee(
 fn binary_first_fee(
     segments: &[SlipstreamSegment],
     total_fee: U256,
+    maximum_final_budget: U256,
+    capped_output: bool,
 ) -> Result<Option<u32>, AdapterEventError> {
     let mut low = 0_u32;
     let mut high = 100_000_u32;
     while low < high {
         let middle = low + (high - low) / 2;
-        let (_, maximum) = slipstream_fee_interval(segments, middle)?;
+        let (_, maximum) =
+            slipstream_fee_interval(segments, middle, maximum_final_budget, capped_output)?;
         if maximum >= total_fee {
             high = middle;
         } else {
             low = middle + 1;
         }
     }
-    let (_, maximum) = slipstream_fee_interval(segments, low)?;
+    let (_, maximum) = slipstream_fee_interval(segments, low, maximum_final_budget, capped_output)?;
     Ok((maximum >= total_fee).then_some(low))
 }
 
 fn binary_last_fee(
     segments: &[SlipstreamSegment],
     total_fee: U256,
+    maximum_final_budget: U256,
+    capped_output: bool,
 ) -> Result<Option<u32>, AdapterEventError> {
     let mut low = 0_u32;
     let mut high = 100_000_u32;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        let (minimum, _) = slipstream_fee_interval(segments, middle)?;
+        let (minimum, _) =
+            slipstream_fee_interval(segments, middle, maximum_final_budget, capped_output)?;
         if minimum <= total_fee {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-    let (minimum, _) = slipstream_fee_interval(segments, low)?;
+    let (minimum, _) = slipstream_fee_interval(segments, low, maximum_final_budget, capped_output)?;
     Ok((minimum <= total_fee).then_some(low))
 }
 
 fn slipstream_fee_interval(
     segments: &[SlipstreamSegment],
     fee: u32,
+    maximum_final_budget: U256,
+    capped_output: bool,
 ) -> Result<(U256, U256), AdapterEventError> {
     let Some((last, preceding)) = segments.split_last() else {
         return Err(contradiction(
@@ -2329,12 +2428,14 @@ fn slipstream_fee_interval(
     let minimum = preceding_fee
         .checked_add(last_minimum)
         .ok_or_else(|| arithmetic("fee inference minimum overflow"))?;
-    let last_maximum = if last.reached_boundary {
+    let last_maximum = if capped_output {
         last_minimum
-            .checked_add(maximum_partial_fee(U256::ZERO, fee)?)
+    } else if last.reached_boundary {
+        last_minimum
+            .checked_add(maximum_partial_fee(U256::ZERO, maximum_final_budget, fee)?)
             .ok_or_else(|| arithmetic("fee inference boundary maximum overflow"))?
     } else {
-        maximum_partial_fee(last.amount_in, fee)?
+        maximum_partial_fee(last.amount_in, maximum_final_budget, fee)?.max(last_minimum)
     };
     let maximum = preceding_fee
         .checked_add(last_maximum)
@@ -2342,16 +2443,20 @@ fn slipstream_fee_interval(
     Ok((minimum, maximum))
 }
 
-fn maximum_partial_fee(amount_in: U256, fee: u32) -> Result<U256, AdapterEventError> {
+fn maximum_partial_fee(
+    amount_in: U256,
+    maximum_budget: U256,
+    fee: u32,
+) -> Result<U256, AdapterEventError> {
     let denominator = U256::from(FEE_DENOMINATOR - u64::from(fee));
-    let next_after_fee = amount_in
+    let next_after_fee = maximum_budget
         .checked_add(U256::from(1))
         .ok_or_else(|| arithmetic("partial-fee input overflow"))?;
     let first_invalid_total =
         mul_div_round_up(next_after_fee, U256::from(FEE_DENOMINATOR), denominator)?;
     first_invalid_total
         .checked_sub(U256::from(1))
-        .and_then(|total| total.checked_sub(amount_in))
+        .map(|total| total.saturating_sub(amount_in))
         .ok_or_else(|| arithmetic("partial-fee maximum underflow"))
 }
 
@@ -2811,24 +2916,174 @@ fn fee_for_full_step(amount_in: U256, fee: u32) -> Result<U256, AdapterEventErro
     mul_div_round_up(amount_in, U256::from(fee), denominator)
 }
 
-fn valid_partial_fee(
+// Only the final step can cap output: it exhausts the remaining exact-output
+// request, even when rounding takes its price all the way to a tick boundary.
+fn output_is_capped(
+    sqrt_start: U256,
+    sqrt_end: U256,
+    liquidity: U256,
+    final_output: U256,
+    derived_output: U256,
+    actual_output: U256,
+    zero_for_one: bool,
+) -> Result<bool, AdapterEventError> {
+    if actual_output == derived_output {
+        return Ok(false);
+    }
+    let preceding = derived_output
+        .checked_sub(final_output)
+        .ok_or_else(|| arithmetic("output path underflow"))?;
+    if let Some(remaining) = actual_output.checked_sub(preceding)
+        && !remaining.is_zero()
+        && remaining < final_output
+        && next_sqrt_from_output(sqrt_start, liquidity, remaining, zero_for_one)? == sqrt_end
+    {
+        return Ok(true);
+    }
+    Err(final_mismatch(
+        "signed output",
+        derived_output,
+        actual_output,
+    ))
+}
+
+fn next_sqrt_from_output(
+    sqrt: U256,
+    liquidity: U256,
+    amount: U256,
+    zero_for_one: bool,
+) -> Result<U256, AdapterEventError> {
+    if sqrt.is_zero() || liquidity.is_zero() {
+        return Err(arithmetic(
+            "next price requires positive price and liquidity",
+        ));
+    }
+    let next = if zero_for_one {
+        sqrt.checked_sub(mul_div_round_up(amount, Q96, liquidity)?)
+            .filter(|price| !price.is_zero())
+            .ok_or_else(|| arithmetic("output exhausts virtual reserves"))?
+    } else {
+        if amount.is_zero() {
+            return Ok(sqrt);
+        }
+        let numerator = liquidity << 96_usize;
+        let denominator = amount
+            .checked_mul(sqrt)
+            .and_then(|product| numerator.checked_sub(product))
+            .filter(|denominator| !denominator.is_zero())
+            .ok_or_else(|| arithmetic("output exhausts virtual reserves"))?;
+        mul_div_round_up(numerator, sqrt, denominator)?
+    };
+    if next > SLOT0_SQRT_MASK {
+        return Err(arithmetic("next price exceeds uint160 bounds"));
+    }
+    Ok(next)
+}
+
+// The amount discounted by the fee is a price budget. Recomputing principal
+// from that rounded price can consume less; SwapMath charges the difference as
+// fee. Validate the forward price, not equality with the discounted budget.
+fn valid_final_step_fee(
+    sqrt_start: U256,
+    sqrt_end: U256,
+    liquidity: U256,
     amount_in: U256,
     fee_amount: U256,
     fee: u32,
+    zero_for_one: bool,
 ) -> Result<bool, AdapterEventError> {
-    let exact_output_fee = fee_for_full_step(amount_in, fee)?;
-    if fee_amount == exact_output_fee {
+    let minimum_fee = fee_for_full_step(amount_in, fee)?;
+    if fee_amount < minimum_fee {
+        return Ok(false);
+    }
+    if fee_amount == minimum_fee {
+        // Exact output, or either mode stopped at an explicit price limit.
         return Ok(true);
     }
-    let total = amount_in
+    let gross = amount_in
         .checked_add(fee_amount)
         .ok_or_else(|| arithmetic("final-step input overflow"))?;
-    let after_fee = mul_div(
-        total,
+    let budget = mul_div(
+        gross,
         U256::from(FEE_DENOMINATOR - u64::from(fee)),
         U256::from(FEE_DENOMINATOR),
     )?;
-    Ok(after_fee == amount_in)
+    Ok(next_sqrt_from_input(sqrt_start, liquidity, budget, zero_for_one)? == sqrt_end)
+}
+
+// Largest exact-input budget whose rounded price does not pass the endpoint.
+// This is the open edge one price unit beyond the event, not the principal
+// derived at the event price. Compute it once before Slipstream's fee search.
+fn maximum_input_budget(
+    sqrt_start: U256,
+    sqrt_end: U256,
+    liquidity: U256,
+    zero_for_one: bool,
+) -> Result<U256, AdapterEventError> {
+    if liquidity.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    let first_past = if zero_for_one {
+        let past = sqrt_end
+            .checked_sub(U256::from(1))
+            .filter(|value| !value.is_zero())
+            .ok_or_else(|| arithmetic("input budget price underflow"))?;
+        let exact = amount0_delta(past, sqrt_start, liquidity, true)?;
+        let numerator = liquidity << 96_usize;
+        let full_math_limit = (U256::MAX - numerator) / sqrt_start;
+        if exact <= full_math_limit {
+            exact
+        } else {
+            // Invert the same overflow fallback as next_sqrt_from_input.
+            div_512(U512::from(numerator), U512::from(past), true)?
+                .checked_sub(numerator / sqrt_start)
+                .ok_or_else(|| arithmetic("input budget fallback underflow"))?
+        }
+    } else {
+        amount1_delta(sqrt_start, sqrt_end + U256::from(1), liquidity, true)?
+    };
+    first_past
+        .checked_sub(U256::from(1))
+        .ok_or_else(|| arithmetic("input budget underflow"))
+}
+
+fn next_sqrt_from_input(
+    sqrt: U256,
+    liquidity: U256,
+    amount: U256,
+    zero_for_one: bool,
+) -> Result<U256, AdapterEventError> {
+    if sqrt.is_zero() || liquidity.is_zero() {
+        return Err(arithmetic(
+            "next price requires positive price and liquidity",
+        ));
+    }
+    let next = if zero_for_one {
+        if amount.is_zero() {
+            return Ok(sqrt);
+        }
+        let numerator = liquidity << 96_usize;
+        if let Some(denominator) = amount
+            .checked_mul(sqrt)
+            .and_then(|product| numerator.checked_add(product))
+        {
+            mul_div_round_up(numerator, sqrt, denominator)?
+        } else {
+            // Match SqrtPriceMath's uint256-overflow fallback, including the
+            // inner floor before adding the input.
+            let denominator = (numerator / sqrt)
+                .checked_add(amount)
+                .ok_or_else(|| arithmetic("next-price denominator overflow"))?;
+            div_512(U512::from(numerator), U512::from(denominator), true)?
+        }
+    } else {
+        sqrt.checked_add(mul_div(amount, Q96, liquidity)?)
+            .ok_or_else(|| arithmetic("next-price addition overflow"))?
+    };
+    if next.is_zero() || next > SLOT0_SQRT_MASK {
+        return Err(arithmetic("next price exceeds uint160 bounds"));
+    }
+    Ok(next)
 }
 
 fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256, AdapterEventError> {
@@ -3031,8 +3286,65 @@ mod tests {
     }
 
     #[test]
+    fn input_budget_bounds_match_price_rounding_in_both_directions() {
+        for tick in [-887000, -301357, 0, 301356, 887000] {
+            let start = sqrt_ratio_at_tick(tick).unwrap();
+            for liquidity in [
+                U256::from(1),
+                U256::from(1_000_000_000_000_u64),
+                Q96 * U256::from(2),
+                WORD_128_MASK,
+            ] {
+                for zero_for_one in [true, false] {
+                    for offset in [U256::ZERO, U256::from(1), start / U256::from(1_000_000)] {
+                        let end = if zero_for_one {
+                            start - offset
+                        } else {
+                            start + offset
+                        };
+                        let maximum =
+                            maximum_input_budget(start, end, liquidity, zero_for_one).unwrap();
+                        let price =
+                            next_sqrt_from_input(start, liquidity, maximum, zero_for_one).unwrap();
+                        let past = next_sqrt_from_input(
+                            start,
+                            liquidity,
+                            maximum + U256::from(1),
+                            zero_for_one,
+                        )
+                        .unwrap();
+                        assert!(if zero_for_one {
+                            price >= end && past < end
+                        } else {
+                            price <= end && past > end
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_price_helpers_reject_impossible_arithmetic() {
+        assert!(next_sqrt_from_input(Q96, U256::ZERO, U256::from(1), true).is_err());
+        assert!(next_sqrt_from_output(U256::ZERO, Q96, U256::from(1), false).is_err());
+        assert!(next_sqrt_from_input(SLOT0_SQRT_MASK, U256::from(1), U256::MAX, false).is_err());
+        assert!(next_sqrt_from_output(Q96, U256::from(1), U256::MAX, false).is_err());
+        assert!(next_sqrt_from_output(Q96, U256::from(1), U256::from(1), true).is_err());
+        // Large amount0 input selects Solidity's checked overflow fallback.
+        let sqrt = SLOT0_SQRT_MASK;
+        let amount = U256::from(1) << 200_usize;
+        assert_eq!(
+            next_sqrt_from_input(sqrt, WORD_128_MASK, amount, true).unwrap(),
+            U256::from(1) << 24_usize
+        );
+    }
+
+    #[test]
     fn slipstream_fee_inference_accepts_unique_zero_fee() {
         let segments = [SlipstreamSegment {
+            sqrt_start: Q96,
+            sqrt_end: Q96,
             liquidity: U256::from(1_000_000),
             staked_liquidity: U256::ZERO,
             amount_in: U256::from(1_000_000),
@@ -3040,12 +3352,17 @@ mod tests {
             reached_boundary: false,
             crossed_tick: None,
         }];
-        assert_eq!(infer_slipstream_fee(&segments, U256::ZERO), Ok(0));
+        assert_eq!(
+            infer_slipstream_fee(&segments, U256::ZERO, U256::from(1_000_000), false),
+            Ok(0)
+        );
     }
 
     #[test]
     fn slipstream_fee_inference_rejects_tiny_rounding_ambiguity() {
         let segments = [SlipstreamSegment {
+            sqrt_start: Q96,
+            sqrt_end: Q96,
             liquidity: U256::from(1),
             staked_liquidity: U256::ZERO,
             amount_in: U256::ZERO,
@@ -3054,7 +3371,7 @@ mod tests {
             crossed_tick: None,
         }];
         assert_eq!(
-            infer_slipstream_fee(&segments, U256::from(1)),
+            infer_slipstream_fee(&segments, U256::from(1), U256::ZERO, false),
             Err(AdapterEventError::V3Transition(
                 V3TransitionError::SlipstreamFeeInferenceAmbiguous {
                     first: 1,
@@ -3378,19 +3695,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_fee_accepts_exact_input_and_output_rounding_only() {
-        for fee in [100_u32, 500, 3_000, 10_000] {
-            for amount in [U256::from(1), U256::from(17), U256::from(1_000_003)] {
-                let exact_output = fee_for_full_step(amount, fee).unwrap();
-                assert!(valid_partial_fee(amount, exact_output, fee).unwrap());
-                let bad = exact_output + U256::from(2);
-                assert!(!valid_partial_fee(amount, bad, fee).unwrap());
-            }
-        }
-    }
-
-    #[test]
-    fn partial_price_steps_accept_exact_input_and_exact_output_in_both_directions() {
+    fn price_limit_steps_accept_fee_ceiling_in_both_directions() {
         let layout = V3StorageLayout::uniswap(1);
         let start_tick = 100;
         let start = sqrt_ratio_at_tick(start_tick).unwrap();
@@ -3402,8 +3707,6 @@ mod tests {
             let (principal, output) =
                 segment_amounts(start, final_sqrt, liquidity, zero_for_one).unwrap();
             let exact_output_fee = fee_for_full_step(principal, 3_000).unwrap();
-            let exact_input_fee = exact_output_fee + U256::from(1);
-            assert!(valid_partial_fee(principal, exact_input_fee, 3_000).unwrap());
 
             let mut state = TestState::default();
             state.insert(layout.slot0_slot, slot0(start, start_tick, 0, 1, 1, 0));
@@ -3417,7 +3720,8 @@ mod tests {
                 U256::ZERO,
             );
 
-            for fee_amount in [exact_output_fee, exact_input_fee] {
+            {
+                let fee_amount = exact_output_fee;
                 let (amount0_negative, amount0, amount1_negative, amount1) = if zero_for_one {
                     (false, principal + fee_amount, true, output)
                 } else {

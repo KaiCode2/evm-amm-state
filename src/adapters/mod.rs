@@ -11,6 +11,8 @@ pub mod cold_start;
 /// Progressive background cold-start scheduling.
 #[cfg(feature = "live-runtime")]
 pub mod cold_start_scheduler;
+/// Bounded decoder diagnostics retained in committed publications.
+pub mod diagnostics;
 /// [`AdapterDriver`], which applies decoded logs to a cache in caller order.
 pub mod driver;
 pub mod factory;
@@ -54,6 +56,9 @@ pub mod types;
 pub mod balancer_v2;
 #[cfg(feature = "curve")]
 pub mod curve;
+/// Reviewed Slipstream transaction-local staking evidence.
+#[cfg(feature = "uniswap-v3")]
+pub mod slipstream_staking;
 /// Solidly V2 (Aerodrome / Velodrome) adapter.
 #[cfg(feature = "solidly-v2")]
 pub mod solidly_v2;
@@ -61,8 +66,9 @@ pub mod solidly_v2;
 #[cfg(feature = "uniswap-v2")]
 pub mod uniswap_v2;
 /// Concentrated-liquidity adapter routing Uniswap V3, PancakeSwap V3, and
-/// Slipstream. Exact event-only `Swap` transitions are currently supported
-/// only for canonical Uniswap V3 semantics; fork families fail closed.
+/// Slipstream. Exact replay is qualified per protocol and reviewed deployment;
+/// arbitrary forks fail closed. Reviewed Optimism staking requires complete
+/// canonical transaction evidence.
 #[cfg(feature = "uniswap-v3")]
 pub mod uniswap_v3;
 #[cfg(feature = "uniswap-v3")]

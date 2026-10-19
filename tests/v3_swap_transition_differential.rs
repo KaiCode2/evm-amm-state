@@ -22,8 +22,8 @@ use evm_amm_state::adapters::storage::{
 };
 use evm_amm_state::adapters::{
     AdapterEventContext, AmmAdapter, ConcentratedLiquidityAdapter, PoolKey, PoolRegistration,
-    ProtocolMetadata, StateUpdate, StateView, UpdateQuality, V3ImmutablePatchValues, V3Metadata,
-    uniswap_v3_code_seed, uniswap_v3_max_liquidity_per_tick,
+    ProtocolMetadata, PurgeScope, StateUpdate, StateView, UpdateQuality, V3ImmutablePatchValues,
+    V3Metadata, uniswap_v3_code_seed, uniswap_v3_max_liquidity_per_tick,
 };
 use evm_fork_cache::cache::EvmCache;
 use revm::{
@@ -79,6 +79,8 @@ struct TickSpec {
 #[derive(Clone, Debug)]
 struct Case {
     name: &'static str,
+    parent_sqrt: U256,
+    parent_tick: i32,
     zero_for_one: bool,
     amount_specified: i128,
     sqrt_price_limit: U256,
@@ -173,7 +175,9 @@ fn execute_calldata(case: &Case) -> Bytes {
 }
 
 fn slot0(case: &Case) -> U256 {
-    Q96 | (U256::from(case.oracle.index) << 184_usize)
+    case.parent_sqrt
+        | ((signed_word(i128::from(case.parent_tick)) & U256::from(0xffffff)) << 160_usize)
+        | (U256::from(case.oracle.index) << 184_usize)
         | (U256::from(case.oracle.cardinality) << 200_usize)
         | (U256::from(case.oracle.cardinality_next) << 216_usize)
         | (U256::from(case.fee_protocol) << 232_usize)
@@ -210,10 +214,16 @@ fn parent_slots(case: &Case, layout: V3StorageLayout) -> (Vec<(U256, U256)>, Vec
         (U256::from(3), U256::from(303)),
         (layout.liquidity_slot, case.liquidity),
     ];
-    let word_minus_one = v3_tick_bitmap_storage_key_with_base(-1, layout.tick_bitmap_base_slot);
-    let word_zero = v3_tick_bitmap_storage_key_with_base(0, layout.tick_bitmap_base_slot);
-    slots.push((word_minus_one, U256::ZERO));
-    slots.push((word_zero, U256::ZERO));
+    let parent_word = case
+        .parent_tick
+        .div_euclid(case.tick_spacing)
+        .div_euclid(256) as i16;
+    for word in (parent_word - 4)..=(parent_word + 4) {
+        slots.push((
+            v3_tick_bitmap_storage_key_with_base(word, layout.tick_bitmap_base_slot),
+            U256::ZERO,
+        ));
+    }
 
     let mut declared = vec![
         layout.slot0_slot,
@@ -259,6 +269,10 @@ fn parent_slots(case: &Case, layout: V3StorageLayout) -> (Vec<(U256, U256)>, Vec
 }
 
 async fn run_case(case: &Case) -> Result<()> {
+    run_checked_case(case, false).await
+}
+
+async fn run_checked_case(case: &Case, check_invalid: bool) -> Result<()> {
     let layout = V3StorageLayout::uniswap(case.tick_spacing);
     let (pool_slots, declared_slots) = parent_slots(case, layout);
     let parent = ParentState(
@@ -339,6 +353,9 @@ async fn run_case(case: &Case) -> Result<()> {
     assert_eq!(decoded.error, None, "reference case {}", case.name);
     let event = decoded.event.expect("reference Swap must decode");
     assert_eq!(event.quality, UpdateQuality::Exact, "case {}", case.name);
+    if check_invalid {
+        assert_invalid_rounding_mutations(case, &reference_log, &registration, &parent, &context);
+    }
     let initial = parent.clone();
     let mut derived = parent;
     derived.apply(&event.updates);
@@ -364,6 +381,13 @@ async fn run_case(case: &Case) -> Result<()> {
                 .filter_map(|(address, slot)| (address == POOL).then_some(slot)),
         )
         .collect();
+    let all_reference_pool_slots = all_reference_pool_slots
+        .into_iter()
+        .chain(event.updates.iter().filter_map(|update| match update {
+            StateUpdate::Slot { address, slot, .. } if *address == POOL => Some(*slot),
+            _ => None,
+        }))
+        .collect::<BTreeSet<_>>();
     for slot in all_reference_pool_slots {
         let expected = reference
             .cached_storage_value(POOL, slot)
@@ -623,6 +647,13 @@ async fn run_ordered_sequence(initial: &Case, actions: &[SwapAction]) -> Result<
                     .filter_map(|(address, slot)| (address == POOL).then_some(slot)),
             )
             .collect();
+        let all_reference_pool_slots = all_reference_pool_slots
+            .into_iter()
+            .chain(event.updates.iter().filter_map(|update| match update {
+                StateUpdate::Slot { address, slot, .. } if *address == POOL => Some(*slot),
+                _ => None,
+            }))
+            .collect::<BTreeSet<_>>();
         for slot in all_reference_pool_slots {
             let expected = reference
                 .cached_storage_value(POOL, slot)
@@ -687,6 +718,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
     };
     let cases = [
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "exact-input zero-for-one",
             zero_for_one: true,
             amount_specified: 1_000_000_000_000_000,
@@ -699,6 +732,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: GROW_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "exact-input one-for-zero with protocol fee",
             zero_for_one: false,
             amount_specified: 1_000_000_000_000_000,
@@ -711,6 +746,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: WRAP_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "exact-output zero-for-one initialized crossing",
             zero_for_one: true,
             amount_specified: -2_000_000_000_000_000,
@@ -726,6 +763,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "exact-output one-for-zero initialized crossing",
             zero_for_one: false,
             amount_specified: -2_000_000_000_000_000,
@@ -741,6 +780,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "zero-for-one explicit price limit",
             zero_for_one: true,
             amount_specified: 100_000_000_000_000_000,
@@ -753,6 +794,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "one-for-zero explicit price limit",
             zero_for_one: false,
             amount_specified: 100_000_000_000_000_000,
@@ -765,6 +808,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "tiny exact-input all fee",
             zero_for_one: true,
             amount_specified: 1,
@@ -777,6 +822,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "tiny exact-output zero-for-one rounding",
             zero_for_one: true,
             amount_specified: -1,
@@ -789,6 +836,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
             oracle: DEFAULT_ORACLE,
         },
         Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "tiny exact-output one-for-zero rounding at same timestamp",
             zero_for_one: false,
             amount_specified: -1,
@@ -823,6 +872,8 @@ async fn canonical_uniswap_v3_generated_swap_corpus_matches_deployed_bytecode() 
                 };
                 for amount_specified in [base_amount, -(base_amount / 2)] {
                     run_case(&Case {
+                        parent_sqrt: Q96,
+                        parent_tick: 0,
                         name: "generated fee/liquidity/direction/exactness matrix",
                         zero_for_one,
                         amount_specified,
@@ -909,6 +960,8 @@ async fn generated_initialized_tick_sequences_match_deployed_bytecode_after_ever
             action(false, false, first_timestamp + 10),
         ];
         let initial = Case {
+            parent_sqrt: Q96,
+            parent_tick: 0,
             name: "fixed-seed ordered initialized-tick property scenario",
             zero_for_one: false,
             amount_specified: actions[0].amount,
@@ -921,6 +974,324 @@ async fn generated_initialized_tick_sequences_match_deployed_bytecode_after_ever
             oracle,
         };
         run_ordered_sequence(&initial, &actions).await?;
+    }
+    Ok(())
+}
+
+// Geometry and amounts from Plasma block 32451176, tx 0x5548f995bd836926932331ab0403abb835e20119a3f7563b23679280b5239001.
+// This executes the canonical runtime with that geometry; the expected storage comes from revm.
+#[tokio::test]
+async fn plasma_exact_input_rounding_matches_deployed_bytecode() -> Result<()> {
+    run_checked_case(
+        &Case {
+            name: "Plasma exact-input 1037-wei budget slack",
+            parent_sqrt: U256::from_str("22663668894434745395613")?,
+            parent_tick: -301357,
+            zero_for_one: true,
+            amount_specified: 86272922443841536,
+            sqrt_price_limit: MIN_SQRT_LIMIT,
+            fee: 500,
+            tick_spacing: 10,
+            liquidity: U256::from(12941633377475003401_u64),
+            fee_protocol: 0,
+            initialized_ticks: vec![],
+            oracle: DEFAULT_ORACLE,
+        },
+        true,
+    )
+    .await
+}
+
+async fn capped_output_case(zero_for_one: bool, initialized: bool) -> Result<()> {
+    let liquidity = Q96 * U256::from(2);
+    run_checked_case(
+        &Case {
+            name: "output capped by one wei at rounded price",
+            parent_sqrt: if zero_for_one {
+                Q96 + U256::from(100)
+            } else {
+                Q96 - U256::from(100)
+            },
+            parent_tick: if zero_for_one { 0 } else { -1 },
+            zero_for_one,
+            amount_specified: if initialized { -199 } else { -197 },
+            sqrt_price_limit: if zero_for_one {
+                MIN_SQRT_LIMIT
+            } else {
+                U256::from_str("1461446703485210103287273052203988822378723970341")?
+            },
+            fee: 500,
+            tick_spacing: 1,
+            liquidity,
+            fee_protocol: 0x44,
+            initialized_ticks: if initialized {
+                vec![positive_tick(0, liquidity)]
+            } else {
+                vec![]
+            },
+            oracle: DEFAULT_ORACLE,
+        },
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn capped_output_zero_for_one_partial() -> Result<()> {
+    capped_output_case(true, false).await
+}
+#[tokio::test]
+async fn capped_output_one_for_zero_partial() -> Result<()> {
+    capped_output_case(false, false).await
+}
+#[tokio::test]
+async fn capped_output_zero_for_one_initialized_boundary() -> Result<()> {
+    capped_output_case(true, true).await
+}
+#[tokio::test]
+async fn capped_output_one_for_zero_initialized_boundary() -> Result<()> {
+    capped_output_case(false, true).await
+}
+
+fn assert_invalid_rounding_mutations(
+    case: &Case,
+    log: &Log,
+    registration: &PoolRegistration,
+    parent: &ParentState,
+    context: &AdapterEventContext,
+) {
+    let input_index = usize::from(!case.zero_for_one);
+    let output_index = 1 - input_index;
+    let word = |index| U256::from_be_slice(&log.data.data[index * 32..(index + 1) * 32]);
+    let input = word(input_index);
+    let output = (!word(output_index)).wrapping_add(U256::from(1));
+    // Double the input while retaining the same price/output, or claim output
+    // beyond the path, or contradict the endpoint's tick/liquidity/ABI widths.
+    // These are constructed contradictions, not arbitrary one-wei mutations.
+    let mut mutations = vec![
+        (input_index, input * U256::from(2)),
+        (
+            output_index,
+            (!(output * U256::from(2))).wrapping_add(U256::from(1)),
+        ),
+        (3, word(3) + U256::from(1)),
+        (4, word(4).wrapping_add(U256::from(2))),
+        (2, U256::from(1) << 160_usize),
+    ];
+    if case.amount_specified < 0 {
+        // The uncapped event can consume this extra wei as exact-input fee;
+        // combining that fee with a capped exact-output event is invalid.
+        mutations.push((input_index, input + U256::from(1)));
+    }
+    for (index, replacement) in mutations {
+        let mut data = log.data.data.to_vec();
+        data[index * 32..(index + 1) * 32].copy_from_slice(&replacement.to_be_bytes::<32>());
+        let bad = Log::new_unchecked(log.address, log.topics().to_vec(), Bytes::from(data));
+        let decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
+            registration,
+            &bad,
+            parent,
+            context,
+        );
+        assert!(
+            decoded.error.is_some(),
+            "{} accepted invalid word {index}",
+            case.name
+        );
+        let invalidation = decoded
+            .event
+            .expect("recognized malformed swap invalidates");
+        assert!(matches!(
+            invalidation.quality,
+            UpdateQuality::RequiresRepair | UpdateQuality::ConservativeInvalidation
+        ));
+        assert_eq!(
+            invalidation.updates,
+            vec![StateUpdate::purge(POOL, PurgeScope::AllStorage)],
+            "rejection must not leak partial exact writes"
+        );
+    }
+}
+
+#[test]
+fn historical_plasma_exact_input_matches_trace_and_runtime_identity() -> Result<()> {
+    historical_plasma_trace(include_str!("fixtures/plasma_exact_input_rounding.json"))
+}
+
+#[test]
+fn historical_plasma_exact_output_matches_trace_and_runtime_identity() -> Result<()> {
+    historical_plasma_trace(include_str!("fixtures/plasma_exact_output_rounding.json"))
+}
+
+fn historical_plasma_trace(fixture: &str) -> Result<()> {
+    let fixture: serde_json::Value = serde_json::from_str(fixture)?;
+    let pool: Address = fixture["pool"]["address"].as_str().unwrap().parse()?;
+    let parse = |value: &serde_json::Value| U256::from_str(value.as_str().unwrap()).unwrap();
+    let storage = |value: &serde_json::Value| {
+        value
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(slot, value)| ((pool, U256::from_str(slot).unwrap()), parse(value)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let parent = ParentState(storage(&fixture["pool_pre"]["storage"]));
+    let mut expected = parent.clone();
+    for key in fixture["pool_diff"]["pre"]["storage"]
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        expected.0.insert((pool, key.parse()?), U256::ZERO);
+    }
+    expected
+        .0
+        .extend(storage(&fixture["pool_diff"]["post"]["storage"]));
+    let log: alloy_rpc_types_eth::Log = serde_json::from_value(fixture["log"].clone())?;
+    let identity = &fixture["reference"];
+    let context = AdapterEventContext::for_block(
+        identity["block_number"].as_u64().unwrap(),
+        identity["block_hash"].as_str().unwrap().parse()?,
+        identity["block_timestamp"].as_u64().unwrap(),
+    )
+    .with_chain_id(9745)
+    .with_parent_hash(identity["parent_hash"].as_str().unwrap().parse()?)
+    .with_transaction_hash(identity["transaction_hash"].as_str().unwrap().parse()?)
+    .with_event_order(
+        identity["transaction_index"].as_u64().unwrap(),
+        identity["log_index"].as_u64().unwrap(),
+    );
+    let metadata = V3Metadata::default()
+        .with_fee(500)
+        .with_tick_spacing(10)
+        .with_storage_layout(V3StorageLayout::uniswap(10));
+    let registration = PoolRegistration::new(PoolKey::UniswapV3(pool))
+        .with_state_address(pool)
+        .with_metadata(ProtocolMetadata::UniswapV3(metadata));
+    let decoded = ConcentratedLiquidityAdapter::default().decode_event_with_context(
+        &registration,
+        &log.inner,
+        &parent,
+        &context,
+    );
+    assert_eq!(decoded.error, None);
+    let event = decoded.event.unwrap();
+    assert_eq!(event.quality, UpdateQuality::Exact);
+    let mut actual = parent;
+    actual.apply(&event.updates);
+    assert_eq!(actual.0, expected.0, "complete trace/write-union poststate");
+    let mut immutables = V3ImmutablePatchValues::default()
+        .with_pool_address(pool)
+        .with_factory(fixture["pool"]["factory"].as_str().unwrap().parse()?)
+        .with_token0(fixture["pool"]["token0"].as_str().unwrap().parse()?)
+        .with_token1(fixture["pool"]["token1"].as_str().unwrap().parse()?)
+        .with_fee(500)
+        .with_tick_spacing(10);
+    immutables.max_liquidity_per_tick = uniswap_v3_max_liquidity_per_tick(10);
+    assert_eq!(
+        keccak256(uniswap_v3_code_seed(pool, &immutables)?.runtime_bytecode),
+        keccak256(Bytes::from_str(
+            fixture["pool_pre"]["code"].as_str().unwrap()
+        )?),
+        "Plasma runtime must match the differential reference after immutable patching"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn asymmetric_price_rounding_matrix_and_sequences_match_bytecode() -> Result<()> {
+    let low = U256::from_str("22663668894434745395613")?;
+    for (parent_sqrt, parent_tick) in [(low, -301357), (Q96 * Q96 / low, 301356)] {
+        for liquidity in [
+            U256::from(1_000_000_000_000_u64),
+            DEFAULT_LIQUIDITY,
+            Q96 * U256::from(2),
+        ] {
+            let token0_amount = (liquidity * Q96 / parent_sqrt / U256::from(100_000))
+                .max(U256::from(1))
+                .to::<i128>();
+            let token1_amount = (liquidity * parent_sqrt / Q96 / U256::from(100_000))
+                .max(U256::from(1))
+                .to::<i128>();
+            for fee in [0, 100, 500, 3000, 10000] {
+                let mut actions = Vec::new();
+                for zero_for_one in [true, false] {
+                    for exact_input in [true, false] {
+                        let amount = if zero_for_one == exact_input {
+                            token0_amount
+                        } else {
+                            token1_amount
+                        };
+                        let case = Case {
+                            name: "asymmetric price/fee/liquidity/exactness matrix",
+                            parent_sqrt,
+                            parent_tick,
+                            liquidity,
+                            fee,
+                            zero_for_one,
+                            amount_specified: if exact_input { amount } else { -amount },
+                            sqrt_price_limit: if zero_for_one {
+                                MIN_SQRT_LIMIT
+                            } else {
+                                U256::from_str("1461446703485210103287273052203988822378723970341")?
+                            },
+                            tick_spacing: 10,
+                            fee_protocol: 0x44,
+                            initialized_ticks: vec![],
+                            oracle: DEFAULT_ORACLE,
+                        };
+                        run_case(&case).await?;
+                        actions.push(SwapAction {
+                            zero_for_one,
+                            exact_input,
+                            amount,
+                            block_timestamp: 110 + actions.len() as u64,
+                        });
+                        if actions.len() == 4 {
+                            run_ordered_sequence(&case, &actions).await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rounding_after_initialized_crossing_preserves_prior_step_fees() -> Result<()> {
+    let liquidity = Q96 * U256::from(2);
+    for zero_for_one in [true, false] {
+        for exact_input in [true, false] {
+            run_case(&Case {
+                name: "rounding after preceding initialized step",
+                parent_sqrt: if zero_for_one {
+                    Q96 + U256::from(100)
+                } else {
+                    Q96 - U256::from(100)
+                },
+                parent_tick: if zero_for_one { 0 } else { -1 },
+                zero_for_one,
+                amount_specified: match (zero_for_one, exact_input) {
+                    (true, true) => 208,
+                    (false, true) => 209,
+                    (true, false) => -202,
+                    (false, false) => -203,
+                },
+                sqrt_price_limit: if zero_for_one {
+                    MIN_SQRT_LIMIT
+                } else {
+                    U256::from_str("1461446703485210103287273052203988822378723970341")?
+                },
+                fee: 500,
+                tick_spacing: 1,
+                liquidity,
+                fee_protocol: 0x44,
+                initialized_ticks: vec![positive_tick(0, liquidity)],
+                oracle: DEFAULT_ORACLE,
+            })
+            .await?;
+        }
     }
     Ok(())
 }

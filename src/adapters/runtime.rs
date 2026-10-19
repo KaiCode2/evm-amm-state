@@ -22,6 +22,8 @@ pub struct AmmRuntimeId(u64);
 
 impl AmmRuntimeId {
     #[cfg(feature = "live-runtime")]
+    // Keep the Rust 1.90 API; newer compilers renamed fetch_update to try_update.
+    #[allow(deprecated)]
     pub(crate) fn allocate() -> Self {
         let value = NEXT_AMM_RUNTIME_ID
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -1001,11 +1003,27 @@ pub struct AmmChangeSet {
     quality: AmmStateQuality,
     pool_changes: Vec<AmmPoolChange>,
     event_refs: Vec<AmmEventRef>,
+    decode_diagnostics: super::diagnostics::AmmDecodeDiagnostics,
     incidents: Vec<AmmStateIncident>,
     requires_full_refresh: bool,
 }
 
 impl AmmChangeSet {
+    /// Attach bounded original decoder failures before committing this state.
+    #[must_use]
+    pub fn with_decode_diagnostics(
+        mut self,
+        diagnostics: super::diagnostics::AmmDecodeDiagnostics,
+    ) -> Self {
+        self.decode_diagnostics = diagnostics;
+        self
+    }
+
+    /// Original decode causes, retained even when an observer misses a notification.
+    pub const fn decode_diagnostics(&self) -> &super::diagnostics::AmmDecodeDiagnostics {
+        &self.decode_diagnostics
+    }
+
     /// Construct a committed change set and canonicalize pool-change ordering.
     pub fn new(
         version: AmmStateVersion,
@@ -1043,6 +1061,7 @@ impl AmmChangeSet {
             quality,
             pool_changes,
             event_refs: Vec::new(),
+            decode_diagnostics: Default::default(),
             incidents,
             requires_full_refresh,
         })
@@ -1496,6 +1515,17 @@ pub enum AmmRuntimeEventKind {
     WorkCompleted {
         /// Completed work attempt.
         work: RuntimeWorkId,
+    },
+    /// Required repair was discarded because its canonical target changed.
+    /// The pool remains degraded; replacement work waits for a fresh target.
+    WorkSuperseded {
+        /// Obsolete repair attempt.
+        work: RuntimeWorkId,
+        /// Block the discarded artifact targeted.
+        target: AmmStatePoint,
+        /// Conflicting provider observation or newer runtime point. This is
+        /// diagnostic evidence, not authority to adopt the reported block.
+        observed: AmmStatePoint,
     },
     /// Work was cancelled or superseded.
     WorkCancelled {

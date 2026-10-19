@@ -31,8 +31,9 @@ use super::{
     V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
 };
 use crate::adapters::storage::{
-    V3StorageLayout, layout_for, slipstream_tick_info_storage_keys_with_base,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
+    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, V3StorageLayout, layout_for,
+    slipstream_tick_info_storage_keys_with_base, v3_tick_bitmap_storage_key_with_base,
+    v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, U256,
@@ -144,7 +145,17 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         ]
     }
 
+    fn route_log(&self, log: &Log, registry: &super::AdapterRegistry) -> Option<super::PoolKey> {
+        super::slipstream_staking::route(log, registry)
+            .or_else(|| registry.route_log_generic(log).map(|pool| pool.key.clone()))
+    }
+
     fn event_sources(&self, pool: &PoolRegistration) -> Vec<EventSource> {
+        if let Some(sources) =
+            super::slipstream_staking::sources(pool, v3_mutating_event_topics(pool.protocol()))
+        {
+            return sources;
+        }
         pool.key
             .address()
             .map(|address| EventSource::direct(address, v3_mutating_event_topics(pool.protocol())))
@@ -272,6 +283,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
                     reviewed.voter,
                     reviewed.module,
                 ]
+                .into_iter()
+                .chain(super::slipstream_staking::code_targets(address))
+                .collect()
             }
             _ => Vec::new(),
         }
@@ -295,6 +309,11 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         log: &Log,
         view: &dyn StateView,
     ) -> AdapterEventResult {
+        if let Some(result) =
+            super::slipstream_staking::decode(pool, log, view, &AdapterEventContext::default())
+        {
+            return result;
+        }
         let Some(topic0) = log.topics().first().copied() else {
             return AdapterEventResult::ignored();
         };
@@ -319,6 +338,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         view: &dyn StateView,
         context: &AdapterEventContext,
     ) -> AdapterEventResult {
+        if let Some(result) = super::slipstream_staking::decode(pool, log, view, context) {
+            return result;
+        }
         let Some(topic0) = log.topics().first().copied() else {
             return AdapterEventResult::ignored();
         };
@@ -1829,19 +1851,9 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 (self.address, U256::from(2)),
                 (self.address, U256::from(3)),
             ]),
-            V3ColdStartExactSurface::Slipstream => verify.extend([
-                // Factory identity plus every non-mapping parent cell the
-                // reviewed swap transition can read or mutate.
-                (self.address, U256::ZERO),
-                (self.address, U256::from(7)),
-                (self.address, U256::from(8)),
-                (self.address, U256::from(9)),
-                (self.address, U256::from(10)),
-                (self.address, U256::from(11)),
-                (self.address, U256::from(12)),
-                (self.address, U256::from(14)),
-                (self.address, U256::from(15)),
-            ]),
+            V3ColdStartExactSurface::Slipstream => verify.extend(
+                SLIPSTREAM_TRANSITION_GLOBAL_SLOTS.map(|slot| (self.address, U256::from(slot))),
+            ),
             V3ColdStartExactSurface::None => {}
         }
         verify.extend(self.external_exact_slots.iter().copied());
@@ -2421,16 +2433,21 @@ mod tests {
             let reviewed = reviewed_slipstream_fee_runtime(family);
             let pool = PoolRegistration::new(PoolKey::Slipstream(reviewed.pool));
             let adapter = ConcentratedLiquidityAdapter::default();
-            assert_eq!(
-                adapter.verified_code_targets(&pool),
-                vec![
-                    reviewed.pool,
-                    reviewed.implementation,
-                    reviewed.factory,
-                    reviewed.voter,
-                    reviewed.module,
-                ]
-            );
+            let mut expected_code = vec![
+                reviewed.pool,
+                reviewed.implementation,
+                reviewed.factory,
+                reviewed.voter,
+                reviewed.module,
+            ];
+            if reviewed.chain_id == 10 {
+                expected_code.extend([
+                    alloy_primitives::address!("41160e66fcaa10cbb148ace60bc2a22d609ec519"),
+                    alloy_primitives::address!("7155b84a704f0657975827c65ff6fe42e3a962bb"),
+                    alloy_primitives::address!("416b433906b1b72fa758e166e239c43d68dc6f29"),
+                ]);
+            }
+            assert_eq!(adapter.verified_code_targets(&pool), expected_code);
             assert_eq!(
                 adapter.verified_storage_targets(&pool),
                 vec![

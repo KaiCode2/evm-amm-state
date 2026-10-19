@@ -5,6 +5,122 @@ All notable changes to `evm-amm-state` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.1-alpha.5] - 2026-10-19
+
+### Changed
+
+- Preserve indexed event-topic constraints through subscriptions, routing,
+  persistence, bloom absence checks and bounded parallel reconciliation.
+- Narrow reviewed Optimism Slipstream NFT traffic to gauge-outgoing custody
+  transfers; fetch hash-pinned Collect/Transfer proofs only for gauge-event
+  token IDs. Preserve withdrawal-before-callback ordering and fail closed on
+  incomplete evidence. No provider reads enter quote or event application.
+
+### Fixed
+
+- Require independent closure proof for independent subscription streams.
+- Discard buffered logs and completeness watermarks together across canonical
+  gaps and replacements, including same-height replacements.
+- Update the validation lock to patched Rustls 0.23.46 without new audit exceptions.
+
+See [staking qualification](docs/slipstream-staking.md). Consumers must select a
+fresh authoritative baseline instead of restoring old broad subscription
+interests. Existing archives without indexed constraints remain readable;
+older readers reject new constrained archives. Deployed latency and savings
+remain subject to consumer release/canary validation.
+
+## [0.3.1-alpha.4] - 2026-09-16
+
+### Fixed
+
+- Preserve ready pool state across proven event-free canonical replacements,
+  retaining reorg notifications and conservative repair for event/state impact,
+  displaced hydration baselines, and missing history.
+- Compare pool subscription identity using typed event sources instead of debug
+  filter formatting, which includes irrelevant set order and bloom-cache state.
+- Distinguish superseded required repairs from terminal work failures. Discard
+  obsolete artifacts and wait for a fresh canonical target without publishing
+  mismatched state or retrying the same target in a loop.
+
+See [canonical reorg repair](docs/reorg-repair.md) for proof boundaries and
+consumer handling of `WorkSuperseded`.
+
+## [0.3.1-alpha.3] - 2026-09-16
+
+### Fixed
+
+- Maintain the reviewed Optimism Slipstream pool's active staked liquidity and
+  boundary staked-liquidity nets through canonical gauge deposits and withdrawals.
+  Correlate pool, NFT-manager, and gauge logs within the delivered transaction;
+  apply withdrawal changes before NFT receiver callbacks. Event application uses
+  cached state and performs no provider reads.
+- Qualify staking evidence with immutable runtime hashes, pool bindings, complete
+  event identity, recipient/custody checks, and delivery ownership. Missing or
+  conflicting evidence remains a typed, fail-closed repair.
+- Prepare gauge/NFT pool bindings in the existing storage program and add their
+  three runtime accounts to existing cold-start code preparation.
+
+### Added
+
+- Bounded original decoder causes on synchronous reports and committed change
+  sets, including pool generation, source input identity, stable error class,
+  and a count of omitted failures. Consumers can diagnose the transition that
+  invalidated state before a later quote reports missing storage.
+- Continuous staking/withdrawal/callback-swap, reorg, malformed-evidence and
+  deployed-pool bytecode parity regressions.
+
+## [0.3.1-alpha.2] - 2026-09-15
+
+### Fixed
+
+- Prepare Slipstream's pool-local transition globals during full-range bulk
+  synchronization, including zero-valued cells. Bulk and windowed cold starts
+  now share the same dependency list, so exact Mint/Burn replay does not depend
+  on incidental quote warmup reads to load reward growth. The existing storage
+  program returns nine additional words without adding a provider request.
+- Verify bulk preparation followed by successive Burns, Mints, tick clearing
+  and reinitialization on both reviewed Slipstream families. Missing required
+  parent state continues to reject the transition and request repair.
+
+## [0.3.1-alpha.1] - 2026-09-14
+
+### Fixed
+
+- Replay valid Uniswap V3 and reviewed Slipstream swaps whose rounded final
+  price leaves exact-output cap slack or exact-input fee slack. Couple output
+  and fee validation to one consistent swap mode, including capped tick-boundary
+  endings, while retaining atomic rejection of contradictory events.
+- Include price-rounding slack in Slipstream's fee-inference bounds without
+  accepting ambiguous fees or changing its accounting-evidence requirements.
+
+### Build
+
+- Refresh the release lockfile to `rustls 0.23.45` and `rustls-webpki 0.103.15`
+  for `RUSTSEC-2026-0285`. Applications must also update their own lockfile.
+
+## [0.3.0] - 2026-09-05
+
+### Changed
+
+- Promotes the current alpha AMM surface, including validated protocol
+  registrations, scoped canonical event replay, quote-read-set hydration, and
+  isolated preconfirmation views. Uses `evm-fork-cache 0.4.0`. Flashblocks
+  integration remains opt-in and in development: current live completeness and
+  latency checks have not passed, and this release makes no readiness or speed
+  claim for that integration.
+
+### Fixed
+
+- Updates the offline V3 Mint/Burn benchmark to supply complete parent storage
+  and exact block/order context required by canonical replay.
+- Migrate the live Flashblocks harness to a verified canonical baseline and
+  hash-pinned complete pool-log reconciliation, including empty blocks and
+  bounded catch-up. Keep independent cache state while sharing immutable proof
+  responses, and report proof-fetch time separately from the old cache-only
+  benchmark boundary.
+
 ## [0.3.0-alpha.10] - 2026-08-22
 
 ### Fixed
@@ -841,7 +957,7 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 
 [`evm-fork-cache`]: https://github.com/KaiCode2/evm-fork-cache
 [`AmmAdapter`]: src/adapters/traits.rs
-[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.9...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0...HEAD
 [0.3.0-alpha.9]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.8...v0.3.0-alpha.9
 [0.3.0-alpha.8]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.7...v0.3.0-alpha.8
 [0.3.0-alpha.7]: https://github.com/KaiCode2/evm-amm-state/compare/v0.3.0-alpha.6...v0.3.0-alpha.7
@@ -853,3 +969,5 @@ uses the `find(PoolQuery) → cold_start_many → register` path.
 [0.3.0-alpha.1]: https://github.com/KaiCode2/evm-amm-state/compare/v0.2.0...v0.3.0-alpha.1
 [0.2.0]: https://github.com/KaiCode2/evm-amm-state/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.1.0
+
+[0.3.0]: https://github.com/KaiCode2/evm-amm-state/releases/tag/v0.3.0

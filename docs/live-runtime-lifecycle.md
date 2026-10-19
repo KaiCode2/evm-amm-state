@@ -1,5 +1,9 @@
 # Transactional Synchronous Lifecycle
 
+The asynchronous actor's event-free reorg proof and typed repair supersession
+are documented in [canonical reorg repair](reorg-repair.md). The synchronous
+compatibility engine remains conservative without that publication proof.
+
 Status: Stage 3 complete
 Date: 2026-07-10
 
