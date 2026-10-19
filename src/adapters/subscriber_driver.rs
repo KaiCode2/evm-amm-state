@@ -1658,6 +1658,7 @@ where
         self.buffered_logs.clear();
         self.pending_headers.clear();
         self.attested_log_coverage = None;
+        self.highest_observed_block = None;
     }
 
     /// Drop buffered logs for blocks already delivered.
@@ -1699,23 +1700,26 @@ where
         if header.inner.number == current.block_number() && header.hash == current.block_hash() {
             return Ok(());
         }
+        let straight_line = current.block_number().checked_add(1) == Some(header.inner.number)
+            && header.inner.parent_hash == current.block_hash();
         let lineage = self.delivery_lineage(header).await?;
-        // More than one block means the parent walk had to fill a gap or a
-        // replacement branch: those blocks were not canonical while the
-        // subscription was delivering, so no buffered set describes them and
-        // the attestation named a different branch.
-        if lineage.len() > 1 {
+        // A gap or replacement invalidates the entire assembly proof, including
+        // a decision computed before the parent walk. A one-block same-height
+        // replacement also belongs here: old successor/coverage watermarks do
+        // not attest delivery on its branch.
+        if !straight_line {
             self.reset_subscription_assembly();
         }
         let last = lineage.len().saturating_sub(1);
         for (index, header) in lineage.into_iter().enumerate() {
             let number = header.inner.number;
             let hash = header.hash;
-            // Only the straight-line head of the walk can be subscription
-            // sourced; everything behind it is a reconciled fill.
-            // Only the straight-line head of the walk may use a seal decision;
-            // everything behind it was filled by the parent walk.
-            let sealable = if index == last { precomputed } else { None };
+            // Cleared buffers can never retain a precomputed seal decision.
+            let sealable = if straight_line && index == last {
+                precomputed
+            } else {
+                None
+            };
             match sealable {
                 Some(reason) => {
                     self.seal_from_subscription(

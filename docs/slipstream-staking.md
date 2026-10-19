@@ -174,3 +174,28 @@ evidence requests; each relevant group of up to 256 gauge token IDs issues two
 hash-pinned elements concurrently. Reconciliation preserves predicates and runs
 at most four reads concurrently. No quote/simulation I/O or automatic retry was
 added. Provider RTTs and deployed end-to-end p95 remain release/canary checks.
+
+## Merge review: canonical assembly invalidation (2026-10-19)
+
+Review found two inherited assembly failures: a header gap cleared buffered logs
+but reused the precomputed seal for the final block; a same-height replacement
+could reuse the old branch's coverage and successor watermark. Both could
+publish a block without all its logs. New driver regressions reproduced both
+failures before the fix. Gap/replacement delivery now clears both watermarks and
+requires exact-hash reconciliation for the entire replacement lineage. A normal
+consecutive canonical block retains its existing seal path and request count.
+No quote, staking arithmetic, callback ordering or execution policy changed.
+
+All 33 subscriber-driver tests and 14 staking-related integration tests pass
+locally on Rust 1.90.0. The regressions explicitly count two reconciliations for
+the two-block gap, and one additional reconciliation for the same-height
+replacement, consuming the queued canonical logs instead of sealing an empty
+buffer. No paid provider is used. The prior final lock-only CI run
+[39144559218](https://github.com/KaiCode2/evm-amm-state/actions/runs/39144559218)
+passed every check, including security audit; the review fix requires a fresh
+complete CI run before merge.
+
+PR #43 is reviewed against the published alpha.4 source on PR #42. Merge into
+that stack does not publish a new crate or integrate the consumer. Publication,
+an exact bot registry-pin update and combined consumer release qualification
+remain separate promotion steps. Neither PR grants deployment authority.
