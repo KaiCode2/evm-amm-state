@@ -73,8 +73,7 @@ live-runtime = ["dep:tokio", "dep:futures"]
 futures = { version = "0.3", optional = true }
 # Companion crate: 0.4.1 supplies the optional generic consumed receipt API.
 # Existing log-coverage/stream-gap and canonical-state contracts are unchanged.
-# The exact registry pin keeps downstream builds reproducible. The temporary
-# Git patch below is review integration only and must be removed before release.
+# The exact registry pin keeps downstream builds reproducible.
 evm-fork-cache = { version = "=0.4.1" }
 
 alloy-eips = "1.0.38"
@@ -384,7 +383,3 @@ required-features = ["uniswap-v2", "uniswap-v3", "curve"]
 [[example]]
 name = "arbitrage_triangular"
 required-features = ["uniswap-v3", "curve"]
-
-# Temporary exact integration pin for consumed receipt timing; no package publication.
-[patch.crates-io]
-evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "b17995b18c5357a7c86b02d49e7ad3955dd36f9e" }

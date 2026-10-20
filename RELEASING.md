@@ -7,14 +7,13 @@ reconciliation and execution-clock behavior is unchanged. See
 `docs/canonical-input-timing.md` for APIs, bounds and disabled costs.
 
 This candidate requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
-dev dependencies. The reviewed cache candidate must be published first under
-separate explicit authorization. Until then, the checked-in exact Git patch is
-integration-only: Cargo removes it when packaging, so final registry package
-verification cannot pass. Do not bypass that gate. After cache appears, remove
-the patch, resolve only that dependency, inspect the lockfile delta, rerun the
-unchanged release matrix and verify the packaged consumer before requesting AMM
-publication. The registry API confirmed this AMM version absent on 2026-10-20;
-recheck immediately before any authorized publication.
+dev dependencies. Cache 0.4.1 is published and its archive was verified against
+commit `8726fe3f2d6b653a912e9f4af84a7f113d1db5da`, checksum
+`d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
+The temporary Git patch is removed. Qualify the unchanged release matrix and
+packaged consumer against this real registry dependency before publishing AMM.
+The registry API confirmed this AMM version absent on 2026-10-20; recheck
+immediately before authorized publication.
 
 Consumers must explicitly select `=0.3.1-alpha.6` after it exists in the registry.
 Both packages add generic data-only telemetry APIs, not metrics exporters or bot

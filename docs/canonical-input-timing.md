@@ -25,11 +25,12 @@ pressure affects observability only. The delivered summary records assembly
 release, preparation completion, optional reconciliation start, event counts,
 first/last event receipt and header input. No new RPC or persisted clock is added.
 
-The standalone workspace temporarily patches evm-fork-cache to exact commit
-`b17995b18c5357a7c86b02d49e7ad3955dd36f9e`, implementing the optional consumed receipt
-API. Downstream workspaces must select that same API explicitly because Cargo
-patches do not propagate from dependencies. The manifest now prepares AMM 0.3.1-alpha.6 against exact cache 0.4.1. No crate
-has been published by this change. A reviewed released version can replace the integration pin later.
+The standalone workspace resolves exact registry `evm-fork-cache = "=0.4.1"`.
+That published archive identifies commit
+`8726fe3f2d6b653a912e9f4af84a7f113d1db5da` and SHA256
+`d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
+The temporary Git patch has been removed; package validation uses the real
+registry dependency. AMM 0.3.1-alpha.6 remains subject to its full release gates.
 
 Focused regression verifies grace/reconciliation retains the original receipt,
 never assigns observed timing to an unobserved fetched log, and keeps reorg hashes
