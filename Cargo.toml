@@ -385,4 +385,4 @@ required-features = ["uniswap-v3", "curve"]
 
 # Temporary exact integration pin for consumed receipt timing; no package publication.
 [patch.crates-io]
-evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "a105b2b5dc7bcdc98c521a1c561dc46790422710" }
+evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "35d58e4c95f31f0452e7728ae8036d45db363984" }

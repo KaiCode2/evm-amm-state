@@ -25,7 +25,7 @@ release, preparation completion, optional reconciliation start, event counts,
 first/last event receipt and header input. No new RPC or persisted clock is added.
 
 The standalone workspace temporarily patches evm-fork-cache to exact commit
-`a105b2b5dc7bcdc98c521a1c561dc46790422710`, implementing the optional consumed receipt
+`35d58e4c95f31f0452e7728ae8036d45db363984`, implementing the optional consumed receipt
 API. Downstream workspaces must select that same API explicitly because Cargo
 patches do not propagate from dependencies. The manifest now prepares AMM 0.3.1-alpha.6 against exact cache 0.4.1. No crate
 has been published by this change. A reviewed released version can replace the integration pin later.
