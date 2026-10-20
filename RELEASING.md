@@ -84,19 +84,19 @@ address-bound code-hash accessors. Publish and verify that companion version
 first. The retained Slipstream evaluator/corpus is research-only and does not
 make Base/Optimism Flashblocks execution-ready.
 
-Alpha.6 restores the full-range, layout-only Slipstream quote bootstrap used by
+Historical `0.3.0-alpha.6` restores the full-range, layout-only Slipstream quote bootstrap used by
 strict provider-free consumers. This is a quote-readiness correction only:
 Slipstream event transitions remain unsupported and fail closed exactly as in
 alpha.5.
 
-Alpha.7 adds event-only quote/search transitions for the reviewed Base BIFI and
+Historical `0.3.0-alpha.7` adds event-only quote/search transitions for the reviewed Base BIFI and
 Optimism mooBIFI Slipstream deployments. `Swap`, `Mint`, `Burn`, and `Collect`
 advance the state consumed by search without a provider reconstruction; full
 fee-growth, gauge, reward, position, and token accounting remain outside that
 guarantee unless the separately attested evidence is present. Arbitrary
 Slipstream deployments remain unsupported.
 
-The local alpha.7 gate routes the two checked-in historical Swap logs through
+The local `0.3.0-alpha.7` gate routes the two checked-in historical Swap logs through
 the pool-scoped reactive runtime and then executes both quote directions through
 the native Slipstream ABI and the real reviewed proxy/implementation bytecode.
 It leaves a provider-failure sentinel queued, requires zero invalidations and
@@ -176,9 +176,10 @@ export E2E_BASE_RPC_URL=<private-base-archive-url>
 
 That runner also fails closed when the Base endpoint is absent. An Ethereum
 endpoint is never treated as Base.
-The scheduled/manual `.github/workflows/live.yml` job invokes the same runner,
-so an explicitly requested CI run fails instead of silently skipping when its
-paid endpoint secret is absent.
+The scheduled/manual `.github/workflows/live.yml` job invokes the mainnet
+runner only. Run the separate Base runner explicitly; the workflow does not
+satisfy that gate. Both runners fail instead of silently skipping when their
+required endpoint is absent.
 
 Record provider class, block, cache mode, sample count, median, p95, maximum,
 failures, and retries. Never record the endpoint.
