@@ -1,27 +1,28 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.1-alpha.5`, based on published
-`0.3.1-alpha.4`. It narrows reviewed Slipstream NFT traffic, preserves indexed
-predicates and requires complete hash-pinned evidence before canonical
-publication. Gap/replacement delivery invalidates both buffered logs and their
-completeness proofs. See `docs/slipstream-staking.md` for correctness, RPC and
-optimized latency qualification. Publication is authorized for this candidate;
-production deployment and activation remain separate and unauthorized.
-`evm-fork-cache` remains exactly pinned to `0.4.0`; no companion release is required.
-Keep unrelated dependency lockfile entries fixed. Rustls is locked to 0.23.46.
+The `0.3.1-alpha.6` release source is based on published
+`0.3.1-alpha.5`. It adds generic optional consumed receipt/assembly provenance and
+an explicit default-off driver builder. Existing canonical state, quote, provider,
+reconciliation and execution-clock behavior is unchanged. See
+`docs/canonical-input-timing.md` for APIs, bounds and disabled costs.
 
-The rounding-specific evidence, historical Plasma fixtures, downstream tests,
-and measured limitations are recorded in
-[`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
-Broader ownership/scheduling redesign, beneficiary hydration, and TLS feature changes remain deferred.
-Preparing the alpha does not establish readiness for those paths or for
-Flashblocks.
+This release requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
+dev dependencies. Cache 0.4.1 is published and its archive was verified against
+commit `8726fe3f2d6b653a912e9f4af84a7f113d1db5da`, checksum
+`d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
+The temporary Git patch is removed. Qualify the unchanged release matrix and
+packaged consumer against this real registry dependency before publishing AMM.
+Check the registry version immediately before authorized publication; an
+ambiguous upload must be resolved by inspecting its archive before retrying.
 
-Consumers must explicitly select `=0.3.1-alpha.5`. After registry publication,
-remove any local path patch, resolve that exact version, and verify the package
-source and the unchanged cache version before rebuilding the service.
-Also update the consumer's own `rustls` lock entry to at least `0.23.46`;
-a library package's lockfile does not replace the application's lockfile.
+Consumers must explicitly select `=0.3.1-alpha.6` after it exists in the registry.
+Both packages add generic data-only telemetry APIs, not metrics exporters or bot
+policy. No new toolchain/runtime/provider capability is required. Broad protocol
+or live-provider qualification is not inferred from these telemetry tests; retain
+all existing gates and the explicit Flashblocks limitations below.
+
+Neither package publishing, tag creation, production deployment nor activation
+is authorized by candidate preparation.
 
 ## Stable baseline publication
 
@@ -34,7 +35,8 @@ The `0.3.0` prerequisites were published in this order:
    cannot resolve until step 2 lands;
 4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
-The final lockfile must resolve `evm-fork-cache 0.4.0` from crates.io.
+That historical baseline resolved cache 0.4.0. The current release must resolve
+`evm-fork-cache 0.4.1` from crates.io before release.
 Candidate integration may use an external patch configuration; neither that
 configuration nor a path dependency may ship. A registry resolution failure
 remains a release blocker.
@@ -82,19 +84,19 @@ address-bound code-hash accessors. Publish and verify that companion version
 first. The retained Slipstream evaluator/corpus is research-only and does not
 make Base/Optimism Flashblocks execution-ready.
 
-Alpha.6 restores the full-range, layout-only Slipstream quote bootstrap used by
+Historical `0.3.0-alpha.6` restores the full-range, layout-only Slipstream quote bootstrap used by
 strict provider-free consumers. This is a quote-readiness correction only:
 Slipstream event transitions remain unsupported and fail closed exactly as in
 alpha.5.
 
-Alpha.7 adds event-only quote/search transitions for the reviewed Base BIFI and
+Historical `0.3.0-alpha.7` adds event-only quote/search transitions for the reviewed Base BIFI and
 Optimism mooBIFI Slipstream deployments. `Swap`, `Mint`, `Burn`, and `Collect`
 advance the state consumed by search without a provider reconstruction; full
 fee-growth, gauge, reward, position, and token accounting remain outside that
 guarantee unless the separately attested evidence is present. Arbitrary
 Slipstream deployments remain unsupported.
 
-The local alpha.7 gate routes the two checked-in historical Swap logs through
+The local `0.3.0-alpha.7` gate routes the two checked-in historical Swap logs through
 the pool-scoped reactive runtime and then executes both quote directions through
 the native Slipstream ABI and the real reviewed proxy/implementation bytecode.
 It leaves a provider-failure sentinel queued, requires zero invalidations and
@@ -174,9 +176,10 @@ export E2E_BASE_RPC_URL=<private-base-archive-url>
 
 That runner also fails closed when the Base endpoint is absent. An Ethereum
 endpoint is never treated as Base.
-The scheduled/manual `.github/workflows/live.yml` job invokes the same runner,
-so an explicitly requested CI run fails instead of silently skipping when its
-paid endpoint secret is absent.
+The scheduled/manual `.github/workflows/live.yml` job invokes the mainnet
+runner only. Run the separate Base runner explicitly; the workflow does not
+satisfy that gate. Both runners fail instead of silently skipping when their
+required endpoint is absent.
 
 Record provider class, block, cache mode, sample count, median, p95, maximum,
 failures, and retries. Never record the endpoint.
@@ -196,7 +199,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.1` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, canonical live gates, downstream compatibility, changelog, and benchmark
 evidence pass. Flashblocks is governed by the explicit in-development scope
@@ -204,3 +207,20 @@ above; its failed live checks must remain visible in the release material.
 
 Publishing and tag creation are external state changes and are never performed
 as part of an ordinary validation run.
+
+## Optional ingress timing feature
+
+The `ingress-timing` Cargo feature is disabled by default and forwards only
+`evm-fork-cache/ingress-timing`. Without it the new public input timing DTO,
+accessors, configuration flag, inline metadata, ledger and clockwork are absent.
+Legacy `AmmCommitTiming` methods and timing behavior remain available unchanged.
+Enabling the Cargo feature still requires `with_input_timing(true)` on the driver
+for collection. An application-owned cache receipt lookup is additionally needed
+for transport-receipt coverage; without a lookup, driver/assembly clocks can be
+collected while consumed receipt origins remain explicitly unknown.
+
+CI exercises default/no-default/enabled configurations, verifies the default
+resolved graph does not enable either crate's ingress feature, and checks API
+absence and original commit-record layout with timing disabled. Enabled tests
+retain capacity, duplicate, content-conflict and exact-input provenance coverage.
+No exporter, subscriber, global setup or runtime dependency is introduced.

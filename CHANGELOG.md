@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.6] - 2026-10-20
+
+- Gate new receipt APIs, inline metadata and the driver ledger behind default-off
+  `ingress-timing`, forwarding the matching cache feature. Runtime collection
+  additionally requires explicit driver opt-in.
+
+### Added
+
+- Optional consumed canonical receive/dequeue/decode provenance on commit timing,
+  with bounded assembly history, exact log content matching, missing-event
+  coverage and reconciliation boundaries. Legacy execution clocks are unchanged.
+  Dropped/retired input watermarks prevent later duplicates from manufacturing
+  fresh roots; conflicting content and per-block overflow retain unknown coverage.
+  Driver collection is explicitly opt-in and disabled by default. The exact
+  companion dependency becomes cache 0.4.1; no exporter/runtime dependency is added.
+  See `docs/canonical-input-timing.md` for the exact registry dependency.
+
 ## [0.3.1-alpha.5] - 2026-10-19
 
 ### Changed

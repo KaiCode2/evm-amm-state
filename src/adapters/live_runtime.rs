@@ -61,6 +61,8 @@ pub struct AmmCanonicalBatch {
 
 #[derive(Clone, Copy, Debug)]
 struct AmmCanonicalBatchTiming {
+    #[cfg(feature = "ingress-timing")]
+    input_timing: Option<super::snapshot::AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
     ordered_after_ingress: Duration,
@@ -68,6 +70,8 @@ struct AmmCanonicalBatchTiming {
 
 #[derive(Clone, Copy, Debug)]
 struct AmmCanonicalTransitionTiming {
+    #[cfg(feature = "ingress-timing")]
+    input_timing: Option<super::snapshot::AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
     ordered_after_ingress: Duration,
@@ -80,6 +84,8 @@ impl AmmCanonicalBatchTiming {
             Instant::now().saturating_duration_since(self.source_ingress);
         assert!(self.ordered_after_ingress <= transitioned_after_ingress);
         AmmCanonicalTransitionTiming {
+            #[cfg(feature = "ingress-timing")]
+            input_timing: self.input_timing,
             source_ingress: self.source_ingress,
             decoded_after_ingress: self.decoded_after_ingress,
             ordered_after_ingress: self.ordered_after_ingress,
@@ -91,17 +97,29 @@ impl AmmCanonicalBatchTiming {
 impl AmmCanonicalTransitionTiming {
     fn committed(self) -> AmmCommitTiming {
         let committed_after_ingress = Instant::now().saturating_duration_since(self.source_ingress);
-        AmmCommitTiming::new(
+        let timing = AmmCommitTiming::new(
             self.source_ingress,
             self.decoded_after_ingress,
             self.ordered_after_ingress,
             self.transitioned_after_ingress,
             committed_after_ingress,
-        )
+        );
+        #[cfg(feature = "ingress-timing")]
+        let timing = timing.with_input_timing(self.input_timing);
+        timing
     }
 }
 
 impl AmmCanonicalBatch {
+    #[cfg(feature = "ingress-timing")]
+    pub(crate) fn with_input_timing(
+        mut self,
+        timing: Option<super::snapshot::AmmCanonicalInputTiming>,
+    ) -> Self {
+        self.timing.input_timing = timing;
+        self
+    }
+
     /// Construct a complete canonical block after source-level reconciliation.
     ///
     /// This typed boundary is the source-ingress stage for direct callers. The
@@ -234,6 +252,8 @@ impl AmmCanonicalBatch {
             interest_revision,
             records,
             timing: AmmCanonicalBatchTiming {
+                #[cfg(feature = "ingress-timing")]
+                input_timing: None,
                 source_ingress,
                 decoded_after_ingress,
                 ordered_after_ingress,

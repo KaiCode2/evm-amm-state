@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.1-alpha.5"
+version = "0.3.1-alpha.6"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -48,6 +48,8 @@ default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", 
 # Protocol-neutral adapter infrastructure (cold-start, reactive, sim, cache
 # orchestration). Always compiled; this marker carries no heavy deps.
 adapters = []
+# Optional receipt provenance; forwarding keeps the cache API equally opt-in.
+ingress-timing = ["evm-fork-cache/ingress-timing"]
 
 # --- Per-protocol ADAPTER flags ---
 # These gate the protocol *adapter* modules in `src/adapters/`.
@@ -69,12 +71,10 @@ live-runtime = ["dep:tokio", "dep:futures"]
 
 [dependencies]
 futures = { version = "0.3", optional = true }
-# Companion crate. The subscription-sourced log path requires 0.4.0-alpha.5's
-# `ChainControl::LogCoverage` attestation and stream-gap detection, on top of
-# alpha.4's preconfirmed overlay, provider provenance, exact log-route index, and
-# generation-safe pending-resync cancellation. The exact registry pin keeps
-# downstream builds reproducible.
-evm-fork-cache = { version = "=0.4.0" }
+# Companion crate: 0.4.1 supplies the optional generic consumed receipt API.
+# Existing log-coverage/stream-gap and canonical-state contracts are unchanged.
+# The exact registry pin keeps downstream builds reproducible.
+evm-fork-cache = { version = "=0.4.1" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -91,7 +91,7 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-evm-fork-cache = { version = "=0.4.0", features = ["reactive-polling", "raw-flashblocks-json"] }
+evm-fork-cache = { version = "=0.4.1", features = ["reactive-polling", "raw-flashblocks-json"] }
 alloy-consensus = "1.0.38"
 alloy-json-rpc = "1.0.38"
 alloy-rpc-client = "1.0.38"

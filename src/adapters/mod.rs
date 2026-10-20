@@ -148,6 +148,8 @@ pub use runtime::{
     RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StatePosition, WorkId,
 };
 pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
+#[cfg(feature = "ingress-timing")]
+pub use snapshot::AmmCanonicalInputTiming;
 pub use snapshot::{
     AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmCommitTiming,
     AmmPreconfirmationTiming, AmmPreconfirmedSnapshot, AmmStateCommit, AmmStateSnapshot,
