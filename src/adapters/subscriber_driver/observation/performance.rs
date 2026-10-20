@@ -18,7 +18,7 @@ fn report(name: &str, values: &mut [u128]) {
 #[ignore = "optimized observational overhead fixture; run explicitly"]
 fn reconciliation_observation_overhead() {
     assert!(
-        !cfg!(debug_assertions),
+        !black_box(cfg!(debug_assertions)),
         "requires optimized release profile"
     );
     const WARMUP: usize = 100;
