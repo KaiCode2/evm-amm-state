@@ -39,15 +39,15 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
-The prepared `0.3.1-alpha.4` candidate adds bounded event-free canonical reorg
-handling and typed required-repair supersession. It retains alpha.3's reviewed
-Optimism staking continuity, committed decoder diagnostics, bulk transition
-preparation and rounded V3 swap replay fixes. After publication, opt in with an
-exact `=0.3.1-alpha.4` requirement and retain the feature selection below.
-`evm-fork-cache` stays exactly pinned to `0.4.0`; no companion release is needed.
-See the [canonical repair guide](docs/reorg-repair.md),
-[staking continuity guide](docs/slipstream-staking.md), and
-[rounding validation report](docs/swap-rounding-validation.md) for coverage.
+The unpublished `0.3.1-alpha.6` candidate adds default-off generic canonical
+receive/assembly timing and requires exact `evm-fork-cache = "=0.4.1"`.
+It preserves alpha.5's canonical state, subscription and reconciliation behavior.
+After the reviewed companion and AMM releases are published, consumers can select
+`=0.3.1-alpha.6` and explicitly enable `with_input_timing(true)` when needed.
+The current Git patch is review integration only; package verification against
+registry cache 0.4.1 remains blocked until that release exists. See the
+[canonical timing guide](docs/canonical-input-timing.md) and
+[release procedure](RELEASING.md). No publication is authorized by this preparation.
 
 All five protocol adapters are enabled by default; trim to what you use with
 feature flags:

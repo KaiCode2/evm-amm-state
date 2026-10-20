@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "evm-amm-state"
-version = "0.3.1-alpha.5"
+version = "0.3.1-alpha.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2005,8 +2005,8 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.4.0"
-source = "git+https://github.com/KaiCode2/evm-fork-cache?rev=e8c8dcb198c267680e20bc21a6c5cf8e7eb4da13#e8c8dcb198c267680e20bc21a6c5cf8e7eb4da13"
+version = "0.4.1"
+source = "git+https://github.com/KaiCode2/evm-fork-cache?rev=a105b2b5dc7bcdc98c521a1c561dc46790422710#a105b2b5dc7bcdc98c521a1c561dc46790422710"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",

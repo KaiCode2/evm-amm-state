@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.1-alpha.5"
+version = "0.3.1-alpha.6"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -69,12 +69,11 @@ live-runtime = ["dep:tokio", "dep:futures"]
 
 [dependencies]
 futures = { version = "0.3", optional = true }
-# Companion crate. The subscription-sourced log path requires 0.4.0-alpha.5's
-# `ChainControl::LogCoverage` attestation and stream-gap detection, on top of
-# alpha.4's preconfirmed overlay, provider provenance, exact log-route index, and
-# generation-safe pending-resync cancellation. The exact registry pin keeps
-# downstream builds reproducible.
-evm-fork-cache = { version = "=0.4.0" }
+# Companion crate: 0.4.1 supplies the optional generic consumed receipt API.
+# Existing log-coverage/stream-gap and canonical-state contracts are unchanged.
+# The exact registry pin keeps downstream builds reproducible. The temporary
+# Git patch below is review integration only and must be removed before release.
+evm-fork-cache = { version = "=0.4.1" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -91,7 +90,7 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-evm-fork-cache = { version = "=0.4.0", features = ["reactive-polling", "raw-flashblocks-json"] }
+evm-fork-cache = { version = "=0.4.1", features = ["reactive-polling", "raw-flashblocks-json"] }
 alloy-consensus = "1.0.38"
 alloy-json-rpc = "1.0.38"
 alloy-rpc-client = "1.0.38"
@@ -386,4 +385,4 @@ required-features = ["uniswap-v3", "curve"]
 
 # Temporary exact integration pin for consumed receipt timing; no package publication.
 [patch.crates-io]
-evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "e8c8dcb198c267680e20bc21a6c5cf8e7eb4da13" }
+evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "a105b2b5dc7bcdc98c521a1c561dc46790422710" }

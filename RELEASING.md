@@ -1,27 +1,29 @@
 # Releasing `evm-amm-state`
 
-The current release candidate is `0.3.1-alpha.5`, based on published
-`0.3.1-alpha.4`. It narrows reviewed Slipstream NFT traffic, preserves indexed
-predicates and requires complete hash-pinned evidence before canonical
-publication. Gap/replacement delivery invalidates both buffered logs and their
-completeness proofs. See `docs/slipstream-staking.md` for correctness, RPC and
-optimized latency qualification. Publication is authorized for this candidate;
-production deployment and activation remain separate and unauthorized.
-`evm-fork-cache` remains exactly pinned to `0.4.0`; no companion release is required.
-Keep unrelated dependency lockfile entries fixed. Rustls is locked to 0.23.46.
+The current unpublished candidate is `0.3.1-alpha.6`, based on published
+`0.3.1-alpha.5`. It adds generic optional consumed receipt/assembly provenance and
+an explicit default-off driver builder. Existing canonical state, quote, provider,
+reconciliation and execution-clock behavior is unchanged. See
+`docs/canonical-input-timing.md` for APIs, bounds and disabled costs.
 
-The rounding-specific evidence, historical Plasma fixtures, downstream tests,
-and measured limitations are recorded in
-[`docs/swap-rounding-validation.md`](docs/swap-rounding-validation.md).
-Broader ownership/scheduling redesign, beneficiary hydration, and TLS feature changes remain deferred.
-Preparing the alpha does not establish readiness for those paths or for
-Flashblocks.
+This candidate requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
+dev dependencies. The reviewed cache candidate must be published first under
+separate explicit authorization. Until then, the checked-in exact Git patch is
+integration-only: Cargo removes it when packaging, so final registry package
+verification cannot pass. Do not bypass that gate. After cache appears, remove
+the patch, resolve only that dependency, inspect the lockfile delta, rerun the
+unchanged release matrix and verify the packaged consumer before requesting AMM
+publication. The registry API confirmed this AMM version absent on 2026-10-20;
+recheck immediately before any authorized publication.
 
-Consumers must explicitly select `=0.3.1-alpha.5`. After registry publication,
-remove any local path patch, resolve that exact version, and verify the package
-source and the unchanged cache version before rebuilding the service.
-Also update the consumer's own `rustls` lock entry to at least `0.23.46`;
-a library package's lockfile does not replace the application's lockfile.
+Consumers must explicitly select `=0.3.1-alpha.6` after it exists in the registry.
+Both packages add generic data-only telemetry APIs, not metrics exporters or bot
+policy. No new toolchain/runtime/provider capability is required. Broad protocol
+or live-provider qualification is not inferred from these telemetry tests; retain
+all existing gates and the explicit Flashblocks limitations below.
+
+Neither package publishing, tag creation, production deployment nor activation
+is authorized by candidate preparation.
 
 ## Stable baseline publication
 
@@ -34,7 +36,8 @@ The `0.3.0` prerequisites were published in this order:
    cannot resolve until step 2 lands;
 4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
-The final lockfile must resolve `evm-fork-cache 0.4.0` from crates.io.
+That historical baseline resolved cache 0.4.0. The current candidate must resolve
+`evm-fork-cache 0.4.1` from crates.io before release.
 Candidate integration may use an external patch configuration; neither that
 configuration nor a path dependency may ship. A registry resolution failure
 remains a release blocker.
@@ -196,7 +199,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.0` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.1` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, canonical live gates, downstream compatibility, changelog, and benchmark
 evidence pass. Flashblocks is governed by the explicit in-development scope
