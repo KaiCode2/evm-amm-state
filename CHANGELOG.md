@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Apply pool status changes to the routing registry in optimized builds. The
+  mutation previously ran inside a debug-only assertion, leaving routing status
+  stale in release builds. The existing consistency assertion is preserved and
+  its regression now also runs in optimized CI.
+
 ### Added
 
 - Full validated canonical headers on the reliable immutable commit stream,

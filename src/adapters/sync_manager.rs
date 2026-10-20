@@ -2438,8 +2438,9 @@ impl AmmSyncEngine {
             .registry
             .update_pool_status(key, status)
             .expect("pool existence was checked before its status update");
+        let routing_updated = self.routing.update_pool_status(key, status);
         debug_assert!(
-            self.routing.update_pool_status(key, status),
+            routing_updated,
             "active pool status must exist in the routing registry"
         );
         if let Some(instance) = self.ownership.active_pool(key).cloned() {
