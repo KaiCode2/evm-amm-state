@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.7] - Release candidate
+
 ### Fixed
 
 - Apply pool status changes to the routing registry in optimized builds. The

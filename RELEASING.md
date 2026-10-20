@@ -1,28 +1,34 @@
 # Releasing `evm-amm-state`
 
-The `0.3.1-alpha.6` release source is based on published
-`0.3.1-alpha.5`. It adds generic optional consumed receipt/assembly provenance and
-an explicit default-off driver builder. Existing canonical state, quote, provider,
-reconciliation and execution-clock behavior is unchanged. See
-`docs/canonical-input-timing.md` for APIs, bounds and disabled costs.
+The `0.3.1-alpha.7` candidate is based on published `0.3.1-alpha.6`.
+It adds an independently opt-in reconciliation observer under the default-off
+`ingress-timing` feature and generic validated full-header evidence on reliable
+canonical commits. It also fixes an existing optimized-build routing-status
+mutation that was incorrectly placed inside a debug-only assertion. See
+`docs/reconciliation-observation.md` and `docs/canonical-header-evidence.md` for
+API, provenance, bounds and cost contracts. Existing bloom closure policy,
+subscription interests, reconciliation requests and timers remain unchanged.
 
-This release requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
-dev dependencies. Cache 0.4.1 is published and its archive was verified against
-commit `8726fe3f2d6b653a912e9f4af84a7f113d1db5da`, checksum
+This candidate retains exact registry `evm-fork-cache = "=0.4.1"` in normal and
+dev dependencies. Cache 0.4.1 was verified against commit
+`8726fe3f2d6b653a912e9f4af84a7f113d1db5da`, checksum
 `d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
-The temporary Git patch is removed. Qualify the unchanged release matrix and
-packaged consumer against this real registry dependency before publishing AMM.
-Check the registry version immediately before authorized publication; an
-ambiguous upload must be resolved by inspecting its archive before retrying.
+No companion cache release or Git/path patch is required. Qualify the full
+matrix, live gates, offline benchmarks and downstream consumer before release;
+the alpha.6 evidence is historical and does not by itself qualify this candidate.
+Check registry availability immediately before any authorized publication;
+resolve an ambiguous upload by inspecting its archive before retrying.
 
-Consumers must explicitly select `=0.3.1-alpha.6` after it exists in the registry.
-Both packages add generic data-only telemetry APIs, not metrics exporters or bot
-policy. No new toolchain/runtime/provider capability is required. Broad protocol
-or live-provider qualification is not inferred from these telemetry tests; retain
-all existing gates and the explicit Flashblocks limitations below.
+After publication, consumers must explicitly select `=0.3.1-alpha.7`. The
+observer requires the Cargo feature and `with_reconciliation_observation(true)`;
+it does not require `with_input_timing(true)`. Header evidence is safety metadata,
+independent of diagnostic features, and does not itself authorize an absence
+proof or protocol state transition. No exporter, bot policy, new dependency,
+provider request or toolchain requirement is introduced.
 
 Neither package publishing, tag creation, production deployment nor activation
-is authorized by candidate preparation.
+is authorized by candidate preparation. The source archive excludes local
+qualification outputs; retain those separately as release evidence.
 
 ## Stable baseline publication
 

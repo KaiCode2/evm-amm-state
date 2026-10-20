@@ -39,25 +39,23 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
-Version `0.3.1-alpha.6` adds default-off generic canonical
-receive/assembly timing and requires exact `evm-fork-cache = "=0.4.1"`.
-It preserves alpha.5's canonical state, subscription and reconciliation behavior.
-The companion cache release is published. After AMM is published, consumers can select
-`=0.3.1-alpha.6` with the default-off `ingress-timing` Cargo feature, then
-explicitly enable `with_input_timing(true)` when needed. The Cargo feature
-forwards cache receipt support; without it, the added APIs and metadata fields
-are absent.
-The exact cache dependency now resolves from the registry with no Git patch.
-Final AMM qualification includes package verification against that release. See the
-[canonical timing guide](docs/canonical-input-timing.md) and
-[release procedure](RELEASING.md). No publication is authorized by this preparation.
+The published `0.3.1-alpha.6` adds default-off generic canonical receive/assembly
+timing and requires exact registry `evm-fork-cache = "=0.4.1"`. Consumers select
+`=0.3.1-alpha.6` with the `ingress-timing` Cargo feature and explicitly enable
+`with_input_timing(true)` to collect driver timing. Without the Cargo feature,
+these diagnostic APIs and metadata fields are absent. See the
+[canonical timing guide](docs/canonical-input-timing.md).
 
-The unreleased reconciliation diagnostic adds a separate default-off runtime
-builder under the same Cargo feature. See the
-[comparison contract and bloom audit](docs/reconciliation-observation.md); this
-API is not part of the published alpha.6 archive. A separate unreleased
-[canonical-header evidence API](docs/canonical-header-evidence.md) preserves full
-headers through the reliable commit stream, independently of diagnostic features.
+The `0.3.1-alpha.7` release candidate adds a separate default-off reconciliation
+observer under the same Cargo feature. See the
+[comparison contract and bloom audit](docs/reconciliation-observation.md).
+The [canonical-header evidence API](docs/canonical-header-evidence.md) preserves
+full validated headers through the reliable commit stream, independently of
+diagnostic features. The candidate also restores routing-status updates in
+optimized builds; it does not change bloom closure policy or add provider reads.
+These additions are not in the published alpha.6 archive. The exact cache pin
+stays at registry 0.4.1. Follow the full [release procedure](RELEASING.md);
+preparation is not publication or deployment.
 
 All five protocol adapters are enabled by default; trim to what you use with
 feature flags:
