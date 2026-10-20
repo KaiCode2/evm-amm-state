@@ -493,6 +493,7 @@ impl AmmCommitTiming {
         }
     }
 
+    #[cfg(feature = "live-runtime")]
     pub(crate) fn with_input_timing(mut self, timing: Option<AmmCanonicalInputTiming>) -> Self {
         self.input_timing = timing;
         self
