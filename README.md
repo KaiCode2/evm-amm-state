@@ -52,6 +52,11 @@ Final AMM qualification includes package verification against that release. See 
 [canonical timing guide](docs/canonical-input-timing.md) and
 [release procedure](RELEASING.md). No publication is authorized by this preparation.
 
+The unreleased reconciliation diagnostic adds a separate default-off runtime
+builder under the same Cargo feature. See the
+[comparison contract and bloom audit](docs/reconciliation-observation.md); this
+API is not part of the published alpha.6 archive.
+
 All five protocol adapters are enabled by default; trim to what you use with
 feature flags:
 

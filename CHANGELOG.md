@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional bounded comparison of driver-consumed subscription logs against
+  existing exact-hash reconciliation responses. Separate runtime opt-in under
+  `ingress-timing` reports equal, missing-at-cutoff, conflicting and unavailable
+  outcomes without new requests, timers or canonical authority. Local selector,
+  branch/reset and capacity limitations remain explicit.
+- Exact-filter bloom soundness regressions and a focused predicate leaf preserve
+  the existing conservative closure policy. The bloom-sealed counter description
+  now correctly describes immediate negative-bloom proof, not grace expiry.
+
 ## [0.3.1-alpha.6] - 2026-10-20
 
 - Gate new receipt APIs, inline metadata and the driver ledger behind default-off

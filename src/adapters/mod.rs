@@ -155,6 +155,8 @@ pub use snapshot::{
     AmmPreconfirmationTiming, AmmPreconfirmedSnapshot, AmmStateCommit, AmmStateSnapshot,
     PoolRevisionMap,
 };
+#[cfg(all(feature = "live-runtime", feature = "ingress-timing"))]
+pub use subscriber_driver::observation::ReconciliationObservationStats;
 #[cfg(feature = "live-runtime")]
 pub use subscriber_driver::{
     AmmPreconfirmationRejectionPolicy, AmmSubscriberDriverConfig, AmmSubscriberDriverError,

@@ -77,3 +77,11 @@ resolved graph does not enable either crate's ingress feature, and checks API
 absence and original commit-record layout with timing disabled. Enabled tests
 retain capacity, duplicate, content-conflict and exact-input provenance coverage.
 No exporter, subscriber, global setup or runtime dependency is introduced.
+
+## Reconciliation comparison
+
+The same Cargo feature also gates a separate runtime opt-in,
+`with_reconciliation_observation(true)`. It compares driver-consumed subscription
+logs at the existing exact-hash fetch cutoff, independently of receipt timing.
+See [the comparison contract and bloom audit](reconciliation-observation.md) for
+the bounded API, denominator, local-matcher assumptions and unavailable cases.
