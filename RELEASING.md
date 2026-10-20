@@ -207,3 +207,20 @@ above; its failed live checks must remain visible in the release material.
 
 Publishing and tag creation are external state changes and are never performed
 as part of an ordinary validation run.
+
+## Optional ingress timing feature
+
+The `ingress-timing` Cargo feature is disabled by default and forwards only
+`evm-fork-cache/ingress-timing`. Without it the new public input timing DTO,
+accessors, configuration flag, inline metadata, ledger and clockwork are absent.
+Legacy `AmmCommitTiming` methods and timing behavior remain available unchanged.
+Enabling the Cargo feature still requires `with_input_timing(true)` on the driver
+for collection. An application-owned cache receipt lookup is additionally needed
+for transport-receipt coverage; without a lookup, driver/assembly clocks can be
+collected while consumed receipt origins remain explicitly unknown.
+
+CI exercises default/no-default/enabled configurations, verifies the default
+resolved graph does not enable either crate's ingress feature, and checks API
+absence and original commit-record layout with timing disabled. Enabled tests
+retain capacity, duplicate, content-conflict and exact-input provenance coverage.
+No exporter, subscriber, global setup or runtime dependency is introduced.

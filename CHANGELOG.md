@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1-alpha.6] - Unreleased candidate
 
+- Gate new receipt APIs, inline metadata and the driver ledger behind default-off
+  `ingress-timing`, forwarding the matching cache feature. Runtime collection
+  additionally requires explicit driver opt-in.
+
 ### Added
 
 - Optional consumed canonical receive/dequeue/decode provenance on commit timing,

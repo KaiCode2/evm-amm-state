@@ -48,6 +48,8 @@ default = ["adapters", "uniswap-v2", "uniswap-v3", "balancer-v2", "solidly-v2", 
 # Protocol-neutral adapter infrastructure (cold-start, reactive, sim, cache
 # orchestration). Always compiled; this marker carries no heavy deps.
 adapters = []
+# Optional receipt provenance; forwarding keeps the cache API equally opt-in.
+ingress-timing = ["evm-fork-cache/ingress-timing"]
 
 # --- Per-protocol ADAPTER flags ---
 # These gate the protocol *adapter* modules in `src/adapters/`.
@@ -385,4 +387,4 @@ required-features = ["uniswap-v3", "curve"]
 
 # Temporary exact integration pin for consumed receipt timing; no package publication.
 [patch.crates-io]
-evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "35d58e4c95f31f0452e7728ae8036d45db363984" }
+evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "b17995b18c5357a7c86b02d49e7ad3955dd36f9e" }

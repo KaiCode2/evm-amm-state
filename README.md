@@ -43,7 +43,10 @@ The unpublished `0.3.1-alpha.6` candidate adds default-off generic canonical
 receive/assembly timing and requires exact `evm-fork-cache = "=0.4.1"`.
 It preserves alpha.5's canonical state, subscription and reconciliation behavior.
 After the reviewed companion and AMM releases are published, consumers can select
-`=0.3.1-alpha.6` and explicitly enable `with_input_timing(true)` when needed.
+`=0.3.1-alpha.6` with the default-off `ingress-timing` Cargo feature, then
+explicitly enable `with_input_timing(true)` when needed. The Cargo feature
+forwards cache receipt support; without it, the added APIs and metadata fields
+are absent.
 The current Git patch is review integration only; package verification against
 registry cache 0.4.1 remains blocked until that release exists. See the
 [canonical timing guide](docs/canonical-input-timing.md) and

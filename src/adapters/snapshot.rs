@@ -432,6 +432,7 @@ impl AmmStateSnapshot {
 
 /// Observation-only receipt and assembly provenance of one canonical block.
 /// This is separate from legacy source clocks used by execution consumers.
+#[cfg(feature = "ingress-timing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmmCanonicalInputTiming {
     /// Earliest received event among the exact input set; incomplete when any event is missing.
@@ -462,7 +463,22 @@ pub struct AmmCanonicalInputTiming {
 /// topology, cold-start, repair, or other command work do not fabricate this
 /// provenance and expose no timing value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "ingress-timing"),
+    doc = r#"
+The optional receipt API is absent without `ingress-timing`:
+```compile_fail
+use evm_amm_state::adapters::AmmCanonicalInputTiming;
+```
+```compile_fail
+fn receipt(timing: &evm_amm_state::adapters::AmmCommitTiming) {
+    let _ = timing.input_timing();
+}
+```
+"#
+)]
 pub struct AmmCommitTiming {
+    #[cfg(feature = "ingress-timing")]
     input_timing: Option<AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
@@ -484,6 +500,7 @@ impl AmmCommitTiming {
         assert!(ordered_after_ingress <= transitioned_after_ingress);
         assert!(transitioned_after_ingress <= committed_after_ingress);
         Self {
+            #[cfg(feature = "ingress-timing")]
             input_timing: None,
             source_ingress,
             decoded_after_ingress,
@@ -493,13 +510,14 @@ impl AmmCommitTiming {
         }
     }
 
-    #[cfg(feature = "live-runtime")]
+    #[cfg(all(feature = "live-runtime", feature = "ingress-timing"))]
     pub(crate) fn with_input_timing(mut self, timing: Option<AmmCanonicalInputTiming>) -> Self {
         self.input_timing = timing;
         self
     }
 
     /// Independent diagnostic receipt/assembly provenance; never a timing authority.
+    #[cfg(feature = "ingress-timing")]
     pub const fn input_timing(&self) -> Option<AmmCanonicalInputTiming> {
         self.input_timing
     }
@@ -576,5 +594,23 @@ impl AmmStateCommit {
     /// event work, or `None` for commits that have no event-source provenance.
     pub const fn timing(&self) -> Option<AmmCommitTiming> {
         self.timing
+    }
+}
+
+#[cfg(all(test, not(feature = "ingress-timing")))]
+mod ingress_feature_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_ingress_timing_preserves_commit_layout() {
+        type PreviousFields = (Instant, Duration, Duration, Duration, Duration);
+        assert_eq!(
+            std::mem::size_of::<AmmCommitTiming>(),
+            std::mem::size_of::<PreviousFields>()
+        );
+        assert_eq!(
+            std::mem::align_of::<AmmCommitTiming>(),
+            std::mem::align_of::<PreviousFields>()
+        );
     }
 }

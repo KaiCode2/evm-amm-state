@@ -1,5 +1,6 @@
 # Canonical input timing
 
+With the default-off `ingress-timing` Cargo feature enabled,
 `AmmCommitTiming::input_timing()` optionally exposes observational transport
 receipt lineage collected by the subscriber driver when explicitly enabled with
 `AmmSubscriberDriverConfig::with_input_timing(true)`. The default is disabled. This is distinct from
@@ -25,7 +26,7 @@ release, preparation completion, optional reconciliation start, event counts,
 first/last event receipt and header input. No new RPC or persisted clock is added.
 
 The standalone workspace temporarily patches evm-fork-cache to exact commit
-`35d58e4c95f31f0452e7728ae8036d45db363984`, implementing the optional consumed receipt
+`b17995b18c5357a7c86b02d49e7ad3955dd36f9e`, implementing the optional consumed receipt
 API. Downstream workspaces must select that same API explicitly because Cargo
 patches do not propagate from dependencies. The manifest now prepares AMM 0.3.1-alpha.6 against exact cache 0.4.1. No crate
 has been published by this change. A reviewed released version can replace the integration pin later.
@@ -57,3 +58,20 @@ current prerelease line. After the reviewed cache 0.4.1 is published, replace it
 integration patch with an exact registry dependency, verify the package against
 that real registry release and prepare the next available AMM alpha. Publication
 remains separately authorized; no package verification assertion is weakened.
+
+## Optional ingress timing feature
+
+The `ingress-timing` Cargo feature is disabled by default and forwards only
+`evm-fork-cache/ingress-timing`. Without it the new public input timing DTO,
+accessors, configuration flag, inline metadata, ledger and clockwork are absent.
+Legacy `AmmCommitTiming` methods and timing behavior remain available unchanged.
+Enabling the Cargo feature still requires `with_input_timing(true)` on the driver
+for collection. An application-owned cache receipt lookup is additionally needed
+for transport-receipt coverage; without a lookup, driver/assembly clocks can be
+collected while consumed receipt origins remain explicitly unknown.
+
+CI exercises default/no-default/enabled configurations, verifies the default
+resolved graph does not enable either crate's ingress feature, and checks API
+absence and original commit-record layout with timing disabled. Enabled tests
+retain capacity, duplicate, content-conflict and exact-input provenance coverage.
+No exporter, subscriber, global setup or runtime dependency is introduced.

@@ -1,5 +1,6 @@
 //! Alloy-specific subscriber owner and complete-block driver.
 
+#[cfg(feature = "ingress-timing")]
 mod timing;
 
 mod filters;
@@ -103,6 +104,7 @@ pub struct AmmSubscriberDriverConfig {
     max_addresses_per_get_logs: usize,
     preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy,
     canonical_log_source: CanonicalLogSource,
+    #[cfg(feature = "ingress-timing")]
     input_timing: bool,
 }
 
@@ -113,6 +115,7 @@ impl Default for AmmSubscriberDriverConfig {
             max_addresses_per_get_logs: 256,
             preconfirmation_rejection_policy: AmmPreconfirmationRejectionPolicy::FailDriver,
             canonical_log_source: CanonicalLogSource::default(),
+            #[cfg(feature = "ingress-timing")]
             input_timing: false,
         }
     }
@@ -121,12 +124,14 @@ impl Default for AmmSubscriberDriverConfig {
 impl AmmSubscriberDriverConfig {
     /// Opt in to bounded diagnostic receipt/assembly lineage. Disabled by default.
     /// This does not affect canonical state, assembly deadlines or provider reads.
+    #[cfg(feature = "ingress-timing")]
     pub const fn with_input_timing(mut self, enabled: bool) -> Self {
         self.input_timing = enabled;
         self
     }
 
     /// Whether the driver retains diagnostic input timing and fingerprints.
+    #[cfg(feature = "ingress-timing")]
     pub const fn input_timing_enabled(&self) -> bool {
         self.input_timing
     }
@@ -832,6 +837,7 @@ where
         attested_log_coverage: None,
         buffered_logs: BTreeMap::new(),
         pending_headers: BTreeMap::new(),
+        #[cfg(feature = "ingress-timing")]
         input_clocks: config.input_timing.then(timing::InputClocks::default),
         highest_observed_block: None,
     };
@@ -874,6 +880,7 @@ struct AlloyAmmSubscriberDriver<P> {
     /// Canonical headers waiting for their log set to be provably closed, with
     /// the instant each started waiting.
     pending_headers: BTreeMap<u64, (RpcHeader, Instant)>,
+    #[cfg(feature = "ingress-timing")]
     input_clocks: Option<timing::InputClocks>,
     /// Highest block number observed from any log or header. An observation
     /// strictly above a pending block proves that block's log set is closed.
@@ -1395,6 +1402,7 @@ where
         let mut headers = Vec::new();
         let mut discarded_logs = 0u64;
         for scoped in batch.into_records() {
+            #[cfg(feature = "ingress-timing")]
             if let Some(clocks) = self.input_clocks.as_mut() {
                 clocks.observe(
                     &scoped.record().input,
@@ -1681,6 +1689,7 @@ where
     /// subscriber never attested.
     fn reset_subscription_assembly(&mut self) {
         self.buffered_logs.clear();
+        #[cfg(feature = "ingress-timing")]
         if let Some(clocks) = self.input_clocks.as_mut() {
             clocks.clear();
         }
@@ -1692,6 +1701,7 @@ where
     /// Drop buffered logs for blocks already delivered.
     fn retire_buffered_logs_through(&mut self, number: u64) {
         self.buffered_logs.retain(|(block, _), _| *block > number);
+        #[cfg(feature = "ingress-timing")]
         if let Some(clocks) = self.input_clocks.as_mut() {
             clocks.retire_through(number);
         }
@@ -1788,6 +1798,7 @@ where
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
+        #[cfg(feature = "ingress-timing")]
         let assembly_released = self.input_clocks.as_ref().map(|_| Instant::now());
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
@@ -1832,6 +1843,7 @@ where
             subscription_keys.len() as u64,
         );
         let records: Vec<ReactiveInputRecord<Ethereum>> = records;
+        #[cfg(feature = "ingress-timing")]
         let input_timing = self.input_clocks.as_ref().zip(assembly_released).and_then(
             |(clocks, assembly_released)| {
                 clocks.capture(
@@ -1857,8 +1869,9 @@ where
             ReactiveInputBatch::new(records),
             source_ingress,
             decoded_after_ingress,
-        )?
-        .with_input_timing(input_timing);
+        )?;
+        #[cfg(feature = "ingress-timing")]
+        let batch = batch.with_input_timing(input_timing);
         self.ingest_while_servicing_controls(batch).await?;
         AmmSubscriberDriverCounters::add(&self.stats.canonical_blocks_delivered, 1);
         AmmSubscriberDriverCounters::add(&self.stats.blocks_sealed_from_subscription, 1);
@@ -1961,6 +1974,7 @@ where
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
+        #[cfg(feature = "ingress-timing")]
         let assembly_released = self.input_clocks.as_ref().map(|_| Instant::now());
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
@@ -2001,6 +2015,7 @@ where
             })
             .collect();
         let records: Vec<ReactiveInputRecord<Ethereum>> = records;
+        #[cfg(feature = "ingress-timing")]
         let input_timing = self.input_clocks.as_ref().zip(assembly_released).and_then(
             |(clocks, assembly_released)| {
                 clocks.capture(
@@ -2026,8 +2041,9 @@ where
             ReactiveInputBatch::new(records),
             source_ingress,
             decoded_after_ingress,
-        )?
-        .with_input_timing(input_timing);
+        )?;
+        #[cfg(feature = "ingress-timing")]
+        let batch = batch.with_input_timing(input_timing);
         self.ingest_while_servicing_controls(batch).await?;
         // Counted only after the runtime accepted the envelope, so a failed
         // ingest is never reported as a delivered block.
@@ -2137,6 +2153,7 @@ fn validated_log_key(log: &RpcLog, block: &BlockRef) -> Result<u64, AmmSubscribe
 
 #[cfg(all(test, feature = "uniswap-v2"))]
 mod tests {
+    #[cfg(feature = "ingress-timing")]
     #[test]
     fn input_timing_is_explicitly_opt_in() {
         let default = super::AmmSubscriberDriverConfig::default();
@@ -2275,6 +2292,7 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
                     highest_observed_block: None,
                 };
@@ -2863,6 +2881,7 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
                     highest_observed_block: None,
                 };
@@ -2952,6 +2971,7 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
                     highest_observed_block: None,
                 };
@@ -3043,6 +3063,7 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
                     highest_observed_block: None,
                 };
@@ -3162,6 +3183,7 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
                     highest_observed_block: None,
                 };
@@ -3788,6 +3810,7 @@ mod tests {
             attested_log_coverage: None,
             buffered_logs: BTreeMap::new(),
             pending_headers: BTreeMap::new(),
+            #[cfg(feature = "ingress-timing")]
             input_clocks: None,
             highest_observed_block: None,
         };

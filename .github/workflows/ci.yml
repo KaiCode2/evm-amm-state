@@ -71,6 +71,14 @@ jobs:
       - name: Tests (no default features)
         run: cargo test --locked --no-default-features
 
+      - name: Ingress timing feature contract
+        run: |
+          cargo check --locked --features ingress-timing
+          cargo check --locked --no-default-features --features ingress-timing
+          cargo test --locked --no-default-features --features live-runtime,uniswap-v2,ingress-timing --lib subscriber_driver
+          cargo metadata --locked --format-version 1 > /tmp/amm-default-features.json
+          python3 -c 'import json; d=json.load(open("/tmp/amm-default-features.json")); ids={p["id"] for p in d["packages"] if p["name"] in ("evm-amm-state", "evm-fork-cache")}; assert all("ingress-timing" not in n["features"] for n in d["resolve"]["nodes"] if n["id"] in ids)'
+
       - name: Check (live runtime only)
         run: cargo check --locked --all-targets --no-default-features --features live-runtime
 

@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "evm-fork-cache"
 version = "0.4.1"
-source = "git+https://github.com/KaiCode2/evm-fork-cache?rev=35d58e4c95f31f0452e7728ae8036d45db363984#35d58e4c95f31f0452e7728ae8036d45db363984"
+source = "git+https://github.com/KaiCode2/evm-fork-cache?rev=b17995b18c5357a7c86b02d49e7ad3955dd36f9e#b17995b18c5357a7c86b02d49e7ad3955dd36f9e"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
