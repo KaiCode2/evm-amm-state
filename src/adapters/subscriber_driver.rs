@@ -1381,7 +1381,11 @@ where
         let mut headers = Vec::new();
         let mut discarded_logs = 0u64;
         for scoped in batch.into_records() {
-            self.input_clocks.observe(&scoped, source_ingress);
+            self.input_clocks.observe(
+                &scoped.record().input,
+                scoped.canonical_timing(),
+                source_ingress,
+            );
             if !scoped.scope().is_canonical() {
                 return Err(AmmSubscriberDriverError::OwnerCatchupRequiresStaging);
             }
