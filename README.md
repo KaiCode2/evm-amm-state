@@ -55,7 +55,9 @@ Final AMM qualification includes package verification against that release. See 
 The unreleased reconciliation diagnostic adds a separate default-off runtime
 builder under the same Cargo feature. See the
 [comparison contract and bloom audit](docs/reconciliation-observation.md); this
-API is not part of the published alpha.6 archive.
+API is not part of the published alpha.6 archive. A separate unreleased
+[canonical-header evidence API](docs/canonical-header-evidence.md) preserves full
+headers through the reliable commit stream, independently of diagnostic features.
 
 All five protocol adapters are enabled by default; trim to what you use with
 feature flags:

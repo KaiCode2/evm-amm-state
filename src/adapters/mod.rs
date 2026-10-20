@@ -151,7 +151,7 @@ pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_fro
 #[cfg(feature = "ingress-timing")]
 pub use snapshot::AmmCanonicalInputTiming;
 pub use snapshot::{
-    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmCommitTiming,
+    AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmCanonicalHeader, AmmCommitTiming,
     AmmPreconfirmationTiming, AmmPreconfirmedSnapshot, AmmStateCommit, AmmStateSnapshot,
     PoolRevisionMap,
 };

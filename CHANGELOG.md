@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Full validated canonical headers on the reliable immutable commit stream,
+  exactly paired with state and absent on lifecycle/prepared/repair commits.
+  The generic evidence is independent of optional diagnostics and introduces
+  no new provider request or protocol-specific absence policy.
+
 - Optional bounded comparison of driver-consumed subscription logs against
   existing exact-hash reconciliation responses. Separate runtime opt-in under
   `ingress-timing` reports equal, missing-at-cutoff, conflicting and unavailable
