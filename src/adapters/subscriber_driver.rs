@@ -2047,10 +2047,14 @@ where
                 fetched.as_ref().ok(),
             ));
         }
-        let mut logs = fetched?;
+        let logs = fetched?;
         #[cfg(feature = "uniswap-v3")]
-        self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
-            .await?;
+        let logs = {
+            let mut logs = logs;
+            self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
+                .await?;
+            logs
+        };
         let records = logs
             .into_values()
             .map(|log| {
