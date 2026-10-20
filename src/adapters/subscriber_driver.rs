@@ -3,7 +3,10 @@
 #[cfg(feature = "ingress-timing")]
 mod timing;
 
+mod bloom;
 mod filters;
+#[cfg(feature = "ingress-timing")]
+pub mod observation;
 mod reconciliation;
 #[cfg(feature = "uniswap-v3")]
 mod staking;
@@ -106,6 +109,8 @@ pub struct AmmSubscriberDriverConfig {
     canonical_log_source: CanonicalLogSource,
     #[cfg(feature = "ingress-timing")]
     input_timing: bool,
+    #[cfg(feature = "ingress-timing")]
+    reconciliation_observation: bool,
 }
 
 impl Default for AmmSubscriberDriverConfig {
@@ -117,6 +122,8 @@ impl Default for AmmSubscriberDriverConfig {
             canonical_log_source: CanonicalLogSource::default(),
             #[cfg(feature = "ingress-timing")]
             input_timing: false,
+            #[cfg(feature = "ingress-timing")]
+            reconciliation_observation: false,
         }
     }
 }
@@ -134,6 +141,22 @@ impl AmmSubscriberDriverConfig {
     #[cfg(feature = "ingress-timing")]
     pub const fn input_timing_enabled(&self) -> bool {
         self.input_timing
+    }
+
+    /// Compare consumed subscription logs with existing exact-hash reads.
+    /// Disabled by default; adds no request or change to canonical policy.
+    /// Local matchers must be pure and stable within an interest revision;
+    /// stateful custom selectors cannot provide a comparable observation domain.
+    #[cfg(feature = "ingress-timing")]
+    pub const fn with_reconciliation_observation(mut self, enabled: bool) -> Self {
+        self.reconciliation_observation = enabled;
+        self
+    }
+
+    /// Whether bounded reconciliation comparison is enabled.
+    #[cfg(feature = "ingress-timing")]
+    pub const fn reconciliation_observation_enabled(&self) -> bool {
+        self.reconciliation_observation
     }
 
     /// Set the bounded subscriber-control capacity.
@@ -338,11 +361,9 @@ impl From<AmmCanonicalBatchError> for AmmSubscriberDriverError {
 /// Canonical-delivery accounting for one attached subscriber driver.
 ///
 /// The driver is the layer that decides *where* canonical log data comes from,
-/// so this is where the cost of that decision is visible. Today every canonical
-/// header triggers a hash-pinned `eth_getLogs` reconciliation while the logs the
-/// WebSocket already delivered are discarded; `subscription_logs_discarded`
-/// beside `reconciliation_requests` reports exactly that, from inside the
-/// process, without reading a provider invoice.
+/// so this is where the cost of that decision is visible. Subscription closure
+/// avoids reconciliation when proven; otherwise exact-hash reads replace the
+/// buffered data. Counters describe this process, not a provider invoice.
 ///
 /// Counts are cumulative for the driver task's lifetime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -358,9 +379,20 @@ pub struct AmmSubscriberDriverStats {
     blocks_sealed_by_bloom_absence: u64,
     blocks_reconciled: u64,
     lineage_parent_requests: u64,
+    #[cfg(feature = "ingress-timing")]
+    reconciliation_observation: Option<observation::ReconciliationObservationStats>,
 }
 
 impl AmmSubscriberDriverStats {
+    /// Optional cumulative comparisons at the driver-consumed fetch-start cutoff.
+    /// This is not physical WebSocket receipt or permanent-loss evidence.
+    #[cfg(feature = "ingress-timing")]
+    pub const fn reconciliation_observation(
+        self,
+    ) -> Option<observation::ReconciliationObservationStats> {
+        self.reconciliation_observation
+    }
+
     /// Canonical headers accepted from the subscriber, before lineage expansion
     /// and before the no-op check against the runtime's current point.
     pub const fn canonical_headers_ingested(self) -> u64 {
@@ -418,9 +450,8 @@ impl AmmSubscriberDriverStats {
         self.blocks_sealed_by_successor
     }
 
-    /// Blocks sealed because the grace window elapsed with no successor
-    /// observed. Expected only on a quiet tail; a high proportion here means
-    /// the window is doing work the successor rule should be doing.
+    /// Blocks sealed because their own header bloom excluded every interest.
+    /// This is an absence proof, not grace-window expiry.
     pub const fn blocks_sealed_by_bloom_absence(self) -> u64 {
         self.blocks_sealed_by_bloom_absence
     }
@@ -455,6 +486,8 @@ struct AmmSubscriberDriverCounters {
     blocks_sealed_by_bloom_absence: AtomicU64,
     blocks_reconciled: AtomicU64,
     lineage_parent_requests: AtomicU64,
+    #[cfg(feature = "ingress-timing")]
+    observation: observation::Counters,
 }
 
 impl AmmSubscriberDriverCounters {
@@ -476,6 +509,8 @@ impl AmmSubscriberDriverCounters {
             blocks_sealed_by_bloom_absence: load(&self.blocks_sealed_by_bloom_absence),
             blocks_reconciled: load(&self.blocks_reconciled),
             lineage_parent_requests: load(&self.lineage_parent_requests),
+            #[cfg(feature = "ingress-timing")]
+            reconciliation_observation: self.observation.snapshot(),
         }
     }
 }
@@ -812,6 +847,10 @@ where
     let (command_tx, command_rx) = mpsc::channel(config.control_capacity);
     let (state_tx, state_rx) = watch::channel(AmmSubscriberDriverState::Paused);
     let stats = Arc::new(AmmSubscriberDriverCounters::default());
+    #[cfg(feature = "ingress-timing")]
+    stats
+        .observation
+        .set_enabled(config.reconciliation_observation);
     let canonical_lineage = initial_canonical_lineage(runtime.latest_snapshot().point());
     let control = AmmSubscriberControl {
         commands: command_tx,
@@ -839,6 +878,10 @@ where
         pending_headers: BTreeMap::new(),
         #[cfg(feature = "ingress-timing")]
         input_clocks: config.input_timing.then(timing::InputClocks::default),
+        #[cfg(feature = "ingress-timing")]
+        observation: config
+            .reconciliation_observation
+            .then(observation::Ledger::default),
         highest_observed_block: None,
     };
     tokio::spawn(actor.run());
@@ -882,6 +925,8 @@ struct AlloyAmmSubscriberDriver<P> {
     pending_headers: BTreeMap<u64, (RpcHeader, Instant)>,
     #[cfg(feature = "ingress-timing")]
     input_clocks: Option<timing::InputClocks>,
+    #[cfg(feature = "ingress-timing")]
+    observation: Option<observation::Ledger>,
     /// Highest block number observed from any log or header. An observation
     /// strictly above a pending block proves that block's log set is closed.
     highest_observed_block: Option<u64>,
@@ -1106,6 +1151,10 @@ where
             }
             self.owners.insert(plan.owner().clone(), epoch.clone());
         }
+        #[cfg(feature = "ingress-timing")]
+        if let Some(observation) = self.observation.as_mut() {
+            observation.clear();
+        }
         self.interest_revision = interest_revision;
         self.paused = false;
         self.publish_running(point);
@@ -1286,6 +1335,10 @@ where
                 self.owners.insert(replacement.owner().clone(), replacement);
             }
         }
+        #[cfg(feature = "ingress-timing")]
+        if let Some(observation) = self.observation.as_mut() {
+            observation.clear();
+        }
         self.interest_revision = interest_revision;
         self.paused = false;
         self.publish_running(point);
@@ -1412,6 +1465,10 @@ where
             }
             if !scoped.scope().is_canonical() {
                 return Err(AmmSubscriberDriverError::OwnerCatchupRequiresStaging);
+            }
+            #[cfg(feature = "ingress-timing")]
+            if let Some(observation) = self.observation.as_mut() {
+                observation.observe(scoped.record());
             }
             match scoped.into_record().input {
                 ReactiveInput::BlockHeader(header) => headers.push(header),
@@ -1647,38 +1704,16 @@ where
     /// interest the bloom admits on both counts, yields `false` and the caller
     /// waits for a log observation or reconciles.
     fn bloom_excludes_every_interest(&self, bloom: &alloy_primitives::Bloom) -> bool {
-        let admits = |value: &[u8]| bloom.contains_input(alloy_primitives::BloomInput::Raw(value));
-        let mut saw_log_interest = false;
-        for interest in self.subscriber.registered_interests() {
-            let ReactiveInterest::Logs(logs) = interest else {
-                continue;
-            };
-            saw_log_interest = true;
-            let filter = &logs.provider_filter;
-            if filter.address.is_empty() {
-                // An address wildcard could match anything in the bloom.
-                return false;
-            }
-            if !filter
-                .address
+        bloom::excludes_every_filter(
+            bloom,
+            self.subscriber
+                .registered_interests()
                 .iter()
-                .any(|address| admits(address.as_slice()))
-            {
-                // No address of this interest can appear, so it cannot match.
-                continue;
-            }
-            // Every constrained topic slot must be present. This is only a
-            // negative proof: bloom membership cannot prove ordering or a log.
-            if filter.topics.iter().any(|topics| {
-                !topics.is_empty() && !topics.iter().any(|topic| admits(topic.as_slice()))
-            }) {
-                continue;
-            }
-            return false;
-        }
-        // With no log interest registered there is nothing to wait for either,
-        // but say so only when at least one interest was examined.
-        saw_log_interest
+                .filter_map(|interest| match interest {
+                    ReactiveInterest::Logs(logs) => Some(&logs.provider_filter),
+                    _ => None,
+                }),
+        )
     }
 
     /// Discard assembly state whose branch is no longer canonical.
@@ -1689,6 +1724,10 @@ where
     /// subscriber never attested.
     fn reset_subscription_assembly(&mut self) {
         self.buffered_logs.clear();
+        #[cfg(feature = "ingress-timing")]
+        if let Some(observation) = self.observation.as_mut() {
+            observation.clear();
+        }
         #[cfg(feature = "ingress-timing")]
         if let Some(clocks) = self.input_clocks.as_mut() {
             clocks.clear();
@@ -1701,6 +1740,10 @@ where
     /// Drop buffered logs for blocks already delivered.
     fn retire_buffered_logs_through(&mut self, number: u64) {
         self.buffered_logs.retain(|(block, _), _| *block > number);
+        #[cfg(feature = "ingress-timing")]
+        if let Some(observation) = self.observation.as_mut() {
+            observation.retire_through(number);
+        }
         #[cfg(feature = "ingress-timing")]
         if let Some(clocks) = self.input_clocks.as_mut() {
             clocks.retire_through(number);
@@ -1993,10 +2036,25 @@ where
             })
             .collect();
         let filters = reconciliation_filters(&interests, self.max_addresses_per_get_logs);
-        let mut logs = self.fetch_reconciliation_logs(&block, filters).await?;
+        // The driver does not drain subscriber input while this existing read
+        // awaits. Its observation ledger is therefore frozen at fetch start.
+        let fetched = self.fetch_reconciliation_logs(&block, filters).await;
+        #[cfg(feature = "ingress-timing")]
+        if let Some(observation) = self.observation.as_ref() {
+            self.stats.observation.record(observation.compare(
+                &block,
+                self.subscriber.registered_interests(),
+                fetched.as_ref().ok(),
+            ));
+        }
+        let logs = fetched?;
         #[cfg(feature = "uniswap-v3")]
-        self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
-            .await?;
+        let logs = {
+            let mut logs = logs;
+            self.complete_staking_evidence(point.chain_id(), &block, &mut logs)
+                .await?;
+            logs
+        };
         let records = logs
             .into_values()
             .map(|log| {
@@ -2167,6 +2225,8 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ingress-timing")]
+    mod observation;
     mod repair;
     #[cfg(feature = "uniswap-v3")]
     mod staking;
@@ -2294,6 +2354,8 @@ mod tests {
                     pending_headers: BTreeMap::new(),
                     #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
+                    #[cfg(feature = "ingress-timing")]
+                    observation: None,
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -2883,6 +2945,8 @@ mod tests {
                     pending_headers: BTreeMap::new(),
                     #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
+                    #[cfg(feature = "ingress-timing")]
+                    observation: None,
                     highest_observed_block: None,
                 };
 
@@ -2973,6 +3037,8 @@ mod tests {
                     pending_headers: BTreeMap::new(),
                     #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
+                    #[cfg(feature = "ingress-timing")]
+                    observation: None,
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -3065,6 +3131,8 @@ mod tests {
                     pending_headers: BTreeMap::new(),
                     #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
+                    #[cfg(feature = "ingress-timing")]
+                    observation: None,
                     highest_observed_block: None,
                 };
 
@@ -3185,6 +3253,8 @@ mod tests {
                     pending_headers: BTreeMap::new(),
                     #[cfg(feature = "ingress-timing")]
                     input_clocks: None,
+                    #[cfg(feature = "ingress-timing")]
+                    observation: None,
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -3812,6 +3882,8 @@ mod tests {
             pending_headers: BTreeMap::new(),
             #[cfg(feature = "ingress-timing")]
             input_clocks: None,
+            #[cfg(feature = "ingress-timing")]
+            observation: None,
             highest_observed_block: None,
         };
         {

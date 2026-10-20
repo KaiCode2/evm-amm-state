@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.7] - Release candidate
+
+### Fixed
+
+- Apply pool status changes to the routing registry in optimized builds. The
+  mutation previously ran inside a debug-only assertion, leaving routing status
+  stale in release builds. The existing consistency assertion is preserved and
+  its regression now also runs in optimized CI.
+
+### Added
+
+- Full validated canonical headers on the reliable immutable commit stream,
+  exactly paired with state and absent on lifecycle/prepared/repair commits.
+  The generic evidence is independent of optional diagnostics and introduces
+  no new provider request or protocol-specific absence policy.
+
+- Optional bounded comparison of driver-consumed subscription logs against
+  existing exact-hash reconciliation responses. Separate runtime opt-in under
+  `ingress-timing` reports equal, missing-at-cutoff, conflicting and unavailable
+  outcomes without new requests, timers or canonical authority. Local selector,
+  branch/reset and capacity limitations remain explicit.
+- Exact-filter bloom soundness regressions and a focused predicate leaf preserve
+  the existing conservative closure policy. The bloom-sealed counter description
+  now correctly describes immediate negative-bloom proof, not grace expiry.
+
 ## [0.3.1-alpha.6] - 2026-10-20
 
 - Gate new receipt APIs, inline metadata and the driver ledger behind default-off

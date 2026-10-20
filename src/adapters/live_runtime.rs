@@ -29,19 +29,20 @@ use super::cold_start_scheduler::{
 };
 use super::subscriber_driver::{AmmSubscriberControl, AmmSubscriberOwnerPlan};
 use super::{
-    AdapterRegistry, AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmChangeSet,
-    AmmChangeSetError, AmmCommitTiming, AmmEventRef, AmmPoolChange, AmmPoolChangeKind,
-    AmmPoolGenerationReservation, AmmPreconfirmationRejectionReason, AmmPreconfirmationTiming,
-    AmmPreconfirmedSnapshot, AmmPreparedPoolState, AmmPreparedStorage, AmmRuntimeEvent,
-    AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeStatusSnapshot, AmmStateCommit,
-    AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateSnapshot, AmmStateVersion,
-    AmmSyncEngine, AmmSyncError, AmmSyncIncident, AmmSyncPoolChangeKind, AmmWorkClass, AmmWorkKind,
-    AmmWorkProgress, DeferredWork, DiscoveryGeneration, DiscoveryOwnerId, DiscoveryOwnerKey,
-    DiscoveryOwnership, PoolDiscovery, PoolKey, PoolRegistration, PoolRevisionMap,
-    PoolRuntimeState, PoolStateRevision, QueryEvidencePolicy, QueueDepths, RegistrationEvidenceSet,
-    RegistrationProvenance, RegistrationReorgAction, RegistrationSourceKey, RepairAction,
-    RuntimeLifecycleMap, RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId,
-    TokenEdgeDiscoveryReport, TokenEdgeDiscoveryRequest, WorkId,
+    AdapterRegistry, AdapterRegistrySnapshot, AdapterRegistrySnapshotError, AmmCanonicalHeader,
+    AmmChangeSet, AmmChangeSetError, AmmCommitTiming, AmmEventRef, AmmPoolChange,
+    AmmPoolChangeKind, AmmPoolGenerationReservation, AmmPreconfirmationRejectionReason,
+    AmmPreconfirmationTiming, AmmPreconfirmedSnapshot, AmmPreparedPoolState, AmmPreparedStorage,
+    AmmRuntimeEvent, AmmRuntimeEventKind, AmmRuntimeHealth, AmmRuntimeStatusSnapshot,
+    AmmStateCommit, AmmStateIncident, AmmStatePoint, AmmStateQuality, AmmStateSnapshot,
+    AmmStateVersion, AmmSyncEngine, AmmSyncError, AmmSyncIncident, AmmSyncPoolChangeKind,
+    AmmWorkClass, AmmWorkKind, AmmWorkProgress, DeferredWork, DiscoveryGeneration,
+    DiscoveryOwnerId, DiscoveryOwnerKey, DiscoveryOwnership, PoolDiscovery, PoolKey,
+    PoolRegistration, PoolRevisionMap, PoolRuntimeState, PoolStateRevision, QueryEvidencePolicy,
+    QueueDepths, RegistrationEvidenceSet, RegistrationProvenance, RegistrationReorgAction,
+    RegistrationSourceKey, RepairAction, RuntimeLifecycleMap, RuntimeOwnerId,
+    RuntimeSequenceOverflow, RuntimeWorkId, TokenEdgeDiscoveryReport, TokenEdgeDiscoveryRequest,
+    WorkId,
 };
 
 /// Hash-pinned, source-reconciled complete canonical block delivery.
@@ -52,7 +53,7 @@ use super::{
 /// reconciliation for the advertised interest revision.
 pub struct AmmCanonicalBatch {
     chain_id: u64,
-    header: RpcHeader,
+    header: Arc<AmmCanonicalHeader>,
     block: BlockRef,
     interest_revision: u64,
     records: ReactiveInputBatch<Ethereum>,
@@ -247,7 +248,7 @@ impl AmmCanonicalBatch {
         assert!(decoded_after_ingress <= ordered_after_ingress);
         Ok(Self {
             chain_id,
-            header,
+            header: Arc::new(AmmCanonicalHeader::from_verified_parts(chain_id, header)),
             block,
             interest_revision,
             records,
@@ -279,7 +280,7 @@ impl AmmCanonicalBatch {
     fn into_parts(
         self,
     ) -> (
-        RpcHeader,
+        Arc<AmmCanonicalHeader>,
         ReactiveInputBatch<Ethereum>,
         AmmCanonicalBatchTiming,
     ) {
@@ -2920,6 +2921,7 @@ impl AmmRuntimeActor {
                 },
             ],
             None,
+            None,
         );
         Ok(instance)
     }
@@ -3007,6 +3009,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
             None,
         );
         Ok(())
@@ -3340,6 +3343,7 @@ impl AmmRuntimeActor {
             first_sequence,
             observer_events,
             None,
+            None,
         ))
     }
 
@@ -3496,6 +3500,7 @@ impl AmmRuntimeActor {
                     point: self.point,
                 },
             ],
+            None,
             None,
         );
         Ok(owner)
@@ -3748,6 +3753,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
             None,
         );
         Ok(())
@@ -5182,6 +5188,7 @@ impl AmmRuntimeActor {
             first_sequence,
             events,
             None,
+            None,
         );
         if let AmmFollowUpTask::Refresh { after_slots, .. } = &scheduled.task
             && !after_slots.is_empty()
@@ -5347,6 +5354,7 @@ impl AmmRuntimeActor {
             permit,
             first_sequence,
             events,
+            None,
             None,
         );
         self.finish_followup(&work, &scheduled)?;
@@ -6003,6 +6011,7 @@ impl AmmRuntimeActor {
             first_sequence,
             observer_events,
             None,
+            None,
         ))
     }
 
@@ -6403,6 +6412,7 @@ impl AmmRuntimeActor {
             first_sequence,
             observer_events,
             None,
+            None,
         ))
     }
 
@@ -6609,6 +6619,7 @@ impl AmmRuntimeActor {
         first_sequence: u64,
         observer_events: Vec<AmmRuntimeEventKind>,
         timing: Option<AmmCanonicalTransitionTiming>,
+        canonical_header: Option<Arc<AmmCanonicalHeader>>,
     ) -> Arc<AmmChangeSet> {
         let version = changes.version();
         let point = changes.point();
@@ -6632,6 +6643,7 @@ impl AmmRuntimeActor {
             Arc::clone(&snapshot),
             Arc::clone(&changes),
             timing,
+            canonical_header,
         ));
         self.version = version;
         self.point = point;
@@ -6779,7 +6791,8 @@ impl AmmRuntimeActor {
         let permit = self.reserve_critical().await?;
         let (next_version, _) = self.next_commit_identity(1)?;
         let event_refs = amm_event_refs(&batch.records);
-        let (header, records, batch_timing) = batch.into_parts();
+        let (canonical_header, records, batch_timing) = batch.into_parts();
+        let header = canonical_header.header().clone();
         let factory_candidates = self.factory_candidates(&records);
         let block = BlockRef {
             number: header.inner.number,
@@ -6972,6 +6985,7 @@ impl AmmRuntimeActor {
             first_sequence,
             observer_events,
             Some(transition_timing),
+            Some(canonical_header),
         );
         self.event_free_reorg_history
             .record(block, has_logs, next_point.chain_id());

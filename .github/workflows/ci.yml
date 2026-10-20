@@ -100,6 +100,18 @@ jobs:
           cargo test --locked --release --all-features --test live_runtime
           reorg:: -- --nocapture
 
+      - name: Routing status propagation regression (optimized)
+        run: >-
+          cargo test --locked --release --all-features --lib
+          adapters::sync_manager::tests::status_transition_preserves_quote_read_sets_in_both_registries
+          -- --exact
+
+      - name: Reconciliation observer overhead (optimized)
+        run: >-
+          cargo test --locked --release --all-features --lib
+          adapters::subscriber_driver::observation::tests::performance::reconciliation_observation_overhead
+          -- --ignored --exact --nocapture
+
       - name: Package
         run: cargo package --locked
 

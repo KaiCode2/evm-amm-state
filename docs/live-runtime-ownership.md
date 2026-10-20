@@ -134,3 +134,13 @@ adapter-family ownership, exact versus whole-account dependencies,
 shared-emitter isolation, adapter-defined routing refresh, generation-safe
 handler and repair IDs, job/resync partitioning, removal isolation, recovery,
 and conservative shared-state eviction.
+
+## Canonical header publication ownership (unreleased)
+
+The data-only `snapshot/canonical_header.rs` leaf owns immutable full-header
+evidence. `snapshot.rs` enforces its exact state-point pairing and
+`live_runtime.rs` propagates it only after canonical batch validation. Consumers
+reach it through `adapters::AmmCanonicalHeader` and the reliable commit accessor;
+no provider or protocol policy belongs in the leaf. See the
+[header evidence contract](canonical-header-evidence.md) for continuity, reorg,
+baseline and noncanonical-publication boundaries.

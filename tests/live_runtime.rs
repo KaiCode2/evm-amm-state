@@ -1,5 +1,8 @@
 #![cfg(feature = "live-runtime")]
 
+#[path = "live_runtime/canonical_header.rs"]
+mod canonical_header_evidence;
+
 #[path = "live_runtime/diagnostics.rs"]
 mod diagnostics;
 

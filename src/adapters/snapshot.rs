@@ -1,5 +1,8 @@
 //! Immutable, versioned AMM state publications for concurrent consumers.
 
+mod canonical_header;
+pub use canonical_header::AmmCanonicalHeader;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -562,6 +565,7 @@ pub struct AmmStateCommit {
     snapshot: Arc<AmmStateSnapshot>,
     changes: Arc<AmmChangeSet>,
     timing: Option<AmmCommitTiming>,
+    canonical_header: Option<Arc<AmmCanonicalHeader>>,
 }
 
 impl AmmStateCommit {
@@ -570,14 +574,30 @@ impl AmmStateCommit {
         snapshot: Arc<AmmStateSnapshot>,
         changes: Arc<AmmChangeSet>,
         timing: Option<AmmCommitTiming>,
+        canonical_header: Option<Arc<AmmCanonicalHeader>>,
     ) -> Self {
         debug_assert_eq!(snapshot.version(), changes.version());
         debug_assert_eq!(snapshot.point(), changes.point());
+        // Never attach mismatched evidence, including in release builds.
+        // Missing evidence forces a consumer to stop its absence-proof chain.
+        let canonical_header = canonical_header.filter(|header| {
+            header.point() == snapshot.point() && header.point() == changes.point()
+        });
         Self {
             snapshot,
             changes,
             timing,
+            canonical_header,
         }
+    }
+
+    /// Exact full header for this canonical block transition, otherwise `None`.
+    ///
+    /// Lifecycle, prepared-state and repair commits never borrow a previous
+    /// header. This evidence travels on the reliable commit stream; a latest
+    /// snapshot or observer notification cannot establish contiguous history.
+    pub fn canonical_header(&self) -> Option<&Arc<AmmCanonicalHeader>> {
+        self.canonical_header.as_ref()
     }
 
     /// Exact immutable state produced by this commit.
