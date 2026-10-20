@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional consumed canonical receive/dequeue/decode provenance on commit timing,
+  with bounded assembly history, exact log content matching, missing-event
+  coverage and reconciliation boundaries. Legacy execution clocks are unchanged.
+  See `docs/canonical-input-timing.md` for the dependency integration pin.
+
 ## [0.3.1-alpha.5] - 2026-10-19
 
 ### Changed

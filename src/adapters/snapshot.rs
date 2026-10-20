@@ -430,6 +430,30 @@ impl AmmStateSnapshot {
     }
 }
 
+/// Observation-only receipt and assembly provenance of one canonical block.
+/// This is separate from legacy source clocks used by execution consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmmCanonicalInputTiming {
+    /// Earliest received event among the exact input set; incomplete when any event is missing.
+    pub first_event: Option<evm_fork_cache::reactive::CanonicalIngressTiming>,
+    /// Last event message receipt, not a proof that an independent stream closed.
+    pub last_event_received: Option<Instant>,
+    /// Matching canonical header notification timing when actually observed.
+    pub header: Option<evm_fork_cache::reactive::CanonicalIngressTiming>,
+    /// Exact log count in the delivered canonical batch.
+    pub event_count: u64,
+    /// Logs without unambiguous consumed transport receipt evidence.
+    pub missing_events: u64,
+    /// First matching header/log handed to this driver, retained across grace expiry.
+    pub driver_first_input: Instant,
+    /// Assembly closure or reconciliation was selected at this instant.
+    pub assembly_released: Instant,
+    /// Records prepared, after any reconciliation/repair reads and before runtime ordering.
+    pub prepared: Instant,
+    /// Reconciliation started; absent for a subscription-sealed block.
+    pub reconciliation_started: Option<Instant>,
+}
+
 /// Provider-free monotonic stage timing for one canonical event commit.
 ///
 /// The values are process-local monotonic measurements, not wall-clock
@@ -439,6 +463,7 @@ impl AmmStateSnapshot {
 /// provenance and expose no timing value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmmCommitTiming {
+    input_timing: Option<AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
     ordered_after_ingress: Duration,
@@ -459,12 +484,23 @@ impl AmmCommitTiming {
         assert!(ordered_after_ingress <= transitioned_after_ingress);
         assert!(transitioned_after_ingress <= committed_after_ingress);
         Self {
+            input_timing: None,
             source_ingress,
             decoded_after_ingress,
             ordered_after_ingress,
             transitioned_after_ingress,
             committed_after_ingress,
         }
+    }
+
+    pub(crate) fn with_input_timing(mut self, timing: Option<AmmCanonicalInputTiming>) -> Self {
+        self.input_timing = timing;
+        self
+    }
+
+    /// Independent diagnostic receipt/assembly provenance; never a timing authority.
+    pub const fn input_timing(&self) -> Option<AmmCanonicalInputTiming> {
+        self.input_timing
     }
 
     /// Process-local monotonic instant at which the earliest contributing

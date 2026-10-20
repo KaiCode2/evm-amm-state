@@ -1,5 +1,7 @@
 //! Alloy-specific subscriber owner and complete-block driver.
 
+mod timing;
+
 mod filters;
 mod reconciliation;
 #[cfg(feature = "uniswap-v3")]
@@ -816,6 +818,7 @@ where
         attested_log_coverage: None,
         buffered_logs: BTreeMap::new(),
         pending_headers: BTreeMap::new(),
+        input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(),
         highest_observed_block: None,
     };
     tokio::spawn(actor.run());
@@ -857,6 +860,7 @@ struct AlloyAmmSubscriberDriver<P> {
     /// Canonical headers waiting for their log set to be provably closed, with
     /// the instant each started waiting.
     pending_headers: BTreeMap<u64, (RpcHeader, Instant)>,
+    input_clocks: timing::InputClocks,
     /// Highest block number observed from any log or header. An observation
     /// strictly above a pending block proves that block's log set is closed.
     highest_observed_block: Option<u64>,
@@ -1377,6 +1381,7 @@ where
         let mut headers = Vec::new();
         let mut discarded_logs = 0u64;
         for scoped in batch.into_records() {
+            self.input_clocks.observe(&scoped, source_ingress);
             if !scoped.scope().is_canonical() {
                 return Err(AmmSubscriberDriverError::OwnerCatchupRequiresStaging);
             }
@@ -1656,6 +1661,7 @@ where
     /// subscriber never attested.
     fn reset_subscription_assembly(&mut self) {
         self.buffered_logs.clear();
+        self.input_clocks.clear();
         self.pending_headers.clear();
         self.attested_log_coverage = None;
         self.highest_observed_block = None;
@@ -1664,6 +1670,7 @@ where
     /// Drop buffered logs for blocks already delivered.
     fn retire_buffered_logs_through(&mut self, number: u64) {
         self.buffered_logs.retain(|(block, _), _| *block > number);
+        self.input_clocks.retire_through(number);
         self.pending_headers.retain(|block, _| *block > number);
     }
 
@@ -1757,6 +1764,7 @@ where
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
+        let assembly_released = Instant::now();
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
             number: header.inner.number,
@@ -1799,6 +1807,21 @@ where
             &self.stats.subscription_logs_applied,
             subscription_keys.len() as u64,
         );
+        let records: Vec<ReactiveInputRecord<Ethereum>> = records;
+        let input_timing = self.input_clocks.capture(
+            block.number,
+            block.hash,
+            records.iter().filter_map(|record| match &record.input {
+                ReactiveInput::Log(log) => log
+                    .transaction_hash
+                    .zip(log.log_index)
+                    .map(|(tx, index)| (tx, index, timing::fingerprint(log))),
+                _ => None,
+            }),
+            assembly_released,
+            Instant::now(),
+            None,
+        );
         let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
             header,
@@ -1806,7 +1829,8 @@ where
             ReactiveInputBatch::new(records),
             source_ingress,
             decoded_after_ingress,
-        )?;
+        )?
+        .with_input_timing(input_timing);
         self.ingest_while_servicing_controls(batch).await?;
         AmmSubscriberDriverCounters::add(&self.stats.canonical_blocks_delivered, 1);
         AmmSubscriberDriverCounters::add(&self.stats.blocks_sealed_from_subscription, 1);
@@ -1909,6 +1933,7 @@ where
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<(), AmmSubscriberDriverError> {
+        let assembly_released = Instant::now();
         let point = self.runtime.latest_snapshot().point();
         let block = BlockRef {
             number: header.inner.number,
@@ -1947,6 +1972,21 @@ where
                 ReactiveInputRecord::new(ReactiveInput::Log(log), context)
             })
             .collect();
+        let records: Vec<ReactiveInputRecord<Ethereum>> = records;
+        let input_timing = self.input_clocks.capture(
+            block.number,
+            block.hash,
+            records.iter().filter_map(|record| match &record.input {
+                ReactiveInput::Log(log) => log
+                    .transaction_hash
+                    .zip(log.log_index)
+                    .map(|(tx, index)| (tx, index, timing::fingerprint(log))),
+                _ => None,
+            }),
+            assembly_released,
+            Instant::now(),
+            Some(assembly_released),
+        );
         let batch = AmmCanonicalBatch::from_verified_block_with_timing(
             point.chain_id(),
             header,
@@ -1954,7 +1994,8 @@ where
             ReactiveInputBatch::new(records),
             source_ingress,
             decoded_after_ingress,
-        )?;
+        )?
+        .with_input_timing(input_timing);
         self.ingest_while_servicing_controls(batch).await?;
         // Counted only after the runtime accepted the envelope, so a failed
         // ingest is never reported as a delivered block.
@@ -2189,6 +2230,8 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(
+                    ),
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -2776,6 +2819,8 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(
+                    ),
                     highest_observed_block: None,
                 };
 
@@ -2864,6 +2909,8 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(
+                    ),
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -2954,6 +3001,8 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(
+                    ),
                     highest_observed_block: None,
                 };
 
@@ -3072,6 +3121,8 @@ mod tests {
                     attested_log_coverage: None,
                     buffered_logs: BTreeMap::new(),
                     pending_headers: BTreeMap::new(),
+                    input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(
+                    ),
                     highest_observed_block: None,
                 };
                 let attach = runtime.attach_subscriber_control(control);
@@ -3697,6 +3748,7 @@ mod tests {
             attested_log_coverage: None,
             buffered_logs: BTreeMap::new(),
             pending_headers: BTreeMap::new(),
+            input_clocks: crate::adapters::subscriber_driver::timing::InputClocks::default(),
             highest_observed_block: None,
         };
         {

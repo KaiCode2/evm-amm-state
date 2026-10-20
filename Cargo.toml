@@ -383,3 +383,7 @@ required-features = ["uniswap-v2", "uniswap-v3", "curve"]
 [[example]]
 name = "arbitrage_triangular"
 required-features = ["uniswap-v3", "curve"]
+
+# Temporary exact integration pin for consumed receipt timing; no package publication.
+[patch.crates-io]
+evm-fork-cache = { git = "https://github.com/KaiCode2/evm-fork-cache", rev = "cc0e000c575b8736e05e1d10642d92716506669f" }

@@ -61,6 +61,7 @@ pub struct AmmCanonicalBatch {
 
 #[derive(Clone, Copy, Debug)]
 struct AmmCanonicalBatchTiming {
+    input_timing: Option<super::snapshot::AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
     ordered_after_ingress: Duration,
@@ -68,6 +69,7 @@ struct AmmCanonicalBatchTiming {
 
 #[derive(Clone, Copy, Debug)]
 struct AmmCanonicalTransitionTiming {
+    input_timing: Option<super::snapshot::AmmCanonicalInputTiming>,
     source_ingress: Instant,
     decoded_after_ingress: Duration,
     ordered_after_ingress: Duration,
@@ -80,6 +82,7 @@ impl AmmCanonicalBatchTiming {
             Instant::now().saturating_duration_since(self.source_ingress);
         assert!(self.ordered_after_ingress <= transitioned_after_ingress);
         AmmCanonicalTransitionTiming {
+            input_timing: self.input_timing,
             source_ingress: self.source_ingress,
             decoded_after_ingress: self.decoded_after_ingress,
             ordered_after_ingress: self.ordered_after_ingress,
@@ -98,10 +101,19 @@ impl AmmCanonicalTransitionTiming {
             self.transitioned_after_ingress,
             committed_after_ingress,
         )
+        .with_input_timing(self.input_timing)
     }
 }
 
 impl AmmCanonicalBatch {
+    pub(crate) fn with_input_timing(
+        mut self,
+        timing: Option<super::snapshot::AmmCanonicalInputTiming>,
+    ) -> Self {
+        self.timing.input_timing = timing;
+        self
+    }
+
     /// Construct a complete canonical block after source-level reconciliation.
     ///
     /// This typed boundary is the source-ingress stage for direct callers. The
@@ -234,6 +246,7 @@ impl AmmCanonicalBatch {
             interest_revision,
             records,
             timing: AmmCanonicalBatchTiming {
+                input_timing: None,
                 source_ingress,
                 decoded_after_ingress,
                 ordered_after_ingress,
