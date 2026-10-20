@@ -1,19 +1,19 @@
 # Releasing `evm-amm-state`
 
-The current unpublished candidate is `0.3.1-alpha.6`, based on published
+The `0.3.1-alpha.6` release source is based on published
 `0.3.1-alpha.5`. It adds generic optional consumed receipt/assembly provenance and
 an explicit default-off driver builder. Existing canonical state, quote, provider,
 reconciliation and execution-clock behavior is unchanged. See
 `docs/canonical-input-timing.md` for APIs, bounds and disabled costs.
 
-This candidate requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
+This release requires exact registry `evm-fork-cache = "=0.4.1"` in normal and
 dev dependencies. Cache 0.4.1 is published and its archive was verified against
 commit `8726fe3f2d6b653a912e9f4af84a7f113d1db5da`, checksum
 `d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
 The temporary Git patch is removed. Qualify the unchanged release matrix and
 packaged consumer against this real registry dependency before publishing AMM.
-The registry API confirmed this AMM version absent on 2026-10-20; recheck
-immediately before authorized publication.
+Check the registry version immediately before authorized publication; an
+ambiguous upload must be resolved by inspecting its archive before retrying.
 
 Consumers must explicitly select `=0.3.1-alpha.6` after it exists in the registry.
 Both packages add generic data-only telemetry APIs, not metrics exporters or bot
@@ -35,7 +35,7 @@ The `0.3.0` prerequisites were published in this order:
    cannot resolve until step 2 lands;
 4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
-That historical baseline resolved cache 0.4.0. The current candidate must resolve
+That historical baseline resolved cache 0.4.0. The current release must resolve
 `evm-fork-cache 0.4.1` from crates.io before release.
 Candidate integration may use an external patch configuration; neither that
 configuration nor a path dependency may ship. A registry resolution failure

@@ -39,7 +39,7 @@ runtime; quoting itself still executes the real quoter bytecode.
 cargo add evm-amm-state
 ```
 
-The unpublished `0.3.1-alpha.6` candidate adds default-off generic canonical
+Version `0.3.1-alpha.6` adds default-off generic canonical
 receive/assembly timing and requires exact `evm-fork-cache = "=0.4.1"`.
 It preserves alpha.5's canonical state, subscription and reconciliation behavior.
 The companion cache release is published. After AMM is published, consumers can select

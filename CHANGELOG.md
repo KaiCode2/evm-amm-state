@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.1-alpha.6] - Unreleased candidate
+## [0.3.1-alpha.6] - 2026-10-20
 
 - Gate new receipt APIs, inline metadata and the driver ledger behind default-off
   `ingress-timing`, forwarding the matching cache feature. Runtime collection
@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fresh roots; conflicting content and per-block overflow retain unknown coverage.
   Driver collection is explicitly opt-in and disabled by default. The exact
   companion dependency becomes cache 0.4.1; no exporter/runtime dependency is added.
-  See `docs/canonical-input-timing.md` for the dependency integration pin.
+  See `docs/canonical-input-timing.md` for the exact registry dependency.
 
 ## [0.3.1-alpha.5] - 2026-10-19
 

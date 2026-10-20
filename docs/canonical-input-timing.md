@@ -30,7 +30,8 @@ That published archive identifies commit
 `8726fe3f2d6b653a912e9f4af84a7f113d1db5da` and SHA256
 `d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c`.
 The temporary Git patch has been removed; package validation uses the real
-registry dependency. AMM 0.3.1-alpha.6 remains subject to its full release gates.
+registry dependency. AMM 0.3.1-alpha.6 uses that verified registry dependency; release validation
+includes the full feature, package, benchmark and canonical live gates.
 
 Focused regression verifies grace/reconciliation retains the original receipt,
 never assigns observed timing to an unobserved fetched log, and keeps reorg hashes
