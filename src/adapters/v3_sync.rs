@@ -64,8 +64,9 @@ use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_program};
 use evm_fork_cache::cache::EvmCache;
 
 use super::storage::{
-    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, V3StorageLayout, v3_tick_bitmap_storage_key_with_base,
-    v3_tick_info_storage_keys_with_base, v3_word_position,
+    AERO_CL_OBSERVATIONS_SLOT, AERO_CL_TRANSITION_GLOBAL_SLOTS, SLIPSTREAM_OBSERVATIONS_SLOT,
+    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, SlipstreamLayoutFamily, V3StorageLayout,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 
 /// The minimum/maximum tick a V3 pool can reach (`±887272`).
@@ -90,7 +91,6 @@ const PANCAKE_FEE_GROWTH_0_SLOT: u64 = 2;
 const PANCAKE_FEE_GROWTH_1_SLOT: u64 = 3;
 const PANCAKE_PROTOCOL_FEES_SLOT: u64 = 4;
 const PANCAKE_OBSERVATIONS_SLOT: u64 = 9;
-const SLIPSTREAM_OBSERVATIONS_SLOT: u64 = 20;
 
 // ---------------------------------------------------------------------------
 // Sync spec
@@ -123,9 +123,9 @@ impl V3ObservationsSpec {
 /// the bitmap word range, and (optionally) the observation ring.
 ///
 /// Construct via [`V3SyncSpec::uniswap`], [`V3SyncSpec::pancake`],
-/// [`V3SyncSpec::slipstream`], [`V3SyncSpec::core`], or [`V3SyncSpec::new`] —
-/// the struct is `#[non_exhaustive]` so fields can be added for further
-/// V3-family variants without a breaking release.
+/// [`V3SyncSpec::slipstream`], [`V3SyncSpec::aero_cl`], [`V3SyncSpec::core`],
+/// or [`V3SyncSpec::new`] — the struct is `#[non_exhaustive]` so fields can be
+/// added for further V3-family variants without a breaking release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct V3SyncSpec {
@@ -248,19 +248,60 @@ impl V3SyncSpec {
         }
     }
 
-    /// Slipstream quote/replay spec: `slot0`, `liquidity`, the additional
-    /// transition globals, the complete observation ring at slot 20, and all
-    /// six consecutive words of every initialized tick. The final two words
-    /// hold Slipstream-specific reward-growth and packed oracle/initialization
-    /// fields that exact event replay must read and preserve or update.
+    /// Slipstream-family quote/replay spec: `slot0`, `liquidity`, the
+    /// family's additional transition globals, the complete observation ring,
+    /// and all six consecutive words of every initialized tick. The final two
+    /// words hold Slipstream-specific reward-growth and packed
+    /// oracle/initialization fields that exact event replay must read and
+    /// preserve or update.
+    ///
+    /// The slot surface follows the layout's
+    /// [`slipstream_family`](V3StorageLayout::slipstream_family): the legacy
+    /// Aerodrome/Velodrome surface (observations at slot 20, eleven globals)
+    /// for the legacy core slots, and the [`aero_cl`](Self::aero_cl) surface
+    /// for the Aero core slots. A layout that pins its own observation slot
+    /// keeps it. Unrecognized core slots fall back to the legacy surface, as
+    /// before this release.
     pub fn slipstream(layout: V3StorageLayout) -> Self {
+        if layout.slipstream_family() == Some(SlipstreamLayoutFamily::AeroCl) {
+            return Self::aero_cl(layout);
+        }
         let (min_word, max_word) = full_word_range(layout.tick_spacing);
         let mut static_slots = vec![layout.slot0_slot, layout.liquidity_slot];
         static_slots.extend(SLIPSTREAM_TRANSITION_GLOBAL_SLOTS.map(U256::from));
         Self {
             static_slots,
             observations: Some(V3ObservationsSpec {
-                array_slot: U256::from(SLIPSTREAM_OBSERVATIONS_SLOT),
+                array_slot: layout
+                    .observations_slot
+                    .unwrap_or(SLIPSTREAM_OBSERVATIONS_SLOT),
+                cardinality_shift: UNISWAP_CARDINALITY_SHIFT,
+            }),
+            min_word,
+            max_word,
+            layout,
+            tick_info_words: 6,
+        }
+    }
+
+    /// Aero (Dromos) CL quote/replay spec: `slot0`, packed `liquidity`, the
+    /// Aero transition globals (factory/gauge/NFT identity, fee and reward
+    /// growth, gauge fees, rollover, the packed staked-liquidity word and the
+    /// post-ring staked-seconds accumulator), the complete observation ring at
+    /// slot 17, and all six words of every initialized tick.
+    ///
+    /// Use [`V3StorageLayout::aero_cl`] as the layout; a layout pinning its
+    /// own observation slot keeps it.
+    pub fn aero_cl(layout: V3StorageLayout) -> Self {
+        let (min_word, max_word) = full_word_range(layout.tick_spacing);
+        let mut static_slots = vec![layout.slot0_slot, layout.liquidity_slot];
+        static_slots.extend(AERO_CL_TRANSITION_GLOBAL_SLOTS.map(U256::from));
+        Self {
+            static_slots,
+            observations: Some(V3ObservationsSpec {
+                array_slot: layout
+                    .observations_slot
+                    .unwrap_or(AERO_CL_OBSERVATIONS_SLOT),
                 cardinality_shift: UNISWAP_CARDINALITY_SHIFT,
             }),
             min_word,
@@ -1166,6 +1207,41 @@ mod tests {
             }
         }
         opcodes
+    }
+
+    #[test]
+    fn slipstream_spec_selects_the_layout_family_surface() {
+        let legacy = V3SyncSpec::slipstream(V3StorageLayout::slipstream(200));
+        assert_eq!(
+            legacy.observations.map(|o| o.array_slot),
+            Some(U256::from(20))
+        );
+        assert_eq!(legacy.static_slots.len(), 13);
+        assert!(legacy.static_slots.contains(&U256::from(15)));
+        assert_eq!(legacy.tick_info_words(), 6);
+
+        let aero = V3SyncSpec::slipstream(V3StorageLayout::aero_cl(50));
+        assert_eq!(aero, V3SyncSpec::aero_cl(V3StorageLayout::aero_cl(50)));
+        assert_eq!(
+            aero.observations.map(|o| o.array_slot),
+            Some(U256::from(17))
+        );
+        assert_eq!(aero.static_slots[..2], [U256::from(6), U256::from(13)]);
+        assert_eq!(aero.static_slots.len(), 12);
+        assert!(aero.static_slots.contains(&U256::from(12)));
+        assert!(aero.static_slots.contains(&U256::from(65_552)));
+        assert!(!aero.static_slots.contains(&U256::from(15)));
+        assert_eq!(aero.tick_info_words(), 6);
+        assert_eq!(aero.min_word, full_word_range(50).0);
+
+        // A pinned observation slot wins over the derived default.
+        let pinned = V3SyncSpec::slipstream(
+            V3StorageLayout::slipstream(200).with_observations_slot(U256::from(20)),
+        );
+        assert_eq!(
+            pinned.observations.map(|o| o.array_slot),
+            Some(U256::from(20))
+        );
     }
 
     #[test]

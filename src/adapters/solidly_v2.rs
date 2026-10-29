@@ -1,17 +1,22 @@
 use super::cold_start::{
-    AdapterColdStartPlanner, ColdStartPlan, ColdStartResults, ColdStartRunReport, ColdStartStep,
-    SlotFetch,
+    AdapterColdStartPlanner, ColdStartCall, ColdStartPlan, ColdStartResults, ColdStartRunReport,
+    ColdStartStep, SlotFetch,
 };
 use super::factory::{FactoryConfig, PoolFactory, SolidlyFactory};
-use super::sim::{SimConfig, SimError, SwapQuote, getAmountOutCall, quote_via_call_from};
+use super::sim::{
+    ExactOutputQuote, POOL_TYPECall, SimConfig, SimError, SwapQuote, getAmountInWithTotalFeeCall,
+    getAmountOutCall, getAmountOutWithTotalFeeCall, quote_via_call_from,
+    quote_via_call_with_config,
+};
 use super::storage::{SolidlyStorageLayout, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
-    AmmAdapter, ColdStartOutcome, ColdStartPolicy, ColdStartReport, DeferredWork, EventSource,
-    PoolRegistration, PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange,
-    SolidlyV2Metadata, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
+    AeroVolatileRuntimeFamily, AmmAdapter, CallOutcome, ColdStartOutcome, ColdStartPolicy,
+    ColdStartReport, DeferredWork, EventSource, PoolRegistration, PoolStatus, ProtocolId,
+    ProtocolMetadata, RepairAction, SlotChange, SolidlyPoolVariant, SolidlyV2Metadata, StateUpdate,
+    StateView, UnsupportedReason, UpdateQuality,
 };
-use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256, keccak256};
 use alloy_sol_types::{SolCall, SolEvent};
 
 /// `sol!`-generated pool event binding (crate-internal, not public API).
@@ -23,6 +28,11 @@ mod abi {
     }
 }
 use abi::Sync;
+
+/// `bytes32("V2_VOLATILE")`: the `POOL_TYPE()` label every Aero basic volatile
+/// pool returns.
+pub const AERO_VOLATILE_POOL_TYPE: B256 =
+    b256!("56325f564f4c4154494c45000000000000000000000000000000000000000000");
 
 /// Adapter for Solidly V2 (Aerodrome / Velodrome V2) reserves pools.
 ///
@@ -36,6 +46,24 @@ use abi::Sync;
 /// ([`SolidlyStorageLayout`]); slot indices are fork-specific, so there is no
 /// derivable default (cold-start returns [`UnsupportedReason::MissingMetadata`]
 /// without one). Validate a fork's layout with the gated RPC-parity test.
+///
+/// # Aero (Dromos) volatile pools
+///
+/// A registration carrying [`SolidlyPoolVariant::AeroVolatile`] quotes through
+/// the pool's `getAmountOutWithTotalFee` / `getAmountInWithTotalFee`, which
+/// charge `factory.getFee(pool, msg.sender, …)` — the base fee plus the MEV
+/// tax the factory's module derives from `tx.gasprice` — exactly as the
+/// pool's `swap` does for the same sender. Quotes therefore run under the
+/// [`SimConfig`] transaction context (`from`, `gas_price`). Cold start verifies
+/// `POOL_TYPE() == "V2_VOLATILE"` and never calls `stable()`, which these
+/// pools do not implement. The reviewed Optimism deployment
+/// ([`AeroVolatileRuntimeFamily::AeroOptimismMooBifi`]) additionally pins its
+/// factory, fee-module, exact-output fee-quoter and MEV-module runtimes and
+/// warms the factory/module cells the getters read, so the production quote
+/// path never relies on the lazy first-quote factory fetch. An Aero volatile
+/// pool outside the reviewed family still quotes correctly against a
+/// live-backed cache, but its factory and modules are fetched lazily on the
+/// first quote: pre-warm them yourself before relying on offline quotes.
 #[derive(Clone, Debug, Default)]
 pub struct SolidlyV2Adapter {
     _private: (),
@@ -45,6 +73,180 @@ fn solidly_layout(pool: &PoolRegistration) -> Option<SolidlyStorageLayout> {
     match &pool.metadata {
         ProtocolMetadata::SolidlyV2(metadata) => metadata.storage_layout,
         _ => None,
+    }
+}
+
+fn solidly_variant(pool: &PoolRegistration) -> SolidlyPoolVariant {
+    match &pool.metadata {
+        ProtocolMetadata::SolidlyV2(metadata) => metadata.variant,
+        _ => SolidlyPoolVariant::Legacy,
+    }
+}
+
+/// Reviewed Aero basic-pool deployment: every runtime the total-fee quote
+/// path executes, with the runtime keccak observed at the pinned block.
+#[derive(Clone, Copy)]
+struct ReviewedAeroVolatileRuntime {
+    pool: Address,
+    proxy_runtime_code_hash: B256,
+    implementation: Address,
+    implementation_runtime_code_hash: B256,
+    factory: Address,
+    factory_runtime_code_hash: B256,
+    fee_module: Address,
+    fee_module_runtime_code_hash: B256,
+    exact_out_fee_quoter: Address,
+    exact_out_fee_quoter_runtime_code_hash: B256,
+    mev_tax_module: Address,
+    mev_tax_module_runtime_code_hash: B256,
+}
+
+/// Aero `PoolFactory` storage: `defaultFee`, packed `feeModule` +
+/// `feeModuleGasLimit`, packed `mevTaxModule` + `mevTaxModuleGasLimit`, and
+/// `exactOutFeeQuoter`. Read at Optimism block 158800699 against the getters
+/// and the `debug_traceCall` read set of `getAmountOutWithTotalFee` /
+/// `getAmountInWithTotalFee`.
+const AERO_VOLATILE_FACTORY_DEFAULT_FEE_SLOT: u64 = 5;
+const AERO_VOLATILE_FACTORY_FEE_MODULE_SLOT: u64 = 7;
+const AERO_VOLATILE_FACTORY_MEV_TAX_MODULE_SLOT: u64 = 13;
+const AERO_VOLATILE_FACTORY_EXACT_OUT_FEE_QUOTER_SLOT: u64 = 14;
+/// `CustomFeeModule.customFee[pool]` mapping base slot.
+const AERO_VOLATILE_FEE_MODULE_CUSTOM_FEE_SLOT: u64 = 0;
+/// `PriorityFeeMevTaxModule`: `pendingOwner` + `priorityFeeMultiplier` (slot 1)
+/// and `minThreshold` + `baseFeeFactor` (slot 2).
+const AERO_VOLATILE_MEV_MODULE_MULTIPLIER_SLOT: u64 = 1;
+const AERO_VOLATILE_MEV_MODULE_THRESHOLD_SLOT: u64 = 2;
+/// Aero basic pool `factory` cell (the getters read it to reach `getFee`).
+const AERO_VOLATILE_POOL_FACTORY_SLOT: u64 = 10;
+
+fn reviewed_aero_volatile_runtime(
+    family: AeroVolatileRuntimeFamily,
+) -> ReviewedAeroVolatileRuntime {
+    match family {
+        AeroVolatileRuntimeFamily::AeroOptimismMooBifi => ReviewedAeroVolatileRuntime {
+            pool: address!("c71b571aa9f06bfa096c24e9df5c45fc4fab4151"),
+            proxy_runtime_code_hash: b256!(
+                "7604f8b17690bd85de7be0b616a0c999322a6d44ae6f6786c314e5644c78a06a"
+            ),
+            implementation: address!("0526cf035c1156b5c598b0d3c2445e38af2e8bde"),
+            implementation_runtime_code_hash: b256!(
+                "15269fbb3aca4305485be2669a8394ec6a14c75181e1eb4c2d46c5b1ee2a7782"
+            ),
+            factory: address!("8e6a9fcd1d638cc760ffba397605fe3355de76d2"),
+            factory_runtime_code_hash: b256!(
+                "bb6f945479608857a220f9643db76e877f1e52844d953d980c18f5ea38d9574b"
+            ),
+            fee_module: address!("7949de8d67e4f6b8509bdbb43ff0503af1247a7a"),
+            fee_module_runtime_code_hash: b256!(
+                "a56614fe447178e62c473ff1333d660c1dbb70965b4a059fae228bf52457c0f2"
+            ),
+            exact_out_fee_quoter: address!("95f6b665a1a97878353737ecb3d68aa978a5cb9f"),
+            exact_out_fee_quoter_runtime_code_hash: b256!(
+                "d102c04e1dded8e498df1f213a61af9a0cf59c4890d1ea103d4d0bb0f4a3f38d"
+            ),
+            mev_tax_module: address!("5de55ebe5b789bd309809c7969334c2c16e64eaf"),
+            mev_tax_module_runtime_code_hash: b256!(
+                "59de6c7ead685b6295ef7dccb7ee30cd2881c697267d09718790f998db3cf016"
+            ),
+        },
+    }
+}
+
+fn reviewed_aero_volatile_runtime_for_pool(
+    pool: &PoolRegistration,
+) -> Option<(AeroVolatileRuntimeFamily, ReviewedAeroVolatileRuntime)> {
+    if solidly_variant(pool) != SolidlyPoolVariant::AeroVolatile {
+        return None;
+    }
+    let address = pool.key.address()?;
+    [AeroVolatileRuntimeFamily::AeroOptimismMooBifi]
+        .into_iter()
+        .map(|family| (family, reviewed_aero_volatile_runtime(family)))
+        .find(|(_, reviewed)| reviewed.pool == address)
+}
+
+fn solidity_address_mapping_key(key: Address, mapping_slot: u64) -> U256 {
+    let mut preimage = [0_u8; 64];
+    preimage[12..32].copy_from_slice(key.as_slice());
+    preimage[32..].copy_from_slice(&U256::from(mapping_slot).to_be_bytes::<32>());
+    U256::from_be_slice(keccak256(preimage).as_slice())
+}
+
+fn reviewed_aero_volatile_storage_targets(
+    reviewed: ReviewedAeroVolatileRuntime,
+) -> Vec<(Address, U256)> {
+    vec![
+        (reviewed.pool, U256::from(AERO_VOLATILE_POOL_FACTORY_SLOT)),
+        (
+            reviewed.factory,
+            U256::from(AERO_VOLATILE_FACTORY_DEFAULT_FEE_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_VOLATILE_FACTORY_FEE_MODULE_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_VOLATILE_FACTORY_MEV_TAX_MODULE_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_VOLATILE_FACTORY_EXACT_OUT_FEE_QUOTER_SLOT),
+        ),
+        (
+            reviewed.fee_module,
+            solidity_address_mapping_key(reviewed.pool, AERO_VOLATILE_FEE_MODULE_CUSTOM_FEE_SLOT),
+        ),
+        (
+            reviewed.mev_tax_module,
+            U256::from(AERO_VOLATILE_MEV_MODULE_MULTIPLIER_SLOT),
+        ),
+        (
+            reviewed.mev_tax_module,
+            U256::from(AERO_VOLATILE_MEV_MODULE_THRESHOLD_SLOT),
+        ),
+    ]
+}
+
+fn reviewed_aero_volatile_identities(
+    reviewed: ReviewedAeroVolatileRuntime,
+) -> Vec<(Address, B256)> {
+    vec![
+        (reviewed.pool, reviewed.proxy_runtime_code_hash),
+        (
+            reviewed.implementation,
+            reviewed.implementation_runtime_code_hash,
+        ),
+        (reviewed.factory, reviewed.factory_runtime_code_hash),
+        (reviewed.fee_module, reviewed.fee_module_runtime_code_hash),
+        (
+            reviewed.exact_out_fee_quoter,
+            reviewed.exact_out_fee_quoter_runtime_code_hash,
+        ),
+        (
+            reviewed.mev_tax_module,
+            reviewed.mev_tax_module_runtime_code_hash,
+        ),
+    ]
+}
+
+impl SolidlyV2Adapter {
+    /// The reviewed Aero volatile deployment family a registration belongs
+    /// to, if it registered as [`SolidlyPoolVariant::AeroVolatile`] under a
+    /// reviewed pool address.
+    pub fn aero_volatile_runtime_family(
+        pool: &PoolRegistration,
+    ) -> Option<AeroVolatileRuntimeFamily> {
+        reviewed_aero_volatile_runtime_for_pool(pool).map(|(family, _)| family)
+    }
+
+    /// The pinned runtime identities (`address → runtime keccak`) of a reviewed
+    /// Aero volatile family: pool proxy, implementation, factory, fee module,
+    /// exact-output fee quoter and MEV-tax module.
+    pub fn aero_volatile_runtime_identities(
+        family: AeroVolatileRuntimeFamily,
+    ) -> Vec<(Address, B256)> {
+        reviewed_aero_volatile_identities(reviewed_aero_volatile_runtime(family))
     }
 }
 
@@ -74,6 +276,33 @@ impl AmmAdapter for SolidlyV2Adapter {
                 Box::new(SolidlyFactory::new(solidly)) as Box<dyn PoolFactory>
             })
             .collect()
+    }
+
+    fn verified_code_targets(&self, pool: &PoolRegistration) -> Vec<Address> {
+        reviewed_aero_volatile_runtime_for_pool(pool)
+            .map(|(_, reviewed)| {
+                vec![
+                    reviewed.pool,
+                    reviewed.implementation,
+                    reviewed.factory,
+                    reviewed.fee_module,
+                    reviewed.exact_out_fee_quoter,
+                    reviewed.mev_tax_module,
+                ]
+            })
+            .unwrap_or_default()
+    }
+
+    fn verified_storage_targets(&self, pool: &PoolRegistration) -> Vec<(Address, U256)> {
+        reviewed_aero_volatile_runtime_for_pool(pool)
+            .map(|(_, reviewed)| reviewed_aero_volatile_storage_targets(reviewed))
+            .unwrap_or_default()
+    }
+
+    fn reviewed_code_identities(&self, pool: &PoolRegistration) -> Vec<(Address, B256)> {
+        reviewed_aero_volatile_runtime_for_pool(pool)
+            .map(|(_, reviewed)| reviewed_aero_volatile_identities(reviewed))
+            .unwrap_or_default()
     }
 
     fn cold_start_planner(
@@ -110,7 +339,11 @@ impl AmmAdapter for SolidlyV2Adapter {
             }
         }
         Ok(Box::new(SolidlyV2ColdStartPlanner::new(
-            address, layout, policy,
+            address,
+            layout,
+            policy,
+            solidly_variant(pool),
+            self.verified_storage_targets(pool),
         )))
     }
 
@@ -184,6 +417,12 @@ impl AmmAdapter for SolidlyV2Adapter {
     /// alone — those slots and the factory's bytecode must be reachable (lazily
     /// fetched from a live backend, or installed for offline tests). `token_out`
     /// is implied (the pool's other token), so it is not part of the call.
+    ///
+    /// An [`AeroVolatile`](SolidlyPoolVariant::AeroVolatile) registration
+    /// quotes through `getAmountOutWithTotalFee(amountIn, tokenIn)` under the
+    /// configured transaction context instead, so the MEV tax the factory's
+    /// module derives from `tx.gasprice` and the `msg.sender`-keyed fee match
+    /// what the pool's `swap` charges that sender.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -198,18 +437,68 @@ impl AmmAdapter for SolidlyV2Adapter {
             .address()
             .ok_or(SimError::MissingMetadata("Solidly V2 pool address"))?;
 
+        let amount_out = match solidly_variant(pool) {
+            SolidlyPoolVariant::Legacy => {
+                let calldata = Bytes::from(
+                    getAmountOutCall {
+                        amountIn: amount_in,
+                        tokenIn: token_in,
+                    }
+                    .abi_encode(),
+                );
+                let output = quote_via_call_from(cache, config.from, pool_address, calldata)?;
+                getAmountOutCall::abi_decode_returns_validate(&output)
+                    .map_err(|_| SimError::MalformedOutput("getAmountOut return"))?
+            }
+            SolidlyPoolVariant::AeroVolatile => {
+                let calldata = Bytes::from(
+                    getAmountOutWithTotalFeeCall {
+                        amountIn: amount_in,
+                        tokenIn: token_in,
+                    }
+                    .abi_encode(),
+                );
+                let output = quote_via_call_with_config(cache, config, pool_address, calldata)?;
+                getAmountOutWithTotalFeeCall::abi_decode_returns_validate(&output)
+                    .map_err(|_| SimError::MalformedOutput("getAmountOutWithTotalFee return"))?
+            }
+        };
+        Ok(SwapQuote::new(amount_out))
+    }
+
+    /// Exact-output quote for an [`AeroVolatile`](SolidlyPoolVariant::AeroVolatile)
+    /// pool through `getAmountInWithTotalFee(amountOut, tokenOut)`: the curve
+    /// input grossed up by `factory.getFeeForAmountIn(pool, msg.sender, …)`
+    /// under the configured transaction context. `token_in` is implied (the
+    /// pool's other token). Legacy pools expose no exact-output getter and
+    /// return [`SimError::Unsupported`].
+    fn simulate_swap_exact_output(
+        &self,
+        pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        _token_in: Address,
+        token_out: Address,
+        amount_out: U256,
+        config: &SimConfig,
+    ) -> Result<ExactOutputQuote, SimError> {
+        if solidly_variant(pool) != SolidlyPoolVariant::AeroVolatile {
+            return Err(SimError::Unsupported(ProtocolId::SolidlyV2));
+        }
+        let pool_address = pool
+            .key
+            .address()
+            .ok_or(SimError::MissingMetadata("Solidly V2 pool address"))?;
         let calldata = Bytes::from(
-            getAmountOutCall {
-                amountIn: amount_in,
-                tokenIn: token_in,
+            getAmountInWithTotalFeeCall {
+                amountOut: amount_out,
+                tokenOut: token_out,
             }
             .abi_encode(),
         );
-
-        let output = quote_via_call_from(cache, config.from, pool_address, calldata)?;
-        let amount_out = getAmountOutCall::abi_decode_returns_validate(&output)
-            .map_err(|_| SimError::MalformedOutput("getAmountOut return"))?;
-        Ok(SwapQuote::new(amount_out))
+        let output = quote_via_call_with_config(cache, config, pool_address, calldata)?;
+        let amount_in = getAmountInWithTotalFeeCall::abi_decode_returns_validate(&output)
+            .map_err(|_| SimError::MalformedOutput("getAmountInWithTotalFee return"))?;
+        Ok(ExactOutputQuote::new(amount_in))
     }
 }
 
@@ -230,30 +519,58 @@ enum SolidlyVerdict {
 /// under `Strict`/`Eager`. The reserves are classified from their per-slot
 /// [`SlotFetch`] verdict, so a genuine zero and an archive miss map to *distinct*
 /// repairs. Token addresses are decoded from the warmed slots and merged into the
-/// metadata; the config-supplied `stable`/`storage_layout` are preserved. Under
-/// `Lazy` the token slots are recorded as deferred work.
+/// metadata; the config-supplied `stable`/`storage_layout`/`variant` are
+/// preserved. Under `Lazy` the token slots are recorded as deferred work.
+///
+/// An [`AeroVolatile`](SolidlyPoolVariant::AeroVolatile) pool additionally
+/// proves its identity with a `POOL_TYPE()` view call (it must return
+/// `bytes32("V2_VOLATILE")`; a legacy pool reverts) and, when it belongs to a
+/// reviewed family, verifies the external factory/module cells its total-fee
+/// getters read under `Strict`/`Eager`. A failed external cell degrades the
+/// pool with a targeted repair; a failed identity check fails closed as
+/// `Unsupported`.
 struct SolidlyV2ColdStartPlanner {
     address: Address,
     layout: SolidlyStorageLayout,
     policy: ColdStartPolicy,
+    variant: SolidlyPoolVariant,
+    external_exact_slots: Vec<(Address, U256)>,
     verified_slots: Vec<(Address, U256)>,
     changed_slots: Vec<SlotChange>,
+    failed_external_slots: Vec<(Address, U256)>,
+    /// Reviewed external cells fetched as genuine zero. They are materialized
+    /// explicitly so an offline quote never treats them as unknown.
+    proven_zero_external_slots: Vec<(Address, U256)>,
     decoded_token0: Option<Address>,
     decoded_token1: Option<Address>,
     verdict: Option<SolidlyVerdict>,
+    /// `Some(false)` once the `POOL_TYPE()` identity call contradicted the
+    /// registered variant.
+    identity_verified: Option<bool>,
 }
 
 impl SolidlyV2ColdStartPlanner {
-    fn new(address: Address, layout: SolidlyStorageLayout, policy: ColdStartPolicy) -> Self {
+    fn new(
+        address: Address,
+        layout: SolidlyStorageLayout,
+        policy: ColdStartPolicy,
+        variant: SolidlyPoolVariant,
+        external_exact_slots: Vec<(Address, U256)>,
+    ) -> Self {
         Self {
             address,
             layout,
             policy,
+            variant,
+            external_exact_slots,
             verified_slots: Vec::new(),
             changed_slots: Vec::new(),
+            failed_external_slots: Vec::new(),
+            proven_zero_external_slots: Vec::new(),
             decoded_token0: None,
             decoded_token1: None,
             verdict: None,
+            identity_verified: None,
         }
     }
 }
@@ -279,7 +596,7 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
         // Both reserve slots are always warmed so subsequent reactive `Sync`
         // writes land exactly. The token slots are warmed up-front except under
         // `Lazy`/`HotSlotsOnly`.
-        let verify: Vec<(Address, U256)> = match self.policy {
+        let mut verify: Vec<(Address, U256)> = match self.policy {
             ColdStartPolicy::Strict | ColdStartPolicy::Eager => vec![
                 (self.address, self.layout.reserve0_slot),
                 (self.address, self.layout.reserve1_slot),
@@ -291,9 +608,26 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
                 (self.address, self.layout.reserve1_slot),
             ],
         };
+        if matches!(
+            self.policy,
+            ColdStartPolicy::Strict | ColdStartPolicy::Eager
+        ) {
+            verify.extend(self.external_exact_slots.iter().copied());
+        }
         self.verified_slots = verify.clone();
+        let discover = if self.variant == SolidlyPoolVariant::AeroVolatile {
+            vec![ColdStartCall {
+                from: Address::ZERO,
+                to: self.address,
+                calldata: Bytes::from(POOL_TYPECall {}.abi_encode()),
+                restrict_to: Some(vec![self.address]),
+            }]
+        } else {
+            Vec::new()
+        };
         ColdStartPlan {
             verify,
+            discover,
             ..Default::default()
         }
     }
@@ -315,6 +649,40 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
             (SolidlyVerdict::Ready, SolidlyVerdict::Ready) => SolidlyVerdict::Ready,
         });
 
+        if matches!(
+            self.policy,
+            ColdStartPolicy::Strict | ColdStartPolicy::Eager
+        ) {
+            for (address, slot) in &self.external_exact_slots {
+                let fetched = results
+                    .fetched
+                    .iter()
+                    .find(|outcome| outcome.address == *address && outcome.slot == *slot);
+                let resident = matches!(
+                    fetched.map(|outcome| &outcome.fetch),
+                    Some(SlotFetch::Value(_) | SlotFetch::Zero)
+                ) || state.storage(*address, *slot).is_some();
+                if !resident {
+                    self.failed_external_slots.push((*address, *slot));
+                } else if matches!(fetched.map(|outcome| &outcome.fetch), Some(SlotFetch::Zero)) {
+                    self.proven_zero_external_slots.push((*address, *slot));
+                }
+            }
+        }
+
+        if self.variant == SolidlyPoolVariant::AeroVolatile {
+            let pool_type = results
+                .discovered
+                .first()
+                .and_then(|call| match &call.result {
+                    CallOutcome::Success { output, .. } if output.len() >= 32 => {
+                        Some(B256::from_slice(&output[..32]))
+                    }
+                    _ => None,
+                });
+            self.identity_verified = Some(pool_type == Some(AERO_VOLATILE_POOL_TYPE));
+        }
+
         self.decoded_token0 = state
             .storage(self.address, self.layout.token0_slot)
             .map(decode_address_slot);
@@ -325,11 +693,29 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
         ColdStartStep::Done
     }
 
+    fn materialization_updates(&self) -> Vec<StateUpdate> {
+        self.proven_zero_external_slots
+            .iter()
+            .map(|(address, slot)| StateUpdate::slot(*address, *slot, U256::ZERO))
+            .collect()
+    }
+
     fn finish(
         &mut self,
         pool: &mut PoolRegistration,
         _report: &ColdStartRunReport,
     ) -> ColdStartOutcome {
+        if self.identity_verified == Some(false) {
+            // Fail closed: the registered variant promised an Aero basic pool
+            // but the runtime did not report `POOL_TYPE() == "V2_VOLATILE"`.
+            // Quoting it through the total-fee getters would revert or, worse,
+            // decode a legacy pool's unrelated selector collision.
+            pool.status = PoolStatus::Degraded;
+            return ColdStartOutcome::Unsupported(UnsupportedReason::Custom(
+                "Aero volatile registration: POOL_TYPE() did not return V2_VOLATILE".into(),
+            ));
+        }
+
         let mut cold_report = ColdStartReport::new(pool.key.clone(), self.policy);
         cold_report.verified_slots = self.verified_slots.clone();
         cold_report.changed_slots = self.changed_slots.clone();
@@ -356,20 +742,33 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
                 cold_report.status = PoolStatus::Degraded;
                 ColdStartOutcome::NeedsRepair(cold_report, RepairAction::VerifySlots(reserve_slots))
             }
+            Some(SolidlyVerdict::Ready) if !self.failed_external_slots.is_empty() => {
+                // The pool's own state is exact but a reviewed external fee cell
+                // could not be fetched: the total-fee quote would fall back to a
+                // lazy provider read, so hold the pool until the cells arrive.
+                cold_report.status = PoolStatus::Degraded;
+                pool.status = PoolStatus::Degraded;
+                ColdStartOutcome::NeedsRepair(
+                    cold_report,
+                    RepairAction::VerifySlots(self.failed_external_slots.clone()),
+                )
+            }
             Some(SolidlyVerdict::Ready) => {
-                // Merge decoded tokens; preserve config `stable`/`storage_layout`.
+                // Merge decoded tokens; preserve config `stable`/`storage_layout`/`variant`.
                 let metadata = match &pool.metadata {
                     ProtocolMetadata::SolidlyV2(existing) => SolidlyV2Metadata {
                         token0: self.decoded_token0,
                         token1: self.decoded_token1,
                         stable: existing.stable,
                         storage_layout: existing.storage_layout,
+                        variant: existing.variant,
                     },
                     _ => SolidlyV2Metadata {
                         token0: self.decoded_token0,
                         token1: self.decoded_token1,
                         stable: None,
                         storage_layout: Some(self.layout),
+                        variant: self.variant,
                     },
                 };
                 pool.metadata = ProtocolMetadata::SolidlyV2(metadata);
@@ -397,4 +796,113 @@ fn data_word(log: &Log, index: usize) -> Option<U256> {
         .data
         .get(start..start + 32)
         .map(U256::from_be_slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::PoolKey;
+
+    fn aero_pool() -> PoolRegistration {
+        PoolRegistration::new(PoolKey::SolidlyV2(address!(
+            "c71b571aa9f06bfa096c24e9df5c45fc4fab4151"
+        )))
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default().with_aero_volatile(),
+        ))
+    }
+
+    #[test]
+    fn pool_type_label_is_v2_volatile() {
+        let mut expected = [0_u8; 32];
+        expected[..11].copy_from_slice(b"V2_VOLATILE");
+        assert_eq!(AERO_VOLATILE_POOL_TYPE, B256::from(expected));
+    }
+
+    #[test]
+    fn reviewed_aero_volatile_family_is_keyed_by_pool_and_variant() {
+        let adapter = SolidlyV2Adapter::default();
+        let pool = aero_pool();
+        assert_eq!(
+            SolidlyV2Adapter::aero_volatile_runtime_family(&pool),
+            Some(AeroVolatileRuntimeFamily::AeroOptimismMooBifi)
+        );
+        let reviewed =
+            reviewed_aero_volatile_runtime(AeroVolatileRuntimeFamily::AeroOptimismMooBifi);
+        assert_eq!(
+            adapter.verified_code_targets(&pool),
+            vec![
+                reviewed.pool,
+                reviewed.implementation,
+                reviewed.factory,
+                reviewed.fee_module,
+                reviewed.exact_out_fee_quoter,
+                reviewed.mev_tax_module,
+            ]
+        );
+        let identities = adapter.reviewed_code_identities(&pool);
+        assert_eq!(identities.len(), 6);
+        assert!(identities.contains(&(
+            reviewed.implementation,
+            b256!("15269fbb3aca4305485be2669a8394ec6a14c75181e1eb4c2d46c5b1ee2a7782")
+        )));
+        let targets = adapter.verified_storage_targets(&pool);
+        assert_eq!(targets.len(), 8);
+        assert!(targets.contains(&(reviewed.factory, U256::from(5))));
+        assert!(targets.contains(&(reviewed.factory, U256::from(7))));
+        assert!(targets.contains(&(reviewed.factory, U256::from(13))));
+        assert!(targets.contains(&(reviewed.factory, U256::from(14))));
+        assert!(targets.contains(&(reviewed.mev_tax_module, U256::from(1))));
+        assert!(targets.contains(&(reviewed.mev_tax_module, U256::from(2))));
+        assert!(targets.contains(&(reviewed.pool, U256::from(10))));
+        // `customFee[pool]` at slot 0 of the fee module, confirmed by the
+        // traced read set at Optimism block 158800699.
+        assert!(targets.contains(&(
+            reviewed.fee_module,
+            U256::from_be_slice(&alloy_primitives::hex!(
+                "cb21fa02f97b30809db1425d6adfdd69eb3e642f7297ea54983670aeb8dd5500"
+            )),
+        )));
+
+        // The same address registered as a legacy pool gets no Aero authority.
+        let legacy = PoolRegistration::new(PoolKey::SolidlyV2(reviewed.pool)).with_metadata(
+            ProtocolMetadata::SolidlyV2(
+                SolidlyV2Metadata::default()
+                    .with_storage_layout(SolidlyStorageLayout::aero_volatile()),
+            ),
+        );
+        assert_eq!(
+            SolidlyV2Adapter::aero_volatile_runtime_family(&legacy),
+            None
+        );
+        assert!(adapter.verified_code_targets(&legacy).is_empty());
+        assert!(adapter.verified_storage_targets(&legacy).is_empty());
+        assert!(adapter.reviewed_code_identities(&legacy).is_empty());
+
+        // An unreviewed Aero volatile pool keeps the variant but pins nothing.
+        let unreviewed = PoolRegistration::new(PoolKey::SolidlyV2(Address::repeat_byte(0x77)))
+            .with_metadata(ProtocolMetadata::SolidlyV2(
+                SolidlyV2Metadata::default().with_aero_volatile(),
+            ));
+        assert_eq!(
+            SolidlyV2Adapter::aero_volatile_runtime_family(&unreviewed),
+            None
+        );
+        assert!(adapter.verified_storage_targets(&unreviewed).is_empty());
+    }
+
+    #[test]
+    fn aero_volatile_metadata_builder_sets_variant_and_layout() {
+        let metadata = SolidlyV2Metadata::default().with_aero_volatile();
+        assert_eq!(metadata.variant, SolidlyPoolVariant::AeroVolatile);
+        assert_eq!(
+            metadata.storage_layout,
+            Some(SolidlyStorageLayout::aero_volatile())
+        );
+        assert_eq!(metadata.stable, Some(false));
+        assert_eq!(
+            SolidlyV2Metadata::default().variant,
+            SolidlyPoolVariant::Legacy
+        );
+    }
 }

@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.8] - 2026-10-29
+
+Additive release candidate for the Aero (Dromos) venues that received the
+BIFI liquidity after the 22 October 2026 launch. Existing registrations,
+layouts, quote targets and the reviewed legacy Slipstream/Solidly families
+keep their exact behaviour; every addition is opt-in through metadata. See
+[Aero families](docs/aero-families.md) for the reviewed identities, warmed
+cells and the gaps that remain.
+
+### Added
+
+- `V3StorageLayout::aero_cl(spacing)` and the `AERO_CL_*_SLOT` constants for
+  the Aero CL layout (`slot0` 6, packed `liquidity` 13, `ticks` 14,
+  `tickBitmap` 15, `observations` 17, packed staked-liquidity word 12 with a
+  `uint48 lastUpdated`), plus `V3StorageLayout::observations_slot` /
+  `with_observations_slot` and `slipstream_family` so the observation ring and
+  the transition surface are part of the layout description. `V3SyncSpec::aero_cl`
+  and a family-aware `V3SyncSpec::slipstream` emit the matching one-shot sync
+  program.
+- Reviewed Aero CL runtime families `SlipstreamRuntimeFamily::AeroEthereumBifi`
+  (`0xff35aa95…`, spacing 50) and `AeroBaseMooBifi` (`0xEEBE78d7…`, spacing
+  100): cold start warms and pins the pool proxy, CL implementation, factory,
+  swap-fee hook, discount registry, MEV-tax module (Base), unstaked-fee
+  module, pool tape and gauge runtimes, warms the deterministic factory /
+  hook / module / voter / registry / tape cells the quote path reads, and
+  `swap_transition_capability` / `liquidity_transition_capability` return
+  `Exact` for ordered `Swap`, `Mint`, `Burn` and `Collect` on the Aero slot
+  surface. Helpers expose the block-keyed `blockFee[pool][height]` cell and the
+  per-account discount cell, and `validate_aero_cl_runtime` checks every pinned
+  identity against a snapshot.
+- `AmmAdapter::reviewed_code_identities`: cold start compares resident or
+  fetched runtimes against the pins and fails the pool closed on a mismatch
+  (`cold_start`, `cold_start_many` and the prepared live-runtime path).
+- Metaquoter quoting: `V3QuoterKind` with `V3Metadata::quoter_kind` /
+  `with_metaquoter`, `quoteExactInputSingleV3` / `quoteExactOutputSingleV3`
+  bindings and `AmmAdapter::simulate_swap_exact_output` (`ExactOutputQuote`).
+- `SimConfig::gas_price` / `with_gas_price` / `with_effective_gas_price` and
+  `with_tx_origin` / `tx_origin` carry the candidate transaction's context into
+  quotes; `CallTxContext`, `AdapterCache::call_raw_with_context` (default:
+  delegate for an empty context, fail closed otherwise), `quote_via_call_with_config`
+  and `overlay_call_raw_with_context` thread it through the live cache, the
+  quote read-set recorder and offline snapshot overlays.
+- Aero volatile Solidly variant: `SolidlyPoolVariant::AeroVolatile`,
+  `SolidlyV2Metadata::with_aero_volatile`, `SolidlyStorageLayout::aero_volatile`
+  (reserves 196619/196620, tokens 7/8) and the reviewed
+  `AeroVolatileRuntimeFamily::AeroOptimismMooBifi` (`0xC71B571a…`). Cold start
+  proves `POOL_TYPE() == "V2_VOLATILE"` and warms the factory, fee-module and
+  MEV-module cells; quotes run through `getAmountOutWithTotalFee` /
+  `getAmountInWithTotalFee` under the configured caller and gas price, so the
+  lazy factory fetch stays off the production quote path.
+- Deterministic fixtures replaying real Aero transactions (an Ethereum swap, a
+  Base swap, and two Base CLM rebalances with up to 19 ordered pool events),
+  mock-backed tests for the Metaquoter, Aero volatile and transaction-context
+  paths, and the live `aero_parity_rpc` / `aero_replay_rpc` gates (new
+  `live-aero.yml` workflow) pinned to Ethereum 26292020, Base 53205395 and
+  Optimism 158800699.
+
+### Changed
+
+- Registration archives persist `observations_slot`, `quoter_kind` and the
+  Solidly `variant` only when set, so existing archives remain byte-identical
+  and older readers keep loading them.
+- The Aero CL families reject `SlipstreamSwapFeeEvidence`
+  (`SlipstreamFeeEvidenceError::UnsupportedFamily`) and the offline unstaked-fee
+  evaluator (`SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily`): their
+  fee is resolved by the deployed hook inside the quote, and their reward
+  accounting settles through the gauge.
+
 ## [0.3.1-alpha.7] - Release candidate
 
 ### Fixed

@@ -8,8 +8,9 @@ use super::cold_start::{
 };
 use super::factory::{ConcentratedLiquidityFactory, FactoryConfig, PoolFactory};
 use super::sim::{
-    ISlipstreamQuoter, QuoteExactInputSingleParams, SimConfig, SimError,
-    SlipstreamQuoteExactInputSingleParams, SwapQuote, quote_via_call_with_code_overrides_from,
+    ExactOutputQuote, IMetaquoter, ISlipstreamQuoter, QuoteExactInputSingleParams, SimConfig,
+    SimError, SlipstreamQuoteExactInputSingleParams, SwapQuote,
+    quote_via_call_with_code_overrides_and_config, quote_via_call_with_code_overrides_from,
     quoteExactInputSingleCall,
 };
 use super::v3_transition::{
@@ -17,8 +18,8 @@ use super::v3_transition::{
     DecodedObservationGrowth, DecodedSwap, derive_slipstream_liquidity, derive_slipstream_swap,
     derive_uniswap_v3_collect_protocol, derive_uniswap_v3_flash, derive_uniswap_v3_liquidity,
     derive_uniswap_v3_observation_growth, derive_uniswap_v3_set_fee_protocol,
-    derive_uniswap_v3_swap, infer_slipstream_swap_fee, uniswap_v3_position_slots,
-    validate_reviewed_slipstream_event,
+    derive_uniswap_v3_swap, infer_slipstream_swap_fee, reviewed_slipstream_family_for_pool,
+    uniswap_v3_position_slots, validate_reviewed_slipstream_event,
 };
 use super::{
     AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind,
@@ -28,17 +29,17 @@ use super::{
     SlipstreamSnapshotIdentity, SlipstreamUnstakedFeeEvaluation,
     SlipstreamUnstakedFeeEvaluationError, SlipstreamUnstakedFeeProof, SlotChange, StateDiff,
     StateSlot, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
-    V3LiquidityTransitionCapability, V3Metadata, V3SwapTransitionCapability,
+    V3LiquidityTransitionCapability, V3Metadata, V3QuoterKind, V3SwapTransitionCapability,
 };
 use crate::adapters::storage::{
-    SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, V3StorageLayout, layout_for,
-    slipstream_tick_info_storage_keys_with_base, v3_tick_bitmap_storage_key_with_base,
-    v3_tick_info_storage_keys_with_base, v3_word_position,
+    AERO_CL_TRANSITION_GLOBAL_SLOTS, SLIPSTREAM_TRANSITION_GLOBAL_SLOTS, SlipstreamLayoutFamily,
+    V3StorageLayout, layout_for, slipstream_tick_info_storage_keys_with_base,
+    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, U256,
     aliases::{I24, U24},
-    keccak256,
+    b256, keccak256,
 };
 use alloy_sol_types::{SolCall, SolEvent};
 use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
@@ -231,9 +232,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         {
             V3ColdStartExactSurface::CanonicalUniswap
         } else if pool.protocol() == ProtocolId::Slipstream
-            && layout == V3StorageLayout::slipstream(layout.tick_spacing)
+            && let Some(family) = layout.slipstream_family()
         {
-            V3ColdStartExactSurface::Slipstream
+            V3ColdStartExactSurface::Slipstream(family)
         } else {
             V3ColdStartExactSurface::None
         };
@@ -273,6 +274,9 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         match pool.protocol() {
             ProtocolId::PancakeV3 => vec![address],
             ProtocolId::Slipstream => {
+                if let Some(reviewed) = reviewed_aero_cl_runtime_for_pool(address) {
+                    return reviewed_aero_cl_code_targets(reviewed);
+                }
                 let Some(reviewed) = reviewed_slipstream_fee_runtime_for_pool(address) else {
                     return vec![address];
                 };
@@ -298,8 +302,25 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         let Some(address) = pool.key.address() else {
             return Vec::new();
         };
+        if let Some(reviewed) = reviewed_aero_cl_runtime_for_pool(address) {
+            let metaquoter = v3_metadata(pool)
+                .filter(|metadata| metadata.quoter_kind == V3QuoterKind::Metaquoter)
+                .and_then(|metadata| metadata.quoter);
+            return reviewed_aero_cl_storage_targets(reviewed, metaquoter);
+        }
         reviewed_slipstream_fee_runtime_for_pool(address)
             .map(reviewed_slipstream_fee_storage_targets)
+            .unwrap_or_default()
+    }
+
+    fn reviewed_code_identities(&self, pool: &PoolRegistration) -> Vec<(Address, B256)> {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return Vec::new();
+        }
+        pool.key
+            .address()
+            .and_then(reviewed_aero_cl_runtime_for_pool)
+            .map(reviewed_aero_cl_identities)
             .unwrap_or_default()
     }
 
@@ -409,6 +430,14 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
     /// adapter selects the fee-keyed struct for Uniswap/Pancake and the native
     /// signed-tick-spacing struct for Slipstream. A discovered Slipstream pool
     /// must therefore be paired with a compatible Slipstream quote target.
+    ///
+    /// A pool whose [`V3Metadata::quoter_kind`] is
+    /// [`V3QuoterKind::Metaquoter`] instead quotes through the Aero
+    /// `Metaquoter.quoteExactInputSingleV3(pool, tokenIn, amountIn, 0)` under
+    /// the configured transaction context (`from` as `tx.origin`,
+    /// [`SimConfig::gas_price`] as `tx.gasprice`), so the deployed swap hook,
+    /// MEV-tax module and discount registry price the quote exactly as the
+    /// pool's `swap` would for that transaction.
     fn simulate_swap(
         &self,
         pool: &PoolRegistration,
@@ -432,6 +461,11 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         // Same resolver `ProtocolMetadata::quote_code_targets` uses, so the quoter
         // we call is always the one an eager cold-start pre-warmed.
         let quoter = v3_metadata(pool).map_or(config.v3_quoter, |m| m.quote_target(config));
+        if v3_metadata(pool).is_some_and(|m| m.quoter_kind == V3QuoterKind::Metaquoter) {
+            return self.simulate_swap_via_metaquoter(
+                pool, cache, quoter, token_in, token_out, amount_in, config,
+            );
+        }
         let slipstream = pool.protocol() == ProtocolId::Slipstream;
         let calldata = if slipstream {
             let tick_spacing = v3_metadata(pool)
@@ -491,6 +525,117 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         };
 
         Ok(SwapQuote::new(amount_out))
+    }
+
+    /// Exact-output quote through the Aero `Metaquoter.quoteExactOutputSingleV3`
+    /// for pools registered with [`V3QuoterKind::Metaquoter`]; QuoterV2-keyed
+    /// registrations return [`SimError::Unsupported`].
+    fn simulate_swap_exact_output(
+        &self,
+        pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        token_in: Address,
+        token_out: Address,
+        amount_out: U256,
+        config: &SimConfig,
+    ) -> Result<ExactOutputQuote, SimError> {
+        pool.check_protocol_agreement()
+            .map_err(|mismatch| SimError::Custom(mismatch.to_string()))?;
+        let Some(metadata) = v3_metadata(pool) else {
+            return Err(SimError::MissingMetadata("V3 metadata"));
+        };
+        if metadata.quoter_kind != V3QuoterKind::Metaquoter {
+            return Err(SimError::Unsupported(pool.protocol()));
+        }
+        let pool_address = pool
+            .key
+            .address()
+            .ok_or(SimError::MissingMetadata("V3 pool address"))?;
+        let calldata = Bytes::from(
+            IMetaquoter::quoteExactOutputSingleV3Call {
+                pool: pool_address,
+                tokenIn: token_in,
+                amountOut: amount_out,
+                sqrtPriceLimitX96: U256::ZERO.to(),
+            }
+            .abi_encode(),
+        );
+        let output = self.metaquoter_call(
+            cache,
+            metadata.quote_target(config),
+            token_in,
+            token_out,
+            calldata,
+            config,
+        )?;
+        let amount_in =
+            IMetaquoter::quoteExactOutputSingleV3Call::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactOutputSingleV3 return"))?
+                .amountIn;
+        Ok(ExactOutputQuote::new(amount_in))
+    }
+}
+
+impl ConcentratedLiquidityAdapter {
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_swap_via_metaquoter(
+        &self,
+        pool: &PoolRegistration,
+        cache: &mut dyn AdapterCache,
+        metaquoter: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        config: &SimConfig,
+    ) -> Result<SwapQuote, SimError> {
+        let pool_address = pool
+            .key
+            .address()
+            .ok_or(SimError::MissingMetadata("V3 pool address"))?;
+        let calldata = Bytes::from(
+            IMetaquoter::quoteExactInputSingleV3Call {
+                pool: pool_address,
+                tokenIn: token_in,
+                amountIn: amount_in,
+                sqrtPriceLimitX96: U256::ZERO.to(),
+            }
+            .abi_encode(),
+        );
+        let output =
+            self.metaquoter_call(cache, metaquoter, token_in, token_out, calldata, config)?;
+        let amount_out =
+            IMetaquoter::quoteExactInputSingleV3Call::abi_decode_returns_validate(&output)
+                .map_err(|_| SimError::MalformedOutput("quoteExactInputSingleV3 return"))?
+                .amountOut;
+        Ok(SwapQuote::new(amount_out))
+    }
+
+    /// Run a Metaquoter quote: like QuoterV2, the quoter obtains its answer by
+    /// executing `pool.swap` and reverting from its callback, so the pool's
+    /// output-token transfer that precedes the revert is neutralized with the
+    /// same snapshot-only runtime override, and the call carries the
+    /// configured transaction context.
+    fn metaquoter_call(
+        &self,
+        cache: &mut dyn AdapterCache,
+        metaquoter: Address,
+        token_in: Address,
+        token_out: Address,
+        calldata: Bytes,
+        config: &SimConfig,
+    ) -> Result<Bytes, SimError> {
+        let transfer_success = Bytes::from_static(ERC20_TRANSFER_SUCCESS_RUNTIME);
+        let code_overrides = [
+            (token_in, transfer_success.clone()),
+            (token_out, transfer_success),
+        ];
+        quote_via_call_with_code_overrides_and_config(
+            cache,
+            config,
+            metaquoter,
+            calldata,
+            &code_overrides,
+        )
     }
 }
 
@@ -683,10 +828,410 @@ fn reviewed_slipstream_fee_storage_targets(
     ]
 }
 
+/// Reviewed Aero (Dromos) CL deployment: every runtime and external cell the
+/// pool's `swap` / the Metaquoter quote path executes or reads, with the
+/// runtime keccak observed at the pinned block (Ethereum 26292020, Base
+/// 53205395; `debug_traceCall` prestate read sets of the metaquoter quotes).
+#[derive(Clone, Copy)]
+struct ReviewedAeroClRuntime {
+    family: SlipstreamRuntimeFamily,
+    chain_id: u64,
+    pool: Address,
+    tick_spacing: i32,
+    proxy_runtime_code_hash: B256,
+    implementation: Address,
+    implementation_runtime_code_hash: B256,
+    factory: Address,
+    factory_runtime_code_hash: B256,
+    /// `DynamicSwapFeeHook` (same address on every chain, per-chain code
+    /// because of its immutable factory).
+    hook: Address,
+    hook_runtime_code_hash: B256,
+    discount_registry: Address,
+    discount_registry_runtime_code_hash: B256,
+    /// `PriorityFeeMevTaxModule` wired into the hook, where one exists.
+    mev_tax_module: Option<(Address, B256)>,
+    /// `CustomUnstakedFeeModule`: present on every chain, wired into the
+    /// factory only where `factory.unstakedFeeModule` names it.
+    unstaked_fee_module: (Address, B256),
+    unstaked_fee_module_wired: bool,
+    pool_tape: (Address, B256),
+    /// The pool's `CLGauge` proxy and its implementation.
+    gauge: (Address, B256),
+    gauge_implementation: (Address, B256),
+    /// `LeafVoter`: the factory's unstaked-fee path reads gauge liveness
+    /// from it; a crossing swap settles the gauge against it.
+    voter: Address,
+    /// The Metaquoter's immutable factory registry.
+    factory_registry: Address,
+    /// Gauge factory the registry/tape path reads.
+    gauge_factory: Address,
+    /// Further contracts the gauge settlement path executes on a crossing
+    /// swap (warmed, proof-verified, not identity-pinned).
+    settlement_path: [Address; 2],
+}
+
+/// `CLFactory` storage (state-variable order of `CLFactory.sol`, confirmed by
+/// the traced read set): `voter` 4, `unstakedFeeModule` 8, `defaultSwapHook`
+/// 9, packed `swapFeeManager` + `defaultUnstakedFee` 11, `discountRegistry`
+/// 12, `clPoolTape` 13, `poolSwapHook[pool]` 10, `tickSpacingToFee[spacing]`
+/// 15, `isPool[pool]` 16.
+const AERO_CL_FACTORY_VOTER_SLOT: u64 = 4;
+const AERO_CL_FACTORY_UNSTAKED_FEE_MODULE_SLOT: u64 = 8;
+const AERO_CL_FACTORY_DEFAULT_SWAP_HOOK_SLOT: u64 = 9;
+const AERO_CL_FACTORY_POOL_SWAP_HOOK_SLOT: u64 = 10;
+const AERO_CL_FACTORY_SWAP_FEE_MANAGER_SLOT: u64 = 11;
+const AERO_CL_FACTORY_DISCOUNT_REGISTRY_SLOT: u64 = 12;
+const AERO_CL_FACTORY_POOL_TAPE_SLOT: u64 = 13;
+const AERO_CL_FACTORY_TICK_SPACING_TO_FEE_SLOT: u64 = 15;
+const AERO_CL_FACTORY_IS_POOL_SLOT: u64 = 16;
+/// `DynamicSwapFeeHook` storage: `defaultScalingFactor` 0, `defaultFeeCap` 1,
+/// packed `secondsAgo` + `recordCallGasLimit` 2, `dynamicFeeConfig[pool]` 3,
+/// `blockFee[pool][height]` 4, `mevTaxModule` 5.
+const AERO_CL_HOOK_DEFAULT_SCALING_FACTOR_SLOT: u64 = 0;
+const AERO_CL_HOOK_DEFAULT_FEE_CAP_SLOT: u64 = 1;
+const AERO_CL_HOOK_SECONDS_AGO_SLOT: u64 = 2;
+const AERO_CL_HOOK_DYNAMIC_FEE_CONFIG_SLOT: u64 = 3;
+const AERO_CL_HOOK_BLOCK_FEE_SLOT: u64 = 4;
+const AERO_CL_HOOK_MEV_TAX_MODULE_SLOT: u64 = 5;
+/// `DiscountRegistry.discounts[account]` (keyed by the account alone).
+const AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT: u64 = 2;
+/// `PriorityFeeMevTaxModule`: `pendingOwner` + `priorityFeeMultiplier` 1,
+/// `minThreshold` + `baseFeeFactor` 2.
+const AERO_CL_MEV_MODULE_MULTIPLIER_SLOT: u64 = 1;
+const AERO_CL_MEV_MODULE_THRESHOLD_SLOT: u64 = 2;
+/// `CustomUnstakedFeeModule.customFee[pool]`.
+const AERO_CL_UNSTAKED_FEE_MODULE_CUSTOM_FEE_SLOT: u64 = 0;
+/// `LeafVoter.gauges[gauge]` struct base; word 1 packs the alive flag the
+/// factory's unstaked-fee path reads.
+const AERO_CL_VOTER_GAUGES_SLOT: u64 = 8;
+/// `V3FactoryRegistry`: `targetToFactory[pool]` 12, `poolToGauge[pool]` 16,
+/// `gaugeToFactory[gauge]` 11 — the Metaquoter's `authenticatePool` reads.
+const AERO_CL_REGISTRY_TARGET_TO_FACTORY_SLOT: u64 = 12;
+const AERO_CL_REGISTRY_POOL_TO_GAUGE_SLOT: u64 = 16;
+const AERO_CL_REGISTRY_GAUGE_TO_FACTORY_SLOT: u64 = 11;
+/// Gauge-factory per-gauge cell read on the quote path.
+const AERO_CL_GAUGE_FACTORY_GAUGE_SLOT: u64 = 6;
+/// `CLPoolTape` per-pool structs whose offsets are not period-dependent:
+/// the hook/gas word at slot 2 and the five-word record at slot 5. The
+/// period-indexed records at slots 4 and 6 are learned by quote read-set
+/// warming.
+const AERO_CL_TAPE_POOL_HOOK_SLOT: u64 = 2;
+const AERO_CL_TAPE_POOL_RECORD_SLOT: u64 = 5;
+const AERO_CL_TAPE_POOL_RECORD_WORDS: u64 = 5;
+
+const AERO_CL_HOOK: Address =
+    alloy_primitives::address!("c0ed888afe87ed1acf01d9f19bb850159e3ce434");
+const AERO_CL_DISCOUNT_REGISTRY: Address =
+    alloy_primitives::address!("aa48aaef655fb7cd7acc04717f66022a4771a345");
+const AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH: B256 =
+    b256!("0b972ebfbde67027f54fe4cef10c5c1ec2a2ada1b1f1c532a5b73fd6f0f3b1cf");
+const AERO_CL_POOL_TAPE: (Address, B256) = (
+    alloy_primitives::address!("27d5eb73e7406675f6b0cbd037490ec3dba935a4"),
+    b256!("6e8c12f89d5bf6abe6abae4c2e11f3539349a7cb82fac167e183ff046e24c288"),
+);
+const AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH: B256 =
+    b256!("b03fb822ffeb7154c5d94f0206d76b417f4f97b2b0a744e07e289cfb5fd0c639");
+const AERO_CL_GAUGE_IMPLEMENTATION: (Address, B256) = (
+    alloy_primitives::address!("89e91a960154b1ed6c093039a8f0725ab67d14e0"),
+    b256!("fdb516e0cf5b1c3f42789c4d7607a16e16b0ae5e73894e21e52a29c93b1ecee3"),
+);
+const AERO_CL_UNSTAKED_FEE_MODULE: Address =
+    alloy_primitives::address!("cc421483cd131a8fd6b68c37e46f244dbec4f797");
+const AERO_CL_VOTER: Address =
+    alloy_primitives::address!("382409fad8503fbcdbb27a4211551fa03e884078");
+const AERO_CL_GAUGE_FACTORY: Address =
+    alloy_primitives::address!("f437f62053acb121665b8fdbfea8f214fb8e589d");
+const AERO_CL_SETTLEMENT_PATH: [Address; 2] = [
+    alloy_primitives::address!("0575b823c22585f1828bbc133d5e522a8499165c"),
+    alloy_primitives::address!("c7e262e848fca78c3c66ee3c9835e4e65e3e0398"),
+];
+
+fn reviewed_aero_cl_runtime(family: SlipstreamRuntimeFamily) -> Option<ReviewedAeroClRuntime> {
+    match family {
+        SlipstreamRuntimeFamily::AeroEthereumBifi => Some(ReviewedAeroClRuntime {
+            family,
+            chain_id: 1,
+            pool: alloy_primitives::address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1"),
+            tick_spacing: 50,
+            proxy_runtime_code_hash: b256!(
+                "55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"
+            ),
+            implementation: alloy_primitives::address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
+            implementation_runtime_code_hash: b256!(
+                "041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"
+            ),
+            factory: alloy_primitives::address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2"),
+            factory_runtime_code_hash: b256!(
+                "3e53af145d8106d91fad73c6dbbbfe3229c5aa96aab1e18a4bf49a705c773ef5"
+            ),
+            hook: AERO_CL_HOOK,
+            hook_runtime_code_hash: b256!(
+                "d64b9e760431c312c53515167ffb260b357705388da9354f31095d974e19e449"
+            ),
+            discount_registry: AERO_CL_DISCOUNT_REGISTRY,
+            discount_registry_runtime_code_hash: AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH,
+            mev_tax_module: None,
+            unstaked_fee_module: (
+                AERO_CL_UNSTAKED_FEE_MODULE,
+                b256!("90c9628c5dd2b42252a3ddadfc1bf8bf4fe81ed4ee4d2df1beb48403d5434a2d"),
+            ),
+            unstaked_fee_module_wired: true,
+            pool_tape: AERO_CL_POOL_TAPE,
+            gauge: (
+                alloy_primitives::address!("0ee89bdfd62e3a5325416fb93c0f1601474a5b04"),
+                AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH,
+            ),
+            gauge_implementation: AERO_CL_GAUGE_IMPLEMENTATION,
+            voter: AERO_CL_VOTER,
+            factory_registry: alloy_primitives::address!(
+                "dd1705e23762f4d6e44d8c31bd8ea80c54612239"
+            ),
+            gauge_factory: AERO_CL_GAUGE_FACTORY,
+            settlement_path: AERO_CL_SETTLEMENT_PATH,
+        }),
+        SlipstreamRuntimeFamily::AeroBaseMooBifi => Some(ReviewedAeroClRuntime {
+            family,
+            chain_id: 8_453,
+            pool: alloy_primitives::address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8"),
+            tick_spacing: 100,
+            proxy_runtime_code_hash: b256!(
+                "55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"
+            ),
+            implementation: alloy_primitives::address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
+            implementation_runtime_code_hash: b256!(
+                "041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"
+            ),
+            factory: alloy_primitives::address!("9cb220581b91b0c83223012fe69688b92ad07a76"),
+            factory_runtime_code_hash: b256!(
+                "6c09090837ace0aefe6bfa24a3bc772d13a9775b7e3109c9fece534a0ce053a6"
+            ),
+            hook: AERO_CL_HOOK,
+            hook_runtime_code_hash: b256!(
+                "198b45ce022f423a9852526890d236531333e97861078501357e1c72f0eeecbd"
+            ),
+            discount_registry: AERO_CL_DISCOUNT_REGISTRY,
+            discount_registry_runtime_code_hash: AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH,
+            mev_tax_module: Some((
+                alloy_primitives::address!("29f12ce5be3d88b56d245b7f4e969c518f799a4a"),
+                b256!("fb10c802d480cf1d35d1878c7dc9b9e12a54b600f66da776991554ff0c2f9657"),
+            )),
+            unstaked_fee_module: (
+                AERO_CL_UNSTAKED_FEE_MODULE,
+                b256!("e3ec637a6e3236331711ec5d4c476d8f0c0e9d54e8c3936fe068195884b5b829"),
+            ),
+            unstaked_fee_module_wired: false,
+            pool_tape: AERO_CL_POOL_TAPE,
+            gauge: (
+                alloy_primitives::address!("84c029f26652d37bc153c39deb8767ec54037334"),
+                AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH,
+            ),
+            gauge_implementation: AERO_CL_GAUGE_IMPLEMENTATION,
+            voter: AERO_CL_VOTER,
+            factory_registry: alloy_primitives::address!(
+                "7b2a2c12dc5ea2a31455952a05031c3e4bb28f3e"
+            ),
+            gauge_factory: AERO_CL_GAUGE_FACTORY,
+            settlement_path: AERO_CL_SETTLEMENT_PATH,
+        }),
+        SlipstreamRuntimeFamily::AerodromeBaseBifi
+        | SlipstreamRuntimeFamily::VelodromeOptimismBifi => None,
+    }
+}
+
+fn reviewed_aero_cl_runtime_for_pool(pool: Address) -> Option<ReviewedAeroClRuntime> {
+    reviewed_slipstream_family_for_pool(pool).and_then(reviewed_aero_cl_runtime)
+}
+
+/// Every runtime the Aero CL quote path executes: pinned identities first,
+/// then the proof-verified settlement/registry path.
+fn reviewed_aero_cl_code_targets(reviewed: ReviewedAeroClRuntime) -> Vec<Address> {
+    let mut targets = vec![
+        reviewed.pool,
+        reviewed.implementation,
+        reviewed.factory,
+        reviewed.hook,
+        reviewed.discount_registry,
+    ];
+    if let Some((module, _)) = reviewed.mev_tax_module {
+        targets.push(module);
+    }
+    targets.extend([
+        reviewed.unstaked_fee_module.0,
+        reviewed.pool_tape.0,
+        reviewed.gauge.0,
+        reviewed.gauge_implementation.0,
+        reviewed.voter,
+        reviewed.factory_registry,
+        reviewed.gauge_factory,
+    ]);
+    targets.extend(reviewed.settlement_path);
+    targets
+}
+
+/// The pinned runtime identities of an Aero CL family: pool proxy,
+/// implementation, factory, hook, discount registry, MEV-tax module (where
+/// present), unstaked-fee module, pool tape and gauge.
+fn reviewed_aero_cl_identities(reviewed: ReviewedAeroClRuntime) -> Vec<(Address, B256)> {
+    let mut identities = vec![
+        (reviewed.pool, reviewed.proxy_runtime_code_hash),
+        (
+            reviewed.implementation,
+            reviewed.implementation_runtime_code_hash,
+        ),
+        (reviewed.factory, reviewed.factory_runtime_code_hash),
+        (reviewed.hook, reviewed.hook_runtime_code_hash),
+        (
+            reviewed.discount_registry,
+            reviewed.discount_registry_runtime_code_hash,
+        ),
+    ];
+    if let Some(module) = reviewed.mev_tax_module {
+        identities.push(module);
+    }
+    identities.extend([
+        reviewed.unstaked_fee_module,
+        reviewed.pool_tape,
+        reviewed.gauge,
+        reviewed.gauge_implementation,
+    ]);
+    identities
+}
+
+fn solidity_nested_mapping_key(outer: Address, inner: U256, mapping_slot: u64) -> U256 {
+    let mut preimage = [0_u8; 64];
+    preimage[..32].copy_from_slice(&inner.to_be_bytes::<32>());
+    preimage[32..]
+        .copy_from_slice(&solidity_address_mapping_key(outer, mapping_slot).to_be_bytes::<32>());
+    U256::from_be_slice(keccak256(preimage).as_slice())
+}
+
+fn solidity_i24_mapping_key(key: i32, mapping_slot: u64) -> U256 {
+    let mut preimage = [0_u8; 64];
+    let word = if key < 0 {
+        U256::MAX - U256::from(key.unsigned_abs() - 1)
+    } else {
+        U256::from(key as u32)
+    };
+    preimage[..32].copy_from_slice(&word.to_be_bytes::<32>());
+    preimage[32..].copy_from_slice(&U256::from(mapping_slot).to_be_bytes::<32>());
+    U256::from_be_slice(keccak256(preimage).as_slice())
+}
+
+/// The deterministic external cells the Aero CL swap/quote path reads:
+/// factory fee routing, hook fee configuration, MEV-tax parameters, the
+/// wired unstaked-fee module cell, the voter liveness word, the registry and
+/// gauge-factory cells the Metaquoter authenticates through, and the
+/// period-independent pool-tape records. Block-keyed (`blockFee[pool][height]`)
+/// and period-indexed tape cells are excluded; see
+/// [`ConcentratedLiquidityAdapter::aero_cl_block_scoped_storage_targets`] and
+/// quote read-set warming.
+fn reviewed_aero_cl_storage_targets(
+    reviewed: ReviewedAeroClRuntime,
+    metaquoter: Option<Address>,
+) -> Vec<(Address, U256)> {
+    let pool = reviewed.pool;
+    let gauge = reviewed.gauge.0;
+    let mut targets = vec![
+        (reviewed.factory, U256::from(AERO_CL_FACTORY_VOTER_SLOT)),
+        (
+            reviewed.factory,
+            U256::from(AERO_CL_FACTORY_UNSTAKED_FEE_MODULE_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_CL_FACTORY_DEFAULT_SWAP_HOOK_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_CL_FACTORY_SWAP_FEE_MANAGER_SLOT),
+        ),
+        (
+            reviewed.factory,
+            U256::from(AERO_CL_FACTORY_DISCOUNT_REGISTRY_SLOT),
+        ),
+        (reviewed.factory, U256::from(AERO_CL_FACTORY_POOL_TAPE_SLOT)),
+        (
+            reviewed.factory,
+            solidity_address_mapping_key(pool, AERO_CL_FACTORY_POOL_SWAP_HOOK_SLOT),
+        ),
+        (
+            reviewed.factory,
+            solidity_i24_mapping_key(
+                reviewed.tick_spacing,
+                AERO_CL_FACTORY_TICK_SPACING_TO_FEE_SLOT,
+            ),
+        ),
+        (
+            reviewed.factory,
+            solidity_address_mapping_key(pool, AERO_CL_FACTORY_IS_POOL_SLOT),
+        ),
+        (
+            reviewed.hook,
+            U256::from(AERO_CL_HOOK_DEFAULT_SCALING_FACTOR_SLOT),
+        ),
+        (reviewed.hook, U256::from(AERO_CL_HOOK_DEFAULT_FEE_CAP_SLOT)),
+        (reviewed.hook, U256::from(AERO_CL_HOOK_SECONDS_AGO_SLOT)),
+        (reviewed.hook, U256::from(AERO_CL_HOOK_MEV_TAX_MODULE_SLOT)),
+        (
+            reviewed.hook,
+            solidity_address_mapping_key(pool, AERO_CL_HOOK_DYNAMIC_FEE_CONFIG_SLOT),
+        ),
+        (
+            reviewed.voter,
+            solidity_address_mapping_key(gauge, AERO_CL_VOTER_GAUGES_SLOT) + U256::from(1),
+        ),
+        (
+            reviewed.gauge_factory,
+            solidity_address_mapping_key(gauge, AERO_CL_GAUGE_FACTORY_GAUGE_SLOT),
+        ),
+        (
+            reviewed.pool_tape.0,
+            solidity_address_mapping_key(pool, AERO_CL_TAPE_POOL_HOOK_SLOT),
+        ),
+    ];
+    let record_base = solidity_address_mapping_key(pool, AERO_CL_TAPE_POOL_RECORD_SLOT);
+    targets.extend(
+        (0..AERO_CL_TAPE_POOL_RECORD_WORDS)
+            .map(|offset| (reviewed.pool_tape.0, record_base + U256::from(offset))),
+    );
+    if let Some((module, _)) = reviewed.mev_tax_module {
+        targets.push((module, U256::from(AERO_CL_MEV_MODULE_MULTIPLIER_SLOT)));
+        targets.push((module, U256::from(AERO_CL_MEV_MODULE_THRESHOLD_SLOT)));
+    }
+    if reviewed.unstaked_fee_module_wired {
+        targets.push((
+            reviewed.unstaked_fee_module.0,
+            solidity_address_mapping_key(pool, AERO_CL_UNSTAKED_FEE_MODULE_CUSTOM_FEE_SLOT),
+        ));
+    }
+    if let Some(metaquoter) = metaquoter {
+        targets.extend([
+            (
+                reviewed.factory_registry,
+                solidity_address_mapping_key(pool, AERO_CL_REGISTRY_TARGET_TO_FACTORY_SLOT),
+            ),
+            (
+                reviewed.factory_registry,
+                solidity_address_mapping_key(pool, AERO_CL_REGISTRY_POOL_TO_GAUGE_SLOT),
+            ),
+            (
+                reviewed.factory_registry,
+                solidity_address_mapping_key(gauge, AERO_CL_REGISTRY_GAUGE_TO_FACTORY_SLOT),
+            ),
+            (
+                reviewed.discount_registry,
+                solidity_address_mapping_key(metaquoter, AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT),
+            ),
+        ]);
+    }
+    targets
+}
+
 fn reviewed_slipstream_fee_runtime(
     family: SlipstreamRuntimeFamily,
-) -> ReviewedSlipstreamFeeRuntime {
-    match family {
+) -> Option<ReviewedSlipstreamFeeRuntime> {
+    Some(match family {
         SlipstreamRuntimeFamily::AerodromeBaseBifi => ReviewedSlipstreamFeeRuntime {
             chain_id: 8_453,
             pool: alloy_primitives::address!("b378137c90444bbcecd44a1f766851fbf53d2a9e"),
@@ -735,7 +1280,10 @@ fn reviewed_slipstream_fee_runtime(
                 "23425577e3d433f535309680b44b53e5cbd1ad581b1d2248e015030fd9816e37"
             ),
         },
-    }
+        SlipstreamRuntimeFamily::AeroEthereumBifi | SlipstreamRuntimeFamily::AeroBaseMooBifi => {
+            return None;
+        }
+    })
 }
 
 fn reviewed_slipstream_fee_runtime_for_pool(pool: Address) -> Option<ReviewedSlipstreamFeeRuntime> {
@@ -744,7 +1292,7 @@ fn reviewed_slipstream_fee_runtime_for_pool(pool: Address) -> Option<ReviewedSli
         SlipstreamRuntimeFamily::VelodromeOptimismBifi,
     ]
     .into_iter()
-    .map(reviewed_slipstream_fee_runtime)
+    .filter_map(reviewed_slipstream_fee_runtime)
     .find(|reviewed| reviewed.pool == pool)
 }
 
@@ -1064,7 +1612,8 @@ impl ConcentratedLiquidityAdapter {
         identity: SlipstreamSnapshotIdentity,
         context: &AdapterEventContext,
     ) -> Result<SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError> {
-        let reviewed = reviewed_slipstream_fee_runtime(family);
+        let reviewed = reviewed_slipstream_fee_runtime(family)
+            .ok_or(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)?;
         validate_snapshot_identity(&snapshot, reviewed, identity, context)?;
         validate_reviewed_runtime_addresses(&snapshot, reviewed, true)?;
         let outcome =
@@ -1101,12 +1650,112 @@ impl ConcentratedLiquidityAdapter {
         identity: SlipstreamSnapshotIdentity,
         context: &AdapterEventContext,
     ) -> Result<SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError> {
-        let reviewed = reviewed_slipstream_fee_runtime(family);
+        let reviewed = reviewed_slipstream_fee_runtime(family)
+            .ok_or(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)?;
         validate_snapshot_identity(&snapshot, reviewed, identity, context)?;
         validate_reviewed_runtime_addresses(&snapshot, reviewed, false)?;
         Ok(SlipstreamUnstakedFeeEvaluation::new(
             0,
             SlipstreamUnstakedFeeProof::unused_all_liquidity_staked(family, identity),
+        ))
+    }
+
+    /// The reviewed Aero CL family a registration belongs to: a
+    /// [`PoolKey::Slipstream`](super::PoolKey::Slipstream) registration at a
+    /// reviewed Aero pool address whose layout classifies as
+    /// [`SlipstreamLayoutFamily::AeroCl`] with the pool's tick spacing.
+    pub fn aero_cl_runtime_family(pool: &PoolRegistration) -> Option<SlipstreamRuntimeFamily> {
+        if pool.protocol() != ProtocolId::Slipstream {
+            return None;
+        }
+        let reviewed = reviewed_aero_cl_runtime_for_pool(pool.key.address()?)?;
+        let layout = layout_for(pool)?;
+        (layout.slipstream_family() == Some(SlipstreamLayoutFamily::AeroCl)
+            && layout.tick_spacing == reviewed.tick_spacing)
+            .then_some(reviewed.family)
+    }
+
+    /// The pinned runtime identities (`address → runtime keccak`) of a
+    /// reviewed Aero CL family: pool proxy, CL implementation, factory, swap
+    /// hook, discount registry, MEV-tax module (Base), unstaked-fee module,
+    /// pool tape and gauge proxy/implementation. Empty for the legacy
+    /// families, whose identities are bound through
+    /// [`SlipstreamSwapFeeEvidence`](super::SlipstreamSwapFeeEvidence).
+    pub fn aero_cl_runtime_identities(family: SlipstreamRuntimeFamily) -> Vec<(Address, B256)> {
+        reviewed_aero_cl_runtime(family)
+            .map(reviewed_aero_cl_identities)
+            .unwrap_or_default()
+    }
+
+    /// Check every pinned Aero CL runtime identity of `family` against an
+    /// immutable snapshot. Fails closed with the first missing or mismatched
+    /// runtime hash, so an address-preserving upgrade of any contract on the
+    /// quote path is detected before the snapshot is quoted or replayed.
+    pub fn validate_aero_cl_runtime(
+        family: SlipstreamRuntimeFamily,
+        snapshot: &EvmSnapshot,
+    ) -> Result<(), SlipstreamUnstakedFeeEvaluationError> {
+        let reviewed = reviewed_aero_cl_runtime(family)
+            .ok_or(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)?;
+        if snapshot.chain_id() != reviewed.chain_id {
+            return Err(SlipstreamUnstakedFeeEvaluationError::SnapshotIdentity);
+        }
+        for (address, expected) in reviewed_aero_cl_identities(reviewed) {
+            if snapshot.account_code_hash(address) != Some(expected) {
+                return Err(SlipstreamUnstakedFeeEvaluationError::RuntimeCodeIdentity {
+                    missing: expected,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The block-keyed hook cell `blockFee[pool][block_number]` the Aero swap
+    /// hook reads first on every swap, for a reviewed Aero CL registration.
+    ///
+    /// Cold start cannot warm it (the cache's quote block is not part of the
+    /// registration), so a consumer hydrating an exact-block state plan adds
+    /// this cell for the block it simulates at: zero for a block in which the
+    /// pool has not yet swapped, the stored block fee otherwise.
+    pub fn aero_cl_block_scoped_storage_targets(
+        pool: &PoolRegistration,
+        block_number: u64,
+    ) -> Vec<(Address, U256)> {
+        let Some(reviewed) = pool
+            .key
+            .address()
+            .filter(|_| pool.protocol() == ProtocolId::Slipstream)
+            .and_then(reviewed_aero_cl_runtime_for_pool)
+        else {
+            return Vec::new();
+        };
+        vec![(
+            reviewed.hook,
+            solidity_nested_mapping_key(
+                reviewed.pool,
+                U256::from(block_number),
+                AERO_CL_HOOK_BLOCK_FEE_SLOT,
+            ),
+        )]
+    }
+
+    /// The discount-registry cell `discounts[account]` the Aero swap hook
+    /// consults for `account` (`msg.sender` of the pool's `swap`, and
+    /// `tx.origin` when that sender is a contract such as the Metaquoter or an
+    /// executor), for a reviewed Aero CL registration. Cold start warms the
+    /// Metaquoter's cell; add the executor's and the transaction origin's.
+    pub fn aero_cl_discount_storage_target(
+        pool: &PoolRegistration,
+        account: Address,
+    ) -> Option<(Address, U256)> {
+        let reviewed = pool
+            .key
+            .address()
+            .filter(|_| pool.protocol() == ProtocolId::Slipstream)
+            .and_then(reviewed_aero_cl_runtime_for_pool)?;
+        Some((
+            reviewed.discount_registry,
+            solidity_address_mapping_key(account, AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT),
         ))
     }
 
@@ -1768,7 +2417,7 @@ enum V3Phase {
 enum V3ColdStartExactSurface {
     None,
     CanonicalUniswap,
-    Slipstream,
+    Slipstream(SlipstreamLayoutFamily),
 }
 
 impl UniswapV3ColdStartPlanner {
@@ -1851,8 +2500,11 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                 (self.address, U256::from(2)),
                 (self.address, U256::from(3)),
             ]),
-            V3ColdStartExactSurface::Slipstream => verify.extend(
+            V3ColdStartExactSurface::Slipstream(SlipstreamLayoutFamily::Legacy) => verify.extend(
                 SLIPSTREAM_TRANSITION_GLOBAL_SLOTS.map(|slot| (self.address, U256::from(slot))),
+            ),
+            V3ColdStartExactSurface::Slipstream(SlipstreamLayoutFamily::AeroCl) => verify.extend(
+                AERO_CL_TRANSITION_GLOBAL_SLOTS.map(|slot| (self.address, U256::from(slot))),
             ),
             V3ColdStartExactSurface::None => {}
         }
@@ -1942,12 +2594,17 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                                     self.address,
                                     U256::from(8) + U256::from(observation_index),
                                 )),
-                                V3ColdStartExactSurface::Slipstream => {
+                                V3ColdStartExactSurface::Slipstream(_) => {
                                     let observation_cardinality =
                                         ((slot0 >> 200_usize) & U256::from(u16::MAX)).to::<u16>();
-                                    verify.extend((0..observation_cardinality).map(|index| {
-                                        (self.address, U256::from(20) + U256::from(index))
-                                    }));
+                                    let ring = self
+                                        .layout
+                                        .observations_slot()
+                                        .expect("classified Slipstream layouts derive their ring");
+                                    verify.extend(
+                                        (0..observation_cardinality)
+                                            .map(|index| (self.address, ring + U256::from(index))),
+                                    );
                                 }
                                 V3ColdStartExactSurface::None => unreachable!(),
                             }
@@ -2008,7 +2665,8 @@ impl AdapterColdStartPlanner for UniswapV3ColdStartPlanner {
                             if !(V3_MIN_TICK..=V3_MAX_TICK).contains(&tick_i) {
                                 continue;
                             }
-                            if self.exact_surface == V3ColdStartExactSurface::Slipstream {
+                            if matches!(self.exact_surface, V3ColdStartExactSurface::Slipstream(_))
+                            {
                                 let keys = slipstream_tick_info_storage_keys_with_base(
                                     tick_i,
                                     self.layout.ticks_base_slot,
@@ -2430,7 +3088,7 @@ mod tests {
             SlipstreamRuntimeFamily::AerodromeBaseBifi,
             SlipstreamRuntimeFamily::VelodromeOptimismBifi,
         ] {
-            let reviewed = reviewed_slipstream_fee_runtime(family);
+            let reviewed = reviewed_slipstream_fee_runtime(family).expect("legacy family");
             let pool = PoolRegistration::new(PoolKey::Slipstream(reviewed.pool));
             let adapter = ConcentratedLiquidityAdapter::default();
             let mut expected_code = vec![

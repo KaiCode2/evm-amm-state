@@ -651,8 +651,9 @@ enum HydrationKind {
     V3 {
         /// The pool whose storage the program reads.
         pool: Address,
-        /// The full-sync spec derived from the pool's storage layout.
-        spec: V3SyncSpec,
+        /// The full-sync spec derived from the pool's storage layout (boxed:
+        /// the layout-bearing spec is far larger than a flat read-set).
+        spec: Box<V3SyncSpec>,
     },
     /// Flat-slot one-shot sync for a pool with a known read-set.
     Flat {
@@ -747,7 +748,7 @@ fn hydration_kind(pool: &PoolRegistration) -> Option<HydrationKind> {
     if let Some(spec) = v3_sync_spec(pool) {
         return Some(HydrationKind::V3 {
             pool: address,
-            spec,
+            spec: Box::new(spec),
         });
     }
     // Without the `uniswap-v3` feature the V3 full-sync path is uncompiled, so
@@ -844,9 +845,12 @@ fn fast_metadata_complete(pool: &PoolRegistration) -> bool {
         // Solidly `finish` decodes+merges token0/token1 like V2, so require them
         // here too — otherwise the fast path would leave metadata tokens `None`
         // while the fallback populates them (an inconsistency for consumers that
-        // read `PoolRegistration.metadata`).
+        // read `PoolRegistration.metadata`). An Aero volatile registration
+        // always takes the planner: its `finish` proves the pool identity
+        // (`POOL_TYPE()`) and verifies the reviewed external fee cells.
         ProtocolMetadata::SolidlyV2(m) => {
-            m.token0.is_some()
+            m.variant != super::SolidlyPoolVariant::AeroVolatile
+                && m.token0.is_some()
                 && m.token1.is_some()
                 && m.stable.is_some()
                 && m.storage_layout.is_some()
@@ -1142,6 +1146,7 @@ async fn prepare_verified_code_target<P>(
     address: Address,
     baseline: AmmStatePoint,
     provider: &P,
+    expected_runtime_code_hash: Option<B256>,
 ) -> Result<PreparedAccountValue, PreparedColdStartError>
 where
     P: alloy_provider::Provider<alloy_network::AnyNetwork>,
@@ -1176,6 +1181,11 @@ where
     if actual != proof.code_hash {
         return Err(PreparedColdStartError::CodeProofMismatch { address });
     }
+    // A reviewed identity pins the runtime beyond the proof: the fetched code
+    // must be the reviewed deployment, not merely self-consistent.
+    if expected_runtime_code_hash.is_some_and(|expected| expected != actual) {
+        return Err(PreparedColdStartError::CodeProofMismatch { address });
+    }
     Ok(PreparedAccountValue::new(
         address,
         evm_fork_cache::AccountProof {
@@ -1199,9 +1209,14 @@ pub(crate) async fn prepare_verified_code_targets<P>(
 where
     P: alloy_provider::Provider<alloy_network::AnyNetwork>,
 {
+    let identities = adapter.reviewed_code_identities(pool);
     let mut values = Vec::new();
     for address in adapter.verified_code_targets(pool) {
-        values.push(prepare_verified_code_target(address, baseline, provider).await?);
+        let expected = identities
+            .iter()
+            .find(|(reviewed, _)| *reviewed == address)
+            .map(|(_, hash)| *hash);
+        values.push(prepare_verified_code_target(address, baseline, provider, expected).await?);
     }
     Ok(values)
 }
@@ -1757,6 +1772,14 @@ impl AdapterRegistry {
         }
 
         let outcome = planner.finish(pool, &report);
+        // Reviewed runtime identities already resident in the cache must match
+        // their pins; the synchronous path cannot fetch missing accounts, so an
+        // absent runtime is left to the eager multi-pool path or the prepared
+        // live-runtime path, both of which fetch and then verify it.
+        if let Err(reason) = verify_reviewed_identities(cache, adapter.as_ref(), pool, false) {
+            pool.status = PoolStatus::Degraded;
+            return Ok(ColdStartOutcome::Unsupported(reason));
+        }
         Ok(attach_code_seeds(outcome, code_seed_report))
     }
 
@@ -1995,7 +2018,37 @@ impl AdapterRegistry {
             }
         }
 
-        // Step 7: every slot is now populated (fast success or fallback).
+        // Step 7: reviewed runtime identities. Every pinned runtime a pool
+        // depends on (an Aero pool proxy, CL implementation, factory, hook,
+        // fee module, …) must be resident with exactly the reviewed hash.
+        // Under `Strict`/`Eager` the account is fetched first and must then be
+        // present; otherwise only a resident runtime is checked. A mismatch
+        // (or, when fetched, an absence) fails that pool closed as
+        // `Unsupported` so an address-preserving upgrade is never quoted or
+        // replayed as the reviewed deployment.
+        let fetch_identities = matches!(policy, ColdStartPolicy::Strict | ColdStartPolicy::Eager);
+        for (index, pool) in pools.iter_mut().enumerate() {
+            let Some(adapter) = self.adapter(pool.protocol()) else {
+                continue;
+            };
+            let identities = adapter.reviewed_code_identities(pool);
+            if identities.is_empty() {
+                continue;
+            }
+            if fetch_identities {
+                for (address, _) in &identities {
+                    let _ = cache.ensure_account(*address).await;
+                }
+            }
+            if let Err(reason) =
+                verify_reviewed_identities(cache, adapter.as_ref(), pool, fetch_identities)
+            {
+                pool.status = PoolStatus::Degraded;
+                outcomes[index] = Some(ColdStartOutcome::Unsupported(reason));
+            }
+        }
+
+        // Step 8: every slot is now populated (fast success or fallback).
         Ok(outcomes
             .into_iter()
             .map(|outcome| outcome.expect("every pool is fast-hydrated or fell back"))
@@ -2032,6 +2085,44 @@ impl AdapterRegistry {
         }
         targets
     }
+}
+
+/// The runtime-code hash of an account already resident in the cache, without
+/// a provider read.
+fn resident_code_hash(cache: &mut EvmCache, address: Address) -> Option<B256> {
+    cache
+        .db_mut()
+        .cache
+        .accounts
+        .get(&address)
+        .map(|account| account.info.code_hash)
+}
+
+/// Compare every reviewed runtime identity of `pool` against its pin. A
+/// resident mismatch always fails; an absent runtime fails only when
+/// `require_resident` (the caller fetched the accounts first).
+fn verify_reviewed_identities(
+    cache: &mut EvmCache,
+    adapter: &dyn super::AmmAdapter,
+    pool: &PoolRegistration,
+    require_resident: bool,
+) -> Result<(), UnsupportedReason> {
+    for (address, expected) in adapter.reviewed_code_identities(pool) {
+        match resident_code_hash(cache, address) {
+            Some(actual) if actual != expected => {
+                return Err(UnsupportedReason::Custom(format!(
+                    "reviewed runtime identity mismatch at {address}: expected {expected}, found {actual}"
+                )));
+            }
+            None if require_resident => {
+                return Err(UnsupportedReason::Custom(format!(
+                    "reviewed runtime identity at {address} could not be fetched for verification"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Attach the verified-code-seed results to the [`ColdStartReport`] carried by a

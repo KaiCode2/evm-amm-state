@@ -83,8 +83,8 @@ pub use bytecode::{
     uniswap_v3_max_liquidity_per_tick, uniswap_v3_pool_template, v3_code_seed_from_metadata,
 };
 pub use cache::{
-    AdapterCache, CacheError, CallOutcome, PurgeScope, SkippedDelta, SkippedMask, SlotChange,
-    SlotDelta, StateDiff, StateUpdate, StateView,
+    AdapterCache, CacheError, CallOutcome, CallTxContext, PurgeScope, SkippedDelta, SkippedMask,
+    SlotChange, SlotDelta, StateDiff, StateUpdate, StateView, overlay_call_raw_with_context,
 };
 pub use cold_start::{
     AdapterColdStartPlanner, CodeSeedMismatch, CodeSeedReport, ColdStartCall, ColdStartCallResult,
@@ -147,7 +147,10 @@ pub use runtime::{
     RegistrationProvenance, RegistrationReorgAction, RegistrationSourceKey, RuntimeLifecycleMap,
     RuntimeOwnerId, RuntimeSequenceOverflow, RuntimeWorkId, StatePosition, WorkId,
 };
-pub use sim::{SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from};
+pub use sim::{
+    ExactOutputQuote, SimConfig, SimError, SwapQuote, quote_via_call, quote_via_call_from,
+    quote_via_call_with_config,
+};
 #[cfg(feature = "ingress-timing")]
 pub use snapshot::AmmCanonicalInputTiming;
 pub use snapshot::{
@@ -167,7 +170,7 @@ pub use subscriber_driver::{
 // them unconditionally — `V3StorageLayout` is the field type of the
 // root-exported `V3Metadata.storage_layout`, and gating `SolidlyStorageLayout`
 // on its adapter feature only hid the root path from mixed builds.
-pub use storage::{SolidlyStorageLayout, V3StorageLayout};
+pub use storage::{SlipstreamLayoutFamily, SolidlyStorageLayout, V3StorageLayout};
 pub use storage_sync::{
     CALLDATA_SLOT_LOADER_CODE, StorageSyncEncoding, StorageSyncError, StorageSyncSnapshot,
     StorageSyncSpec, build_calldata_slot_loader_program, build_slot_loader_program,
@@ -183,15 +186,16 @@ pub use sync_manager::{
 pub use traits::AmmAdapter;
 pub use types::{
     AdapterEvent, AdapterEventContext, AdapterEventError, AdapterEventKind, AdapterEventReport,
-    AdapterEventResult, BalancerTokenBalance, BalancerV2Metadata, ColdStartOutcome,
-    ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant, CustomPoolKey, DeferredOutcome,
-    DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolId,
-    ProtocolMetadata, ProtocolMismatch, RepairAction, SlipstreamFeeEvidenceError,
+    AdapterEventResult, AeroVolatileRuntimeFamily, BalancerTokenBalance, BalancerV2Metadata,
+    ColdStartOutcome, ColdStartPolicy, ColdStartReport, CurveMetadata, CurveVariant, CustomPoolKey,
+    DeferredOutcome, DeferredWork, EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus,
+    ProtocolId, ProtocolMetadata, ProtocolMismatch, RepairAction, SlipstreamFeeEvidenceError,
     SlipstreamRuntimeFamily, SlipstreamSnapshotIdentity, SlipstreamSwapFeeEvidence,
     SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError,
-    SlipstreamUnstakedFeeProof, SlipstreamUnstakedFeeProofKind, SolidlyV2Metadata,
-    UniswapV2Metadata, UnsupportedReason, UpdateQuality, V3LiquidityTransitionCapability,
-    V3Metadata, V3SwapTransitionCapability, V3TransitionError,
+    SlipstreamUnstakedFeeProof, SlipstreamUnstakedFeeProofKind, SolidlyPoolVariant,
+    SolidlyV2Metadata, UniswapV2Metadata, UnsupportedReason, UpdateQuality,
+    V3LiquidityTransitionCapability, V3Metadata, V3QuoterKind, V3SwapTransitionCapability,
+    V3TransitionError,
 };
 
 #[cfg(feature = "balancer-v2")]

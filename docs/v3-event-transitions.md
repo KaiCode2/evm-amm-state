@@ -132,7 +132,8 @@ layout similarity.
 | Canonical Uniswap V3 | `Exact` with complete parent/context, for every pricing-state event except `Initialize` | Canonical storage and event semantics are covered by historical traces and local deployed-runtime differential execution, including the `onlyFactoryOwner` paths and the flash callback. |
 | PancakeSwap V3 | `Unsupported` | Its extended event and family-specific fee/oracle/tick behavior require independent deployed-bytecode parity. Canonical semantics are not inferred from similar fields or slots. |
 | Reviewed Base/Optimism Slipstream pools | event-scoped `Exact` for the declared quote/search surface | Deployed proxy and implementation runtimes, historical crossings, generated swap shapes, Mint/Burn state, and provider-disconnected follow-up quotes are differential-tested. Optional runtime-bound evidence covers the stronger swap accounting surface. |
-| Other Slipstream / Aerodrome CL | `Unsupported` | Address, chain, runtime semantics, and layout have not been independently proven. |
+| Reviewed Aero (Dromos) CL pools (Ethereum BIFI, Base mooBIFI) | event-scoped `Exact` for the quote/search surface on the Aero slot layout (`V3StorageLayout::aero_cl`) | Real Ethereum/Base swaps and Base CLM rebalances replay against traced post-state (`tests/fixtures/*aero_cl*.json`) and a live multi-block differential replay. The hook-resolved fee is inferred from the event; no accounting evidence exists for this family. See [Aero families](aero-families.md). |
+| Other Slipstream / Aerodrome / Aero CL | `Unsupported` | Address, chain, runtime semantics, and layout have not been independently proven. |
 
 The checked-in Base and Optimism Slipstream fixtures pin the deployed proxy and
 implementation identities and complete accessed/write sets used by the stronger

@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.1-alpha.7"
+version = "0.3.1-alpha.8"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -384,3 +384,32 @@ required-features = ["uniswap-v2", "uniswap-v3", "curve"]
 [[example]]
 name = "arbitrage_triangular"
 required-features = ["uniswap-v3", "curve"]
+
+# Deterministic Aero (Dromos) CL family coverage: layout classification,
+# capability gating, reviewed identity/warm-cell tables, Metaquoter quotes and
+# exact replay of captured Ethereum/Base transactions.
+[[test]]
+name = "aero_cl_family"
+required-features = ["uniswap-v3"]
+
+# Deterministic Aero volatile Solidly-variant coverage against a mock pool.
+[[test]]
+name = "aero_volatile"
+required-features = ["solidly-v2"]
+
+# Transaction-context (`tx.gasprice` / `tx.origin`) plumbing through the cache
+# facades and the offline overlay helper.
+[[test]]
+name = "sim_tx_context"
+required-features = ["adapters"]
+
+# Live Aero parity (env-gated, #[ignore]): offline Metaquoter / total-fee
+# quotes against hash-pinned `eth_call`s and a multi-block differential
+# replay on Ethereum, Base and Optimism.
+[[test]]
+name = "aero_parity_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]
+
+[[test]]
+name = "aero_replay_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]

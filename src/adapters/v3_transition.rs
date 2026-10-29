@@ -13,7 +13,7 @@
 use alloy_primitives::{Address, U256, address, aliases::U512, b256};
 
 use super::storage::{
-    V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
+    SlipstreamLayoutFamily, V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
 };
 use super::{
@@ -45,6 +45,30 @@ const UNISWAP_V3_SURFACE: SwapStorageSurface = SwapStorageSurface {
     observations_base_slot: U256::from_limbs([8, 0, 0, 0]),
 };
 
+/// Pool-local slot surface of one reviewed Slipstream-family runtime beyond
+/// the four core layout slots. Both families keep `factory` at slot 0 and fee
+/// growth at slots 7/8; they differ in where the observation ring, the reward
+/// accounting and the packed staked-liquidity word live, and in the width of
+/// `lastUpdated` inside that word.
+#[derive(Clone, Copy, Debug)]
+struct SlipstreamSlots {
+    surface: SwapStorageSurface,
+    reward_growth_slot: U256,
+    gauge_fees_slot: U256,
+    /// Legacy runtimes settle gauge rewards from a pool-local `rewardRate` /
+    /// `rewardReserve`; the Aero CL pool settles through its gauge instead,
+    /// so these are `None` there and the reward-accounting replay is
+    /// unavailable.
+    reward_rate_slot: Option<U256>,
+    reward_reserve_slot: Option<U256>,
+    rollover_slot: U256,
+    /// Packed `stakedLiquidity` (low 128) + `lastUpdated` + `tickSpacing`.
+    staked_slot: U256,
+    /// Bit width of `lastUpdated` inside the staked word: `uint32` on legacy
+    /// runtimes, `uint48` on Aero CL. `tickSpacing` follows it.
+    last_updated_bits: usize,
+}
+
 const SLIPSTREAM_SURFACE: SwapStorageSurface = SwapStorageSurface {
     fee_growth_0_slot: U256::from_limbs([7, 0, 0, 0]),
     fee_growth_1_slot: U256::from_limbs([8, 0, 0, 0]),
@@ -54,13 +78,47 @@ const SLIPSTREAM_SURFACE: SwapStorageSurface = SwapStorageSurface {
     observations_base_slot: U256::from_limbs([20, 0, 0, 0]),
 };
 
+const AERO_CL_SURFACE: SwapStorageSurface = SwapStorageSurface {
+    fee_growth_0_slot: U256::from_limbs([7, 0, 0, 0]),
+    fee_growth_1_slot: U256::from_limbs([8, 0, 0, 0]),
+    protocol_fees_slot: U256::ZERO,
+    observations_base_slot: U256::from_limbs([17, 0, 0, 0]),
+};
+
+/// Both families keep the factory address in slot 0.
 const SLIPSTREAM_FACTORY_SLOT: U256 = U256::ZERO;
-const SLIPSTREAM_REWARD_GROWTH_SLOT: U256 = U256::from_limbs([9, 0, 0, 0]);
-const SLIPSTREAM_GAUGE_FEES_SLOT: U256 = U256::from_limbs([10, 0, 0, 0]);
-const SLIPSTREAM_REWARD_RATE_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
-const SLIPSTREAM_REWARD_RESERVE_SLOT: U256 = U256::from_limbs([12, 0, 0, 0]);
-const SLIPSTREAM_ROLLOVER_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
-const SLIPSTREAM_STAKED_LAST_SPACING_SLOT: U256 = U256::from_limbs([15, 0, 0, 0]);
+
+const LEGACY_SLIPSTREAM_SLOTS: SlipstreamSlots = SlipstreamSlots {
+    surface: SLIPSTREAM_SURFACE,
+    reward_growth_slot: U256::from_limbs([9, 0, 0, 0]),
+    gauge_fees_slot: U256::from_limbs([10, 0, 0, 0]),
+    reward_rate_slot: Some(U256::from_limbs([11, 0, 0, 0])),
+    reward_reserve_slot: Some(U256::from_limbs([12, 0, 0, 0])),
+    rollover_slot: U256::from_limbs([14, 0, 0, 0]),
+    staked_slot: U256::from_limbs([15, 0, 0, 0]),
+    last_updated_bits: 32,
+};
+
+/// Aero CL (`new-cl.sol` state order, confirmed by raw slot reads at Ethereum
+/// 26292020 and Base 53205395): `rewardGrowthGlobalX128` 9, `gaugeFees` 10,
+/// `rollover` 11, `stakedLiquidity`/`lastUpdated` (`uint48`)/`tickSpacing` 12.
+const AERO_CL_SLOTS: SlipstreamSlots = SlipstreamSlots {
+    surface: AERO_CL_SURFACE,
+    reward_growth_slot: U256::from_limbs([9, 0, 0, 0]),
+    gauge_fees_slot: U256::from_limbs([10, 0, 0, 0]),
+    reward_rate_slot: None,
+    reward_reserve_slot: None,
+    rollover_slot: U256::from_limbs([11, 0, 0, 0]),
+    staked_slot: U256::from_limbs([12, 0, 0, 0]),
+    last_updated_bits: 48,
+};
+
+const fn slipstream_slots(family: SlipstreamLayoutFamily) -> SlipstreamSlots {
+    match family {
+        SlipstreamLayoutFamily::Legacy => LEGACY_SLIPSTREAM_SLOTS,
+        SlipstreamLayoutFamily::AeroCl => AERO_CL_SLOTS,
+    }
+}
 
 #[cfg(test)]
 const FEE_GROWTH_0_SLOT: U256 = UNISWAP_V3_SURFACE.fee_growth_0_slot;
@@ -267,7 +325,22 @@ struct ReviewedSlipstreamRuntime {
     proxy_runtime_code_hash: alloy_primitives::B256,
     implementation: Address,
     implementation_runtime_code_hash: alloy_primitives::B256,
+    /// The pool's immutable tick spacing; a registration must agree.
+    tick_spacing: i32,
+    /// The storage-layout family the runtime implements; a registration's
+    /// layout must classify as it.
+    layout_family: SlipstreamLayoutFamily,
+    /// Whether `Tick.update` seeds `rewardGrowthOutsideX128` from the global
+    /// accumulator for a newly initialized tick at or below the current tick.
+    initializes_reward_growth_outside: bool,
 }
+
+const ALL_REVIEWED_SLIPSTREAM_FAMILIES: [SlipstreamRuntimeFamily; 4] = [
+    SlipstreamRuntimeFamily::AerodromeBaseBifi,
+    SlipstreamRuntimeFamily::VelodromeOptimismBifi,
+    SlipstreamRuntimeFamily::AeroEthereumBifi,
+    SlipstreamRuntimeFamily::AeroBaseMooBifi,
+];
 
 /// Derive the complete canonical Uniswap V3 swap-induced update batch.
 pub(super) fn derive_uniswap_v3_swap(
@@ -1373,7 +1446,9 @@ pub(super) fn derive_slipstream_liquidity(
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<Vec<StateUpdate>, AdapterEventError> {
-    validate_reviewed_slipstream_event(address, layout, context)?;
+    let family = validate_reviewed_slipstream_event(address, layout, context)?;
+    let reviewed = reviewed_slipstream_runtime(family);
+    let slots = slipstream_slots(reviewed.layout_family);
     if event.tick_lower < -887_272
         || event.tick_upper > 887_272
         || event.tick_lower >= event.tick_upper
@@ -1407,19 +1482,20 @@ pub(super) fn derive_slipstream_liquidity(
 
     let (observation_index, observation_cardinality, oracle_write, oracle_now) = advance_oracle(
         address,
-        SLIPSTREAM_SURFACE,
+        slots.surface,
         slot0,
         active_liquidity,
         state,
         context,
     )?;
-    let fee_growth_0 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_0_slot)?;
-    let fee_growth_1 = required(state, address, SLIPSTREAM_SURFACE.fee_growth_1_slot)?;
-    // The reviewed Optimism runtime initializes rewardGrowthOutside for a new
-    // tick at/below the current tick. The reviewed Base runtime does not; this
-    // is an observed deployed-bytecode semantic difference, not ABI parity.
-    let initial_reward_growth = if context.chain_id == Some(10) {
-        required(state, address, SLIPSTREAM_REWARD_GROWTH_SLOT)?
+    let fee_growth_0 = required(state, address, slots.surface.fee_growth_0_slot)?;
+    let fee_growth_1 = required(state, address, slots.surface.fee_growth_1_slot)?;
+    // The reviewed Optimism runtime and the Aero CL runtime initialize
+    // rewardGrowthOutside for a new tick at/below the current tick. The
+    // reviewed legacy Base runtime does not; this is an observed
+    // deployed-bytecode semantic difference, not ABI parity.
+    let initial_reward_growth = if reviewed.initializes_reward_growth_outside {
+        required(state, address, slots.reward_growth_slot)?
     } else {
         U256::ZERO
     };
@@ -1638,34 +1714,46 @@ fn update_slipstream_liquidity_tick(
     })
 }
 
+/// Validate that `address`/`layout`/`context` name one reviewed Slipstream
+/// family deployment and return it. The registration layout must classify
+/// as that family's storage layout and carry the pool's immutable tick
+/// spacing; the context must name the family's chain and complete lineage.
 pub(super) fn validate_reviewed_slipstream_event(
     address: Address,
     layout: V3StorageLayout,
     context: &AdapterEventContext,
-) -> Result<(), AdapterEventError> {
+) -> Result<SlipstreamRuntimeFamily, AdapterEventError> {
     validate_context(context)?;
-    if layout != V3StorageLayout::slipstream(layout.tick_spacing) {
+    let Some(layout_family) = layout.slipstream_family() else {
         return Err(contradiction(
             "exact Slipstream event transition requires the deployed core storage layout",
         ));
-    }
+    };
     if layout.tick_spacing <= 0 {
         return Err(contradiction("Slipstream tick spacing must be positive"));
     }
-    let reviewed = match context.chain_id {
-        Some(8_453) => reviewed_slipstream_runtime(SlipstreamRuntimeFamily::AerodromeBaseBifi),
-        Some(10) => reviewed_slipstream_runtime(SlipstreamRuntimeFamily::VelodromeOptimismBifi),
-        _ => return Err(contradiction("unreviewed Slipstream chain identity")),
-    };
-    if address != reviewed.pool {
-        return Err(contradiction("unreviewed Slipstream pool identity"));
+    let chain_id = context.chain_id.expect("validated");
+    if !ALL_REVIEWED_SLIPSTREAM_FAMILIES
+        .iter()
+        .any(|family| reviewed_slipstream_runtime(*family).chain_id == chain_id)
+    {
+        return Err(contradiction("unreviewed Slipstream chain identity"));
     }
-    if layout.tick_spacing != 200 {
+    let Some(family) = reviewed_slipstream_family_for(chain_id, address) else {
+        return Err(contradiction("unreviewed Slipstream pool identity"));
+    };
+    let reviewed = reviewed_slipstream_runtime(family);
+    if reviewed.layout_family != layout_family {
+        return Err(contradiction(
+            "registration storage layout does not match the reviewed Slipstream family",
+        ));
+    }
+    if layout.tick_spacing != reviewed.tick_spacing {
         return Err(contradiction(
             "reviewed Slipstream pool tick spacing does not match registration",
         ));
     }
-    Ok(())
+    Ok(family)
 }
 
 pub(super) fn infer_slipstream_swap_fee(
@@ -1685,7 +1773,8 @@ fn derive_slipstream_swap_inner(
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<(Vec<StateUpdate>, u32), AdapterEventError> {
-    validate_reviewed_slipstream_event(address, layout, context)?;
+    let family = validate_reviewed_slipstream_event(address, layout, context)?;
+    let slots = slipstream_slots(reviewed_slipstream_runtime(family).layout_family);
     let evidence = context
         .slipstream_fee_evidence
         .map(|_| validate_slipstream_evidence(address, state, context))
@@ -1705,14 +1794,16 @@ fn derive_slipstream_swap_inner(
     validate_parent_slot0(slot0)?;
     let liquidity_word = required(state, address, layout.liquidity_slot)?;
     let start_liquidity = liquidity_word & WORD_128_MASK;
-    let staked_word = required(state, address, SLIPSTREAM_STAKED_LAST_SPACING_SLOT)?;
+    let staked_word = required(state, address, slots.staked_slot)?;
     let start_staked_liquidity = staked_word & WORD_128_MASK;
     if start_staked_liquidity > start_liquidity {
         return Err(contradiction(
             "parent staked liquidity exceeds active liquidity",
         ));
     }
-    let stored_spacing = signed_from_bits((staked_word >> 160_usize) & SLOT0_TICK_MASK, 24) as i32;
+    let spacing_shift = 128 + slots.last_updated_bits;
+    let stored_spacing =
+        signed_from_bits((staked_word >> spacing_shift) & SLOT0_TICK_MASK, 24) as i32;
     if stored_spacing != layout.tick_spacing {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeEvidence(
@@ -1720,24 +1811,28 @@ fn derive_slipstream_swap_inner(
             ),
         ));
     }
+    // Only the legacy accounting replay (evidence path) consumes
+    // `lastUpdated`; it is a `uint32` there. The Aero CL runtime widens it to
+    // `uint48` but rejects accounting evidence, so the quote-surface path
+    // below preserves the word's upper bits verbatim.
     let mut last_updated = ((staked_word >> 128_usize) & WORD_32_MASK).to::<u32>();
     let mut fee_growth_0 = if evidence.is_some() {
-        required(state, address, SLIPSTREAM_SURFACE.fee_growth_0_slot)?
+        required(state, address, slots.surface.fee_growth_0_slot)?
     } else {
         U256::ZERO
     };
     let mut fee_growth_1 = if evidence.is_some() {
-        required(state, address, SLIPSTREAM_SURFACE.fee_growth_1_slot)?
+        required(state, address, slots.surface.fee_growth_1_slot)?
     } else {
         U256::ZERO
     };
     let mut reward_growth = if evidence.is_some() {
-        required(state, address, SLIPSTREAM_REWARD_GROWTH_SLOT)?
+        required(state, address, slots.reward_growth_slot)?
     } else {
         U256::ZERO
     };
     let mut gauge_fees = if evidence.is_some() {
-        required(state, address, SLIPSTREAM_GAUGE_FEES_SLOT)?
+        required(state, address, slots.gauge_fees_slot)?
     } else {
         U256::ZERO
     };
@@ -1775,7 +1870,7 @@ fn derive_slipstream_swap_inner(
     let (oracle_index, oracle_cardinality, oracle_write, oracle_now) = if slot0.tick != swap.tick {
         advance_oracle(
             address,
-            SLIPSTREAM_SURFACE,
+            slots.surface,
             slot0,
             start_liquidity,
             state,
@@ -2064,11 +2159,7 @@ fn derive_slipstream_swap_inner(
             (liquidity_word & (WORD_128_MASK << 128_usize)) | current_liquidity;
         let mut updates = vec![
             StateUpdate::slot(address, layout.slot0_slot, final_slot0),
-            StateUpdate::slot(
-                address,
-                SLIPSTREAM_STAKED_LAST_SPACING_SLOT,
-                final_staked_word,
-            ),
+            StateUpdate::slot(address, slots.staked_slot, final_staked_word),
             StateUpdate::slot(address, layout.liquidity_slot, final_liquidity_word),
         ];
         if let Some((slot, value)) = oracle_write {
@@ -2102,6 +2193,7 @@ fn derive_slipstream_swap_inner(
             if !rewards_updated {
                 let reward_update = update_slipstream_rewards(
                     address,
+                    slots,
                     reward_growth,
                     segment.staked_liquidity,
                     last_updated,
@@ -2157,9 +2249,9 @@ fn derive_slipstream_swap_inner(
         StateUpdate::slot(
             address,
             if zero_for_one {
-                SLIPSTREAM_SURFACE.fee_growth_0_slot
+                slots.surface.fee_growth_0_slot
             } else {
-                SLIPSTREAM_SURFACE.fee_growth_1_slot
+                slots.surface.fee_growth_1_slot
             },
             if zero_for_one {
                 fee_growth_0
@@ -2167,30 +2259,22 @@ fn derive_slipstream_swap_inner(
                 fee_growth_1
             },
         ),
-        StateUpdate::slot(address, SLIPSTREAM_GAUGE_FEES_SLOT, gauge_fees),
-        StateUpdate::slot(
-            address,
-            SLIPSTREAM_STAKED_LAST_SPACING_SLOT,
-            final_staked_word,
-        ),
+        StateUpdate::slot(address, slots.gauge_fees_slot, gauge_fees),
+        StateUpdate::slot(address, slots.staked_slot, final_staked_word),
         StateUpdate::slot(address, layout.liquidity_slot, final_liquidity_word),
     ];
     if rewards_updated {
         updates.push(StateUpdate::slot(
             address,
-            SLIPSTREAM_REWARD_GROWTH_SLOT,
+            slots.reward_growth_slot,
             reward_growth,
         ));
     }
-    if let Some(value) = reward_reserve_update {
-        updates.push(StateUpdate::slot(
-            address,
-            SLIPSTREAM_REWARD_RESERVE_SLOT,
-            value,
-        ));
+    if let Some((slot, value)) = reward_reserve_update {
+        updates.push(StateUpdate::slot(address, slot, value));
     }
     if let Some(value) = rollover_update {
-        updates.push(StateUpdate::slot(address, SLIPSTREAM_ROLLOVER_SLOT, value));
+        updates.push(StateUpdate::slot(address, slots.rollover_slot, value));
     }
     if let Some((slot, value)) = oracle_write {
         updates.push(StateUpdate::slot(address, slot, value));
@@ -2203,9 +2287,18 @@ fn derive_slipstream_swap_inner(
 struct SlipstreamRewardUpdate {
     reward_growth: U256,
     last_updated: u32,
-    reward_reserve: Option<U256>,
+    /// `(rewardReserve slot, value)` when the reserve moved.
+    reward_reserve: Option<(U256, U256)>,
     rollover: Option<U256>,
 }
+
+/// Shared Aero (Dromos) CL implementation behind every Aero CL pool proxy.
+const AERO_CL_IMPLEMENTATION: Address = address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8");
+const AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH: alloy_primitives::B256 =
+    b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693");
+/// EIP-1167 proxy runtime delegating to [`AERO_CL_IMPLEMENTATION`].
+const AERO_CL_PROXY_RUNTIME_CODE_HASH: alloy_primitives::B256 =
+    b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45");
 
 fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlipstreamRuntime {
     match family {
@@ -2220,6 +2313,9 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             implementation_runtime_code_hash: b256!(
                 "772fb5c610b40a122036f544e5b9b5bce6becb19db9524331289d1aaed2d5888"
             ),
+            tick_spacing: 200,
+            layout_family: SlipstreamLayoutFamily::Legacy,
+            initializes_reward_growth_outside: false,
         },
         SlipstreamRuntimeFamily::VelodromeOptimismBifi => ReviewedSlipstreamRuntime {
             chain_id: 10,
@@ -2232,8 +2328,54 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             implementation_runtime_code_hash: b256!(
                 "36c3da904ca0b58544254cd0d978fe4801c32dc1f9e3b3e644487ef541299794"
             ),
+            tick_spacing: 200,
+            layout_family: SlipstreamLayoutFamily::Legacy,
+            initializes_reward_growth_outside: true,
+        },
+        SlipstreamRuntimeFamily::AeroEthereumBifi => ReviewedSlipstreamRuntime {
+            chain_id: 1,
+            pool: address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1"),
+            factory: address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2"),
+            proxy_runtime_code_hash: AERO_CL_PROXY_RUNTIME_CODE_HASH,
+            implementation: AERO_CL_IMPLEMENTATION,
+            implementation_runtime_code_hash: AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH,
+            tick_spacing: 50,
+            layout_family: SlipstreamLayoutFamily::AeroCl,
+            initializes_reward_growth_outside: true,
+        },
+        SlipstreamRuntimeFamily::AeroBaseMooBifi => ReviewedSlipstreamRuntime {
+            chain_id: 8_453,
+            pool: address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8"),
+            factory: address!("9cb220581b91b0c83223012fe69688b92ad07a76"),
+            proxy_runtime_code_hash: AERO_CL_PROXY_RUNTIME_CODE_HASH,
+            implementation: AERO_CL_IMPLEMENTATION,
+            implementation_runtime_code_hash: AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH,
+            tick_spacing: 100,
+            layout_family: SlipstreamLayoutFamily::AeroCl,
+            initializes_reward_growth_outside: true,
         },
     }
+}
+
+/// The reviewed family deployed at `pool` on `chain_id`, if any.
+pub(super) fn reviewed_slipstream_family_for(
+    chain_id: u64,
+    pool: Address,
+) -> Option<SlipstreamRuntimeFamily> {
+    ALL_REVIEWED_SLIPSTREAM_FAMILIES.into_iter().find(|family| {
+        let reviewed = reviewed_slipstream_runtime(*family);
+        reviewed.chain_id == chain_id && reviewed.pool == pool
+    })
+}
+
+/// The reviewed family deployed at `pool` on any chain, if any. Pool addresses
+/// are distinct across the reviewed families, so this is unambiguous.
+pub(super) fn reviewed_slipstream_family_for_pool(
+    pool: Address,
+) -> Option<SlipstreamRuntimeFamily> {
+    ALL_REVIEWED_SLIPSTREAM_FAMILIES
+        .into_iter()
+        .find(|family| reviewed_slipstream_runtime(*family).pool == pool)
 }
 
 fn validate_slipstream_evidence(
@@ -2462,12 +2604,24 @@ fn maximum_partial_fee(
 
 fn update_slipstream_rewards(
     address: Address,
+    slots: SlipstreamSlots,
     reward_growth: U256,
     staked_liquidity: U256,
     last_updated: u32,
     timestamp: u32,
     state: &dyn StateView,
 ) -> Result<SlipstreamRewardUpdate, AdapterEventError> {
+    let (Some(reserve_slot), Some(rate_slot)) = (slots.reward_reserve_slot, slots.reward_rate_slot)
+    else {
+        // The Aero CL runtime settles rewards through its gauge; the legacy
+        // pool-local reward replay does not describe it. Evidence for that
+        // family is rejected before this point, so this is a defensive guard.
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::SlipstreamFeeEvidence(
+                "reward settlement is not replayable for this Slipstream family",
+            ),
+        ));
+    };
     let delta = timestamp.wrapping_sub(last_updated);
     if delta == 0 {
         return Ok(SlipstreamRewardUpdate {
@@ -2477,7 +2631,7 @@ fn update_slipstream_rewards(
             rollover: None,
         });
     }
-    let reserve = required(state, address, SLIPSTREAM_REWARD_RESERVE_SLOT)?;
+    let reserve = required(state, address, reserve_slot)?;
     if reserve.is_zero() {
         return Ok(SlipstreamRewardUpdate {
             reward_growth,
@@ -2486,22 +2640,22 @@ fn update_slipstream_rewards(
             rollover: None,
         });
     }
-    let rate = required(state, address, SLIPSTREAM_REWARD_RATE_SLOT)?;
+    let rate = required(state, address, rate_slot)?;
     let reward = rate.wrapping_mul(U256::from(delta)).min(reserve);
     let remaining_reserve = reserve - reward;
     if staked_liquidity.is_zero() {
-        let rollover = required(state, address, SLIPSTREAM_ROLLOVER_SLOT)?.wrapping_add(reward);
+        let rollover = required(state, address, slots.rollover_slot)?.wrapping_add(reward);
         Ok(SlipstreamRewardUpdate {
             reward_growth,
             last_updated: timestamp,
-            reward_reserve: Some(remaining_reserve),
+            reward_reserve: Some((reserve_slot, remaining_reserve)),
             rollover: Some(rollover),
         })
     } else {
         Ok(SlipstreamRewardUpdate {
             reward_growth: reward_growth.wrapping_add(mul_div(reward, Q128, staked_liquidity)?),
             last_updated: timestamp,
-            reward_reserve: Some(remaining_reserve),
+            reward_reserve: Some((reserve_slot, remaining_reserve)),
             rollover: None,
         })
     }
