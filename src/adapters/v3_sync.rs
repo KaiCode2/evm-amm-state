@@ -1227,7 +1227,10 @@ mod tests {
             Some(U256::from(17))
         );
         assert_eq!(aero.static_slots[..2], [U256::from(6), U256::from(13)]);
-        assert_eq!(aero.static_slots.len(), 12);
+        assert_eq!(aero.static_slots.len(), 14);
+        // The Metaquoter reads token0/token1; a strict quote needs them.
+        assert!(aero.static_slots.contains(&U256::from(1)));
+        assert!(aero.static_slots.contains(&U256::from(2)));
         assert!(aero.static_slots.contains(&U256::from(12)));
         assert!(aero.static_slots.contains(&U256::from(65_552)));
         assert!(!aero.static_slots.contains(&U256::from(15)));

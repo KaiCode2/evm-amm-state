@@ -7,8 +7,9 @@ Base 53205395
 (`0x82167d8751d4e3731d238bb99c86a45cd84722760cbf77912a8b020dd23a40df`) and
 Optimism 158800699
 (`0x69f98edbc36470a6954f5e1f2522c698666f30cb812775c206c2f6b8869b0666`),
-and is exercised by `tests/aero_parity_rpc.rs` and `tests/aero_replay_rpc.rs`
-(`.github/workflows/live-aero.yml`).
+and is exercised by `tests/aero_parity_rpc.rs`, `tests/aero_replay_rpc.rs`
+(`.github/workflows/live-aero.yml`) and the long-window
+`tests/aero_campaign_rpc.rs` (`scripts/stage10-aero-campaign.sh`).
 
 ## Registering the pools
 
@@ -123,18 +124,20 @@ traces of the Metaquoter quotes):
   cell of the Metaquoter.
 
 Two cells cannot be derived from the registration alone and are exposed as
-helpers for exact-block hydration:
+helpers for exact-block hydration (see [Strict snapshot quotes](#strict-snapshot-quotes)):
 
 - `ConcentratedLiquidityAdapter::aero_cl_block_scoped_storage_targets(pool,
-  block)`: the hook's `blockFee[pool][block]` cell, read first on every swap.
-  It is zero for a block in which the pool has not yet swapped.
+  block)` / `aero_cl_block_scoped_materialization`: the hook's
+  `blockFee[pool][block]` cell, read first on every swap; zero for a block in
+  which the pool has not yet swapped.
 - `ConcentratedLiquidityAdapter::aero_cl_discount_storage_target(pool,
-  account)`: the discount registry's `discounts[account]` cell for the
-  executor and for `tx.origin`.
+  account)`: the discount registry's `discounts[account]` cell for the swap
+  caller and for `tx.origin`.
 
-The pool tape's period-indexed records (slots 4 and 6) and the gauge
-settlement path a tick-crossing swap executes are learned by quote read-set
-warming (`warm_quote_read_sets`) and refreshed by `hydrate_quote_read_sets`.
+The pool tape's period-indexed records and the gauge settlement path a
+tick-crossing swap executes are stubbed out of snapshot quotes
+(`aero_cl_quote_code_overrides`); live-backed caches execute the real
+runtimes and still warm them.
 
 Aero volatile: factory `defaultFee` 5, `feeModule` 7, `mevTaxModule` 13,
 `exactOutFeeQuoter` 14; fee module `customFee[pool]`; MEV module slots 1 and
@@ -161,26 +164,154 @@ quoting at a zero gas price; `EvmCache`, the quote read-set recorder and
 
 ## Event replay
 
-Ordered `Swap`, `Mint`, `Burn` and `Collect` on the reviewed Aero CL pools
-replay exactly on the quote/search surface: slot0, active liquidity, the
-staked-liquidity bound, the observation ring, both boundary ticks (six words)
-and their bitmap words. `tests/fixtures/*aero_cl*.json` replay real
-transactions, including nineteen-event CLM rebalances, against the chain's
-post-state.
+Ordered `Swap`, `Mint`, `Burn`, `Collect`, `CollectFees` and
+`IncreaseObservationCardinalityNext` on the reviewed Aero CL pools replay
+exactly on the quote/search surface: slot0, active liquidity, the
+staked-liquidity bound, the observation ring (including reservation growth),
+both boundary ticks (six words) and their bitmap words, and the packed
+`gaugeFees` word after a gauge fee claim. `tests/fixtures/*aero_cl*.json`
+replay real transactions, including nineteen-event CLM rebalances and the
+gauge flows below, against the chain's post-state.
+
+### Gauge staking
+
+The pool emits nothing when the gauge stakes or unstakes a position. The
+reviewed Aero gauges (`0x0eE89BDf…` Ethereum, `0x84C029F2…` Base) and the
+shared NonfungiblePositionManager `0x4857db57…` (pinned per chain) jointly
+attest every staking transition, exactly as the legacy Optimism module does:
+
+- `Deposit(sender, owner, tokenId, liquidityToStake)` applies at the gauge
+  event; `Withdraw(sender, account, tokenId, liquidityToStake)` applies at
+  the NFT `Transfer(gauge → sender, tokenId)` that precedes it, so a receiver
+  callback cannot swap against stale staked state. The range comes from the
+  pool `Collect` the gauge's `nft.collect` emitted two logs before the
+  manager's `Collect(tokenId, …)` (owner = manager on deposit, gauge on
+  withdrawal); the custody transfer and the collect recipient must agree
+  with the gauge event. Ambiguity inside a transaction invalidates its proofs
+  and the event fails closed into a repair.
+- Settlements are events of their own. Every `GaugeSettled(cumulative,
+  delta)` the gauge emits is the pool's `_settleToBlock` at that log: `delta`
+  is credited to `rewardGrowthGlobalX128` per unit of the liquidity staked at
+  that moment (or banked into `rollover` with nothing staked),
+  `secondsPerStakedLiquidityCumulativeX128` advances by the elapsed seconds
+  per staked unit and `lastUpdated` (`uint48`) becomes the block timestamp.
+  A `stake` in range, a tick-crossing swap, an emission claim
+  (`claimEmissions`, the claim step of every withdrawal) and `forfeitRollover`
+  all settle this way; the last three run `pool.settleToBlock()`, which also
+  clears `rollover`, so a `GaugeSettled` that no deposit window or following
+  `Swap` claims is applied with `rollover = 0`. A claim whose gauge accrued
+  nothing emits no `GaugeSettled` but still settles silently and clears
+  `rollover`: the emission-claim logs (`EmissionsClaimed`,
+  `EmissionsDeferred`, `ReferralEmissionsDeferred`,
+  `DeferredEmissionsClaimed`) carry that transition. Stakes themselves settle
+  silently (a withdrawal unconditionally, a deposit when in range); a block
+  that already settled changes nothing.
+- The staked word (slot 12), both ticks' `stakedLiquidityNet` (word 1),
+  slot 9, slot 11 and slot 65552 are therefore exact after every rebalance
+  and claim without a repair (`tests/fixtures/base_aero_cl_gauge_rebalance.json`,
+  `ethereum_aero_cl_gauge_{deposit,withdraw}.json`).
+
+Live subscriptions (`event_sources`) include the gauge's `Deposit`,
+`Withdraw`, `GaugeSettled` and emission-claim events and the manager's
+`Transfer` from the gauge; the complete-block driver fetches the manager's
+`Transfer` / `Collect` logs for the staked token ids. Historical replay builds
+the same evidence from a block's ordered logs with
+`SlipstreamStakingBatch::from_block_logs`. `EmergencyWithdraw` (never
+observed) has no evidence and fails closed through the custody transfer; a
+claim that accrued nothing and emitted no claim event settles the pool
+unobservably (measured: none in the campaign windows).
+
+### Swap accounting (fee evidence)
+
+With `SlipstreamSwapFeeEvidence` for an Aero family the swap transition also
+reproduces the accounting writes: `feeGrowthGlobal0/1X128` and the packed
+`gaugeFees` word from the event-derived effective fee split by the exact
+unstaked fee, and on a tick-crossing swap the silent settlement (the
+`GaugeSettled` a crossing swap pulls is applied at its own, earlier log, so
+`gauge_settlement_delta` stays zero whenever gauge logs are routed; a consumer
+that does not route them passes the transaction's delta instead) followed by
+the six words of every crossed tick.
+`evaluate_slipstream_unstaked_fee` evaluates `pool.unstakedFee()` /
+`factory.getUnstakedFee(pool)` on the exact parent snapshot with the pinned
+identities (Ethereum: the wired module's `customFee[pool]`, 0 at the pins;
+Base: the factory default, 5%), and `infer_slipstream_swap_fee` derives the
+effective fee from the event. Fee evidence is optional: without it the
+quote/search surface is still exact and only the accounting words drift.
+
+### Governance
+
+Configuration the quote path reads is replayed from the setters' events
+(`AdapterEventKind::Unknown`, exact writes, confirmed against every event the
+contracts emitted since deployment on both chains):
+
+| emitter | event | effect |
+| --- | --- | --- |
+| hook | `CustomFeeSet(pool, uint24)`, `FeeCapSet(pool, uint256)`, `ScalingFactorSet(pool, uint256)` | `dynamicFeeConfig[pool]` bits 0..24, 24..48, 48..112 (packing confirmed on live pools) |
+| hook | `DefaultScalingFactorSet`, `DefaultFeeCapSet`, `SecondsAgoSet`, `RecordCallGasLimitSet` | slots 0, 1, 2 bits 0..32, 2 bits 32..64 |
+| hook | `InitialFeeSet`, `InitialFeeDisabled`, `DynamicFeeReset` | unconfirmed packing: `dynamicFeeConfig[pool]` is purged and verified |
+| hook | `MevTaxModuleSet` | re-setting the reviewed module is exact; any other module purges the pool (re-review) |
+| MEV module | `MultiplierSet(uint64)`, `MinThresholdSet(uint96)`, `BaseFeeFactorSet(uint96)` | slot 1 bits 160..224, slot 2 bits 0..96, slot 2 bits 96..192 (confirmed by state-override calls) |
+| factory | `TickSpacingEnabled(spacing, fee)`, `DefaultUnstakedFeeChanged`, `SwapFeeManagerChanged` | `tickSpacingToFee[spacing]`, slot 11 bits 160..184, slot 11 bits 0..160 |
+| factory | `DefaultSwapHookChanged`, `PoolSwapHookChanged(pool)`, `UnstakedFeeModuleChanged`, `DiscountRegistryChanged`, `ClPoolTapeChanged` | a reviewed runtime binding changed: the pool is purged and its next cold start re-checks identities |
+| discount registry | `DiscountSet(account, uint24)`, `PoolDiscountSet(pool, account, uint24)`, `0xc5dba97f…` | the named accounts' `discounts[account]` cells are purged and verified |
+| unstaked-fee module (Ethereum) | `CustomFeeSet(pool, uint24)` | `customFee[pool]` is purged and verified |
+
+Hook events carry the pool as `topic1`; setters for other pools never route
+to a reviewed registration.
+
+## Strict snapshot quotes
+
+A Metaquoter quote over an immutable snapshot (no provider, no lazy fetch)
+resolves every read locally when the snapshot holds, besides the cold-start
+state above:
+
+- the pool tape and the pool's gauge are replaced by a zero-returning stub
+  (`aero_cl_quote_code_overrides`): neither can change the quoted amounts
+  (`record` return data is discarded; `settleGauge` only feeds reward
+  accounting), so their period-indexed / settlement cells are not read;
+- `blockFee[pool][height]` for the simulated height
+  (`aero_cl_block_scoped_storage_targets`): zero before the pool's first swap
+  of that block (`aero_cl_block_scoped_materialization`), otherwise the hook's
+  stored first-swap fee `min(baseFee + dynamic, feeCap)`, which must be
+  hydrated from the chain when quoting inside a block that already swapped;
+- `discounts[msg.sender]` and `discounts[tx.origin]` on the discount registry
+  (`aero_cl_discount_storage_target`): the hook applies the registry's
+  discount for the swap caller (the Metaquoter, warmed) and for the
+  transaction origin;
+- the account headers of `tx.origin`, the block's coinbase and the path
+  tokens (cold start warms the tokens; `EvmCache::ensure_account` the rest).
+
+`tests/aero_campaign_rpc.rs` measures this: at every check block the quote
+runs on such a snapshot and every missing cell is reported by contract and
+slot.
+
+## Replay campaign
+
+`scripts/stage10-aero-campaign.sh` (`tests/aero_campaign_rpc.rs`) replays
+long windows (Ethereum 20 000 blocks, Base and Optimism 100 000 blocks by
+default, ending near head) through the driver with staking and fee evidence
+built from the chain's logs, and at every event block, the block after it,
+every `AERO_CAMPAIGN_STRIDE`-th block (default 100) and the window end:
+
+- reads the complete quote-relevant pool state with one `eth_call` storage
+  program (statics, every bitmap word, all six words of every initialized
+  tick, the whole observation ring) plus the reviewed external cells and
+  classifies every divergent cell;
+- quotes both directions and exact output at 1 and 5 mooBIFI-equivalent
+  under tips 0 and 1 gwei (Optimism: 10 000 001 wei, 1.05 and 1.1 gwei) on
+  the strict snapshot, wei-exact against `eth_call` at that block, and once
+  per check block with a synthetic non-zero scaling factor (state override on
+  both sides) so the hook's `observe`-based dynamic fee is exercised;
+- counts adapter repairs, evidence failures, campaign re-syncs by cause and
+  the `blockFee` hydration outcome, and writes `aero-campaign-<chain>.{json,md}`
+  under `AERO_CAMPAIGN_REPORT_DIR`.
 
 ## Known gaps
 
-- Gauge `stake` / `unstake` emit no pool event. After a staked position is
-  burned, the cached `stakedLiquidity` and the ticks' `stakedLiquidityNet`
-  stay stale until a swap replay observes `stakedLiquidity > liquidity` and
-  fails closed into a repair. The Base pool is almost fully staked, so each
-  CLM rebalance costs one repair; Ethereum (0.2% staked) is unaffected. Aero
-  gauge staking evidence (the counterpart of the Optimism legacy module) is a
-  follow-up.
-- No runtime-bound accounting evidence: fee growth, gauge fees, reward growth,
-  `lastUpdated`, `secondsPerStakedLiquidityCumulativeX128` and crossed-tick
-  outside accumulators are not reproduced (they do not affect quotes).
 - The Optimism Aero CL deployment (USDC pool, hook `0x3064a620…`) and the
   Aero factories' discovery (`getPool`) are not reviewed in this release.
-- `blockFee[pool][block]` and the tape's period-indexed cells are not part of
-  cold start; see the helpers and read-set warming above.
+- `EmergencyWithdraw`, the hook's initial-fee setters and dynamic-fee reset,
+  and discount-registry writes have no confirmed packing: they fail closed
+  into a verify/purge of the affected cells instead of an exact write.
+- `blockFee[pool][height]` inside a block that already swapped is hydrated,
+  not derived.

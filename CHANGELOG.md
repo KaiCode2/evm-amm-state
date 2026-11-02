@@ -63,17 +63,61 @@ cells and the gaps that remain.
   paths, and the live `aero_parity_rpc` / `aero_replay_rpc` gates (new
   `live-aero.yml` workflow) pinned to Ethereum 26292020, Base 53205395 and
   Optimism 158800699.
+- Aero gauge staking evidence: the reviewed Aero gauges and the pinned
+  NonfungiblePositionManager attest `Deposit` / `Withdraw` (range from the
+  preceding pool `Collect`, delta from the event, withdrawals applied at the
+  custody transfer) and every pool settlement the gauge performs: each
+  `GaugeSettled` is an exact settlement event (`rewardGrowthGlobalX128` /
+  `rollover`, the staked-seconds accumulator, the `uint48 lastUpdated`,
+  `rollover` cleared when it ran through `settleToBlock()`), emission claims
+  settle silently, and stakes settle silently before moving staked
+  liquidity, so the staked word, `stakedLiquidityNet` and the reward
+  accounting stay exact without repairs.
+  `SlipstreamStakingBatch::from_block_logs` builds the same evidence from a
+  block's ordered logs; `StakingBlockRef` names the block.
+- Swap accounting for the Aero families: `SlipstreamSwapFeeEvidence` accepts
+  `AeroEthereumBifi` / `AeroBaseMooBifi` with their pinned identities and a
+  `gauge_settlement_delta` (`with_gauge_settlement_delta`), the offline
+  unstaked-fee evaluators run `pool.unstakedFee()` / `factory.getUnstakedFee`
+  on the exact parent snapshot, and the swap transition reproduces fee growth,
+  gauge fees, the gauge settlement on a crossing swap and every crossed
+  tick's six words. `SlipstreamFeeEvidenceError::SettlementDelta` rejects a
+  delta on a legacy family.
+- Exact Slipstream / Aero `CollectFees` (gauge fee claims leave one wei per
+  token) and `IncreaseObservationCardinalityNext` (ring reservation growth)
+  transitions; both topics are subscribed for Slipstream registrations.
+- Event-driven Aero governance (`aero_governance`): hook per-pool and default
+  setters, MEV-module setters and factory fee cells become exact packed
+  writes (packings confirmed against live pools and state-override calls);
+  runtime rebinding (hook, MEV module, tape, registry, unstaked-fee module)
+  purges the pool for re-review; unconfirmed setters and discount-registry
+  writes purge and verify the affected cells. Setters for other pools never
+  route to a reviewed registration.
+- Snapshot Metaquoter quotes stub the pool tape and the pool's gauge
+  (`ConcentratedLiquidityAdapter::aero_cl_quote_code_overrides`): neither can
+  change a quoted amount, and their period-indexed / settlement cells leave
+  the strict read set. The Aero sync statics now include `token0` / `token1`,
+  cold start warms the path tokens' account headers, and
+  `aero_cl_block_scoped_materialization` writes the zero `blockFee` cell for a
+  not-yet-swapped block.
+- `tests/aero_campaign_rpc.rs` / `scripts/stage10-aero-campaign.sh`: the
+  long-window exact replay and strict-quote campaign (full-state comparison
+  at every event and stride block, wei-exact quotes against `eth_call`
+  including a synthetic non-zero scaling factor, per-chain JSON/Markdown
+  reports), plus real-transaction fixtures for the Base gauge rebalance, the
+  Ethereum gauge deposit / withdrawal and a gauge fee claim.
 
 ### Changed
 
 - Registration archives persist `observations_slot`, `quoter_kind` and the
   Solidly `variant` only when set, so existing archives remain byte-identical
   and older readers keep loading them.
-- The Aero CL families reject `SlipstreamSwapFeeEvidence`
-  (`SlipstreamFeeEvidenceError::UnsupportedFamily`) and the offline unstaked-fee
-  evaluator (`SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily`): their
-  fee is resolved by the deployed hook inside the quote, and their reward
-  accounting settles through the gauge.
+- `SlipstreamSwapFeeEvidence` carries `gauge_settlement_delta` (zero from
+  `new`; legacy families must keep it zero) and the Aero families are no
+  longer rejected by `validate` or the offline unstaked-fee evaluators.
+- The reviewed Aero cold start also pins the NonfungiblePositionManager
+  runtime (per-chain hash) and subscribes the gauge, manager, hook, factory,
+  discount-registry and MEV-module sources above.
 
 ## [0.3.1-alpha.7] - Release candidate
 

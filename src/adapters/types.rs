@@ -395,6 +395,14 @@ pub struct SlipstreamSwapFeeEvidence {
     pub effective_unstaked_fee: u32,
     /// Provider-free proof for the effective unstaked-liquidity fee.
     pub unstaked_fee_proof: SlipstreamUnstakedFeeProof,
+    /// Aero CL only: the emissions the pool's gauge settled into the pool
+    /// inside this event's transaction (`GaugeSettled.delta` emitted by the
+    /// gauge before this log and after any earlier pool event of the same
+    /// transaction), zero when the gauge emitted none. A crossing swap settles
+    /// the pool to its block before crossing; the delta credits
+    /// `rewardGrowthGlobalX128` (or `rollover` with nothing staked). The
+    /// legacy families settle from pool-local state and require zero.
+    pub gauge_settlement_delta: U256,
     /// Exact block containing the event.
     pub block_number: u64,
     /// Exact block identity containing the event.
@@ -428,6 +436,9 @@ pub enum SlipstreamFeeEvidenceError {
     /// so their accounting surface is not reproducible from pool state alone;
     /// they remain exact on the quote/search surface without evidence.
     UnsupportedFamily,
+    /// A gauge settlement delta on a family whose rewards settle from
+    /// pool-local state (only the Aero CL families carry one).
+    SettlementDelta,
 }
 
 impl fmt::Display for SlipstreamFeeEvidenceError {
@@ -439,6 +450,10 @@ impl fmt::Display for SlipstreamFeeEvidenceError {
             Self::UnstakedFeeProofMismatch => {
                 write!(f, "Slipstream unstaked fee does not match its proof")
             }
+            Self::SettlementDelta => write!(
+                f,
+                "gauge settlement delta on a Slipstream family that settles rewards from pool state"
+            ),
             Self::UnsupportedFamily => {
                 write!(
                     f,
@@ -484,6 +499,7 @@ impl SlipstreamSwapFeeEvidence {
             effective_swap_fee,
             effective_unstaked_fee,
             unstaked_fee_proof,
+            gauge_settlement_delta: U256::ZERO,
             block_number,
             block_hash,
             parent_hash,
@@ -496,15 +512,25 @@ impl SlipstreamSwapFeeEvidence {
         Ok(evidence)
     }
 
+    /// Set the Aero CL gauge settlement delta of this event's transaction and
+    /// revalidate the record (see [`Self::gauge_settlement_delta`]).
+    pub fn with_gauge_settlement_delta(
+        mut self,
+        delta: U256,
+    ) -> Result<Self, SlipstreamFeeEvidenceError> {
+        self.gauge_settlement_delta = delta;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Revalidate a retained or deserialized evidence value.
     ///
-    /// The Aero CL families reject every evidence value with
-    /// [`SlipstreamFeeEvidenceError::UnsupportedFamily`]: their quote/search
-    /// surface is exact without evidence, and their fee/reward accounting is
-    /// not reproducible from pool state.
+    /// Every reviewed family is accepted with its own pinned identities. The
+    /// Aero CL families additionally carry the gauge settlement delta of the
+    /// event's transaction; the legacy families must carry zero.
     pub fn validate(self) -> Result<(), SlipstreamFeeEvidenceError> {
-        if self.runtime_family.is_aero_cl() {
-            return Err(SlipstreamFeeEvidenceError::UnsupportedFamily);
+        if !self.runtime_family.is_aero_cl() && !self.gauge_settlement_delta.is_zero() {
+            return Err(SlipstreamFeeEvidenceError::SettlementDelta);
         }
         let identity_matches = match self.runtime_family {
             SlipstreamRuntimeFamily::AerodromeBaseBifi => {
@@ -527,8 +553,26 @@ impl SlipstreamSwapFeeEvidence {
                     && self.implementation_runtime_code_hash
                         == b256!("36c3da904ca0b58544254cd0d978fe4801c32dc1f9e3b3e644487ef541299794")
             }
-            SlipstreamRuntimeFamily::AeroEthereumBifi
-            | SlipstreamRuntimeFamily::AeroBaseMooBifi => false,
+            SlipstreamRuntimeFamily::AeroEthereumBifi => {
+                self.chain_id == 1
+                    && self.pool == address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1")
+                    && self.factory == address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2")
+                    && self.proxy_runtime_code_hash
+                        == b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45")
+                    && self.implementation == address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8")
+                    && self.implementation_runtime_code_hash
+                        == b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693")
+            }
+            SlipstreamRuntimeFamily::AeroBaseMooBifi => {
+                self.chain_id == 8_453
+                    && self.pool == address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8")
+                    && self.factory == address!("9cb220581b91b0c83223012fe69688b92ad07a76")
+                    && self.proxy_runtime_code_hash
+                        == b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45")
+                    && self.implementation == address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8")
+                    && self.implementation_runtime_code_hash
+                        == b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693")
+            }
         };
         if !identity_matches {
             return Err(SlipstreamFeeEvidenceError::RuntimeIdentity);

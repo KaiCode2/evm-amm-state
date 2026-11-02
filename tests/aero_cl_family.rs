@@ -242,9 +242,7 @@ fn aero_families_pin_their_identities() {
 }
 
 #[test]
-fn aero_evidence_fails_closed_everywhere() {
-    // Build evidence for a legacy family (the only way to obtain a proof), then
-    // check that re-labelling it as an Aero family is rejected at every gate.
+fn aero_evidence_binds_its_own_identities_and_settlement() {
     let identity = SlipstreamSnapshotIdentity::new(
         8_453,
         1_000,
@@ -256,8 +254,44 @@ fn aero_evidence_fails_closed_everywhere() {
         7,
     )
     .expect("complete identity");
-    let proof = evidence_proof_for_tests(identity);
-    let evidence = SlipstreamSwapFeeEvidence::new(
+    let proof = aero_proof_for_tests(SlipstreamRuntimeFamily::AeroBaseMooBifi, identity);
+    let build = |factory: Address| {
+        SlipstreamSwapFeeEvidence::new(
+            SlipstreamRuntimeFamily::AeroBaseMooBifi,
+            8_453,
+            BASE_POOL,
+            factory,
+            b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"),
+            address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
+            b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"),
+            10_000,
+            0,
+            proof,
+            1_000,
+            BLOCK_HASH,
+            PARENT_HASH,
+            1_792_000_000,
+            TX_HASH,
+            3,
+            7,
+        )
+    };
+    // The reviewed Base factory is accepted; the legacy Base factory is not.
+    let evidence =
+        build(address!("9cb220581b91b0c83223012fe69688b92ad07a76")).expect("aero evidence");
+    assert_eq!(evidence.gauge_settlement_delta, U256::ZERO);
+    assert_eq!(
+        build(address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a")).map(|_| ()),
+        Err(SlipstreamFeeEvidenceError::RuntimeIdentity)
+    );
+    // Aero evidence carries the transaction's gauge settlement.
+    let settled = evidence
+        .with_gauge_settlement_delta(U256::from(5))
+        .expect("aero settlement");
+    assert_eq!(settled.gauge_settlement_delta, U256::from(5));
+    // A legacy family's proof cannot label Aero evidence.
+    let legacy_proof = evidence_proof_for_tests(identity);
+    let mislabelled = SlipstreamSwapFeeEvidence::new(
         SlipstreamRuntimeFamily::AeroBaseMooBifi,
         8_453,
         BASE_POOL,
@@ -267,7 +301,7 @@ fn aero_evidence_fails_closed_everywhere() {
         b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"),
         10_000,
         0,
-        proof,
+        legacy_proof,
         1_000,
         BLOCK_HASH,
         PARENT_HASH,
@@ -277,9 +311,37 @@ fn aero_evidence_fails_closed_everywhere() {
         7,
     );
     assert_eq!(
-        evidence.map(|_| ()),
-        Err(SlipstreamFeeEvidenceError::UnsupportedFamily)
+        mislabelled.map(|_| ()),
+        Err(SlipstreamFeeEvidenceError::RuntimeIdentity)
     );
+    // Legacy families settle from pool-local state: no settlement delta.
+    let legacy = SlipstreamSwapFeeEvidence::new(
+        SlipstreamRuntimeFamily::AerodromeBaseBifi,
+        8_453,
+        LEGACY_BASE_POOL,
+        address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"),
+        b256!("acd6710f7037ad095b1e4d5f8ee5b2681069cb4dd316e77e4e0cb8f85716a2a1"),
+        address!("ec8e5342b19977b4ef8892e02d8daecfa1315831"),
+        b256!("772fb5c610b40a122036f544e5b9b5bce6becb19db9524331289d1aaed2d5888"),
+        10_000,
+        0,
+        evidence_proof_for_tests(identity),
+        1_000,
+        BLOCK_HASH,
+        PARENT_HASH,
+        1_792_000_000,
+        TX_HASH,
+        3,
+        7,
+    )
+    .expect("legacy evidence");
+    assert_eq!(
+        legacy
+            .with_gauge_settlement_delta(U256::from(1))
+            .map(|_| ()),
+        Err(SlipstreamFeeEvidenceError::SettlementDelta)
+    );
+    // The unstaked-fee evaluators bind to an exact-lineage snapshot.
     let snapshot_cache = offline_cache(8_453);
     assert_eq!(
         ConcentratedLiquidityAdapter::evaluate_slipstream_unstaked_fee(
@@ -289,7 +351,7 @@ fn aero_evidence_fails_closed_everywhere() {
             &full_context(8_453),
         )
         .map(|_| ()),
-        Err(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)
+        Err(SlipstreamUnstakedFeeEvaluationError::SnapshotIdentity)
     );
     assert_eq!(
         ConcentratedLiquidityAdapter::evaluate_slipstream_all_staked_candidate(
@@ -299,8 +361,58 @@ fn aero_evidence_fails_closed_everywhere() {
             &full_context(8_453),
         )
         .map(|_| ()),
-        Err(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)
+        Err(SlipstreamUnstakedFeeEvaluationError::SnapshotIdentity)
     );
+}
+
+/// An Aero all-staked attestation over a snapshot carrying the pinned pool
+/// proxy and implementation identities at the exact lineage.
+fn aero_proof_for_tests(
+    family: SlipstreamRuntimeFamily,
+    identity: SlipstreamSnapshotIdentity,
+) -> SlipstreamUnstakedFeeProof {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+        let mut cache = EvmCache::new(Arc::new(provider)).await;
+        cache.set_chain_id(8_453);
+        cache.set_block(alloy_eips::BlockId::from((BLOCK_HASH, Some(true))));
+        cache.set_timestamp(Some(1_792_000_000));
+        cache.set_block_context(Some(1_000), Some(0));
+        cache
+            .db_mut()
+            .cache
+            .block_hashes
+            .insert(U256::from(999_u64), PARENT_HASH);
+        for (address, hash) in [
+            (
+                BASE_POOL,
+                b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"),
+            ),
+            (
+                address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
+                b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"),
+            ),
+        ] {
+            cache.db_mut().insert_account_info(
+                address,
+                AccountInfo {
+                    code_hash: hash,
+                    ..Default::default()
+                },
+            );
+        }
+        ConcentratedLiquidityAdapter::evaluate_slipstream_all_staked_candidate(
+            family,
+            cache.snapshot(),
+            identity,
+            &full_context(8_453),
+        )
+        .expect("aero all-staked candidate")
+        .proof()
+    })
 }
 
 /// A legacy all-staked attestation, obtained the only way the crate allows:
@@ -1079,4 +1191,403 @@ fn base_aero_swap_then_rebalance_replays_exactly() {
         include_str!("fixtures/base_aero_cl_swap_rebalance.json"),
         Surface::Liquidity,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Gauge staking (`evm-amm-state-aero-historical-v2` fixtures: every pool,
+// gauge and NFT-manager log of one real transaction, in receipt order)
+// ---------------------------------------------------------------------------
+
+const AERO_IMPLEMENTATION: Address = address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8");
+const AERO_GAUGE_IMPLEMENTATION: Address = address!("89e91a960154b1ed6c093039a8f0725ab67d14e0");
+const AERO_NFT: Address = address!("4857db576ee0e45f10525ec59527bfd10beec60b");
+const ETH_GAUGE: Address = address!("0ee89bdfd62e3a5325416fb93c0f1601474a5b04");
+const BASE_GAUGE: Address = address!("84c029f26652d37bc153c39deb8767ec54037334");
+
+fn aero_staking_identities(chain_id: u64) -> Vec<(Address, B256)> {
+    let (pool, gauge, nft_hash) = if chain_id == 1 {
+        (
+            ETH_POOL,
+            ETH_GAUGE,
+            b256!("0e52c540913f0de73b9063379637246c59eff6e75ebad5ad7ed23f0bd591ab04"),
+        )
+    } else {
+        (
+            BASE_POOL,
+            BASE_GAUGE,
+            b256!("b2d0d8278354542651e2db288b71292635d9fd7bd28784f736373da801974599"),
+        )
+    };
+    vec![
+        (
+            pool,
+            b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"),
+        ),
+        (
+            AERO_IMPLEMENTATION,
+            b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"),
+        ),
+        (
+            gauge,
+            b256!("b03fb822ffeb7154c5d94f0206d76b417f4f97b2b0a744e07e289cfb5fd0c639"),
+        ),
+        (
+            AERO_GAUGE_IMPLEMENTATION,
+            b256!("fdb516e0cf5b1c3f42789c4d7607a16e16b0ae5e73894e21e52a29c93b1ecee3"),
+        ),
+        (AERO_NFT, nft_hash),
+    ]
+}
+
+/// A snapshot-bearing cache with the reviewed runtime identities and the
+/// fixture's parent pool storage, backed by a provider that must never be
+/// reached.
+async fn snapshot_cache(chain_id: u64, state: &FixtureState) -> EvmCache {
+    let asserter = Asserter::new();
+    let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(asserter.clone()));
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
+    cache.set_chain_id(chain_id);
+    for (address, hash) in aero_staking_identities(chain_id) {
+        cache.db_mut().insert_account_info(
+            address,
+            AccountInfo {
+                code_hash: hash,
+                ..Default::default()
+            },
+        );
+    }
+    asserter.push_failure_msg("staking evidence must not access the provider");
+    let updates: Vec<evm_fork_cache::StateUpdate> = state
+        .0
+        .iter()
+        .map(|((address, slot), value)| evm_fork_cache::StateUpdate::slot(*address, *slot, *value))
+        .collect();
+    cache.apply_updates(&updates);
+    cache
+}
+
+fn fixture_v2_logs(fixture: &Value) -> Vec<alloy_rpc_types_eth::Log> {
+    let reference = &fixture["reference"];
+    fixture["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let topics = entry["topics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|topic| B256::from_str(topic.as_str().unwrap()).unwrap())
+                .collect();
+            let data = Bytes::from(
+                hex::decode(entry["data"].as_str().unwrap().trim_start_matches("0x")).unwrap(),
+            );
+            let address = Address::from_str(entry["address"].as_str().unwrap()).unwrap();
+            alloy_rpc_types_eth::Log {
+                inner: Log::new(address, topics, data).expect("valid fixture log"),
+                block_hash: Some(
+                    B256::from_str(reference["block_hash"].as_str().unwrap()).unwrap(),
+                ),
+                block_number: Some(reference["block_number"].as_u64().unwrap()),
+                block_timestamp: Some(reference["block_timestamp"].as_u64().unwrap()),
+                transaction_hash: Some(
+                    B256::from_str(reference["transaction_hash"].as_str().unwrap()).unwrap(),
+                ),
+                transaction_index: Some(reference["transaction_index"].as_u64().unwrap()),
+                log_index: Some(entry["log_index"].as_u64().unwrap()),
+                removed: false,
+            }
+        })
+        .collect()
+}
+
+fn topic_tick(topic: &str) -> i32 {
+    let raw = U256::from_str(topic).unwrap();
+    let low = (raw & U256::from(0x00ff_ffff_u32)).to::<u32>();
+    if low & 0x0080_0000 != 0 {
+        (low | 0xff00_0000) as i32
+    } else {
+        low as i32
+    }
+}
+
+/// Replay every log of a v2 fixture through the adapter with transaction-local
+/// staking evidence and compare the staking/settlement surface, the quote
+/// surface and the named ticks' first two words against the on-chain
+/// post-state. Returns the number of gauge stake transitions applied.
+async fn replay_fixture_v2(contents: &str) -> usize {
+    let fixture: Value = serde_json::from_str(contents).expect("checked-in fixture");
+    assert_eq!(fixture["schema"], "evm-amm-state-aero-historical-v2");
+    let (registration, chain_id, pool) = fixture_registration(&fixture);
+    let (gauge, spacing) = if chain_id == 1 {
+        (ETH_GAUGE, 50)
+    } else {
+        (BASE_GAUGE, 100)
+    };
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let mut state = FixtureState::default();
+    for (slot, value) in fixture["parent_storage"].as_object().unwrap() {
+        state
+            .0
+            .insert((pool, word(slot)), word(value.as_str().unwrap()));
+    }
+    // The gauge and manager bindings are immutable after `setGaugeAndPositionManager`.
+    state
+        .0
+        .entry((pool, U256::from(3)))
+        .or_insert_with(|| U256::from_be_slice(gauge.as_slice()));
+    state
+        .0
+        .entry((pool, U256::from(4)))
+        .or_insert_with(|| U256::from_be_slice(AERO_NFT.as_slice()));
+    let parent = state.clone();
+    let mut cache = snapshot_cache(chain_id, &state).await;
+    let snapshot = cache.snapshot();
+    let logs = fixture_v2_logs(&fixture);
+    let reference = &fixture["reference"];
+    let block = evm_amm_state::adapters::slipstream_staking::StakingBlockRef {
+        number: reference["block_number"].as_u64().unwrap(),
+        hash: B256::from_str(reference["block_hash"].as_str().unwrap()).unwrap(),
+        parent_hash: B256::from_str(reference["parent_hash"].as_str().unwrap()).unwrap(),
+        timestamp: reference["block_timestamp"].as_u64().unwrap(),
+    };
+    let batch =
+        evm_amm_state::adapters::slipstream_staking::SlipstreamStakingBatch::from_block_logs(
+            pool,
+            block,
+            logs.iter(),
+            &snapshot,
+        );
+    let gauge_topic = |log: &alloy_rpc_types_eth::Log, prefix: [u8; 4]| {
+        log.address() == gauge
+            && log
+                .topics()
+                .first()
+                .is_some_and(|topic| topic.as_slice()[..4] == prefix)
+    };
+    let count = |prefix: [u8; 4]| logs.iter().filter(|log| gauge_topic(log, prefix)).count();
+    let deposits = count([0xc9, 0x81, 0x7c, 0x7b]);
+    let withdrawals = count([0xac, 0x2f, 0x12, 0x1b]);
+    let settlements = count([0xd1, 0x4a, 0x5b, 0xd0]);
+    let claims = count([0x7b, 0x6b, 0xd7, 0x20]);
+    assert_eq!(
+        batch.len(),
+        deposits + withdrawals * 2 + settlements + claims,
+        "every gauge stake (withdrawals twice: custody transfer and event), settlement and claim must be attested"
+    );
+    let mut applied = 0;
+    let mut has_swap = false;
+    for log in &logs {
+        let log_index = log.log_index.unwrap();
+        let mut context = fixture_context(&fixture, log_index);
+        context.slipstream_staking_evidence = batch.evidence(pool, &context);
+        let result = adapter.decode_event_with_context(&registration, &log.inner, &state, &context);
+        assert!(
+            result.error.is_none(),
+            "log {log_index} ({:?}) must replay exactly: {:?}",
+            log.topics().first(),
+            result.error
+        );
+        let Some(event) = result.event else {
+            continue;
+        };
+        assert_eq!(
+            event.quality,
+            UpdateQuality::Exact,
+            "log {log_index} must be an exact transition"
+        );
+        if log.address() == gauge || log.address() == AERO_NFT {
+            applied += 1;
+        }
+        if log
+            .topics()
+            .first()
+            .is_some_and(|topic| topic.as_slice()[..4] == [0xc4, 0x20, 0x79, 0xf9])
+        {
+            has_swap = true;
+        }
+        for update in event.updates {
+            match update {
+                StateUpdate::Slot {
+                    address,
+                    slot,
+                    value,
+                } => {
+                    state.0.insert((address, slot), value);
+                }
+                StateUpdate::Purge {
+                    address,
+                    scope: PurgeScope::Slots(slots),
+                } => {
+                    for slot in slots {
+                        state.0.remove(&(address, slot));
+                    }
+                }
+                other => panic!("unexpected non-exact update {other:?}"),
+            }
+        }
+    }
+
+    let expected: BTreeMap<U256, U256> = fixture["expected_writes"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(slot, value)| (word(slot), word(value.as_str().unwrap())))
+        .collect();
+    let layout = V3StorageLayout::aero_cl(spacing);
+    let chain_value = |slot: U256| -> Option<U256> {
+        expected
+            .get(&slot)
+            .copied()
+            .or_else(|| parent.0.get(&(pool, slot)).copied())
+    };
+    let replayed = |slot: U256| -> Option<U256> { state.0.get(&(pool, slot)).copied() };
+    let mut classes: Vec<(&str, U256)> = vec![
+        ("slot0", layout.slot0_slot),
+        ("liquidity", layout.liquidity_slot),
+        (
+            "stakedLiquidity|lastUpdated|tickSpacing",
+            AERO_CL_STAKED_LIQUIDITY_SLOT,
+        ),
+        ("rewardGrowthGlobalX128", U256::from(9)),
+        ("rollover", U256::from(11)),
+        (
+            "secondsPerStakedLiquidityCumulativeX128",
+            AERO_CL_SECONDS_PER_STAKED_LIQUIDITY_SLOT,
+        ),
+    ];
+    if !has_swap {
+        classes.push(("gaugeFees", U256::from(10)));
+    }
+    for (name, slot) in &classes {
+        assert_eq!(
+            replayed(*slot),
+            chain_value(*slot),
+            "{name} (slot {slot:#x}) must match the on-chain post-state"
+        );
+    }
+    let ring = AERO_CL_OBSERVATIONS_SLOT;
+    let ring_end = ring + U256::from(65_535);
+    for (slot, expected_value) in &expected {
+        if *slot >= ring && *slot < ring_end {
+            assert_eq!(
+                replayed(*slot),
+                Some(*expected_value),
+                "observation {slot:#x}"
+            );
+        }
+    }
+    let mut ticks = Vec::new();
+    for log in &logs {
+        if log.address() != pool {
+            continue;
+        }
+        let topics = log.topics();
+        let selector = &topics[0].as_slice()[..4];
+        let named = selector == [0x7a, 0x53, 0x08, 0x0b]
+            || selector == [0x0c, 0x39, 0x6c, 0xd9]
+            || selector == [0x70, 0x93, 0x53, 0x38];
+        if !named {
+            continue;
+        }
+        for topic in &topics[2..4] {
+            let tick = topic_tick(&format!("{topic:#x}"));
+            if !ticks.contains(&tick) {
+                ticks.push(tick);
+            }
+        }
+    }
+    assert!(!ticks.is_empty(), "the fixture must name staked ticks");
+    for tick in ticks {
+        let keys = slipstream_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
+        for (index, name) in [
+            (0, "liquidityGross|liquidityNet"),
+            (1, "stakedLiquidityNet"),
+        ] {
+            assert_eq!(
+                replayed(keys[index]).unwrap_or(U256::ZERO),
+                chain_value(keys[index]).unwrap_or(U256::ZERO),
+                "tick {tick} word {index} ({name}) must match"
+            );
+        }
+        let bitmap = v3_tick_bitmap_storage_key_with_base(
+            v3_word_position(tick, spacing),
+            layout.tick_bitmap_base_slot,
+        );
+        assert_eq!(
+            replayed(bitmap).unwrap_or(U256::ZERO),
+            chain_value(bitmap).unwrap_or(U256::ZERO),
+            "bitmap word of tick {tick} must match"
+        );
+    }
+    applied
+}
+
+#[tokio::test]
+async fn base_gauge_rebalance_stakes_and_settles_exactly() {
+    // Swap, two staked withdrawals (the first settles the pool through the
+    // gauge: `GaugeSettled` → rewardGrowthGlobalX128 / staked-seconds /
+    // lastUpdated), burns, collects, mints and two deposits.
+    let applied =
+        replay_fixture_v2(include_str!("fixtures/base_aero_cl_gauge_rebalance.json")).await;
+    assert_eq!(
+        applied, 8,
+        "two withdrawals (transfer + event), two deposits, one GaugeSettled and one claim"
+    );
+}
+
+#[tokio::test]
+async fn ethereum_gauge_deposit_replays_exactly() {
+    let applied =
+        replay_fixture_v2(include_str!("fixtures/ethereum_aero_cl_gauge_deposit.json")).await;
+    assert_eq!(applied, 1);
+}
+
+#[tokio::test]
+async fn ethereum_gauge_withdraw_replays_exactly() {
+    let applied = replay_fixture_v2(include_str!(
+        "fixtures/ethereum_aero_cl_gauge_withdraw.json"
+    ))
+    .await;
+    assert_eq!(applied, 2);
+}
+
+#[tokio::test]
+async fn ethereum_gauge_fee_collection_replays_exactly() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/ethereum_aero_cl_collect_fees.json")).unwrap();
+    let (registration, _chain_id, pool) = fixture_registration(&fixture);
+    let adapter = ConcentratedLiquidityAdapter::default();
+    let mut state = FixtureState::default();
+    for (slot, value) in fixture["parent_storage"].as_object().unwrap() {
+        state
+            .0
+            .insert((pool, word(slot)), word(value.as_str().unwrap()));
+    }
+    let logs = fixture_v2_logs(&fixture);
+    let collect = logs.iter().find(|log| log.address() == pool).unwrap();
+    let context = fixture_context(&fixture, collect.log_index.unwrap());
+    let result = adapter.decode_event_with_context(&registration, &collect.inner, &state, &context);
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let event = result.event.unwrap();
+    assert_eq!(event.quality, UpdateQuality::Exact);
+    assert_eq!(
+        event.updates,
+        vec![StateUpdate::slot(
+            pool,
+            U256::from(10),
+            word(fixture["expected_writes"]["0x000000000000000000000000000000000000000000000000000000000000000a"]
+                .as_str()
+                .unwrap())
+        )]
+    );
+    // Amounts that contradict the parent word fail closed.
+    let mut forged = collect.inner.clone();
+    let mut data = forged.data.data.to_vec();
+    data[31] ^= 1;
+    forged.data =
+        alloy_primitives::LogData::new(forged.data.topics().to_vec(), data.into()).unwrap();
+    let forged = adapter.decode_event_with_context(&registration, &forged, &state, &context);
+    assert!(forged.error.is_some());
+    assert_eq!(forged.event.unwrap().quality, UpdateQuality::RequiresRepair);
 }

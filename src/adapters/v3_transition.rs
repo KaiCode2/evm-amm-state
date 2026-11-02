@@ -113,6 +113,12 @@ const AERO_CL_SLOTS: SlipstreamSlots = SlipstreamSlots {
     last_updated_bits: 48,
 };
 
+/// Storage slot of the packed `gaugeFees` word for a reviewed Slipstream
+/// layout family.
+pub(super) const fn slipstream_gauge_fees_slot(family: SlipstreamLayoutFamily) -> U256 {
+    slipstream_slots(family).gauge_fees_slot
+}
+
 const fn slipstream_slots(family: SlipstreamLayoutFamily) -> SlipstreamSlots {
     match family {
         SlipstreamLayoutFamily::Legacy => LEGACY_SLIPSTREAM_SLOTS,
@@ -1643,8 +1649,24 @@ fn update_slipstream_liquidity_tick(
 ) -> Result<LiquidityTickUpdate, AdapterEventError> {
     let keys = slipstream_tick_info_storage_keys_with_base(tick, layout.ticks_base_slot);
     let mut words = [U256::ZERO; 6];
+    // A tick whose bitmap bit is clear in a resident bitmap word is provably
+    // uninitialized, so its six (absent) words are zero: a Mint at a new tick
+    // needs no cold read. A set bit or a missing bitmap word keeps the exact
+    // requirement.
+    let bitmap_key = v3_tick_bitmap_storage_key_with_base(
+        v3_word_position(tick, layout.tick_spacing),
+        layout.tick_bitmap_base_slot,
+    );
+    let proven_uninitialized = state.storage(address, bitmap_key).is_some_and(|bitmap| {
+        let bit = tick.div_euclid(layout.tick_spacing).rem_euclid(256) as usize;
+        (bitmap >> bit) & U256::from(1) == U256::ZERO
+    });
     for (word, key) in words.iter_mut().zip(keys) {
-        *word = required(state, address, key)?;
+        *word = match state.storage(address, key) {
+            Some(value) => value,
+            None if proven_uninitialized => U256::ZERO,
+            None => return Err(AdapterEventError::MissingState { address, slot: key }),
+        };
     }
     let old_gross = words[0] & WORD_128_MASK;
     let old_net = ((words[0] >> 128_usize) & WORD_128_MASK).to::<u128>() as i128;
@@ -1756,6 +1778,56 @@ pub(super) fn validate_reviewed_slipstream_event(
     Ok(family)
 }
 
+/// Derive the exact transition for a reviewed Slipstream / Aero CL
+/// `IncreaseObservationCardinalityNext`: the reservation grows and every newly
+/// reserved ring entry is warmed with timestamp `1`.
+pub(super) fn derive_slipstream_observation_growth(
+    address: Address,
+    layout: V3StorageLayout,
+    event: DecodedObservationGrowth,
+    state: &dyn StateView,
+    context: &AdapterEventContext,
+) -> Result<Vec<StateUpdate>, AdapterEventError> {
+    validate_reviewed_slipstream_event(address, layout, context)?;
+    if event.new <= event.old {
+        return Err(contradiction(
+            "observation cardinality growth must increase the reservation",
+        ));
+    }
+    let slot0_raw = required(state, address, layout.slot0_slot)?;
+    let slot0 = Slot0::decode(slot0_raw);
+    if slot0.observation_cardinality == 0 {
+        return Err(AdapterEventError::V3Transition(
+            V3TransitionError::Observation("observation cardinality is zero"),
+        ));
+    }
+    if slot0.observation_cardinality_next != event.old {
+        return Err(final_mismatch(
+            "slot0 observationCardinalityNext",
+            U256::from(slot0.observation_cardinality_next),
+            U256::from(event.old),
+        ));
+    }
+    let ring = layout.observations_slot().ok_or_else(|| {
+        contradiction("Slipstream observation growth requires a known observation ring slot")
+    })?;
+    let mut updates = Vec::with_capacity(usize::from(event.new - event.old) + 1);
+    for index in event.old..event.new {
+        updates.push(StateUpdate::slot(
+            address,
+            ring + U256::from(index),
+            U256::from(1),
+        ));
+    }
+    let mask = U256::from(u16::MAX) << 216_usize;
+    updates.push(StateUpdate::slot(
+        address,
+        layout.slot0_slot,
+        (slot0_raw & !mask) | (U256::from(event.new) << 216_usize),
+    ));
+    Ok(updates)
+}
+
 pub(super) fn infer_slipstream_swap_fee(
     address: Address,
     layout: V3StorageLayout,
@@ -1811,11 +1883,11 @@ fn derive_slipstream_swap_inner(
             ),
         ));
     }
-    // Only the legacy accounting replay (evidence path) consumes
-    // `lastUpdated`; it is a `uint32` there. The Aero CL runtime widens it to
-    // `uint48` but rejects accounting evidence, so the quote-surface path
-    // below preserves the word's upper bits verbatim.
-    let mut last_updated = ((staked_word >> 128_usize) & WORD_32_MASK).to::<u32>();
+    // Only the accounting replay (evidence path) consumes `lastUpdated`: a
+    // `uint32` on the legacy runtimes, a `uint48` on Aero CL. The
+    // quote-surface path preserves the word's upper bits verbatim.
+    let last_updated_mask = (U256::from(1) << slots.last_updated_bits) - U256::from(1);
+    let mut last_updated = ((staked_word >> 128_usize) & last_updated_mask).to::<u64>();
     let mut fee_growth_0 = if evidence.is_some() {
         required(state, address, slots.surface.fee_growth_0_slot)?
     } else {
@@ -2173,6 +2245,7 @@ fn derive_slipstream_swap_inner(
     let mut rewards_updated = false;
     let mut reward_reserve_update = None;
     let mut rollover_update = None;
+    let mut staked_seconds_update = None;
     for (segment, fee_amount) in segments.iter().zip(step_fees) {
         if !segment.liquidity.is_zero() {
             let (growth, step_gauge_fee) = slipstream_fee_growth(
@@ -2197,13 +2270,15 @@ fn derive_slipstream_swap_inner(
                     reward_growth,
                     segment.staked_liquidity,
                     last_updated,
-                    timestamp,
+                    context.block_timestamp.expect("validated"),
+                    evidence.map_or(U256::ZERO, |evidence| evidence.gauge_settlement_delta),
                     state,
                 )?;
                 reward_growth = reward_update.reward_growth;
                 last_updated = reward_update.last_updated;
                 reward_reserve_update = reward_update.reward_reserve;
                 rollover_update = reward_update.rollover;
+                staked_seconds_update = reward_update.staked_seconds;
                 rewards_updated = true;
             }
             let initialized = &mut ticks[tick_index];
@@ -2240,7 +2315,7 @@ fn derive_slipstream_swap_inner(
         oracle_index,
         oracle_cardinality,
     );
-    let final_staked_word = (staked_word & !(WORD_128_MASK | (WORD_32_MASK << 128_usize)))
+    let final_staked_word = (staked_word & !(WORD_128_MASK | (last_updated_mask << 128_usize)))
         | current_staked_liquidity
         | (U256::from(last_updated) << 128_usize);
     let final_liquidity_word = (liquidity_word & (WORD_128_MASK << 128_usize)) | current_liquidity;
@@ -2276,6 +2351,13 @@ fn derive_slipstream_swap_inner(
     if let Some(value) = rollover_update {
         updates.push(StateUpdate::slot(address, slots.rollover_slot, value));
     }
+    if let Some(value) = staked_seconds_update {
+        updates.push(StateUpdate::slot(
+            address,
+            crate::adapters::storage::AERO_CL_SECONDS_PER_STAKED_LIQUIDITY_SLOT,
+            value,
+        ));
+    }
     if let Some((slot, value)) = oracle_write {
         updates.push(StateUpdate::slot(address, slot, value));
     }
@@ -2286,10 +2368,12 @@ fn derive_slipstream_swap_inner(
 #[derive(Clone, Copy, Debug)]
 struct SlipstreamRewardUpdate {
     reward_growth: U256,
-    last_updated: u32,
+    last_updated: u64,
     /// `(rewardReserve slot, value)` when the reserve moved.
     reward_reserve: Option<(U256, U256)>,
     rollover: Option<U256>,
+    /// Aero CL: the advanced `secondsPerStakedLiquidityCumulativeX128` word.
+    staked_seconds: Option<U256>,
 }
 
 /// Shared Aero (Dromos) CL implementation behind every Aero CL pool proxy.
@@ -2602,42 +2686,57 @@ fn maximum_partial_fee(
         .ok_or_else(|| arithmetic("partial-fee maximum underflow"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_slipstream_rewards(
     address: Address,
     slots: SlipstreamSlots,
     reward_growth: U256,
     staked_liquidity: U256,
-    last_updated: u32,
-    timestamp: u32,
+    last_updated: u64,
+    timestamp: u64,
+    settlement_delta: U256,
     state: &dyn StateView,
 ) -> Result<SlipstreamRewardUpdate, AdapterEventError> {
     let (Some(reserve_slot), Some(rate_slot)) = (slots.reward_reserve_slot, slots.reward_rate_slot)
     else {
-        // The Aero CL runtime settles rewards through its gauge; the legacy
-        // pool-local reward replay does not describe it. Evidence for that
-        // family is rejected before this point, so this is a defensive guard.
+        return settle_aero_rewards(
+            address,
+            slots,
+            reward_growth,
+            staked_liquidity,
+            last_updated,
+            timestamp,
+            settlement_delta,
+            state,
+        );
+    };
+    if !settlement_delta.is_zero() {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeEvidence(
-                "reward settlement is not replayable for this Slipstream family",
+                "gauge settlement delta on a pool-local reward runtime",
             ),
         ));
-    };
+    }
+    let last_updated = last_updated as u32;
+    let timestamp = timestamp as u32;
     let delta = timestamp.wrapping_sub(last_updated);
     if delta == 0 {
         return Ok(SlipstreamRewardUpdate {
             reward_growth,
-            last_updated,
+            last_updated: u64::from(last_updated),
             reward_reserve: None,
             rollover: None,
+            staked_seconds: None,
         });
     }
     let reserve = required(state, address, reserve_slot)?;
     if reserve.is_zero() {
         return Ok(SlipstreamRewardUpdate {
             reward_growth,
-            last_updated: timestamp,
+            last_updated: u64::from(timestamp),
             reward_reserve: None,
             rollover: None,
+            staked_seconds: None,
         });
     }
     let rate = required(state, address, rate_slot)?;
@@ -2647,18 +2746,90 @@ fn update_slipstream_rewards(
         let rollover = required(state, address, slots.rollover_slot)?.wrapping_add(reward);
         Ok(SlipstreamRewardUpdate {
             reward_growth,
-            last_updated: timestamp,
+            last_updated: u64::from(timestamp),
             reward_reserve: Some((reserve_slot, remaining_reserve)),
             rollover: Some(rollover),
+            staked_seconds: None,
         })
     } else {
         Ok(SlipstreamRewardUpdate {
             reward_growth: reward_growth.wrapping_add(mul_div(reward, Q128, staked_liquidity)?),
-            last_updated: timestamp,
+            last_updated: u64::from(timestamp),
             reward_reserve: Some((reserve_slot, remaining_reserve)),
             rollover: None,
+            staked_seconds: None,
         })
     }
+}
+
+/// The Aero CL pool's `_settleToBlock` inside a crossing swap: the gauge pulls
+/// the LeafVoter's accrued emissions (`settlement_delta`, the transaction's
+/// `GaugeSettled.delta`, zero when the gauge emitted none) and the pool credits
+/// them to `rewardGrowthGlobalX128` per unit of the liquidity staked at the
+/// start of the swap (banking them into `rollover` when nothing is staked),
+/// advances `secondsPerStakedLiquidityCumulativeX128` by the elapsed seconds
+/// per staked unit and sets `lastUpdated` to the block timestamp. A block
+/// that already settled (`lastUpdated == timestamp`) changes nothing and can
+/// carry no delta.
+#[allow(clippy::too_many_arguments)]
+fn settle_aero_rewards(
+    address: Address,
+    slots: SlipstreamSlots,
+    reward_growth: U256,
+    staked_liquidity: U256,
+    last_updated: u64,
+    timestamp: u64,
+    settlement_delta: U256,
+    state: &dyn StateView,
+) -> Result<SlipstreamRewardUpdate, AdapterEventError> {
+    let unchanged = SlipstreamRewardUpdate {
+        reward_growth,
+        last_updated,
+        reward_reserve: None,
+        rollover: None,
+        staked_seconds: None,
+    };
+    if timestamp == last_updated {
+        if !settlement_delta.is_zero() {
+            return Err(contradiction(
+                "gauge settlement emitted inside an already settled block",
+            ));
+        }
+        return Ok(unchanged);
+    }
+    if timestamp < last_updated {
+        return Err(contradiction(
+            "block timestamp precedes the pool's lastUpdated",
+        ));
+    }
+    if staked_liquidity.is_zero() {
+        let rollover = required(state, address, slots.rollover_slot)?
+            .checked_add(settlement_delta)
+            .ok_or_else(|| arithmetic("rollover overflows"))?;
+        return Ok(SlipstreamRewardUpdate {
+            last_updated: timestamp,
+            rollover: Some(rollover),
+            ..unchanged
+        });
+    }
+    let growth = reward_growth.wrapping_add(mul_div(settlement_delta, Q128, staked_liquidity)?);
+    let elapsed = U256::from(timestamp - last_updated);
+    let per_staked = ((elapsed << 128_usize) / staked_liquidity) & WORD_160_MASK;
+    let cumulative = required(
+        state,
+        address,
+        crate::adapters::storage::AERO_CL_SECONDS_PER_STAKED_LIQUIDITY_SLOT,
+    )?;
+    let next = (cumulative & WORD_160_MASK)
+        .checked_add(per_staked)
+        .filter(|value| *value <= WORD_160_MASK)
+        .ok_or_else(|| arithmetic("staked seconds accumulator overflows uint160"))?;
+    Ok(SlipstreamRewardUpdate {
+        reward_growth: growth,
+        last_updated: timestamp,
+        staked_seconds: Some((cumulative & !WORD_160_MASK) | next),
+        ..unchanged
+    })
 }
 
 fn next_slipstream_step_boundary(
@@ -3240,7 +3411,7 @@ fn next_sqrt_from_input(
     Ok(next)
 }
 
-fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256, AdapterEventError> {
+pub(crate) fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256, AdapterEventError> {
     div_512(
         U512::from(a) * U512::from(b),
         U512::from(denominator),

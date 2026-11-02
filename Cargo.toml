@@ -413,3 +413,7 @@ required-features = ["uniswap-v3", "solidly-v2"]
 [[test]]
 name = "aero_replay_rpc"
 required-features = ["uniswap-v3", "solidly-v2"]
+
+[[test]]
+name = "aero_campaign_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]

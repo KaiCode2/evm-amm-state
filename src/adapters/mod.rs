@@ -51,6 +51,10 @@ pub mod traits;
 pub mod types;
 
 // Per-protocol adapters — gated by their protocol feature.
+#[cfg(all(test, feature = "uniswap-v3"))]
+mod aero_accounting_tests;
+#[cfg(feature = "uniswap-v3")]
+pub(crate) mod aero_governance;
 /// Balancer V2 adapter (shared-vault `queryBatchSwap` quotes).
 #[cfg(feature = "balancer-v2")]
 pub mod balancer_v2;

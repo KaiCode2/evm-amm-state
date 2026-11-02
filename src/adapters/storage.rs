@@ -79,19 +79,38 @@ pub const AERO_CL_TICK_BITMAP_BASE_SLOT: U256 = U256::from_limbs([15, 0, 0, 0]);
 /// Storage slot of `observations[0]` on the Aero CL layout.
 pub const AERO_CL_OBSERVATIONS_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
 
+/// Storage slots of Aero CL `feeGrowthGlobal0X128` and `feeGrowthGlobal1X128`.
+pub const AERO_CL_FEE_GROWTH_0_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
+/// See [`AERO_CL_FEE_GROWTH_0_SLOT`].
+pub const AERO_CL_FEE_GROWTH_1_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
+
+/// Storage slot of Aero CL `rewardGrowthGlobalX128`, credited by the pool's
+/// gauge settlement (`_settleToBlock`).
+pub const AERO_CL_REWARD_GROWTH_SLOT: U256 = U256::from_limbs([9, 0, 0, 0]);
+
+/// Storage slot of the packed Aero CL `gaugeFees` word (`token0` low 128 bits,
+/// `token1` high 128 bits).
+pub const AERO_CL_GAUGE_FEES_SLOT: U256 = U256::from_limbs([10, 0, 0, 0]);
+
+/// Storage slot of Aero CL `rollover`: emissions settled while nothing was
+/// staked.
+pub const AERO_CL_ROLLOVER_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
+
 /// Storage slot of Aero CL `secondsPerStakedLiquidityCumulativeX128`, the
 /// first state variable after the fixed-size observation array.
 pub const AERO_CL_SECONDS_PER_STAKED_LIQUIDITY_SLOT: U256 = U256::from_limbs([65_552, 0, 0, 0]);
 
-/// Pool-local parent cells for reviewed Aero CL transitions: factory, gauge
-/// and NFT identity (0, 3, 4), fee growth (7, 8), reward growth (9), gauge
-/// fees (10), rollover (11), the packed staked-liquidity/`lastUpdated`/spacing
-/// word (12) and the post-observation staked-seconds accumulator (65552). The
-/// deployed hook and pool tape read several of these on the quote path, so bulk
-/// and windowed preparation both keep them resident, including zeros.
+/// Pool-local parent cells for reviewed Aero CL transitions and quotes:
+/// factory, token and gauge/NFT identity (0, 1, 2, 3, 4), fee growth (7, 8),
+/// reward growth (9), gauge fees (10), rollover (11), the packed
+/// staked-liquidity/`lastUpdated`/spacing word (12) and the post-observation
+/// staked-seconds accumulator (65552). The Metaquoter, the deployed hook and
+/// the pool itself read these on the quote path, so bulk and windowed
+/// preparation both keep them resident, including zeros, and a strict
+/// (no-fetch) snapshot quote resolves every pool read locally.
 #[cfg(feature = "uniswap-v3")]
-pub(super) const AERO_CL_TRANSITION_GLOBAL_SLOTS: [u64; 10] =
-    [0, 3, 4, 7, 8, 9, 10, 11, 12, 65_552];
+pub(super) const AERO_CL_TRANSITION_GLOBAL_SLOTS: [u64; 12] =
+    [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 65_552];
 
 /// Which reviewed Slipstream-family storage layout a [`V3StorageLayout`]
 /// describes.
