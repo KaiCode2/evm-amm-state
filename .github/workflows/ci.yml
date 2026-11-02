@@ -122,7 +122,9 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Security audit
-        run: cargo audit --ignore RUSTSEC-2025-0055
+        run: |
+          python3 -m unittest discover -s .github/security -p 'test_*.py'
+          python3 .github/security/alpha8_audit.py
 
   # Build each protocol independently so a combined all-feature build cannot
   # hide incorrect cfg-gating.
