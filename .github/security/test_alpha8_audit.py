@@ -14,7 +14,7 @@ INACTIVE = ("RUSTSEC-2025-0055", "tracing-subscriber", "0.2.25", gate.SOURCE, "f
 def report(*entries):
     rows = [{"advisory": {"id": r[0]}, "package": dict(zip(("name", "version", "source", "checksum"), r[1:]))}
             for r in entries]
-    return {"vulnerabilities": {"list": rows, "count": len(rows), "found": bool(rows)}}
+    return {"settings": {"ignore": [], "target_arch": [], "target_os": [], "severity": None}, "vulnerabilities": {"list": rows, "count": len(rows), "found": bool(rows)}}
 
 
 class DecisionTests(unittest.TestCase):
@@ -28,6 +28,14 @@ class DecisionTests(unittest.TestCase):
                 gate.findings(report(gate.BIGINT, tuple(other)), INACTIVE)
         with self.assertRaises(ValueError):
             gate.findings(report(gate.BIGINT, gate.BIGINT), INACTIVE)
+
+    def test_hidden_findings_reject_the_report(self):
+        value = report(gate.BIGINT, INACTIVE)
+        value["settings"]["ignore"] = ["RUSTSEC-2026-0387"]
+        with self.assertRaisesRegex(ValueError, "filtered"):
+            gate.findings(value, INACTIVE)
+        with self.assertRaisesRegex(ValueError, "inactive"):
+            gate.findings(report(gate.BIGINT), INACTIVE)
 
     def test_approval_boundary_and_source_scope(self):
         for when, paths in [(gate.START - dt.timedelta(seconds=1), []), (gate.END, []),

@@ -55,12 +55,16 @@ def verify_payload(archive, head):
 
 
 def findings(report, inactive):
+    settings = report["settings"]
+    require(not any(settings[field] for field in ("ignore", "target_arch", "target_os", "severity")),
+            "audit report was filtered")
     summary = report["vulnerabilities"]
     entries = summary["list"]
     require(summary["count"] == len(entries) and summary["found"] == bool(entries), "incomplete audit findings")
     rows = [(v["advisory"]["id"], *(v["package"][key] for key in ("name", "version", "source", "checksum")))
             for v in entries]
     require(len(rows) == len(set(rows)), "duplicate vulnerability findings")
+    require(inactive in rows, "expected inactive finding missing from unfiltered audit; review its scope")
     require(not set(rows) - {BIGINT, inactive}, "unaccepted vulnerability in the unfiltered audit")
     return BIGINT in rows
 
