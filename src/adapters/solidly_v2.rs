@@ -573,6 +573,16 @@ impl SolidlyV2ColdStartPlanner {
             identity_verified: None,
         }
     }
+
+    fn proven_volatile_runtime(&self, state: &dyn StateView) -> bool {
+        let family = AeroVolatileRuntimeFamily::AeroOptimismMooBifi;
+        let reviewed = reviewed_aero_volatile_runtime(family);
+        self.address == reviewed.pool
+            && state.verified_code_hash(family.chain_id(), reviewed.pool)
+                == Some(reviewed.proxy_runtime_code_hash)
+            && state.verified_code_hash(family.chain_id(), reviewed.implementation)
+                == Some(reviewed.implementation_runtime_code_hash)
+    }
 }
 
 /// Classify a single reserve slot from its per-slot [`SlotFetch`] outcome.
@@ -592,7 +602,7 @@ fn classify_slot(results: &ColdStartResults, address: Address, slot: U256) -> So
 }
 
 impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
-    fn initial_plan(&mut self, _state: &dyn StateView) -> ColdStartPlan {
+    fn initial_plan(&mut self, state: &dyn StateView) -> ColdStartPlan {
         // Both reserve slots are always warmed so subsequent reactive `Sync`
         // writes land exactly. The token slots are warmed up-front except under
         // `Lazy`/`HotSlotsOnly`.
@@ -615,15 +625,21 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
             verify.extend(self.external_exact_slots.iter().copied());
         }
         self.verified_slots = verify.clone();
-        let discover = if self.variant == SolidlyPoolVariant::AeroVolatile {
+        // POOL_TYPE is a bytecode constant. The prepared worker already has
+        // exact-block proofs for the immutable clone and its implementation.
+        // Other views must execute the getter before declaring the pool ready.
+        let discover = if self.variant != SolidlyPoolVariant::AeroVolatile {
+            Vec::new()
+        } else if self.proven_volatile_runtime(state) {
+            self.identity_verified = Some(true);
+            Vec::new()
+        } else {
             vec![ColdStartCall {
                 from: Address::ZERO,
                 to: self.address,
                 calldata: Bytes::from(POOL_TYPECall {}.abi_encode()),
                 restrict_to: Some(vec![self.address]),
             }]
-        } else {
-            Vec::new()
         };
         ColdStartPlan {
             verify,
@@ -658,19 +674,20 @@ impl AdapterColdStartPlanner for SolidlyV2ColdStartPlanner {
                     .fetched
                     .iter()
                     .find(|outcome| outcome.address == *address && outcome.slot == *slot);
-                let resident = matches!(
-                    fetched.map(|outcome| &outcome.fetch),
-                    Some(SlotFetch::Value(_) | SlotFetch::Zero)
-                ) || state.storage(*address, *slot).is_some();
-                if !resident {
-                    self.failed_external_slots.push((*address, *slot));
-                } else if matches!(fetched.map(|outcome| &outcome.fetch), Some(SlotFetch::Zero)) {
-                    self.proven_zero_external_slots.push((*address, *slot));
+                match fetched.map(|outcome| &outcome.fetch) {
+                    Some(SlotFetch::Value(_)) => {}
+                    Some(SlotFetch::Zero) => {
+                        self.proven_zero_external_slots.push((*address, *slot))
+                    }
+                    Some(SlotFetch::FetchFailed { .. } | SlotFetch::NotAttempted) | None => {
+                        self.failed_external_slots.push((*address, *slot));
+                    }
                 }
             }
         }
 
-        if self.variant == SolidlyPoolVariant::AeroVolatile {
+        if self.variant == SolidlyPoolVariant::AeroVolatile && self.identity_verified != Some(true)
+        {
             let pool_type = results
                 .discovered
                 .first()

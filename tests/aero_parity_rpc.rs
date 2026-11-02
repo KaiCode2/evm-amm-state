@@ -262,22 +262,15 @@ const OP_LADDER: [LadderStep; 5] = [
     ),
 ];
 
-fn eth_url() -> Option<String> {
-    std::env::var("E2E_RPC_URL").ok()
-}
+#[path = "support/aero_rpc.rs"]
+mod aero_rpc;
+use aero_rpc::{derived_url, eth_url};
 
-fn derived_url(explicit: &str, host: &str) -> Option<String> {
-    if let Ok(url) = std::env::var(explicit) {
-        return Some(url);
-    }
-    eth_url().map(|url| url.replace("eth-mainnet", host))
-}
-
-fn base_url() -> Option<String> {
+fn base_url() -> Result<String> {
     derived_url("E2E_BASE_RPC_URL", "base-mainnet")
 }
 
-fn optimism_url() -> Option<String> {
+fn optimism_url() -> Result<String> {
     derived_url("E2E_OPTIMISM_RPC_URL", "opt-mainnet")
 }
 
@@ -530,10 +523,7 @@ async fn cl_parity(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an Ethereum archive RPC (E2E_RPC_URL); run with --ignored"]
 async fn ethereum_aero_cl_metaquoter_parity() -> Result<()> {
-    let Some(url) = eth_url() else {
-        eprintln!("E2E_RPC_URL unset; skipping");
-        return Ok(());
-    };
+    let url = eth_url()?;
     cl_parity(
         &url,
         1,
@@ -553,10 +543,7 @@ async fn ethereum_aero_cl_metaquoter_parity() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a Base archive RPC (E2E_BASE_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
 async fn base_aero_cl_metaquoter_parity() -> Result<()> {
-    let Some(url) = base_url() else {
-        eprintln!("no Base RPC; skipping");
-        return Ok(());
-    };
+    let url = base_url()?;
     cl_parity(
         &url,
         8_453,
@@ -576,10 +563,7 @@ async fn base_aero_cl_metaquoter_parity() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an Optimism archive RPC (E2E_OPTIMISM_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
 async fn optimism_aero_volatile_total_fee_parity() -> Result<()> {
-    let Some(url) = optimism_url() else {
-        eprintln!("no Optimism RPC; skipping");
-        return Ok(());
-    };
+    let url = optimism_url()?;
     let provider = provider(&url).await?;
     let mut cache = pinned_cache(&provider, OP_BLOCK, OP_BLOCK_HASH).await?;
     ensure!(cache.chain_id() == 10);

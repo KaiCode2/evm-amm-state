@@ -1,5 +1,20 @@
 # Releasing `evm-amm-state`
 
+## Aero release candidate
+
+`0.3.1-alpha.8` retains the exact `evm-fork-cache = "=0.4.1"` dependency.
+Run the offline matrix below, then run `scripts/stage10-aero-live-gates.sh`
+for hash-pinned parity and replay on all three chains. Run the long-window
+campaign with `scripts/stage10-aero-campaign.sh`. The reviewed pool identities,
+fee context and quote-state requirements are in [Aero families](docs/aero-families.md).
+
+The dependency audit remains a publication gate. The candidate resolves the
+two TLS advisories with `rustls-webpki 0.103.16` and `webpki-roots 1.0.10`.
+The locked Alloy and EVM graph still includes `crypto-bigint 0.5.5` through
+`elliptic-curve 0.13.8`. RUSTSEC-2026-0387 requires `crypto-bigint >=0.7.6`.
+
+## Previous alpha.7 release
+
 The `0.3.1-alpha.7` candidate is based on published `0.3.1-alpha.6`.
 It adds an independently opt-in reconciliation observer under the default-off
 `ingress-timing` feature and generic validated full-header evidence on reliable

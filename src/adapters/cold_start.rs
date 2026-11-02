@@ -1033,6 +1033,8 @@ impl std::error::Error for PreparedColdStartError {}
 
 #[cfg(feature = "live-runtime")]
 struct WorkerStateView<'a> {
+    chain_id: u64,
+    accounts: &'a PreparedAccountPatch,
     base: &'a dyn StateView,
     storage: &'a BTreeMap<(Address, U256), U256>,
 }
@@ -1301,6 +1303,17 @@ impl StateView for WorkerStateView<'_> {
             .copied()
             .or_else(|| self.base.storage(address, slot))
     }
+
+    fn verified_code_hash(&self, chain_id: u64, address: Address) -> Option<B256> {
+        if chain_id != self.chain_id {
+            return None;
+        }
+        self.accounts
+            .values()
+            .iter()
+            .find(|account| account.address() == address)
+            .map(|account| account.proof().code_hash)
+    }
 }
 
 #[derive(Clone)]
@@ -1440,6 +1453,8 @@ impl PreparedPoolJob {
             .map_err(PreparedColdStartError::Unsupported)?;
         let empty_storage = BTreeMap::new();
         let empty = WorkerStateView {
+            chain_id: self.baseline.chain_id(),
+            accounts: &self.account_patch,
             base: self.base.as_ref(),
             storage: &empty_storage,
         };
@@ -1449,6 +1464,8 @@ impl PreparedPoolJob {
                 return Err(PreparedColdStartError::PlannerTranscriptDiverged);
             }
             let view = WorkerStateView {
+                chain_id: self.baseline.chain_id(),
+                accounts: &self.account_patch,
                 base: self.base.as_ref(),
                 storage: &historical.storage,
             };
@@ -1505,6 +1522,8 @@ impl PreparedPoolJob {
             storage: storage.clone(),
         });
         let view = WorkerStateView {
+            chain_id: self.baseline.chain_id(),
+            accounts: &self.account_patch,
             base: self.base.as_ref(),
             storage: &storage,
         };
@@ -2499,6 +2518,79 @@ mod hydration_tests {
                 && entry.slot() == V2_RESERVES_SLOT
                 && entry.value() == reserves
         }));
+    }
+
+    #[cfg(feature = "solidly-v2")]
+    #[test]
+    fn prepared_optimism_volatile_pool_requires_its_proved_constant_getter() {
+        use crate::adapters::{SolidlyV2Adapter, SolidlyV2Metadata};
+        use alloy_primitives::address;
+
+        let adapter = SolidlyV2Adapter::default();
+        let registration = PoolRegistration::new(PoolKey::SolidlyV2(address!(
+            "c71b571aa9f06bfa096c24e9df5c45fc4fab4151"
+        )))
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default().with_aero_volatile(),
+        ));
+        let implementation = address!("0526cf035c1156b5c598b0d3c2445e38af2e8bde");
+        // Fixture at the boundary after the worker has verified code/proof pairs.
+        let accounts: Vec<_> = adapter
+            .reviewed_code_identities(&registration)
+            .into_iter()
+            .map(|(address, code_hash)| {
+                PreparedAccountValue::new(
+                    address,
+                    evm_fork_cache::AccountProof {
+                        storage_hash: B256::ZERO,
+                        balance: U256::ZERO,
+                        nonce: 1,
+                        code_hash,
+                        slots: vec![],
+                    },
+                    Default::default(),
+                )
+            })
+            .collect();
+        let mut registry = AdapterRegistry::new().with_code_seeding(false);
+        registry.register_adapter(Arc::new(adapter)).unwrap();
+        for (chain_id, missing_impl) in [(10, false), (10, true), (8453, false)] {
+            let baseline = AmmStatePoint::post_block(chain_id, 158800699, B256::repeat_byte(0x69));
+            let fetcher = StorageRoundFetcher::new(Arc::new(move |requests, block| {
+                assert_eq!(block, BlockId::from((baseline.block_hash(), Some(true))));
+                requests
+                    .into_iter()
+                    .map(|(address, slot)| (address, slot, Ok(slot + U256::from(1))))
+                    .collect()
+            }));
+            let verified = accounts
+                .iter()
+                .filter(|entry| !missing_impl || entry.address() != implementation)
+                .cloned()
+                .collect();
+            let result = prepare_resumable_pool(
+                &registry,
+                registration.clone(),
+                baseline,
+                ColdStartPolicy::Strict,
+                Arc::new(EmptyState),
+                PreparedPoolFetchers::new(fetcher, None).with_verified_accounts(verified),
+                ResumableColdStartConfig::default(),
+            );
+            if chain_id == 10 && !missing_impl {
+                let prepared = result.expect("proved immutable getter needs no discover call");
+                assert_eq!(prepared.baseline(), baseline);
+                assert_eq!(prepared.registration().status, PoolStatus::Ready);
+                assert_eq!(prepared.storage().len(), 12);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PreparedColdStartError::UnsupportedPhase(
+                        UnsupportedPreparedPhase::Discover
+                    ))
+                ));
+            }
+        }
     }
 
     #[test]

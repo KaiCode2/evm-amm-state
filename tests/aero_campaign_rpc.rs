@@ -167,16 +167,9 @@ fn env_u64(name: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-fn eth_url() -> Option<String> {
-    std::env::var("E2E_RPC_URL").ok()
-}
-
-fn derived_url(explicit: &str, host: &str) -> Option<String> {
-    if let Ok(url) = std::env::var(explicit) {
-        return Some(url);
-    }
-    eth_url().map(|url| url.replace("eth-mainnet", host))
-}
+#[path = "support/aero_rpc.rs"]
+mod aero_rpc;
+use aero_rpc::{derived_url, eth_url};
 
 /// An HTTP provider that backs off and retries on rate limits and transient
 /// transport errors (a long campaign issues tens of thousands of requests).
@@ -2254,10 +2247,7 @@ fn record_volatile_quote(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "long-window campaign; requires an Ethereum archive RPC (E2E_RPC_URL)"]
 async fn ethereum_aero_cl_campaign() -> Result<()> {
-    let Some(url) = eth_url() else {
-        eprintln!("E2E_RPC_URL unset; skipping");
-        return Ok(());
-    };
+    let url = eth_url()?;
     run_cl(
         &url,
         ClChain {
@@ -2283,10 +2273,7 @@ async fn ethereum_aero_cl_campaign() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "long-window campaign; requires a Base archive RPC (E2E_BASE_RPC_URL / E2E_RPC_URL on Alchemy)"]
 async fn base_aero_cl_campaign() -> Result<()> {
-    let Some(url) = derived_url("E2E_BASE_RPC_URL", "base-mainnet") else {
-        eprintln!("no Base RPC; skipping");
-        return Ok(());
-    };
+    let url = derived_url("E2E_BASE_RPC_URL", "base-mainnet")?;
     run_cl(
         &url,
         ClChain {
@@ -2311,9 +2298,6 @@ async fn base_aero_cl_campaign() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "long-window campaign; requires an Optimism archive RPC (E2E_OPTIMISM_RPC_URL / E2E_RPC_URL on Alchemy)"]
 async fn optimism_aero_volatile_campaign() -> Result<()> {
-    let Some(url) = derived_url("E2E_OPTIMISM_RPC_URL", "opt-mainnet") else {
-        eprintln!("no Optimism RPC; skipping");
-        return Ok(());
-    };
+    let url = derived_url("E2E_OPTIMISM_RPC_URL", "opt-mainnet")?;
     run_volatile(&url).await
 }

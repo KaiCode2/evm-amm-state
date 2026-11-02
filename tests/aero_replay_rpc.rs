@@ -61,16 +61,9 @@ const MUTATION_TOPICS: [B256; 5] = [
     b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a"),
 ];
 
-fn eth_url() -> Option<String> {
-    std::env::var("E2E_RPC_URL").ok()
-}
-
-fn derived_url(explicit: &str, host: &str) -> Option<String> {
-    if let Ok(url) = std::env::var(explicit) {
-        return Some(url);
-    }
-    eth_url().map(|url| url.replace("eth-mainnet", host))
-}
+#[path = "support/aero_rpc.rs"]
+mod aero_rpc;
+use aero_rpc::{derived_url, eth_url};
 
 struct Window {
     start: u64,
@@ -348,10 +341,7 @@ async fn replay(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an Ethereum archive RPC (E2E_RPC_URL); run with --ignored"]
 async fn ethereum_aero_cl_window_replays_exactly() -> Result<()> {
-    let Some(url) = eth_url() else {
-        eprintln!("E2E_RPC_URL unset; skipping");
-        return Ok(());
-    };
+    let url = eth_url()?;
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
     let layout = V3StorageLayout::aero_cl(50);
@@ -381,10 +371,7 @@ async fn ethereum_aero_cl_window_replays_exactly() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a Base archive RPC (E2E_BASE_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
 async fn base_aero_cl_window_replays_exactly() -> Result<()> {
-    let Some(url) = derived_url("E2E_BASE_RPC_URL", "base-mainnet") else {
-        eprintln!("no Base RPC; skipping");
-        return Ok(());
-    };
+    let url = derived_url("E2E_BASE_RPC_URL", "base-mainnet")?;
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
     let layout = V3StorageLayout::aero_cl(100);
@@ -414,10 +401,7 @@ async fn base_aero_cl_window_replays_exactly() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an Optimism archive RPC (E2E_OPTIMISM_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
 async fn optimism_aero_volatile_window_replays_exactly() -> Result<()> {
-    let Some(url) = derived_url("E2E_OPTIMISM_RPC_URL", "opt-mainnet") else {
-        eprintln!("no Optimism RPC; skipping");
-        return Ok(());
-    };
+    let url = derived_url("E2E_OPTIMISM_RPC_URL", "opt-mainnet")?;
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(SolidlyV2Adapter::default()))?;
     replay(

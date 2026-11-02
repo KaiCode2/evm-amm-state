@@ -42,9 +42,11 @@ let aero_volatile = PoolRegistration::new(PoolKey::SolidlyV2(volatile_pool))
     ));
 
 // Quotes run under the candidate's transaction context.
-let config = SimConfig::default()
+let cl_config = SimConfig::default()
     .with_tx_origin(bot_eoa)
     .with_effective_gas_price(basefee, priority_fee);
+// The volatile pool getter receives its caller as the fee payer.
+let volatile_config = cl_config.with_from(executor);
 ```
 
 The Aero CL pools register under `PoolKey::Slipstream`; the adapter
@@ -103,6 +105,13 @@ pool closed (`ColdStartOutcome::Unsupported`) when a resident or fetched
 runtime hashes differently, and `ConcentratedLiquidityAdapter::validate_aero_cl_runtime`
 checks a snapshot.
 
+For the Optimism volatile pool, the prepared worker proves the constant
+`POOL_TYPE` getter from the exact-block runtime hashes of the fixed proxy and
+its implementation on chain 10. Storage-only cold starts execute the getter.
+Strict and eager preparation require a successful exact-block read for each
+reviewed fee cell. A failed or missing result returns the cell for repair
+even when the previous block's value is resident.
+
 ## Warmed cells
 
 `verified_storage_targets` returns the cells the quote path reads whose keys
@@ -142,7 +151,9 @@ runtimes and still warm them.
 Aero volatile: factory `defaultFee` 5, `feeModule` 7, `mevTaxModule` 13,
 `exactOutFeeQuoter` 14; fee module `customFee[pool]`; MEV module slots 1 and
 2; pool `factory` 10. The factory's `getFee` does not consult the discount
-registry at the pin.
+registry at the pin. The volatile adapter routes pool `Sync` events.
+Consumers must verify the fee cells and their active module bindings at the
+quote block or invalidate them on governance changes before reusing a quote.
 
 ## Quotes and the transaction context
 

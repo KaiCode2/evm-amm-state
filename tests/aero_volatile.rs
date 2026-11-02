@@ -252,3 +252,68 @@ async fn aero_variant_on_a_legacy_pool_fails_cold_start_closed() -> Result<()> {
     assert_eq!(registration.status, PoolStatus::Degraded);
     Ok(())
 }
+
+#[test]
+fn cached_mev_threshold_cannot_replace_an_exact_block_fetch() {
+    use evm_amm_state::adapters::{
+        CallOutcome, ColdStartCallResult, ColdStartResults, ColdStartRunReport, RepairAction,
+        SlotFetch, SlotOutcome, StateView,
+    };
+
+    // The previous block charged the low fee. Even a resident nonzero word
+    // cannot prove the Optimism MEV threshold at the candidate block.
+    struct PriorState;
+    impl StateView for PriorState {
+        fn storage(&self, _: Address, _: U256) -> Option<U256> {
+            Some(U256::from(1))
+        }
+    }
+    let fee_cell = (
+        address!("5de55ebe5b789bd309809c7969334c2c16e64eaf"),
+        U256::from(2),
+    );
+    let adapter = SolidlyV2Adapter::default();
+    let reviewed_pool = address!("c71b571aa9f06bfa096c24e9df5c45fc4fab4151");
+    for unavailable in [
+        Some(SlotFetch::FetchFailed {
+            reason: "archive read failed".into(),
+        }),
+        Some(SlotFetch::NotAttempted),
+        None,
+    ] {
+        let mut pool = PoolRegistration::new(PoolKey::SolidlyV2(reviewed_pool)).with_metadata(
+            ProtocolMetadata::SolidlyV2(SolidlyV2Metadata::default().with_aero_volatile()),
+        );
+        let mut planner = adapter
+            .cold_start_planner(&pool, ColdStartPolicy::Strict)
+            .unwrap();
+        let plan = planner.initial_plan(&PriorState);
+        let mut results = ColdStartResults::default();
+        for (address, slot) in plan.verify {
+            let fetch = if (address, slot) == fee_cell {
+                unavailable.clone()
+            } else {
+                Some(SlotFetch::Value(U256::from(1)))
+            };
+            if let Some(fetch) = fetch {
+                results.fetched.push(SlotOutcome::new(address, slot, fetch));
+            }
+        }
+        results.discovered.push(ColdStartCallResult::new(
+            CallOutcome::Success {
+                output: Bytes::from(alloy_primitives::FixedBytes::<32>::right_padding_from(
+                    b"V2_VOLATILE",
+                )),
+                gas_used: 0,
+            },
+            Default::default(),
+        ));
+        planner.on_results(&results, &PriorState);
+        let outcome = planner.finish(&mut pool, &ColdStartRunReport::default());
+        assert!(
+            matches!(outcome, ColdStartOutcome::NeedsRepair(_, RepairAction::VerifySlots(ref cells)) if cells == &[fee_cell]),
+            "{outcome:?}"
+        );
+        assert_eq!(pool.status, PoolStatus::Degraded);
+    }
+}
