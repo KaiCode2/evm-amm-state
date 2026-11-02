@@ -317,6 +317,10 @@ every `AERO_CAMPAIGN_STRIDE`-th block (default 100) and the window end:
   the `blockFee` hydration outcome, and writes `aero-campaign-<chain>.{json,md}`
   under `AERO_CAMPAIGN_REPORT_DIR`.
 
+The short replay includes the gauge's transaction receipts when checking CL
+staked liquidity. The campaign writes its diagnostics before failing a run
+with divergent storage, repairs, missing evidence, or unmatched quotes.
+
 ## Known gaps
 
 - The Optimism Aero CL deployment (USDC pool, hook `0x3064a620…`) and the

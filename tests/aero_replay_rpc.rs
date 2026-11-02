@@ -21,7 +21,10 @@
 //! E2E_RPC_URL=<alchemy archive url> cargo test --test aero_replay_rpc -- --ignored --nocapture
 //! ```
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, U256, address, b256};
@@ -30,6 +33,7 @@ use alloy_rpc_types_eth::Filter;
 use anyhow::{Context, Result, anyhow, ensure};
 
 use evm_amm_state::adapters::driver::AdapterDriver;
+use evm_amm_state::adapters::slipstream_staking::{SlipstreamStakingBatch, StakingBlockRef};
 use evm_amm_state::adapters::storage::{
     AERO_CL_OBSERVATIONS_SLOT, AERO_CL_STAKED_LIQUIDITY_SLOT, SolidlyStorageLayout,
     V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
@@ -109,13 +113,11 @@ async fn compare_cl(
     let cached_staked = cache
         .cached_storage_value(pool, AERO_CL_STAKED_LIQUIDITY_SLOT)
         .ok_or_else(|| anyhow!("staked word must stay resident"))?;
-    if cached_staked & WORD_128_MASK != staked & WORD_128_MASK {
-        eprintln!(
-            "  block {block}: stakedLiquidity drifted (cache {} vs chain {}): gauge stake/unstake emits no pool event; a later swap replay fails closed into repair",
-            cached_staked & WORD_128_MASK,
-            staked & WORD_128_MASK
-        );
-    }
+    ensure!(
+        cached_staked & WORD_128_MASK == staked & WORD_128_MASK,
+        "block {block}: staked liquidity mismatch"
+    );
+    compared += 1;
     // Bitmap words and word 0 of every initialized tick within ±2 words of
     // the current tick.
     let tick_raw = ((slot0 >> 160_usize) & U256::from(0x00ff_ffff_u32)).to::<u32>();
@@ -182,7 +184,7 @@ async fn compare_volatile(
 }
 
 enum Venue {
-    Cl(V3StorageLayout),
+    Cl(V3StorageLayout, Address),
     Volatile,
 }
 
@@ -222,7 +224,7 @@ async fn replay(
         outcomes[0]
     );
     let registration = pools.remove(0);
-    if let Venue::Cl(layout) = venue {
+    if let Venue::Cl(layout, _) = venue {
         ensure!(ConcentratedLiquidityAdapter::aero_cl_runtime_family(&registration).is_some());
         compare_cl(&provider, &cache, pool, layout, window.start).await?;
     } else {
@@ -237,23 +239,60 @@ async fn replay(
     registry.register_pool(registration)?;
     let driver = AdapterDriver::new(registry);
 
+    let addresses = match venue {
+        Venue::Cl(_, gauge) => vec![pool, gauge],
+        Venue::Volatile => vec![pool],
+    };
     let filter = Filter::new()
-        .address(pool)
+        .address(addresses)
         .from_block(window.start + 1)
         .to_block(window.end);
     let mut logs = provider.get_logs(&filter).await?;
-    logs.sort_by_key(|log| (log.block_number, log.log_index));
+    if let Venue::Cl(_, gauge) = venue {
+        // The manager's Transfer/Collect logs are needed to authenticate the
+        // gauge transaction. Fetch only receipts already identified in this window.
+        let manager = address!("4857db576ee0e45f10525ec59527bfd10beec60b");
+        let gauge_txs = logs
+            .iter()
+            .filter(|log| log.address() == gauge)
+            .map(|log| {
+                log.transaction_hash
+                    .context("gauge log without transaction")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        for tx in gauge_txs {
+            let receipt = provider
+                .get_transaction_receipt(tx)
+                .await?
+                .context("missing gauge receipt")?;
+            logs.extend(
+                receipt
+                    .inner
+                    .inner
+                    .logs()
+                    .iter()
+                    .filter(|log| log.address() == manager)
+                    .cloned(),
+            );
+        }
+    }
+    let mut blocks = BTreeMap::new();
+    for log in logs {
+        blocks
+            .entry(log.block_number.context("log without block")?)
+            .or_insert_with(Vec::new)
+            .push(log);
+    }
     ensure!(
-        !logs.is_empty(),
+        !blocks.is_empty(),
         "the window {}..={} must contain pool events",
         window.start,
         window.end
     );
     let mut exact_events = 0;
     let mut compared_blocks = 0;
-    let mut index = 0;
-    while index < logs.len() {
-        let number = logs[index].block_number.expect("block number");
+    for (number, mut logs) in blocks {
+        logs.sort_by_key(|log| log.log_index);
         let header = provider
             .get_block_by_number(BlockNumberOrTag::Number(number))
             .await?
@@ -261,10 +300,24 @@ async fn replay(
         let block_hash = header.header.hash;
         let parent_hash = header.header.parent_hash;
         let timestamp = header.header.timestamp;
-        while index < logs.len() && logs[index].block_number == Some(number) {
-            let log = &logs[index];
-            index += 1;
-            let context = AdapterEventContext::for_block(number, block_hash, timestamp)
+        ensure!(
+            logs.iter()
+                .all(|log| !log.removed && log.block_hash == Some(block_hash)),
+            "block {number}: noncanonical log"
+        );
+        let batch = SlipstreamStakingBatch::from_block_logs(
+            pool,
+            StakingBlockRef {
+                number,
+                hash: block_hash,
+                parent_hash,
+                timestamp,
+            },
+            &logs,
+            &cache.snapshot(),
+        );
+        for log in &logs {
+            let mut context = AdapterEventContext::for_block(number, block_hash, timestamp)
                 .with_chain_id(chain_id)
                 .with_parent_hash(parent_hash)
                 .with_transaction_hash(log.transaction_hash.expect("tx hash"))
@@ -272,6 +325,7 @@ async fn replay(
                     log.transaction_index.expect("tx index"),
                     log.log_index.expect("log index"),
                 );
+            context.slipstream_staking_evidence = batch.evidence(pool, &context);
             let report = driver
                 .apply_log_with_context(&mut cache, &log.inner, &context)
                 .map_err(|error| anyhow!("block {number} log {:?}: {error}", log.log_index))?;
@@ -318,14 +372,14 @@ async fn replay(
             eprintln!("  block {number} log {:?}: {kind:?} exact", log.log_index);
         }
         let compared = match venue {
-            Venue::Cl(layout) => compare_cl(&provider, &cache, pool, layout, number).await?,
+            Venue::Cl(layout, _) => compare_cl(&provider, &cache, pool, layout, number).await?,
             Venue::Volatile => compare_volatile(&provider, &cache, pool, number).await?,
         };
         compared_blocks += 1;
         eprintln!("  block {number}: {compared} quote-surface cells match the chain");
     }
     let compared = match venue {
-        Venue::Cl(layout) => compare_cl(&provider, &cache, pool, layout, window.end).await?,
+        Venue::Cl(layout, _) => compare_cl(&provider, &cache, pool, layout, window.end).await?,
         Venue::Volatile => compare_volatile(&provider, &cache, pool, window.end).await?,
     };
     ensure!(exact_events > 0, "no exact pool transition was replayed");
@@ -359,7 +413,7 @@ async fn ethereum_aero_cl_window_replays_exactly() -> Result<()> {
                     .with_metaquoter(METAQUOTER),
             )),
         registry,
-        Venue::Cl(layout),
+        Venue::Cl(layout, address!("0ee89bdfd62e3a5325416fb93c0f1601474a5b04")),
         Window {
             start: 26_291_760,
             end: 26_291_970,
@@ -389,7 +443,7 @@ async fn base_aero_cl_window_replays_exactly() -> Result<()> {
                     .with_metaquoter(METAQUOTER),
             )),
         registry,
-        Venue::Cl(layout),
+        Venue::Cl(layout, address!("84c029f26652d37bc153c39deb8767ec54037334")),
         Window {
             start: 53_203_890,
             end: 53_203_960,

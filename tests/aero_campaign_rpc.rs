@@ -21,7 +21,8 @@
 //!
 //! Divergences and adapter repairs re-synchronise the cache from the chain so
 //! later checks measure fresh behaviour. The per-chain report is written as
-//! JSON and Markdown under `AERO_CAMPAIGN_REPORT_DIR`.
+//! JSON and Markdown under `AERO_CAMPAIGN_REPORT_DIR` before any divergence,
+//! repair or incomplete quote evidence fails the run.
 //!
 //! ```text
 //! E2E_RPC_URL=<alchemy archive url> [E2E_BASE_RPC_URL=…] [E2E_OPTIMISM_RPC_URL=…] \
@@ -449,8 +450,55 @@ impl Report {
         std::fs::write(dir.join(format!("{stem}.md")), self.markdown())?;
         eprintln!("{}", self.markdown());
         eprintln!("report written to {}", dir.display());
+        self.validate(quotes_enabled())
+    }
+
+    fn validate(&self, quotes_enabled: bool) -> Result<()> {
+        ensure!(
+            self.event_blocks > 0 && self.blocks_checked > 0 && self.cells_compared > 0,
+            "campaign did not exercise pool state"
+        );
+        ensure!(
+            self.adapter_repairs == 0
+                && self.evidence_failures == 0
+                && self.resyncs == 0
+                && self.classes.is_empty()
+                && self.external.is_empty()
+                && self.block_fee_cache_mismatch == 0,
+            "replay diverged or required repair; inspect the campaign report"
+        );
+        if quotes_enabled {
+            ensure!(
+                self.quotes > 0
+                    && self.parity_ok == self.quotes
+                    && self.strict_failures == 0
+                    && self.strict_misses.is_empty()
+                    && self.parity_mismatch == 0
+                    && self.dynamic_parity_ok == self.dynamic_quotes,
+                "strict quote parity failed; inspect the campaign report"
+            );
+        }
         Ok(())
     }
+}
+
+#[test]
+fn campaign_gate_rejects_repaired_state_and_incomplete_quote_evidence() {
+    let mut report = Report {
+        event_blocks: 1,
+        blocks_checked: 1,
+        cells_compared: 1,
+        quotes: 1,
+        parity_ok: 1,
+        ..Default::default()
+    };
+    assert!(report.validate(true).is_ok());
+    report.resyncs = 1;
+    assert!(report.validate(false).is_err());
+    report.resyncs = 0;
+    report.parity_ok = 0;
+    report.both_reverted = 1;
+    assert!(report.validate(true).is_err());
 }
 
 fn stat_json(stat: &ClassStat) -> Value {
@@ -1324,6 +1372,26 @@ async fn cl_quotes(
     Ok(())
 }
 
+fn record_missing_hashes(
+    report: &mut Report,
+    missing: &evm_fork_cache::cache::MissingState,
+    block: u64,
+    label: &str,
+) {
+    for hash in &missing.code_hashes {
+        report.miss(
+            "runtime code".to_owned(),
+            format!("block {block} {label}: {hash:#x}"),
+        );
+    }
+    for height in &missing.block_hashes {
+        report.miss(
+            "block hash".to_owned(),
+            format!("block {block} {label}: BLOCKHASH({height})"),
+        );
+    }
+}
+
 fn record_quote(
     report: &mut Report,
     strict: &StrictCache,
@@ -1338,26 +1406,18 @@ fn record_quote(
         report.dynamic_quotes += 1;
     }
     let missing = strict.overlay.missing_state();
-    let mut missed = false;
+    let missed = !missing.is_empty();
     for (address, slot) in &missing.storage {
-        missed = true;
         let class = classify_miss(*address, *slot, chain.pool, chain.gauge, block);
         report.miss(class, format!("block {block} {label}: {address}:{slot:#x}"));
     }
     for address in &missing.accounts {
-        missed = true;
         report.miss(
             format!("account {address}"),
             format!("block {block} {label}: account header"),
         );
     }
-    for hash in &missing.code_hashes {
-        missed = true;
-        report.miss(
-            "runtime code".to_owned(),
-            format!("block {block} {label}: {hash:#x}"),
-        );
-    }
+    record_missing_hashes(report, missing, block, label);
     match (offline, truth) {
         (Ok(amount), Some(truth)) if amount == truth => {
             report.parity_ok += 1;
@@ -2219,6 +2279,7 @@ fn record_volatile_quote(
             format!("block {block} {label}"),
         );
     }
+    record_missing_hashes(report, missing, block, label);
     match (offline, truth) {
         (Ok(amount), Some(truth)) if amount == truth => report.parity_ok += 1,
         (Err(_), None) => report.both_reverted += 1,
