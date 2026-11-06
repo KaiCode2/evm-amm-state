@@ -124,7 +124,7 @@ jobs:
       - name: Security audit
         run: |
           python3 -m unittest discover -s .github/security -p 'test_*.py'
-          python3 .github/security/alpha8_audit.py
+          python3 .github/security/aero_alpha_audit.py
 
   # Build each protocol independently so a combined all-feature build cannot
   # hide incorrect cfg-gating.
