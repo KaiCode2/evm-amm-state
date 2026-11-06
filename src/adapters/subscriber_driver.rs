@@ -4,6 +4,7 @@
 mod timing;
 
 mod bloom;
+mod event_only;
 mod filters;
 #[cfg(feature = "ingress-timing")]
 pub mod observation;
@@ -64,9 +65,19 @@ pub enum AmmPreconfirmationRejectionPolicy {
 /// notification loss went unhealed at or below a block. That attestation alone
 /// does not close independent streams: closure also needs conservative bloom
 /// absence or a successor on the only registered log stream. Otherwise the
-/// driver reconciles after the bounded grace window.
+/// compatibility mode reconciles after the bounded grace window, while strict
+/// [`CanonicalLogSource::SubscriptionOnly`] holds the incomplete point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanonicalLogSource {
+    /// Use only ordered canonical subscription events, with no fallback read.
+    ///
+    /// Cold attachment installs one bounded address-superset log subscription;
+    /// exact adapter routing remains local. A block waits until source coverage
+    /// plus a later log, or its bloom absence, proves closure. Quiet or incomplete
+    /// streams can hold indefinitely; this is not latest-head latency proof.
+    /// Notification loss, gaps and reorgs fail closed for explicit cold repair.
+    /// Attachment requires pubsub, fail-on-gap and all automatic read paths off.
+    SubscriptionOnly,
     /// Assemble blocks from the subscription, reconciling only what is not
     /// attested.
     ///
@@ -213,6 +224,16 @@ impl AmmSubscriberDriverConfig {
 pub enum AmmSubscriberDriverState {
     /// Driver exists but canonical delivery is paused behind attach/lifecycle work.
     Paused,
+    /// Strict subscription delivery has a canonical header whose log set is
+    /// not closed. Consumers must not label the older point current at this head.
+    WaitingForClosure {
+        /// Current logical owner generation.
+        interest_revision: u64,
+        /// Last complete acknowledged state.
+        point: AmmStatePoint,
+        /// First header waiting for log-source closure evidence.
+        pending_block: u64,
+    },
     /// Subscriber and actor are continuously delivering the same interest revision.
     Running {
         /// Interest revision carried by new canonical deliveries.
@@ -270,6 +291,8 @@ pub enum AmmSubscriberDriverError {
     OwnerState,
     /// Stage 4 received owner-only catch-up outside its current-point commit seam.
     OwnerCatchupRequiresStaging,
+    /// Strict event-only configuration or canonical continuity was not satisfied.
+    EventOnly(&'static str),
 }
 
 impl fmt::Display for AmmSubscriberDriverError {
@@ -318,6 +341,7 @@ impl fmt::Display for AmmSubscriberDriverError {
                 f,
                 "owner-only catch-up requires the progressive staging scheduler"
             ),
+            Self::EventOnly(reason) => write!(f, "event-only canonical delivery: {reason}"),
         }
     }
 }
@@ -825,6 +849,7 @@ pub(crate) fn spawn_alloy_subscriber<P>(
 where
     P: Provider<Ethereum> + Clone + Send + Sync + 'static,
 {
+    event_only::validate_attachment(&subscriber, config)?;
     if config.control_capacity == 0 || config.max_addresses_per_get_logs == 0 {
         return Err(AmmSubscriberDriverError::ZeroControlCapacity);
     }
@@ -1137,6 +1162,7 @@ where
         if self.pending.is_some() || !self.owners.is_empty() {
             return Err(AmmSubscriberDriverError::TransactionInProgress);
         }
+        self.prepare_event_only_sources(&plans).await?;
         let epochs = self.stage_and_reconcile(&plans, point).await?;
         if !epochs.iter().all(|epoch| {
             self.subscriber.interest_owner_state(epoch) == Some(SubscriberOwnerState::Staged)
@@ -1166,6 +1192,7 @@ where
         plans: Vec<AmmSubscriberOwnerPlan>,
         point: AmmStatePoint,
     ) -> Result<SubscriberTransaction, AmmSubscriberDriverError> {
+        self.require_automatic_source_mutation_allowed()?;
         if self.pending.is_some() {
             return Err(AmmSubscriberDriverError::TransactionInProgress);
         }
@@ -1223,6 +1250,7 @@ where
         plan: AmmSubscriberOwnerPlan,
         point: AmmStatePoint,
     ) -> Result<SubscriberTransaction, AmmSubscriberDriverError> {
+        self.require_automatic_source_mutation_allowed()?;
         if self.pending.is_some() {
             return Err(AmmSubscriberDriverError::TransactionInProgress);
         }
@@ -1423,6 +1451,7 @@ where
         &mut self,
         batch: evm_fork_cache::reactive::SubscriberInputBatch<Ethereum>,
     ) -> Result<(), AmmSubscriberDriverError> {
+        self.require_event_only_controls(&batch)?;
         // `SubscriberInputBatch` is already the typed domain form at this
         // boundary. Preserve this ingress across canonical reconciliation so
         // provider wait is included instead of resetting latency downstream.
@@ -1502,11 +1531,15 @@ where
         }
         for header in headers {
             let number = header.inner.number;
+            if !self.accept_event_only_header(&header)? {
+                continue;
+            }
             // Deliberately NOT note_observed_block: a header proves only that
             // the header stream advanced, never that an earlier block's logs
             // have all been delivered.
             self.pending_headers
                 .insert(number, (header, Instant::now()));
+            self.require_event_only_buffer_bound()?;
         }
         self.drain_sealable(source_ingress, decoded_after_ingress)
             .await
@@ -1516,8 +1549,9 @@ where
     ///
     /// Stops at the first block that must still wait, so delivery stays in
     /// canonical order. A block whose grace window elapsed without an
-    /// attestation falls back to reconciliation rather than stalling: the point
-    /// is to avoid the fetch when it is unnecessary, never to withhold state.
+    /// attestation falls back to reconciliation in compatibility mode.
+    /// `SubscriptionOnly` instead holds the block and exposes that incomplete
+    /// state until actual closure or an explicit repair/restart.
     async fn drain_sealable(
         &mut self,
         source_ingress: Instant,
@@ -1533,7 +1567,18 @@ where
             // The straggler window no longer authorises publishing a buffer; it
             // only bounds how long we wait for one of the two proofs before
             // falling back to a hash-pinned reconciliation.
-            if sealable.is_none() && waiting_since.elapsed() < self.seal_grace() {
+            if sealable.is_none()
+                && (self.canonical_log_source == CanonicalLogSource::SubscriptionOnly
+                    || waiting_since.elapsed() < self.seal_grace())
+            {
+                if self.canonical_log_source == CanonicalLogSource::SubscriptionOnly {
+                    self.state
+                        .send_replace(AmmSubscriberDriverState::WaitingForClosure {
+                            interest_revision: self.interest_revision,
+                            point: self.runtime.latest_snapshot().point(),
+                            pending_block: number,
+                        });
+                }
                 return Ok(());
             }
             let Some((header, _)) = self.pending_headers.remove(&number) else {
@@ -1549,7 +1594,9 @@ where
 
     /// When the oldest pending block's grace window expires, if one is waiting.
     fn next_seal_deadline(&self) -> Option<Instant> {
-        if !self.buffers_subscription_logs() {
+        if !self.buffers_subscription_logs()
+            || self.canonical_log_source == CanonicalLogSource::SubscriptionOnly
+        {
             return None;
         }
         self.pending_headers
@@ -1562,7 +1609,7 @@ where
     const fn buffers_subscription_logs(&self) -> bool {
         matches!(
             self.canonical_log_source,
-            CanonicalLogSource::Subscription { .. }
+            CanonicalLogSource::Subscription { .. } | CanonicalLogSource::SubscriptionOnly
         )
     }
 
@@ -1570,7 +1617,7 @@ where
     const fn seal_grace(&self) -> Duration {
         match self.canonical_log_source {
             CanonicalLogSource::Subscription { grace } => grace,
-            CanonicalLogSource::Reconcile => Duration::ZERO,
+            CanonicalLogSource::Reconcile | CanonicalLogSource::SubscriptionOnly => Duration::ZERO,
         }
     }
 
@@ -1597,6 +1644,7 @@ where
     /// arrival costs nothing. A log missing its block identity cannot be placed
     /// and is rejected rather than guessed at.
     fn buffer_subscription_log(&mut self, log: RpcLog) -> Result<(), AmmSubscriberDriverError> {
+        self.require_event_only_log(&log)?;
         let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
             return Err(AmmSubscriberDriverError::InvalidCanonicalLog(
                 "canonical log is missing its block identity",
@@ -1620,7 +1668,7 @@ where
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
-        Ok(())
+        self.require_event_only_buffer_bound()
     }
 
     /// Note the highest block observed **on the log subscription**.
@@ -1666,14 +1714,18 @@ where
         // The subscriber's attestation proves no detected loss, not that every
         // independent stream has advanced. Without per-stream watermarks only a
         // single registered log interest can use a successor as closure proof.
-        let single_log_interest = self
-            .subscriber
-            .registered_interests()
-            .iter()
-            .filter(|interest| matches!(interest, ReactiveInterest::Logs(_)))
-            .take(2)
-            .count()
-            == 1;
+        let single_log_interest =
+            if self.canonical_log_source == CanonicalLogSource::SubscriptionOnly {
+                self.subscriber.planned_log_subscription_filters().len() == 1
+            } else {
+                self.subscriber
+                    .registered_interests()
+                    .iter()
+                    .filter(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+                    .take(2)
+                    .count()
+                    == 1
+            };
         if single_log_interest
             && self
                 .highest_observed_block
@@ -1786,6 +1838,11 @@ where
         }
         let straight_line = current.block_number().checked_add(1) == Some(header.inner.number)
             && header.inner.parent_hash == current.block_hash();
+        if self.canonical_log_source == CanonicalLogSource::SubscriptionOnly {
+            return self
+                .deliver_event_only(header, precomputed, source_ingress, decoded_after_ingress)
+                .await;
+        }
         let lineage = self.delivery_lineage(header).await?;
         // A gap or replacement invalidates the entire assembly proof, including
         // a decision computed before the parent walk. A one-block same-height
@@ -1832,8 +1889,9 @@ where
 
     /// Submit a block whose log set the subscription already delivered whole.
     ///
-    /// Pool/gauge logs cost no extra request. Relevant staking transitions
-    /// require bounded hash-pinned NFT evidence before publication.
+    /// Compatibility mode enriches relevant staking transitions with bounded
+    /// hash-pinned NFT evidence. `SubscriptionOnly` uses only delivered evidence;
+    /// missing dependent logs must reject in the protocol reducer.
     async fn seal_from_subscription(
         &mut self,
         header: RpcHeader,
@@ -1857,8 +1915,10 @@ where
             .unwrap_or_default();
         let subscription_keys: std::collections::BTreeSet<_> = buffered.keys().copied().collect();
         #[cfg(feature = "uniswap-v3")]
-        self.complete_staking_evidence(point.chain_id(), &block, &mut buffered)
-            .await?;
+        if self.canonical_log_source != CanonicalLogSource::SubscriptionOnly {
+            self.complete_staking_evidence(point.chain_id(), &block, &mut buffered)
+                .await?;
+        }
         let mut records = Vec::with_capacity(buffered.len());
         for log in buffered.into_values() {
             // Re-run the same identity checks reconciliation applies, so a
@@ -2225,6 +2285,7 @@ mod tests {
         );
     }
 
+    mod event_only;
     #[cfg(feature = "ingress-timing")]
     mod observation;
     mod repair;

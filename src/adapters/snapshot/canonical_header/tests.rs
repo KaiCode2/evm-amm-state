@@ -44,11 +44,22 @@ async fn commit_rejects_wrong_chain_number_or_hash_even_with_valid_header() {
                 .unwrap(),
             );
             let matching = Arc::new(AmmCanonicalHeader::from_verified_parts(1, header.clone()));
+            let matching =
+                AmmStateCommit::new(snapshot.clone(), changes.clone(), None, Some(matching));
+            assert!(matching.canonical_header().is_some());
             assert!(
-                AmmStateCommit::new(snapshot.clone(), changes.clone(), None, Some(matching))
-                    .canonical_header()
-                    .is_some()
+                matching.canonical_logs().is_none(),
+                "header-only is not an empty batch"
             );
+            let retained = Arc::new(
+                AmmCanonicalHeader::from_verified_parts(1, header.clone())
+                    .with_validated_logs(Arc::from([])),
+            );
+            let observed_empty =
+                AmmStateCommit::new(snapshot.clone(), changes.clone(), None, Some(retained));
+            assert_eq!(observed_empty.canonical_logs(), Some([].as_slice()));
+            let lifecycle = AmmStateCommit::new(snapshot.clone(), changes.clone(), None, None);
+            assert!(lifecycle.canonical_logs().is_none());
             let mut next_number = header.inner.clone();
             next_number.number += 1;
             let mut other_hash = header.inner.clone();
@@ -65,6 +76,7 @@ async fn commit_rejects_wrong_chain_number_or_hash_even_with_valid_header() {
                     Some(Arc::new(evidence)),
                 );
                 assert!(commit.canonical_header().is_none());
+                assert!(commit.canonical_logs().is_none());
                 assert_eq!(commit.snapshot().point(), snapshot.point());
             }
             runtime.shutdown().await.unwrap();

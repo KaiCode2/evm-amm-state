@@ -504,3 +504,101 @@ fn indexed_event_predicates_survive_restart_and_legacy_archives_load() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn aero_metadata_fields_round_trip_and_legacy_payloads_stay_identical() -> Result<()> {
+    use evm_amm_state::adapters::{SolidlyPoolVariant, V3QuoterKind};
+    let pool = Address::repeat_byte(0x15);
+    let volatile = Address::repeat_byte(0x16);
+    let aero_cl = PoolRegistration::new(PoolKey::Slipstream(pool)).with_metadata(
+        ProtocolMetadata::Slipstream(
+            V3Metadata::default()
+                .with_tick_spacing(50)
+                .with_storage_layout(
+                    V3StorageLayout::aero_cl(50).with_observations_slot(U256::from(17)),
+                )
+                .with_metaquoter(Address::repeat_byte(0x1d)),
+        ),
+    );
+    let aero_volatile = PoolRegistration::new(PoolKey::SolidlyV2(volatile)).with_metadata(
+        ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_token0(Address::repeat_byte(0x41))
+                .with_token1(Address::repeat_byte(0x42))
+                .with_aero_volatile(),
+        ),
+    );
+    let snapshot = snapshot_for_all(vec![aero_cl, aero_volatile])?;
+    let path = temp_path("aero_fields");
+    AmmRegistrationArchive::capture(1, &snapshot)?.save(&path)?;
+    let loaded = AmmRegistrationArchive::load(&path, 1)?;
+    let cl = loaded
+        .registrations()
+        .iter()
+        .find(|registration| matches!(registration.key, PoolKey::Slipstream(_)))
+        .expect("Aero CL registration");
+    match &cl.metadata {
+        ProtocolMetadata::Slipstream(metadata) => {
+            assert_eq!(metadata.quoter_kind, V3QuoterKind::Metaquoter);
+            assert_eq!(metadata.quoter, Some(Address::repeat_byte(0x1d)));
+            assert_eq!(
+                metadata.storage_layout,
+                Some(V3StorageLayout::aero_cl(50).with_observations_slot(U256::from(17)))
+            );
+        }
+        other => panic!("expected Slipstream metadata, got {other:?}"),
+    }
+    let solidly = loaded
+        .registrations()
+        .iter()
+        .find(|registration| matches!(registration.key, PoolKey::SolidlyV2(_)))
+        .expect("Aero volatile registration");
+    match &solidly.metadata {
+        ProtocolMetadata::SolidlyV2(metadata) => {
+            assert_eq!(metadata.variant, SolidlyPoolVariant::AeroVolatile);
+            assert_eq!(
+                metadata.storage_layout,
+                Some(SolidlyStorageLayout::aero_volatile())
+            );
+        }
+        other => panic!("expected Solidly metadata, got {other:?}"),
+    }
+    let payload = String::from_utf8(std::fs::read(&path)?[PAYLOAD_OFFSET..].to_vec())?;
+    assert!(payload.contains("\"quoter_kind\":\"metaquoter\""));
+    assert!(payload.contains("\"variant\":\"aero_volatile\""));
+    assert!(payload.contains("\"observations_slot\""));
+
+    // Legacy registrations serialize without any of the new keys, so archives
+    // written before this release and archives of unchanged registrations are
+    // byte-identical and readable by older releases.
+    let legacy = snapshot_for_all(vec![
+        PoolRegistration::new(PoolKey::Slipstream(pool)).with_metadata(
+            ProtocolMetadata::Slipstream(
+                V3Metadata::default()
+                    .with_tick_spacing(200)
+                    .with_storage_layout(V3StorageLayout::slipstream(200))
+                    .with_quoter(Address::repeat_byte(0x25)),
+            ),
+        ),
+        PoolRegistration::new(PoolKey::SolidlyV2(volatile)).with_metadata(
+            ProtocolMetadata::SolidlyV2(
+                SolidlyV2Metadata::default()
+                    .with_stable(false)
+                    .with_storage_layout(SolidlyStorageLayout::new(
+                        U256::from(20),
+                        U256::from(21),
+                        U256::from(13),
+                        U256::from(14),
+                    )),
+            ),
+        ),
+    ])?;
+    let legacy_path = temp_path("aero_legacy_fields");
+    AmmRegistrationArchive::capture(1, &legacy)?.save(&legacy_path)?;
+    let payload = String::from_utf8(std::fs::read(&legacy_path)?[PAYLOAD_OFFSET..].to_vec())?;
+    assert!(!payload.contains("quoter_kind"));
+    assert!(!payload.contains("\"variant\":\"legacy\""));
+    assert!(!payload.contains("observations_slot"));
+    AmmRegistrationArchive::load(&legacy_path, 1)?;
+    Ok(())
+}

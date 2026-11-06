@@ -12,7 +12,7 @@
 //! [`SlotChange`] / [`SkippedDelta`] / [`SkippedMask`] leaves, [`PurgeScope`],
 //! [`SlotDelta`], and the read-only [`StateView`] trait.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 
 /// A relative storage-slot mutation: read the current value, transform it, and
 /// write it back.
@@ -383,6 +383,12 @@ pub trait StateView {
     /// Current cached value of `(address, slot)`, or `None` when the slot is
     /// **cold** — neither cache layer has seen it.
     fn storage(&self, address: Address, slot: U256) -> Option<U256>;
+
+    /// Hash of runtime code proved for this view's exact block on `chain_id`.
+    /// Storage-only views provide no runtime attestation.
+    fn verified_code_hash(&self, _chain_id: u64, _address: Address) -> Option<B256> {
+        None
+    }
 }
 
 /// Adapts an upstream [`evm_fork_cache::StateView`] into the crate-owned

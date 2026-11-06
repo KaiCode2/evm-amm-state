@@ -1,6 +1,6 @@
 //! Immutable, versioned AMM state publications for concurrent consumers.
 
-mod canonical_header;
+pub(crate) mod canonical_header;
 pub use canonical_header::AmmCanonicalHeader;
 
 use std::collections::BTreeMap;
@@ -598,6 +598,17 @@ impl AmmStateCommit {
     /// snapshot or observer notification cannot establish contiguous history.
     pub fn canonical_header(&self) -> Option<&Arc<AmmCanonicalHeader>> {
         self.canonical_header.as_ref()
+    }
+
+    /// Ordered source-closed canonical logs paired with this commit's header.
+    ///
+    /// `Some(&[])` is an observed empty batch, not missing evidence. Lifecycle,
+    /// prepared-state and repair commits return `None`. The batch is bounded
+    /// to 4,096 logs and 2 MiB of data/topics plus a conservative per-log
+    /// metadata allowance. This retains the source's existing completeness
+    /// contract; it is not a transaction-receipt trie proof or finality proof.
+    pub fn canonical_logs(&self) -> Option<&[alloy_rpc_types_eth::Log]> {
+        self.canonical_header.as_ref()?.logs()
     }
 
     /// Exact immutable state produced by this commit.
