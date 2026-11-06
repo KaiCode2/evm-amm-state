@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.9] - Unreleased candidate
+
+- Add explicit transport-free execution-state handling for reviewed Aero CL and
+  volatile families. Ordered event transitions preserve exact economic cells,
+  reject unsupported tape/checkpoint ambiguity and retain generation/block pins.
+- Add opt-in event-only subscriber delivery using cache 0.4.2-alpha.1's fail-closed
+  gap policy. Ordinary delivery cannot request implicit reconciliation; incomplete
+  state remains unavailable. This is not a complete block-source implementation.
+- Expose canonical local log application and prepared execution-state read sets
+  to the owning runtime. Existing default subscriber behavior remains unchanged.
+- Retain the Aero layouts, reviewed runtimes, Metaquoter/total-fee quote handling
+  and transaction-context support introduced by the alpha.8 candidate below.
+- Pin the companion cache to `=0.4.2-alpha.1`; require downstream lockfile updates.
+  Publication of both alpha payloads requires exact-artifact security approval.
+
 ## [0.3.1-alpha.8] - 2026-10-29
 
 Additive release candidate for the Aero (Dromos) venues that received the

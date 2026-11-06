@@ -10,15 +10,16 @@
 //!
 //! - exact cell writes where the deployed packing is confirmed by live reads
 //!   (hook `dynamicFeeConfig[pool]`: `baseFee` bits 0..24, `feeCap` bits
-//!   24..48, `scalingFactor` bits 48..112; hook defaults and
+//!   24..48, `scalingFactor` bits 48..112, `initialFeeEnabled` byte14,
+//!   `initialFee` bytes15..18; hook defaults and
 //!   `secondsAgo | recordCallGasLimit`; MEV `priorityFeeMultiplier` at bits
 //!   160..224 of slot 1 and `minThreshold | baseFeeFactor` in slot 2; factory
 //!   `swapFeeManager | defaultUnstakedFee` and `tickSpacingToFee`);
 //! - fail-closed repairs where the change replaces a reviewed runtime (a new
 //!   hook, MEV module, discount registry, pool tape or unstaked-fee module:
 //!   the pool is purged and its next cold start re-checks identities), or
-//!   where a setter's packing is unconfirmed (initial-fee setters, dynamic
-//!   fee resets, discount-registry writes, unstaked-fee module writes: the
+//!   where a setter's packing is unconfirmed (alternate initial-fee ABI,
+//!   discount-registry writes, unstaked-fee module writes: the
 //!   affected cells are purged and verified).
 //!
 //! Hook events carry the pool as `topic1`; events for other pools never route
@@ -43,6 +44,8 @@ use super::{
 };
 use alloy_primitives::{Address, B256, Log, U256};
 use alloy_sol_types::SolEvent;
+
+mod initial_fee;
 
 mod abi {
     alloy_sol_types::sol! {
@@ -78,7 +81,8 @@ mod abi {
 }
 
 /// The hook's second variant of the initial-fee setter (`uint256` payload);
-/// unobserved on chain, handled fail-closed like the `uint24` one.
+/// unobserved on chain, retained as an invalidation rather than the reviewed
+/// exact `uint24` transition.
 mod abi_alt {
     alloy_sol_types::sol! {
         event InitialFeeSet(address indexed pool, uint256 fee);
@@ -276,6 +280,9 @@ fn derive(
     let hook = runtime.hook;
     let factory = runtime.factory;
     if log.address == hook {
+        if let Some(transition) = initial_fee::derive(runtime, log, state) {
+            return transition;
+        }
         if topic0 == abi::CustomFeeSet::SIGNATURE_HASH {
             let event = decode::<abi::CustomFeeSet>(log)?;
             return packed(
@@ -346,8 +353,7 @@ fn derive(
                 Ok(Transition::Identity)
             };
         }
-        // Initial-fee setters and dynamic-fee resets write fields whose
-        // packing is not confirmed by a live read: verify the config word.
+        // An unreviewed ABI or hook event does not establish an exact write.
         return Ok(Transition::Verify(vec![(hook, config_key(runtime))]));
     }
     if Some(log.address) == runtime.mev_tax_module {

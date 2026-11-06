@@ -19,6 +19,8 @@ use super::{
 use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256, keccak256};
 use alloy_sol_types::{SolCall, SolEvent};
 
+mod execution;
+
 /// `sol!`-generated pool event binding (crate-internal, not public API).
 mod abi {
     alloy_sol_types::sol! {
@@ -231,6 +233,22 @@ fn reviewed_aero_volatile_identities(
 }
 
 impl SolidlyV2Adapter {
+    /// Derive the reviewed volatile pool's execution cells from one ordered event.
+    ///
+    /// This is an opt-in execution surface, separate from the legacy Sync-only
+    /// quote surface. The caller must attest the runtime and exact parent and
+    /// apply a complete transaction atomically. Tape calls require separate
+    /// authenticated call-outcome evidence; these updates alone do not establish
+    /// complete execution state.
+    pub fn aero_volatile_execution_event_updates(
+        pool: &PoolRegistration,
+        log: &Log,
+        view: &dyn StateView,
+        context: &super::AdapterEventContext,
+    ) -> Result<Option<Vec<StateUpdate>>, AdapterEventError> {
+        execution::event_updates(pool, log, view, context)
+    }
+
     /// The reviewed Aero volatile deployment family a registration belongs
     /// to, if it registered as [`SolidlyPoolVariant::AeroVolatile`] under a
     /// reviewed pool address.

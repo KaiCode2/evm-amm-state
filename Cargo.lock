@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "evm-amm-state"
-version = "0.3.1-alpha.8"
+version = "0.3.1-alpha.9"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1986,6 +1986,7 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-pubsub",
  "alloy-rpc-client",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
@@ -2005,9 +2006,9 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.4.1"
+version = "0.4.2-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5be321d4ab546df56ef8f765ae0401f8352c44be4a6c763ac1efea277b0ce7c"
+checksum = "dac4bf1f5f0d35b24d842e00288b4cc87aff9bed88ae6ba25adfa205626bf89f"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",

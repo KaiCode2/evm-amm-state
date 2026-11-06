@@ -48,6 +48,8 @@ use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
 use revm::context::result::ExecutionResult;
 use std::{collections::BTreeSet, sync::Arc};
 
+mod aero_execution;
+
 /// `sol!`-generated pool event bindings (crate-internal, not public API).
 mod abi {
     alloy_sol_types::sol! {
@@ -2035,10 +2037,12 @@ impl ConcentratedLiquidityAdapter {
     /// The exact value of the block-keyed hook cell for a block in which the
     /// pool has not swapped yet: zero. A consumer simulating at the next block
     /// (the common case: quoting for inclusion in `head + 1`) materializes it
-    /// before a strict snapshot quote; a block that already contains a swap of
-    /// the pool holds the hook's stored first-swap fee instead and must be
-    /// hydrated from the chain (see
-    /// [`aero_cl_block_scoped_storage_targets`](Self::aero_cl_block_scoped_storage_targets)).
+    /// before a strict snapshot quote. A block that already contains a swap
+    /// holds the hook's stored raw first-swap fee. Derive that value from the
+    /// ordered pre-swap state using
+    /// [`derive_aero_execution_event`](Self::derive_aero_execution_event), or
+    /// obtain it during an explicitly authorized baseline repair. Never
+    /// overwrite an existing-height unknown fee with this zero materialization.
     pub fn aero_cl_block_scoped_materialization(
         pool: &PoolRegistration,
         block_number: u64,
