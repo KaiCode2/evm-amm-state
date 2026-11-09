@@ -1,6 +1,23 @@
 # Releasing `evm-amm-state`
 
-## Aero release candidate
+## Canonical state source alpha.10 preparation
+
+`0.3.1-alpha.10` adds only the provider-free canonical source API described in
+[canonical state source](docs/canonical-state-source.md), based on reviewed API
+commit `f2d1251402aa1177aa5a9b6b2114a716214cbda5`. The published alpha.9 archive
+remains unchanged. Cache stays pinned to registry `=0.4.2-alpha.1`; no cache
+release, runtime dependency or toolchain change is required.
+
+Preparation is authorized; publication, tags, deployment and activation are
+held. The previous crypto-bigint acceptance expired. Keep the full audit and
+all gates; obtain an exact new artifact decision after the combined consumer
+qualification. A local path/source override is qualification evidence only and
+must not ship in a published manifest or replace the final registry checksum.
+Offline matrix, package verification, downstream three-chain/recovery and
+release performance results must identify this exact source/archive. Existing
+alpha.9 live parity is historical, not alpha.10 release acceptance.
+
+## Published Aero alpha.9 baseline
 
 `0.3.1-alpha.9` requires the exact `evm-fork-cache = "=0.4.2-alpha.1"` dependency.
 Publish and verify that cache artifact first. Its optional fail-closed gap policy

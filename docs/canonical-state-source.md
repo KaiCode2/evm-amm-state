@@ -13,7 +13,8 @@ and monotonically increasing generations; no quote/economics/permission change;
 source durability, cursor and readiness remain with the embedding application.
 Tests must cover coherent advancement, code/coverage/header/identity rejection,
 rollback and alternate branch, finality/deep undo, version growth and immutable
-older publications. No release/publication or new dependency version is approved.
+older publications. The alpha.10 preparation versions this API without changing any dependency.
+Publication, deployment and activation remain held.
 
 This API is a source trust boundary, like complete canonical-log ingestion. It
 does not cryptographically prove arbitrary state values against the state root.
@@ -44,3 +45,20 @@ library tests with `live-runtime`, and strict all-target Clippy passed. There is
 no hosted acceptance, new published version, or release authority. The bot
 must qualify against this exact local source before a reviewed upstream pin
 can replace alpha.9. `evm-fork-cache = 0.4.2-alpha.1` is unchanged.
+
+The alpha.10 packaging branch retains the API at
+`f2d1251402aa1177aa5a9b6b2114a716214cbda5` byte-for-byte. Only package/root-lock
+version and release documentation change. Registry inspection on 9 November
+confirmed published alpha.9 checksum
+`6b479657c772c2e7d61144945c5a34c328156b5b018a52bc272ce32016758303`;
+alpha.10 was absent. Packaging and complete validation are still in progress.
+
+
+Preparation checklist for alpha.10: the source API tree remains byte-identical
+at the binding above; all applicable offline matrix/package checks must run
+against the versioned candidate, and the downstream bot must use a separately
+recorded immutable source override until publication is authorized. Full
+unfiltered audit is captured outside the repository's advisory-ignore config;
+ordinary policy evaluation remains separate and release-blocking. No runtime
+I/O, source scope, economic behavior or permission changes are introduced by
+the packaging commit.

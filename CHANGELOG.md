@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.1-alpha.9] - Unreleased candidate
+## [0.3.1-alpha.10] - Unreleased candidate
+
+- Add the opt-in `live-runtime` canonical state source owner. Complete source
+  deliveries produce ordinary immutable AMM snapshots after exact header,
+  lineage, account/code/static-cell coverage and fixed-topology validation.
+- Bound retained rollback history and dynamic storage coverage. Undo and
+  alternate branches allocate fresh state and pool revisions; old snapshots
+  remain immutable. Missing state, changed code, identity/finality mismatch and
+  exhausted revisions reject before mutation.
+- Allow a complete cold execution scope to accompany the prepared AMM topology,
+  requiring identical overlapping accounts, storage, ancestor hashes and fork
+  identity. Code bytes must match every declared code hash.
+- This interface trusts an authenticated source owner for effect completeness;
+  it does not verify state-root proofs, implement a feed, persist checkpoints,
+  fetch missing state or grant worker readiness. Existing log runtime, quote
+  behavior, default features and dependency pins are unchanged.
+- Cache remains exactly `evm-fork-cache = 0.4.2-alpha.1`. Alpha.9 is not changed
+  or republished. Functional qualification and exact-artifact security approval
+  remain required; publication, deployment and activation are held.
+
+## [0.3.1-alpha.9] - 2026-11-06
 
 - Add explicit transport-free execution-state handling for reviewed Aero CL and
   volatile families. Ordered event transitions preserve exact economic cells,
