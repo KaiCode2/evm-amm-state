@@ -130,11 +130,44 @@ impl CanonicalStateOwner {
         baseline: &AmmStateSnapshot,
         source: SourceIdentity,
         header: Header,
-        mut required: StorageAccessList,
+        required: StorageAccessList,
         max_slots: usize,
         history_limit: usize,
         irreversible: u64,
     ) -> Result<Self, StateSourceError> {
+        Self::bootstrap_from_delivery(
+            baseline,
+            StateDelivery {
+                source,
+                header,
+                state: baseline.cache_snapshot(),
+                irreversible,
+            },
+            required,
+            max_slots,
+            history_limit,
+        )
+    }
+
+    /// Transfer topology and a complete cold source state at the same exact point.
+    ///
+    /// This permits a source scope to include execution dependencies beyond the
+    /// AMM cache. Every resident baseline account, slot and ancestor hash must
+    /// agree with the supplied state. The caller must separately attest the cold
+    /// reads for the added scope; matching headers are not proof of those reads.
+    pub fn bootstrap_from_delivery(
+        baseline: &AmmStateSnapshot,
+        delivery: StateDelivery,
+        mut required: StorageAccessList,
+        max_slots: usize,
+        history_limit: usize,
+    ) -> Result<Self, StateSourceError> {
+        let StateDelivery {
+            source,
+            header,
+            state,
+            irreversible,
+        } = delivery;
         if source.chain_id == 0
             || source.scope == B256::ZERO
             || source.package == B256::ZERO
@@ -146,7 +179,8 @@ impl CanonicalStateOwner {
         if !(1..=256).contains(&history_limit) || !(1..=65_536).contains(&max_slots) {
             return Err(StateSourceError::Bounds);
         }
-        let resident = baseline.cache().resident_read_set();
+        Self::validate_bootstrap_overlap(baseline, &state)?;
+        let resident = state.resident_read_set();
         required.accounts.extend(resident.accounts);
         required.code_hashes.extend(resident.code_hashes);
         if required.accounts.is_empty()
@@ -164,8 +198,7 @@ impl CanonicalStateOwner {
             .accounts
             .iter()
             .map(|a| {
-                baseline
-                    .cache()
+                state
                     .account_code_hash(*a)
                     .map(|hash| (*a, hash))
                     .ok_or(StateSourceError::Incomplete)
@@ -184,7 +217,7 @@ impl CanonicalStateOwner {
             AmmStateVersion::initial(),
             baseline.point(),
             baseline.interest_revision(),
-            baseline.cache_snapshot(),
+            state,
             baseline.registry_snapshot(),
             baseline.pool_revisions_snapshot(),
         ));
@@ -210,6 +243,47 @@ impl CanonicalStateOwner {
             owner.current.snapshot.cache_snapshot(),
         )?;
         Ok(owner)
+    }
+
+    fn validate_bootstrap_overlap(
+        baseline: &AmmStateSnapshot,
+        state: &Arc<EvmSnapshot>,
+    ) -> Result<(), StateSourceError> {
+        if baseline.cache().spec_id() != state.spec_id() {
+            return Err(StateSourceError::Identity);
+        }
+        let resident = baseline.cache().resident_read_set();
+        if !state.missing_read_set(&resident).is_empty() {
+            return Err(StateSourceError::Incomplete);
+        }
+        if resident.slots.iter().any(|(address, slot)| {
+            baseline.cache().storage_value(*address, *slot) != state.storage_value(*address, *slot)
+        }) || resident
+            .block_numbers
+            .iter()
+            .any(|number| baseline.cache().block_hash(*number) != state.block_hash(*number))
+        {
+            return Err(StateSourceError::Identity);
+        }
+        let mut old = EvmOverlay::new(baseline.cache_snapshot(), None);
+        let mut new = EvmOverlay::new(Arc::clone(state), None);
+        for address in &resident.accounts {
+            let old = old
+                .basic(*address)
+                .map_err(|_| StateSourceError::Incomplete)?;
+            let new = new
+                .basic(*address)
+                .map_err(|_| StateSourceError::Incomplete)?;
+            match (old, new) {
+                (Some(old), Some(new))
+                    if old.nonce == new.nonce
+                        && old.balance == new.balance
+                        && old.code_hash == new.code_hash => {}
+                (None, None) => {}
+                _ => return Err(StateSourceError::Identity),
+            }
+        }
+        Ok(())
     }
 
     /// Last committed state. This is not an application readiness permit.

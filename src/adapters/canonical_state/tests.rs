@@ -98,6 +98,73 @@ fn delivery(header: Header, state: Arc<EvmSnapshot>) -> StateDelivery {
 }
 
 #[tokio::test]
+async fn cold_delivery_extends_scope_without_relabeling_disagreeing_baseline() {
+    let h = header(None, 1);
+    let seed = baseline(&h, cache(&h, 1).await);
+    let extra = Address::repeat_byte(0x22);
+    let state = cache_with(&h, 1, |cache| {
+        cache
+            .db_mut()
+            .insert_account_info(extra, AccountInfo::default());
+        cache
+            .db_mut()
+            .insert_account_storage(extra, U256::ZERO, U256::from(9))
+            .unwrap();
+    })
+    .await;
+    let mut required = state.resident_read_set();
+    required.block_numbers.clear();
+    let owner = CanonicalStateOwner::bootstrap_from_delivery(
+        &seed,
+        delivery(h.clone(), state),
+        required,
+        4,
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        owner
+            .current()
+            .snapshot()
+            .cache()
+            .storage_value(extra, U256::ZERO),
+        Some(U256::from(9))
+    );
+    assert_eq!(seed.cache().storage_value(extra, U256::ZERO), None);
+    for account_change in [false, true] {
+        let state = cache_with(&h, 1, |cache| {
+            if account_change {
+                cache
+                    .db_mut()
+                    .cache
+                    .accounts
+                    .get_mut(&ACCOUNT)
+                    .unwrap()
+                    .info
+                    .nonce += 1;
+            } else {
+                cache
+                    .db_mut()
+                    .insert_account_storage(ACCOUNT, U256::ZERO, U256::from(2))
+                    .unwrap();
+            }
+        })
+        .await;
+        assert_eq!(
+            CanonicalStateOwner::bootstrap_from_delivery(
+                &seed,
+                delivery(h.clone(), state),
+                seed.cache().resident_read_set(),
+                4,
+                16,
+            )
+            .err(),
+            Some(StateSourceError::Identity)
+        );
+    }
+}
+
+#[tokio::test]
 async fn complete_states_advance_and_rewind_without_event_derivation() {
     let (mut owner, seed) = owner().await;
     let first = owner.current().clone();

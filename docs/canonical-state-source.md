@@ -33,7 +33,13 @@ actual code bytes must hash to its reviewed identity. A regression supplies an
 irrelevant code body in the backing cache, shadowed by a valid account overlay;
 the otherwise coherent state is rejected before history can retain it.
 
-Local validation on macOS/Rust 1.90: five focused canonical-state tests, 248
+`bootstrap_from_delivery` transfers a complete cold execution scope alongside
+the baseline topology. It requires the same exact point and identical overlapping
+accounts, storage and ancestor hashes. Added cells still require application-owned
+actual cold read evidence; the API does not turn matching pins into read proofs.
+The original bootstrap delegates to this path using its existing cache.
+
+Local validation on macOS/Rust 1.90: six focused canonical-state tests, 249
 library tests with `live-runtime`, and strict all-target Clippy passed. There is
 no hosted acceptance, new published version, or release authority. The bot
 must qualify against this exact local source before a reviewed upstream pin
