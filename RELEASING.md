@@ -1,5 +1,40 @@
 # Releasing `evm-amm-state`
 
+## Canonical state source alpha.10 preparation
+
+`0.3.1-alpha.10` adds only the provider-free canonical source API described in
+[canonical state source](docs/canonical-state-source.md), based on reviewed API
+commit `f2d1251402aa1177aa5a9b6b2114a716214cbda5`. The published alpha.9 archive
+remains unchanged. Cache stays pinned to registry `=0.4.2-alpha.1`; no cache
+release, runtime dependency or toolchain change is required.
+
+Preparation is authorized; publication, tags, deployment and activation are
+held. The previous crypto-bigint acceptance expired. Keep the full audit and
+all gates; obtain an exact new artifact decision after the combined consumer
+qualification. A local path/source override is qualification evidence only and
+must not ship in a published manifest or replace the final registry checksum.
+Offline matrix, package verification, downstream three-chain/recovery and
+release performance results must identify this exact source/archive. Existing
+alpha.9 live parity is historical, not alpha.10 release acceptance.
+
+## Published Aero alpha.9 baseline
+
+`0.3.1-alpha.9` requires the exact `evm-fork-cache = "=0.4.2-alpha.1"` dependency.
+Publish and verify that cache artifact first. Its optional fail-closed gap policy
+and hardfork getter support the event-only Aero consumer; default behavior stays
+unchanged. Current source implementation is separately owned.
+Run the offline matrix below, then run `scripts/stage10-aero-live-gates.sh`
+for hash-pinned parity and replay on all three chains. Run the long-window
+campaign with `scripts/stage10-aero-campaign.sh`. The reviewed pool identities,
+fee context and quote-state requirements are in [Aero families](docs/aero-families.md).
+
+The dependency audit remains a publication gate. The candidate resolves the
+two TLS advisories with `rustls-webpki 0.103.16` and `webpki-roots 1.0.10`.
+The locked Alloy and EVM graph still includes `crypto-bigint 0.5.5` through
+`elliptic-curve 0.13.8`. RUSTSEC-2026-0387 requires `crypto-bigint >=0.7.6`.
+
+## Previous alpha.7 release
+
 The `0.3.1-alpha.7` candidate is based on published `0.3.1-alpha.6`.
 It adds an independently opt-in reconciliation observer under the default-off
 `ingress-timing` feature and generic validated full-header evidence on reliable
@@ -42,7 +77,7 @@ The `0.3.0` prerequisites were published in this order:
 4. publish `evm-amm-state 0.3.0` after the gates below pass.
 
 That historical baseline resolved cache 0.4.0. The current release must resolve
-`evm-fork-cache 0.4.1` from crates.io before release.
+`evm-fork-cache 0.4.2-alpha.1` from crates.io before release.
 Candidate integration may use an external patch configuration; neither that
 configuration nor a path dependency may ship. A registry resolution failure
 remains a release blocker.
@@ -205,7 +240,7 @@ cargo publish --dry-run --locked
 ```
 
 Warnings about excluded explicit test targets are expected. A dependency
-resolution failure for `evm-fork-cache 0.4.1` is not waived; publish and
+resolution failure for `evm-fork-cache 0.4.2-alpha.1` is not waived; publish and
 verify the companion crate first. Do not tag or publish until packaged-source
 builds, canonical live gates, downstream compatibility, changelog, and benchmark
 evidence pass. Flashblocks is governed by the explicit in-development scope

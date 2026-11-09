@@ -7,6 +7,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1-alpha.10] - Unreleased candidate
+
+- Add the opt-in `live-runtime` canonical state source owner. Complete source
+  deliveries produce ordinary immutable AMM snapshots after exact header,
+  lineage, account/code/static-cell coverage and fixed-topology validation.
+- Bound retained rollback history and dynamic storage coverage. Undo and
+  alternate branches allocate fresh state and pool revisions; old snapshots
+  remain immutable. Missing state, changed code, identity/finality mismatch and
+  exhausted revisions reject before mutation.
+- Allow a complete cold execution scope to accompany the prepared AMM topology,
+  requiring identical overlapping accounts, storage, ancestor hashes and fork
+  identity. Code bytes must match every declared code hash.
+- This interface trusts an authenticated source owner for effect completeness;
+  it does not verify state-root proofs, implement a feed, persist checkpoints,
+  fetch missing state or grant worker readiness. Existing log runtime, quote
+  behavior, default features and dependency pins are unchanged.
+- Cache remains exactly `evm-fork-cache = 0.4.2-alpha.1`. Alpha.9 is not changed
+  or republished. Functional qualification and exact-artifact security approval
+  remain required; publication, deployment and activation are held.
+
+## [0.3.1-alpha.9] - 2026-11-06
+
+- Add explicit transport-free execution-state handling for reviewed Aero CL and
+  volatile families. Ordered event transitions preserve exact economic cells,
+  reject unsupported tape/checkpoint ambiguity and retain generation/block pins.
+- Add opt-in event-only subscriber delivery using cache 0.4.2-alpha.1's fail-closed
+  gap policy. Ordinary delivery cannot request implicit reconciliation; incomplete
+  state remains unavailable. This is not a complete block-source implementation.
+- Expose canonical local log application and prepared execution-state read sets
+  to the owning runtime. Existing default subscriber behavior remains unchanged.
+- Retain the Aero layouts, reviewed runtimes, Metaquoter/total-fee quote handling
+  and transaction-context support introduced by the alpha.8 candidate below.
+- Pin the companion cache to `=0.4.2-alpha.1`; require downstream lockfile updates.
+  Publication of both alpha payloads requires exact-artifact security approval.
+
+## [0.3.1-alpha.8] - 2026-10-29
+
+Additive release candidate for the Aero (Dromos) venues that received the
+BIFI liquidity after the 22 October 2026 launch. Existing registrations,
+layouts, quote targets and the reviewed legacy Slipstream/Solidly families
+keep their exact behaviour; every addition is opt-in through metadata. See
+[Aero families](docs/aero-families.md) for the reviewed identities, warmed
+cells and the gaps that remain.
+
+### Added
+
+- `V3StorageLayout::aero_cl(spacing)` and the `AERO_CL_*_SLOT` constants for
+  the Aero CL layout (`slot0` 6, packed `liquidity` 13, `ticks` 14,
+  `tickBitmap` 15, `observations` 17, packed staked-liquidity word 12 with a
+  `uint48 lastUpdated`), plus `V3StorageLayout::observations_slot` /
+  `with_observations_slot` and `slipstream_family` so the observation ring and
+  the transition surface are part of the layout description. `V3SyncSpec::aero_cl`
+  and a family-aware `V3SyncSpec::slipstream` emit the matching one-shot sync
+  program.
+- Reviewed Aero CL runtime families `SlipstreamRuntimeFamily::AeroEthereumBifi`
+  (`0xff35aa95…`, spacing 50) and `AeroBaseMooBifi` (`0xEEBE78d7…`, spacing
+  100): cold start warms and pins the pool proxy, CL implementation, factory,
+  swap-fee hook, discount registry, MEV-tax module (Base), unstaked-fee
+  module, pool tape and gauge runtimes, warms the deterministic factory /
+  hook / module / voter / registry / tape cells the quote path reads, and
+  `swap_transition_capability` / `liquidity_transition_capability` return
+  `Exact` for ordered `Swap`, `Mint`, `Burn` and `Collect` on the Aero slot
+  surface. Helpers expose the block-keyed `blockFee[pool][height]` cell and the
+  per-account discount cell, and `validate_aero_cl_runtime` checks every pinned
+  identity against a snapshot.
+- `AmmAdapter::reviewed_code_identities`: cold start compares resident or
+  fetched runtimes against the pins and fails the pool closed on a mismatch
+  (`cold_start`, `cold_start_many` and the prepared live-runtime path).
+- Metaquoter quoting: `V3QuoterKind` with `V3Metadata::quoter_kind` /
+  `with_metaquoter`, `quoteExactInputSingleV3` / `quoteExactOutputSingleV3`
+  bindings and `AmmAdapter::simulate_swap_exact_output` (`ExactOutputQuote`).
+- `SimConfig::gas_price` / `with_gas_price` / `with_effective_gas_price` and
+  `with_tx_origin` / `tx_origin` carry the candidate transaction's context into
+  quotes; `CallTxContext`, `AdapterCache::call_raw_with_context` (default:
+  delegate for an empty context, fail closed otherwise), `quote_via_call_with_config`
+  and `overlay_call_raw_with_context` thread it through the live cache, the
+  quote read-set recorder and offline snapshot overlays.
+- Aero volatile Solidly variant: `SolidlyPoolVariant::AeroVolatile`,
+  `SolidlyV2Metadata::with_aero_volatile`, `SolidlyStorageLayout::aero_volatile`
+  (reserves 196619/196620, tokens 7/8) and the reviewed
+  `AeroVolatileRuntimeFamily::AeroOptimismMooBifi` (`0xC71B571a…`). Cold start
+  proves `POOL_TYPE() == "V2_VOLATILE"` and warms the factory, fee-module and
+  MEV-module cells; quotes run through `getAmountOutWithTotalFee` /
+  `getAmountInWithTotalFee` under the configured caller and gas price, so the
+  lazy factory fetch stays off the production quote path.
+- Deterministic fixtures replaying real Aero transactions (an Ethereum swap, a
+  Base swap, and two Base CLM rebalances with up to 19 ordered pool events),
+  mock-backed tests for the Metaquoter, Aero volatile and transaction-context
+  paths, and the live `aero_parity_rpc` / `aero_replay_rpc` gates (new
+  `live-aero.yml` workflow) pinned to Ethereum 26292020, Base 53205395 and
+  Optimism 158800699.
+- Aero gauge staking evidence: the reviewed Aero gauges and the pinned
+  NonfungiblePositionManager attest `Deposit` / `Withdraw` (range from the
+  preceding pool `Collect`, delta from the event, withdrawals applied at the
+  custody transfer) and every pool settlement the gauge performs: each
+  `GaugeSettled` is an exact settlement event (`rewardGrowthGlobalX128` /
+  `rollover`, the staked-seconds accumulator, the `uint48 lastUpdated`,
+  `rollover` cleared when it ran through `settleToBlock()`), emission claims
+  settle silently, and stakes settle silently before moving staked
+  liquidity, so the staked word, `stakedLiquidityNet` and the reward
+  accounting stay exact without repairs.
+  `SlipstreamStakingBatch::from_block_logs` builds the same evidence from a
+  block's ordered logs; `StakingBlockRef` names the block.
+- Swap accounting for the Aero families: `SlipstreamSwapFeeEvidence` accepts
+  `AeroEthereumBifi` / `AeroBaseMooBifi` with their pinned identities and a
+  `gauge_settlement_delta` (`with_gauge_settlement_delta`), the offline
+  unstaked-fee evaluators run `pool.unstakedFee()` / `factory.getUnstakedFee`
+  on the exact parent snapshot, and the swap transition reproduces fee growth,
+  gauge fees, the gauge settlement on a crossing swap and every crossed
+  tick's six words. `SlipstreamFeeEvidenceError::SettlementDelta` rejects a
+  delta on a legacy family.
+- Exact Slipstream / Aero `CollectFees` (gauge fee claims leave one wei per
+  token) and `IncreaseObservationCardinalityNext` (ring reservation growth)
+  transitions; both topics are subscribed for Slipstream registrations.
+- Event-driven Aero governance (`aero_governance`): hook per-pool and default
+  setters, MEV-module setters and factory fee cells become exact packed
+  writes (packings confirmed against live pools and state-override calls);
+  runtime rebinding (hook, MEV module, tape, registry, unstaked-fee module)
+  purges the pool for re-review; unconfirmed setters and discount-registry
+  writes purge and verify the affected cells. Setters for other pools never
+  route to a reviewed registration.
+- Snapshot Metaquoter quotes stub the pool tape and the pool's gauge
+  (`ConcentratedLiquidityAdapter::aero_cl_quote_code_overrides`): neither can
+  change a quoted amount, and their period-indexed / settlement cells leave
+  the strict read set. The Aero sync statics now include `token0` / `token1`,
+  cold start warms the path tokens' account headers, and
+  `aero_cl_block_scoped_materialization` writes the zero `blockFee` cell for a
+  not-yet-swapped block.
+- `tests/aero_campaign_rpc.rs` / `scripts/stage10-aero-campaign.sh`: the
+  long-window exact replay and strict-quote campaign (full-state comparison
+  at every event and stride block, wei-exact quotes against `eth_call`
+  including a synthetic non-zero scaling factor, per-chain JSON/Markdown
+  reports), plus real-transaction fixtures for the Base gauge rebalance, the
+  Ethereum gauge deposit / withdrawal and a gauge fee claim.
+
+### Changed
+
+- Registration archives persist `observations_slot`, `quoter_kind` and the
+  Solidly `variant` only when set, so existing archives remain byte-identical
+  and older readers keep loading them.
+- `SlipstreamSwapFeeEvidence` carries `gauge_settlement_delta` (zero from
+  `new`; legacy families must keep it zero) and the Aero families are no
+  longer rejected by `validate` or the offline unstaked-fee evaluators.
+- The reviewed Aero cold start also pins the NonfungiblePositionManager
+  runtime (per-chain hash) and subscribes the gauge, manager, hook, factory,
+  discount-registry and MEV-module sources above.
+
 ## [0.3.1-alpha.7] - Release candidate
 
 ### Fixed

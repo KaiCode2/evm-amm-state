@@ -1,6 +1,6 @@
 [package]
 name = "evm-amm-state"
-version = "0.3.1-alpha.7"
+version = "0.3.1-alpha.10"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -72,10 +72,10 @@ live-runtime = ["dep:tokio", "dep:futures"]
 
 [dependencies]
 futures = { version = "0.3", optional = true }
-# Companion crate: 0.4.1 supplies the optional generic consumed receipt API.
-# Existing log-coverage/stream-gap and canonical-state contracts are unchanged.
+# Companion crate: the alpha adds opt-in fail-closed gap delivery and snapshot
+# hardfork identity. Existing default reconciliation remains unchanged.
 # The exact registry pin keeps downstream builds reproducible.
-evm-fork-cache = { version = "=0.4.1" }
+evm-fork-cache = { version = "=0.4.2-alpha.1" }
 
 alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
@@ -92,9 +92,10 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-evm-fork-cache = { version = "=0.4.1", features = ["reactive-polling", "raw-flashblocks-json"] }
+evm-fork-cache = { version = "=0.4.2-alpha.1", features = ["reactive-polling", "raw-flashblocks-json"] }
 alloy-consensus = "1.0.38"
 alloy-json-rpc = "1.0.38"
+alloy-pubsub = "1.0.38"
 alloy-rpc-client = "1.0.38"
 alloy-transport = "1.0.38"
 alloy-transport-http = "1.0.38"
@@ -384,3 +385,36 @@ required-features = ["uniswap-v2", "uniswap-v3", "curve"]
 [[example]]
 name = "arbitrage_triangular"
 required-features = ["uniswap-v3", "curve"]
+
+# Deterministic Aero (Dromos) CL family coverage: layout classification,
+# capability gating, reviewed identity/warm-cell tables, Metaquoter quotes and
+# exact replay of captured Ethereum/Base transactions.
+[[test]]
+name = "aero_cl_family"
+required-features = ["uniswap-v3"]
+
+# Deterministic Aero volatile Solidly-variant coverage against a mock pool.
+[[test]]
+name = "aero_volatile"
+required-features = ["solidly-v2"]
+
+# Transaction-context (`tx.gasprice` / `tx.origin`) plumbing through the cache
+# facades and the offline overlay helper.
+[[test]]
+name = "sim_tx_context"
+required-features = ["adapters"]
+
+# Live Aero parity (env-gated, #[ignore]): offline Metaquoter / total-fee
+# quotes against hash-pinned `eth_call`s and a multi-block differential
+# replay on Ethereum, Base and Optimism.
+[[test]]
+name = "aero_parity_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]
+
+[[test]]
+name = "aero_replay_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]
+
+[[test]]
+name = "aero_campaign_rpc"
+required-features = ["uniswap-v3", "solidly-v2"]

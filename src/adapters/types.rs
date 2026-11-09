@@ -8,12 +8,20 @@ use super::cache::{SlotChange, StateDiff, StateUpdate};
 use super::sim::SimConfig;
 use super::storage::{SolidlyStorageLayout, V3StorageLayout};
 
-/// Independently reviewed deployed Slipstream runtime family.
+/// Independently reviewed deployed Slipstream-family runtime.
 ///
 /// This is deliberately narrower than [`ProtocolId::Slipstream`]. Exact
 /// event-only replay is granted only to the concrete deployed implementations
 /// whose storage and swap semantics have been checked against their runtime
 /// bytecode.
+///
+/// The two Aero (Dromos) families share one CL implementation (runtime keccak
+/// `0x041172c7…`) behind EIP-1167 proxies but differ per chain in factory,
+/// swap-fee hook, MEV-tax module and gauge identity, so each is reviewed
+/// separately. They are exact on the quote/search surface (`Swap`, `Mint`,
+/// `Burn`, `Collect`); the optional runtime-bound accounting evidence of the
+/// legacy families does not apply to them (see
+/// [`SlipstreamSwapFeeEvidence::validate`]).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SlipstreamRuntimeFamily {
@@ -21,6 +29,53 @@ pub enum SlipstreamRuntimeFamily {
     AerodromeBaseBifi,
     /// Velodrome Slipstream implementation deployed by the Optimism mooBIFI pool.
     VelodromeOptimismBifi,
+    /// Aero (Dromos) CL implementation behind the Ethereum BIFI/WETH pool
+    /// `0xff35aa95…` (tick spacing 50).
+    AeroEthereumBifi,
+    /// Aero (Dromos) CL implementation behind the Base WETH/mooBIFI pool
+    /// `0xEEBE78d7…` (tick spacing 100).
+    AeroBaseMooBifi,
+}
+
+impl SlipstreamRuntimeFamily {
+    /// Whether this family is an Aero (Dromos) CL deployment, as opposed to a
+    /// legacy Aerodrome/Velodrome Slipstream deployment.
+    pub const fn is_aero_cl(self) -> bool {
+        matches!(self, Self::AeroEthereumBifi | Self::AeroBaseMooBifi)
+    }
+
+    /// The chain this reviewed family is deployed on.
+    pub const fn chain_id(self) -> u64 {
+        match self {
+            Self::AerodromeBaseBifi | Self::AeroBaseMooBifi => 8_453,
+            Self::VelodromeOptimismBifi => 10,
+            Self::AeroEthereumBifi => 1,
+        }
+    }
+}
+
+/// Independently reviewed deployed Aero (Dromos) basic-pool runtime.
+///
+/// Narrower than [`ProtocolId::SolidlyV2`] with
+/// [`SolidlyPoolVariant::AeroVolatile`]: the reviewed deployment pins the pool
+/// proxy, implementation, factory, fee module, exact-output fee quoter and
+/// MEV-tax module runtimes, and cold start warms the factory, fee-module and
+/// MEV-module cells the total-fee getters read so the production quote path
+/// never performs the lazy factory fetch.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AeroVolatileRuntimeFamily {
+    /// Aero volatile WETH/mooBIFI pool `0xC71B571a…` on Optimism.
+    AeroOptimismMooBifi,
+}
+
+impl AeroVolatileRuntimeFamily {
+    /// The chain this reviewed family is deployed on.
+    pub const fn chain_id(self) -> u64 {
+        match self {
+            Self::AeroOptimismMooBifi => 10,
+        }
+    }
 }
 
 /// Proof of how the event-scoped unstaked-liquidity fee was obtained.
@@ -277,6 +332,10 @@ pub enum SlipstreamUnstakedFeeEvaluationError {
     FeeRange,
     /// Factory, voter liveness, and module results did not describe one state.
     FeePathMismatch,
+    /// The reviewed family has no offline unstaked-fee evaluator. The Aero CL
+    /// families resolve their swap fee through the deployed hook inside the
+    /// quote itself and carry no evidence-gated accounting replay.
+    UnsupportedFamily,
 }
 
 impl fmt::Display for SlipstreamUnstakedFeeEvaluationError {
@@ -294,6 +353,12 @@ impl fmt::Display for SlipstreamUnstakedFeeEvaluationError {
             Self::MalformedOutput => write!(f, "malformed offline Slipstream fee output"),
             Self::FeeRange => write!(f, "offline Slipstream unstaked fee is out of range"),
             Self::FeePathMismatch => write!(f, "inconsistent Slipstream fee-path result"),
+            Self::UnsupportedFamily => {
+                write!(
+                    f,
+                    "offline Slipstream fee evaluation is unsupported for this family"
+                )
+            }
         }
     }
 }
@@ -330,6 +395,14 @@ pub struct SlipstreamSwapFeeEvidence {
     pub effective_unstaked_fee: u32,
     /// Provider-free proof for the effective unstaked-liquidity fee.
     pub unstaked_fee_proof: SlipstreamUnstakedFeeProof,
+    /// Aero CL only: the emissions the pool's gauge settled into the pool
+    /// inside this event's transaction (`GaugeSettled.delta` emitted by the
+    /// gauge before this log and after any earlier pool event of the same
+    /// transaction), zero when the gauge emitted none. A crossing swap settles
+    /// the pool to its block before crossing; the delta credits
+    /// `rewardGrowthGlobalX128` (or `rollover` with nothing staked). The
+    /// legacy families settle from pool-local state and require zero.
+    pub gauge_settlement_delta: U256,
     /// Exact block containing the event.
     pub block_number: u64,
     /// Exact block identity containing the event.
@@ -358,6 +431,14 @@ pub enum SlipstreamFeeEvidenceError {
     IncompleteLineage,
     /// Effective unstaked fee does not match the opaque evaluator attestation.
     UnstakedFeeProofMismatch,
+    /// The family does not support runtime-bound accounting evidence. The Aero
+    /// CL families settle rewards through their gauge on every crossed tick,
+    /// so their accounting surface is not reproducible from pool state alone;
+    /// they remain exact on the quote/search surface without evidence.
+    UnsupportedFamily,
+    /// A gauge settlement delta on a family whose rewards settle from
+    /// pool-local state (only the Aero CL families carry one).
+    SettlementDelta,
 }
 
 impl fmt::Display for SlipstreamFeeEvidenceError {
@@ -368,6 +449,16 @@ impl fmt::Display for SlipstreamFeeEvidenceError {
             Self::IncompleteLineage => write!(f, "Slipstream event lineage is incomplete"),
             Self::UnstakedFeeProofMismatch => {
                 write!(f, "Slipstream unstaked fee does not match its proof")
+            }
+            Self::SettlementDelta => write!(
+                f,
+                "gauge settlement delta on a Slipstream family that settles rewards from pool state"
+            ),
+            Self::UnsupportedFamily => {
+                write!(
+                    f,
+                    "runtime-bound accounting evidence is unsupported for this Slipstream family"
+                )
             }
         }
     }
@@ -408,6 +499,7 @@ impl SlipstreamSwapFeeEvidence {
             effective_swap_fee,
             effective_unstaked_fee,
             unstaked_fee_proof,
+            gauge_settlement_delta: U256::ZERO,
             block_number,
             block_hash,
             parent_hash,
@@ -420,8 +512,26 @@ impl SlipstreamSwapFeeEvidence {
         Ok(evidence)
     }
 
+    /// Set the Aero CL gauge settlement delta of this event's transaction and
+    /// revalidate the record (see [`Self::gauge_settlement_delta`]).
+    pub fn with_gauge_settlement_delta(
+        mut self,
+        delta: U256,
+    ) -> Result<Self, SlipstreamFeeEvidenceError> {
+        self.gauge_settlement_delta = delta;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Revalidate a retained or deserialized evidence value.
+    ///
+    /// Every reviewed family is accepted with its own pinned identities. The
+    /// Aero CL families additionally carry the gauge settlement delta of the
+    /// event's transaction; the legacy families must carry zero.
     pub fn validate(self) -> Result<(), SlipstreamFeeEvidenceError> {
+        if !self.runtime_family.is_aero_cl() && !self.gauge_settlement_delta.is_zero() {
+            return Err(SlipstreamFeeEvidenceError::SettlementDelta);
+        }
         let identity_matches = match self.runtime_family {
             SlipstreamRuntimeFamily::AerodromeBaseBifi => {
                 self.chain_id == 8_453
@@ -442,6 +552,26 @@ impl SlipstreamSwapFeeEvidence {
                     && self.implementation == address!("c28ad28853a547556780bebf7847628501a3bcbb")
                     && self.implementation_runtime_code_hash
                         == b256!("36c3da904ca0b58544254cd0d978fe4801c32dc1f9e3b3e644487ef541299794")
+            }
+            SlipstreamRuntimeFamily::AeroEthereumBifi => {
+                self.chain_id == 1
+                    && self.pool == address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1")
+                    && self.factory == address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2")
+                    && self.proxy_runtime_code_hash
+                        == b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45")
+                    && self.implementation == address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8")
+                    && self.implementation_runtime_code_hash
+                        == b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693")
+            }
+            SlipstreamRuntimeFamily::AeroBaseMooBifi => {
+                self.chain_id == 8_453
+                    && self.pool == address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8")
+                    && self.factory == address!("9cb220581b91b0c83223012fe69688b92ad07a76")
+                    && self.proxy_runtime_code_hash
+                        == b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45")
+                    && self.implementation == address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8")
+                    && self.implementation_runtime_code_hash
+                        == b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693")
             }
         };
         if !identity_matches {
@@ -1222,6 +1352,11 @@ pub struct V3Metadata {
     /// fills this from the fork's [`ClFactorySpec`](super::factory::ClFactorySpec)
     /// quoter when one was configured.
     pub quoter: Option<Address>,
+    /// Which quote ABI the resolved [`quoter`](Self::quoter) speaks. Defaults
+    /// to the QuoterV2 ABI every existing registration used;
+    /// [`V3QuoterKind::Metaquoter`] selects the Aero `Metaquoter` single-pool
+    /// quote (set it with [`with_metaquoter`](Self::with_metaquoter)).
+    pub quoter_kind: V3QuoterKind,
     /// Explicit V3 storage layout (slot bases + tick spacing). When unset it is
     /// derived from `tick_spacing` per the pool's family.
     pub storage_layout: Option<V3StorageLayout>,
@@ -1238,6 +1373,25 @@ pub struct V3Metadata {
     /// the runtime records the concrete warmed set here instead of claiming
     /// unverifiable whole-account ownership.
     pub warmed_slots: Vec<U256>,
+}
+
+/// The quote ABI a V3-family pool's swap-quote target speaks.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum V3QuoterKind {
+    /// Uniswap `QuoterV2.quoteExactInputSingle` with the fee-keyed struct
+    /// (Uniswap V3, PancakeSwap V3) or the signed tick-spacing struct
+    /// (Slipstream). The default for every registration.
+    #[default]
+    QuoterV2,
+    /// Aero (Dromos) `Metaquoter.quoteExactInputSingleV3(pool, tokenIn,
+    /// amountIn, sqrtPriceLimitX96)` / `quoteExactOutputSingleV3`. The pool is
+    /// addressed directly, so the quote needs no fee or tick-spacing key, and
+    /// the quote executes the pool's swap hook, MEV-tax module, discount
+    /// registry and pool tape. Quotes should run under the candidate's
+    /// transaction context ([`SimConfig::gas_price`](super::SimConfig::gas_price),
+    /// [`SimConfig::from`](super::SimConfig::from)).
+    Metaquoter,
 }
 
 /// Evidence-backed event-only swap-transition capability for a V3-family pool.
@@ -1317,6 +1471,22 @@ impl V3Metadata {
         self
     }
 
+    /// Set the quote ABI of the resolved quote target (see
+    /// [`quoter_kind`](Self::quoter_kind)).
+    pub fn with_quoter_kind(mut self, quoter_kind: V3QuoterKind) -> Self {
+        self.quoter_kind = quoter_kind;
+        self
+    }
+
+    /// Quote this pool through the Aero `Metaquoter` at `metaquoter`: sets
+    /// [`quoter`](Self::quoter) and [`quoter_kind`](Self::quoter_kind) together
+    /// so the warmed address and the ABI spoken to it cannot drift.
+    pub fn with_metaquoter(mut self, metaquoter: Address) -> Self {
+        self.quoter = Some(metaquoter);
+        self.quoter_kind = V3QuoterKind::Metaquoter;
+        self
+    }
+
     /// Set the pool's V3 storage layout descriptor.
     pub fn with_storage_layout(mut self, storage_layout: V3StorageLayout) -> Self {
         self.storage_layout = Some(storage_layout);
@@ -1348,6 +1518,24 @@ impl V3Metadata {
     }
 }
 
+/// Which Solidly-family pool implementation a [`SolidlyV2Metadata`] describes.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SolidlyPoolVariant {
+    /// Legacy Velodrome V2 / Aerodrome pool: quotes through
+    /// `getAmountOut(amountIn, tokenIn)` with the factory's flat `getFee`. The
+    /// default for every existing registration.
+    #[default]
+    Legacy,
+    /// Aero (Dromos) basic volatile pool (`POOL_TYPE() == "V2_VOLATILE"`):
+    /// quotes through `getAmountOutWithTotalFee` / `getAmountInWithTotalFee`,
+    /// whose fee is `factory.getFee(pool, msg.sender, …)` including the
+    /// MEV tax derived from `tx.gasprice`. `stable()` does not exist on these
+    /// pools and is never called. Register with
+    /// [`SolidlyStorageLayout::aero_volatile`].
+    AeroVolatile,
+}
+
 /// Metadata for a Solidly V2 (Aerodrome / Velodrome) reserves pool.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1357,10 +1545,14 @@ pub struct SolidlyV2Metadata {
     /// The pool's `token1` (decoded from the config layout at cold-start).
     pub token1: Option<Address>,
     /// `true` for stable (x³y+y³x) pools, `false` for volatile (xy=k). Config-
-    /// supplied; preserved across cold-start.
+    /// supplied; preserved across cold-start. Unused by
+    /// [`SolidlyPoolVariant::AeroVolatile`], which is volatile by definition.
     pub stable: Option<bool>,
     /// Fork-specific reserve/token storage layout (config-supplied; no default).
     pub storage_layout: Option<SolidlyStorageLayout>,
+    /// Which pool implementation and quote ABI this registration uses.
+    /// Defaults to [`SolidlyPoolVariant::Legacy`].
+    pub variant: SolidlyPoolVariant,
 }
 
 impl SolidlyV2Metadata {
@@ -1385,6 +1577,22 @@ impl SolidlyV2Metadata {
     /// Set the pool's Solidly storage layout descriptor (fork-specific slots).
     pub fn with_storage_layout(mut self, storage_layout: SolidlyStorageLayout) -> Self {
         self.storage_layout = Some(storage_layout);
+        self
+    }
+
+    /// Set the pool implementation / quote ABI variant.
+    pub fn with_variant(mut self, variant: SolidlyPoolVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// Register as an Aero (Dromos) basic volatile pool: sets the
+    /// [`AeroVolatile`](SolidlyPoolVariant::AeroVolatile) variant and the
+    /// [`aero_volatile`](SolidlyStorageLayout::aero_volatile) layout.
+    pub fn with_aero_volatile(mut self) -> Self {
+        self.variant = SolidlyPoolVariant::AeroVolatile;
+        self.storage_layout = Some(SolidlyStorageLayout::aero_volatile());
+        self.stable = Some(false);
         self
     }
 }
