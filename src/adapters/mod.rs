@@ -7,6 +7,9 @@
 pub mod bytecode;
 /// The [`AdapterCache`] facade over `evm-fork-cache` (reads, writes, raw calls).
 pub mod cache;
+/// Provider-free canonical full-state source ownership.
+#[cfg(feature = "live-runtime")]
+pub mod canonical_state;
 pub mod cold_start;
 /// Progressive background cold-start scheduling.
 #[cfg(feature = "live-runtime")]
