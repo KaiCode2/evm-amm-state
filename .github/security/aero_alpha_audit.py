@@ -13,21 +13,44 @@ import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
-PACKAGE = 'evm-amm-state-0.3.1-alpha.9'
+PACKAGE = 'evm-amm-state-0.3.1-alpha.10'
 REPO = 'KaiCode2/evm-amm-state'
 PR = 46
-BASE = '7352514b79d5741d887ff4a11bae6fa59408aabf'
-LOCK = 'b275e8871eb80a195a16265e8b0c2e053f9a77510d3fb0f4a601d40bc7f7a451'
-PAYLOAD = 'b932ec2d3362d34161737d8d7fd7db559bada6bbad5a7a3ea6072c0271f9ca34'
-ARCHIVE = '6b479657c772c2e7d61144945c5a34c328156b5b018a52bc272ce32016758303'
+BASE = '5dca44f86f533065c0f4934ff29dbf2dcb74522e'
+LOCK = '4c5f1a26029b85ea20a7c91f00363190878f515a56bb2be36605e6d3112542ae'
+PAYLOAD = '2f12ab0465a75598add46ad17862ed53dc36b697dcadd2739f3b5eaeff48f9b8'
+ARCHIVE = 'c9eeca201c264ffc6da831b59d0ec9d94438706292ab252b6ad8f10faa11d700'
 WORKFLOW = 'e55313d466203cb38e5824c18bce4dd9afd30f4e05a4726c96f20ebace398452'
 SOURCE = 'registry+https://github.com/rust-lang/crates.io-index'
 BIGINT = ('RUSTSEC-2026-0387', 'crypto-bigint', '0.5.5', SOURCE,
           '0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76')
-START = dt.datetime(2026, 11, 6, 11, 28, 47, tzinfo=dt.timezone.utc)
-END = dt.datetime(2026, 11, 8, 16, tzinfo=dt.timezone.utc)
+# Kai approved the exact crate-only terms on 18 November 2026 at 15:39:41 UTC.
+APPROVED = True
+START = dt.datetime(2026, 11, 18, 15, 39, 41, tzinfo=dt.timezone.utc)
+END = dt.datetime(2026, 11, 19, 16, tzinfo=dt.timezone.utc)
 POLICY_FILES = {'.github/workflows/ci.yml', '.github/security/aero_alpha_audit.py',
-                '.github/security/test_aero_alpha_audit.py', '.github/security/aero-alpha-approval.md'}
+                '.github/security/test_aero_alpha_audit.py', '.github/security/aero-alpha-approval.md',
+                '.github/security/alpha10-preparation.md'}
+QUALIFICATION_SOURCE = 'cfa549ba9773ce2d32dce2a17d2fb3244161b0df'
+QUALIFICATION_TESTS = {
+    'tests/reactive_ws_e2e.rs': '818cc8277a534431300be1b5f30409249abdb9f821f325e3a6133fa3769b9ac8',
+    'tests/reactive_ws_e2e/lineage.rs': '18e18780a2055e4db0bb24dd998df79263d129ed39ac5780a3421362916a0fb5',
+    'tests/reactive_ws_e2e/regression.rs': '9850120d4f5c786024dcc827e300b189904b39dec96aff62959acf628586435f',
+    'tests/reactive_ws_e2e/strict.rs': 'a871b329b798ac03f7cd980ed84db231ab5cb70b5981967e1589283e457b5934',
+}
+
+# Complete current warning identities; these remain visible and new warnings refuse.
+WARNINGS = {
+    ('unmaintained', 'RUSTSEC-2024-0388', 'derivative', '2.2.0', 'registry+https://github.com/rust-lang/crates.io-index', 'fcc3dd5e9e9c0b295d6e1e4d811fb6f157d5ffd784b8d202fc62eac8035a770b'),
+    ('unmaintained', 'RUSTSEC-2024-0436', 'paste', '1.0.15', 'registry+https://github.com/rust-lang/crates.io-index', '57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a'),
+    ('unmaintained', 'RUSTSEC-2025-0141', 'bincode', '1.3.3', 'registry+https://github.com/rust-lang/crates.io-index', 'b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad'),
+    ('unmaintained', 'RUSTSEC-2026-0173', 'proc-macro-error2', '2.0.1', 'registry+https://github.com/rust-lang/crates.io-index', '11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802'),
+    ('unmaintained', 'RUSTSEC-2026-0441', 'pin-utils', '0.1.0', 'registry+https://github.com/rust-lang/crates.io-index', '8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184'),
+    ('unmaintained', 'RUSTSEC-2026-0543', 'chrono', '0.4.45', 'registry+https://github.com/rust-lang/crates.io-index', '1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327'),
+    ('unsound', 'RUSTSEC-2026-0253', 'lru', '0.16.4', 'registry+https://github.com/rust-lang/crates.io-index', '7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39'),
+    ('unsound', 'RUSTSEC-2026-0386', 'tokio', '1.52.3', 'registry+https://github.com/rust-lang/crates.io-index', '8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe'),
+    ('unsound', 'RUSTSEC-2026-0486', 'rustix', '1.1.4', 'registry+https://github.com/rust-lang/crates.io-index', 'b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190'),
+}
 
 
 def require(ok, reason):
@@ -75,22 +98,57 @@ def findings(report, inactive, returncode):
     rows = [(v['advisory']['id'], *(v['package'][key] for key in ('name', 'version', 'source', 'checksum')))
             for v in entries]
     require(len(rows) == 2 and set(rows) == {BIGINT, inactive}, 'unaccepted, absent or duplicate vulnerability')
+    warning_rows = [(kind, entry['advisory']['id'],
+                     *(entry['package'][key] for key in ('name', 'version', 'source', 'checksum')))
+                    for kind, entries in report['warnings'].items() for entry in entries]
+    require(len(warning_rows) == len(WARNINGS) and set(warning_rows) == WARNINGS,
+            'unaccepted, absent or duplicate audit warning')
     require(re.fullmatch(r'[0-9a-f]{40}', report['database'].get('last-commit') or ''),
             'fresh advisory database identity unavailable')
 
 
+def qualification_tests(root, head, changes):
+    require(set(changes) - POLICY_FILES == set(QUALIFICATION_TESTS),
+            'qualification requires the exact four excluded test changes')
+    for parent, child in ((BASE, QUALIFICATION_SOURCE), (QUALIFICATION_SOURCE, head)):
+        ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', parent, child],
+                                  cwd=root, capture_output=True)
+        require(ancestry.returncode == 0, 'qualification requires verified test-source ancestry')
+    changed = subprocess.check_output(
+        ['git', 'diff', '--name-only', '--no-renames', '-z', BASE, QUALIFICATION_SOURCE], cwd=root)
+    require(set(filter(None, changed.decode().split('\0'))) == set(QUALIFICATION_TESTS),
+            'qualified test source changes runtime or other files')
+    for name, expected in QUALIFICATION_TESTS.items():
+        source = subprocess.check_output(['git', 'show', QUALIFICATION_SOURCE + ':' + name], cwd=root)
+        path = root / name
+        require(sha(source) == expected and path.is_file() and not path.is_symlink()
+                and path.resolve() == root.resolve() / name and sha(path.read_bytes()) == expected,
+                'qualification test hash differs from reviewed source')
+
+
 def qualify(root, now, head, changes, publication=False):
+    require(APPROVED is True, 'exact alpha10 owner approval is absent')
     require(START <= now < END, 'alpha acceptance expired or not yet valid')
-    require(not set(changes) - POLICY_FILES, 'source changed outside qualification policy')
+    require(not set(changes) - POLICY_FILES - set(QUALIFICATION_TESTS),
+            'source changed outside qualification policy')
     require(sha((root / 'Cargo.lock').read_bytes()) == LOCK, 'lockfile differs from approved alpha')
     if publication:
         require(head == BASE and not changes, 'publication requires approved clean source')
     else:
         require(sha((root / '.github/workflows/ci.yml').read_bytes()) == WORKFLOW,
                 'qualification workflow changed')
+        qualification_tests(root, head, changes)
 
 
 def github_scope(env, event):
+    if env.get('GITHUB_EVENT_NAME') == 'push':
+        require(env.get('GITHUB_REPOSITORY') == REPO
+                and env.get('GITHUB_REF') == 'refs/heads/main'
+                and event.get('ref') == 'refs/heads/main'
+                and event.get('deleted') is False
+                and event.get('repository', {}).get('full_name') == REPO,
+                'not approved normal main promotion')
+        return
     require(env.get('GITHUB_EVENT_NAME') == 'pull_request'
             and env.get('GITHUB_REPOSITORY') == REPO
             and env.get('GITHUB_REF') == f'refs/pull/{PR}/merge', 'not approved PR context')
