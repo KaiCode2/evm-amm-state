@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     AdapterRegistrySnapshot, BalancerTokenBalance, BalancerV2Metadata, CurveMetadata, CurveVariant,
     EventRoute, EventSource, PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata,
-    SolidlyStorageLayout, SolidlyV2Metadata, UniswapV2Metadata, V3Metadata, V3StorageLayout,
+    SolidlyPoolVariant, SolidlyStorageLayout, SolidlyV2Metadata, UniswapV2Metadata, V3Metadata,
+    V3QuoterKind, V3StorageLayout,
 };
 
 const MAGIC: &[u8; 8] = b"EASREG\0\0";
@@ -407,6 +408,10 @@ enum PersistedMetadata {
         token1: Option<Address>,
         stable: Option<bool>,
         storage_layout: Option<PersistedSolidlyLayout>,
+        /// Absent for legacy registrations so their archives stay byte-identical;
+        /// older readers reject archives that carry a non-legacy variant.
+        #[serde(default, skip_serializing_if = "PersistedSolidlyVariant::is_legacy")]
+        variant: PersistedSolidlyVariant,
     },
     BalancerV2 {
         vault: Option<Address>,
@@ -432,10 +437,78 @@ struct PersistedV3Metadata {
     tick_spacing: Option<i32>,
     factory: Option<Address>,
     quoter: Option<Address>,
+    /// Absent for QuoterV2 registrations so their archives stay byte-identical;
+    /// older readers reject archives that carry another quoter kind.
+    #[serde(default, skip_serializing_if = "PersistedV3QuoterKind::is_quoter_v2")]
+    quoter_kind: PersistedV3QuoterKind,
     storage_layout: Option<PersistedV3Layout>,
     warm_word_radius: Option<i16>,
     #[serde(default)]
     warmed_slots: Vec<U256>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedV3QuoterKind {
+    #[default]
+    QuoterV2,
+    Metaquoter,
+}
+
+impl PersistedV3QuoterKind {
+    fn is_quoter_v2(&self) -> bool {
+        *self == Self::QuoterV2
+    }
+}
+
+impl From<V3QuoterKind> for PersistedV3QuoterKind {
+    fn from(kind: V3QuoterKind) -> Self {
+        match kind {
+            V3QuoterKind::QuoterV2 => Self::QuoterV2,
+            V3QuoterKind::Metaquoter => Self::Metaquoter,
+        }
+    }
+}
+
+impl From<PersistedV3QuoterKind> for V3QuoterKind {
+    fn from(kind: PersistedV3QuoterKind) -> Self {
+        match kind {
+            PersistedV3QuoterKind::QuoterV2 => Self::QuoterV2,
+            PersistedV3QuoterKind::Metaquoter => Self::Metaquoter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedSolidlyVariant {
+    #[default]
+    Legacy,
+    AeroVolatile,
+}
+
+impl PersistedSolidlyVariant {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
+impl From<SolidlyPoolVariant> for PersistedSolidlyVariant {
+    fn from(variant: SolidlyPoolVariant) -> Self {
+        match variant {
+            SolidlyPoolVariant::Legacy => Self::Legacy,
+            SolidlyPoolVariant::AeroVolatile => Self::AeroVolatile,
+        }
+    }
+}
+
+impl From<PersistedSolidlyVariant> for SolidlyPoolVariant {
+    fn from(variant: PersistedSolidlyVariant) -> Self {
+        match variant {
+            PersistedSolidlyVariant::Legacy => Self::Legacy,
+            PersistedSolidlyVariant::AeroVolatile => Self::AeroVolatile,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -446,6 +519,10 @@ struct PersistedV3Layout {
     ticks_base_slot: U256,
     tick_bitmap_base_slot: U256,
     tick_spacing: i32,
+    /// Absent unless a layout pins its observation ring explicitly, so
+    /// preset-built layouts persist exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observations_slot: Option<U256>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -572,6 +649,7 @@ impl TryFrom<&PoolRegistration> for PersistedRegistration {
                     token1: metadata.token1,
                     stable: metadata.stable,
                     storage_layout: metadata.storage_layout.map(Into::into),
+                    variant: metadata.variant.into(),
                 }
             }
             ProtocolMetadata::BalancerV2(metadata)
@@ -674,12 +752,14 @@ impl TryFrom<PersistedRegistration> for PoolRegistration {
                 token1,
                 stable,
                 storage_layout,
+                variant,
             } if matches!(key, PoolKey::SolidlyV2(_)) => {
                 ProtocolMetadata::SolidlyV2(SolidlyV2Metadata {
                     token0,
                     token1,
                     stable,
                     storage_layout: storage_layout.map(Into::into),
+                    variant: variant.into(),
                 })
             }
             PersistedMetadata::BalancerV2 {
@@ -849,6 +929,7 @@ impl From<&V3Metadata> for PersistedV3Metadata {
             tick_spacing: metadata.tick_spacing,
             factory: metadata.factory,
             quoter: metadata.quoter,
+            quoter_kind: metadata.quoter_kind.into(),
             storage_layout: metadata.storage_layout.map(Into::into),
             warm_word_radius: metadata.warm_word_radius,
             warmed_slots: metadata.warmed_slots.clone(),
@@ -865,6 +946,7 @@ impl From<PersistedV3Metadata> for V3Metadata {
             tick_spacing: metadata.tick_spacing,
             factory: metadata.factory,
             quoter: metadata.quoter,
+            quoter_kind: metadata.quoter_kind.into(),
             storage_layout: metadata.storage_layout.map(Into::into),
             warm_word_radius: metadata.warm_word_radius,
             warmed_slots: metadata.warmed_slots,
@@ -880,19 +962,24 @@ impl From<V3StorageLayout> for PersistedV3Layout {
             ticks_base_slot: layout.ticks_base_slot,
             tick_bitmap_base_slot: layout.tick_bitmap_base_slot,
             tick_spacing: layout.tick_spacing,
+            observations_slot: layout.observations_slot,
         }
     }
 }
 
 impl From<PersistedV3Layout> for V3StorageLayout {
     fn from(layout: PersistedV3Layout) -> Self {
-        Self::new(
+        let restored = Self::new(
             layout.slot0_slot,
             layout.liquidity_slot,
             layout.ticks_base_slot,
             layout.tick_bitmap_base_slot,
             layout.tick_spacing,
-        )
+        );
+        match layout.observations_slot {
+            Some(slot) => restored.with_observations_slot(slot),
+            None => restored,
+        }
     }
 }
 

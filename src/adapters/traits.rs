@@ -1,9 +1,9 @@
-use alloy_primitives::{Address, Log, U256};
+use alloy_primitives::{Address, B256, Log, U256};
 
 use super::bytecode::{AdapterCodeSeed, BytecodeTemplateError};
 use super::cold_start::AdapterColdStartPlanner;
 use super::factory::{FactoryConfig, PoolFactory};
-use super::sim::{SimConfig, SimError, SwapQuote};
+use super::sim::{ExactOutputQuote, SimConfig, SimError, SwapQuote};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventContext, AdapterEventResult, AdapterRegistry,
     ColdStartPolicy, EventSource, PoolKey, PoolRegistration, PoolStateDependencies, ProtocolId,
@@ -130,6 +130,21 @@ pub trait AmmAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Reviewed runtime-code identities (`address → expected runtime keccak`)
+    /// a registration depends on.
+    ///
+    /// Cold start compares every resident or fetched runtime against these
+    /// pins after warming and **fails the pool closed** on a mismatch, so an
+    /// address-preserving upgrade of a reviewed pool, implementation, factory,
+    /// hook or fee module can never be quoted or replayed as if it were the
+    /// reviewed deployment. The default is empty: protocols whose runtime is
+    /// reconstructed from an embedded template verify it through
+    /// [`code_seeds`](Self::code_seeds) instead, and unreviewed registrations
+    /// pin nothing.
+    fn reviewed_code_identities(&self, _pool: &PoolRegistration) -> Vec<(Address, B256)> {
+        Vec::new()
+    }
+
     /// Decode a routed log into a semantic event with its cache updates.
     /// Defaults to [`AdapterEventResult::ignored`]; a malformed watched log
     /// should return [`AdapterEventResult::error`] (it is isolated per-log, not
@@ -199,6 +214,28 @@ pub trait AmmAdapter: Send + Sync {
         _amount_in: U256,
         _config: &SimConfig,
     ) -> Result<SwapQuote, SimError> {
+        Err(SimError::Unsupported(self.protocol()))
+    }
+
+    /// Simulate the `token_in` amount required to receive exactly `amount_out`
+    /// of `token_out` from `pool`, through the protocol's canonical
+    /// exact-output quote entrypoint.
+    ///
+    /// Defaults to [`SimError::Unsupported`]. Implemented for V3-family pools
+    /// quoting through the Aero `Metaquoter`
+    /// (`quoteExactOutputSingleV3`) and for Aero volatile Solidly pools
+    /// (`getAmountInWithTotalFee`), the two families whose executor path buys
+    /// an exact output. The same [`SimConfig`] transaction context as
+    /// [`simulate_swap`](Self::simulate_swap) applies.
+    fn simulate_swap_exact_output(
+        &self,
+        _pool: &PoolRegistration,
+        _cache: &mut dyn AdapterCache,
+        _token_in: Address,
+        _token_out: Address,
+        _amount_out: U256,
+        _config: &SimConfig,
+    ) -> Result<ExactOutputQuote, SimError> {
         Err(SimError::Unsupported(self.protocol()))
     }
 }

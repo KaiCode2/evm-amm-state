@@ -1,5 +1,7 @@
 //! Feature-gated asynchronous owner of canonical AMM cache state.
 
+#[cfg(test)]
+mod canonical_logs;
 mod reorg;
 mod repair_supersession;
 
@@ -50,7 +52,8 @@ use super::{
 /// Construction validates that every record belongs to the same canonical
 /// block and chain. The caller/driver is responsible for the external proof of
 /// completeness: live implementations build this only after hash-pinned log
-/// reconciliation for the advertised interest revision.
+/// reconciliation or the reviewed strict subscription closure for the exact
+/// interest revision. No receipt-trie or execution-state proof is implied.
 pub struct AmmCanonicalBatch {
     chain_id: u64,
     header: Arc<AmmCanonicalHeader>,
@@ -151,6 +154,19 @@ impl AmmCanonicalBatch {
         source_ingress: Instant,
         decoded_after_ingress: Duration,
     ) -> Result<Self, AmmCanonicalBatchError> {
+        if super::snapshot::canonical_header::logs::checked_size(
+            records
+                .records()
+                .iter()
+                .filter_map(|record| match &record.input {
+                    ReactiveInput::Log(log) => Some(log),
+                    _ => None,
+                }),
+        )
+        .is_none()
+        {
+            return Err(AmmCanonicalBatchError::PayloadLimitExceeded);
+        }
         let computed_hash = header.inner.hash_slow();
         if header.hash != computed_hash {
             return Err(AmmCanonicalBatchError::HeaderHashMismatch {
@@ -244,11 +260,24 @@ impl AmmCanonicalBatch {
             }
             previous_position = Some(position);
         }
+        let retained_logs: Arc<[_]> = records
+            .records()
+            .iter()
+            .map(|record| {
+                let ReactiveInput::Log(log) = &record.input else {
+                    unreachable!("validated log")
+                };
+                log.clone()
+            })
+            .collect();
         let ordered_after_ingress = Instant::now().saturating_duration_since(source_ingress);
         assert!(decoded_after_ingress <= ordered_after_ingress);
         Ok(Self {
             chain_id,
-            header: Arc::new(AmmCanonicalHeader::from_verified_parts(chain_id, header)),
+            header: Arc::new(
+                AmmCanonicalHeader::from_verified_parts(chain_id, header)
+                    .with_validated_logs(retained_logs),
+            ),
             block,
             interest_revision,
             records,
@@ -292,6 +321,8 @@ impl AmmCanonicalBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AmmCanonicalBatchError {
+    /// Canonical retention exceeded 4,096 logs or 2 MiB of bounded payload.
+    PayloadLimitExceeded,
     /// The RPC envelope's advertised hash did not seal its consensus header.
     HeaderHashMismatch {
         /// Hash advertised by the RPC response.
@@ -358,6 +389,9 @@ pub enum AmmCanonicalBatchError {
 impl fmt::Display for AmmCanonicalBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PayloadLimitExceeded => {
+                write!(f, "canonical log payload exceeds bounded retention")
+            }
             Self::HeaderHashMismatch {
                 advertised,
                 computed,

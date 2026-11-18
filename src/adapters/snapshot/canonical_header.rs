@@ -1,6 +1,10 @@
 //! Immutable header provenance; no protocol-specific decision or provider I/O.
 use super::AmmStatePoint;
-use alloy_rpc_types_eth::Header;
+use alloy_rpc_types_eth::{Header, Log};
+use std::sync::Arc;
+
+#[cfg(feature = "live-runtime")]
+pub(crate) mod logs;
 
 /// Full header carried by a validated canonical block publication.
 ///
@@ -13,6 +17,7 @@ use alloy_rpc_types_eth::Header;
 pub struct AmmCanonicalHeader {
     point: AmmStatePoint,
     header: Header,
+    logs: Option<Arc<[Log]>>,
 }
 
 impl AmmCanonicalHeader {
@@ -23,7 +28,20 @@ impl AmmCanonicalHeader {
         Self {
             point: AmmStatePoint::post_block(chain_id, header.inner.number, header.hash),
             header,
+            logs: None,
         }
+    }
+
+    /// Only the canonical batch validator may attach its complete ordered log
+    /// payload. Header-only construction never establishes log completeness.
+    #[cfg(feature = "live-runtime")]
+    pub(crate) fn with_validated_logs(mut self, logs: Arc<[Log]>) -> Self {
+        self.logs = Some(logs);
+        self
+    }
+
+    pub(crate) fn logs(&self) -> Option<&[Log]> {
+        self.logs.as_deref()
     }
 
     /// Exact chain, number and advertised hash paired with this full header.

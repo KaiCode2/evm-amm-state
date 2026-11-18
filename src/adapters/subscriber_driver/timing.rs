@@ -72,11 +72,9 @@ impl InputClocks {
             overflow: false,
         });
         match input {
-            ReactiveInput::BlockHeader(_) => {
-                if !block.header_seen {
-                    block.header_seen = true;
-                    block.header = timing;
-                }
+            ReactiveInput::BlockHeader(_) if !block.header_seen => {
+                block.header_seen = true;
+                block.header = timing;
             }
             ReactiveInput::Log(log) => {
                 let Some(key) = log.transaction_hash.zip(log.log_index) else {

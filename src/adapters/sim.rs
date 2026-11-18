@@ -10,7 +10,12 @@
 //! - **Uniswap V3 (+ family):** `QuoterV2.quoteExactInputSingle(..)`. Uniswap
 //!   and Pancake use the fee-keyed struct; Slipstream uses its signed
 //!   tick-spacing struct. Target = the QuoterV2 contract (mainnet default,
-//!   per-pool/chain override).
+//!   per-pool/chain override). A pool registered with
+//!   [`V3QuoterKind::Metaquoter`](super::V3QuoterKind) instead quotes through
+//!   the Aero `Metaquoter.quoteExactInputSingleV3(pool, tokenIn, amountIn,
+//!   limit)`, which executes `pool.swap` and therefore reproduces the pool's
+//!   swap hook, MEV-tax module, discount registry and pool-tape behaviour
+//!   when those contracts are resident.
 //! - **Uniswap V2:** `UniswapV2Router02.getAmountsOut(amountIn, path)`. Target =
 //!   the router (mainnet default, override).
 //! - **Balancer V2:** `Vault.queryBatchSwap(GIVEN_IN, swaps, assets, funds)`.
@@ -27,10 +32,22 @@
 //! dependencies stay a one-time lazy first-quote fetch: Solidly's `PoolFactory`
 //! (the `getFee()` target, read from pool storage rather than carried in
 //! metadata) and a Curve NG pool's `DELEGATECALL`ed math/views implementation.
+//! The reviewed Aero volatile family is the exception: its factory, fee
+//! module, exact-output fee quoter and MEV-tax module are fixed reviewed
+//! identities that cold start warms up front, so its production quote path
+//! never relies on the lazy factory fetch.
+//!
+//! # Transaction context
+//!
+//! Aero's fee modules read `tx.gasprice` and `block.basefee` (the MEV tax is a
+//! function of the priority fee) and its discount registry reads `tx.origin`.
+//! [`SimConfig::gas_price`] and [`SimConfig::from`] (which is both
+//! `msg.sender` and `tx.origin` of a top-level simulated call) carry that
+//! context into every quote; see [`CallTxContext`].
 
 use alloy_primitives::{Address, Bytes, U256, address};
 
-use super::{AdapterCache, CallOutcome};
+use super::{AdapterCache, CallOutcome, CallTxContext};
 
 /// A swap-simulation quote: the output amount the protocol's canonical quote
 /// entrypoint returns for the requested input.
@@ -48,6 +65,25 @@ impl SwapQuote {
     /// Construct a quote from a decoded output amount.
     pub fn new(amount_out: U256) -> Self {
         Self { amount_out }
+    }
+}
+
+/// An exact-output quote: the input amount the protocol's canonical
+/// exact-output entrypoint requires for the requested output.
+///
+/// `#[non_exhaustive]` so future fields (price after, ticks crossed) can be
+/// added without breaking callers.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExactOutputQuote {
+    /// The token-in amount required for `amount_out`.
+    pub amount_in: U256,
+}
+
+impl ExactOutputQuote {
+    /// Construct a quote from a decoded required input amount.
+    pub fn new(amount_in: U256) -> Self {
+        Self { amount_in }
     }
 }
 
@@ -120,7 +156,21 @@ pub struct SimConfig {
     /// [`Address::ZERO`]; override for the rare quoter/router that gates its
     /// output on the caller. Threaded into [`quote_via_call_from`] by every
     /// adapter's `simulate_swap`.
+    ///
+    /// A simulated quote is a top-level call, so this account is also
+    /// `tx.origin`. The Aero discount registry and the Aero volatile pool's
+    /// total-fee getters key their fee context on it (see
+    /// [`with_tx_origin`](Self::with_tx_origin)).
     pub from: Address,
+    /// The `tx.gasprice` each quote call runs under, in wei. `None` keeps the
+    /// cache's default (a zero gas price), which is what every quote ran as
+    /// before this field existed.
+    ///
+    /// Aero MEV-tax modules charge `priorityFee = tx.gasprice - block.basefee`
+    /// above a threshold, so a quote for a candidate transaction must run as
+    /// `basefee + tip` to reproduce the fee the swap will pay. The cache's
+    /// block context supplies `block.basefee`.
+    pub gas_price: Option<u128>,
 }
 
 /// Ethereum-mainnet Uniswap V3 `QuoterV2`.
@@ -135,6 +185,7 @@ impl Default for SimConfig {
             v3_quoter: MAINNET_V3_QUOTER_V2,
             v2_router: MAINNET_V2_ROUTER_02,
             from: Address::ZERO,
+            gas_price: None,
         }
     }
 }
@@ -158,6 +209,43 @@ impl SimConfig {
     pub fn with_from(mut self, from: Address) -> Self {
         self.from = from;
         self
+    }
+
+    /// Set the `tx.origin` quote calls run under.
+    ///
+    /// A simulated quote is a top-level call, so `tx.origin` and `msg.sender`
+    /// are the same account: this is an alias of [`with_from`](Self::with_from)
+    /// named for the Aero fee context, where the discount registry consults
+    /// `tx.origin` when the hook's caller is the metaquoter and the Aero
+    /// volatile pool's total-fee getters key the fee on `msg.sender`.
+    pub fn with_tx_origin(self, origin: Address) -> Self {
+        self.with_from(origin)
+    }
+
+    /// The `tx.origin` quote calls run under (see
+    /// [`with_tx_origin`](Self::with_tx_origin)).
+    pub const fn tx_origin(&self) -> Address {
+        self.from
+    }
+
+    /// Set the `tx.gasprice` quote calls run under, in wei (see
+    /// [`gas_price`](Self::gas_price)).
+    pub fn with_gas_price(mut self, gas_price: u128) -> Self {
+        self.gas_price = Some(gas_price);
+        self
+    }
+
+    /// Set `tx.gasprice` as `basefee + priority_fee`, the effective gas price
+    /// of an EIP-1559 candidate transaction. Saturates at `u128::MAX`.
+    pub fn with_effective_gas_price(self, basefee: u128, priority_fee: u128) -> Self {
+        self.with_gas_price(basefee.saturating_add(priority_fee))
+    }
+
+    /// The transaction context (`tx.gasprice`) quote calls execute under.
+    pub const fn tx_context(&self) -> CallTxContext {
+        CallTxContext {
+            gas_price: self.gas_price,
+        }
     }
 }
 
@@ -203,6 +291,36 @@ pub fn quote_via_call_from(
     )
 }
 
+/// Like [`quote_via_call_from`], but runs the quote under the complete
+/// [`SimConfig`] transaction context: `from` as `msg.sender`/`tx.origin` and
+/// [`SimConfig::gas_price`] as `tx.gasprice`.
+///
+/// With no configured gas price this is exactly [`quote_via_call_from`]. With
+/// one, the cache must implement
+/// [`AdapterCache::call_raw_with_context`]; a cache that cannot honour
+/// `tx.gasprice` fails the quote instead of silently running it at a zero
+/// gas price. Adapters whose fee depends on the transaction context (the Aero
+/// families) thread their calls through here.
+pub fn quote_via_call_with_config(
+    cache: &mut dyn AdapterCache,
+    config: &SimConfig,
+    target: Address,
+    calldata: Bytes,
+) -> Result<Bytes, SimError> {
+    classify_quote_outcome(
+        cache
+            .call_raw_with_context(
+                config.from,
+                target,
+                calldata,
+                &[],
+                &config.tx_context(),
+                false,
+            )
+            .map_err(|e| SimError::Execution(Box::new(e)))?,
+    )
+}
+
 /// Internal quote helper for a call that needs temporary runtime-code
 /// overrides on snapshot-backed execution. Live-backed caches may ignore the
 /// overrides and resolve the real callee state lazily.
@@ -217,6 +335,40 @@ pub(crate) fn quote_via_call_with_code_overrides_from(
     classify_quote_outcome(
         cache
             .call_raw_with_code_overrides(from, target, calldata, code_overrides, false)
+            .map_err(|e| SimError::Execution(Box::new(e)))?,
+    )
+}
+
+/// Internal quote helper combining temporary runtime-code overrides with the
+/// configured transaction context. Without a configured gas price it is the
+/// plain override call, so existing registrations keep their exact behaviour.
+#[cfg(feature = "uniswap-v3")]
+pub(crate) fn quote_via_call_with_code_overrides_and_config(
+    cache: &mut dyn AdapterCache,
+    config: &SimConfig,
+    target: Address,
+    calldata: Bytes,
+    code_overrides: &[(Address, Bytes)],
+) -> Result<Bytes, SimError> {
+    if config.gas_price.is_none() {
+        return quote_via_call_with_code_overrides_from(
+            cache,
+            config.from,
+            target,
+            calldata,
+            code_overrides,
+        );
+    }
+    classify_quote_outcome(
+        cache
+            .call_raw_with_context(
+                config.from,
+                target,
+                calldata,
+                code_overrides,
+                &config.tx_context(),
+                false,
+            )
             .map_err(|e| SimError::Execution(Box::new(e)))?,
     )
 }
@@ -277,6 +429,27 @@ pub(crate) mod abi {
         /// cold-start does not pre-warm the factory's code — it is a one-time lazy
         /// fetch on the first Solidly quote of each fork.
         function getAmountOut(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
+        /// Aero (Dromos) basic pool `getAmountOutWithTotalFee(amountIn, tokenIn)`.
+        ///
+        /// Like `getAmountOut` but resolves the complete swap fee through
+        /// `factory.getFee(pool, msg.sender, amount0In, amount1In, reserve0,
+        /// reserve1)`: the base/custom fee plus the MEV tax the factory's module
+        /// derives from `tx.gasprice`. This is the fee the pool's `swap` charges
+        /// the same `msg.sender`, so it is the executable quote.
+        function getAmountOutWithTotalFee(uint256 amountIn, address tokenIn) returns (uint256 amountOut);
+
+        /// Aero (Dromos) basic pool `getAmountInWithTotalFee(amountOut, tokenOut)`.
+        ///
+        /// The exact-output counterpart: the curve input for `amountOut` grossed
+        /// up by `factory.getFeeForAmountIn(pool, msg.sender, ...)` (the deployed
+        /// flat fee quoter forwards to `getFee`, so it includes the MEV tax).
+        function getAmountInWithTotalFee(uint256 amountOut, address tokenOut) returns (uint256 amountIn);
+
+        /// Aero (Dromos) pool type label (`bytes32("V2_VOLATILE")`,
+        /// `bytes32("V2_STABLE")`, `bytes32("CL")`), exposed by every Aero pool
+        /// and absent on legacy Velodrome/Aerodrome pools.
+        function POOL_TYPE() returns (bytes32 poolType);
 
         /// Curve StableSwap (plain pool) `get_dy(i, j, dx)`.
         ///
@@ -349,6 +522,30 @@ pub(crate) mod abi {
                     uint32 initializedTicksCrossed,
                     uint256 gasEstimate
                 );
+        }
+    }
+
+    sol! {
+        /// Aero (Dromos) `Metaquoter` single-pool CL quotes. The pool is
+        /// addressed directly and authenticated through the quoter's immutable
+        /// factory registry; the quote executes `pool.swap` and decodes the
+        /// amounts from the quoter's reverting callback, so the swap hook, MEV
+        /// tax module, discount registry and pool tape all run as they would
+        /// on chain. `sqrtPriceLimitX96 = 0` means the directional extreme.
+        interface IMetaquoter {
+            function quoteExactInputSingleV3(
+                address pool,
+                address tokenIn,
+                uint256 amountIn,
+                uint160 sqrtPriceLimitX96
+            ) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed);
+
+            function quoteExactOutputSingleV3(
+                address pool,
+                address tokenIn,
+                uint256 amountOut,
+                uint160 sqrtPriceLimitX96
+            ) returns (uint256 amountIn, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed);
         }
     }
 }

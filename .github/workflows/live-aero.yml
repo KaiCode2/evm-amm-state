@@ -1,0 +1,43 @@
+name: Stage 10 Aero live gates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: evm-amm-state
+
+jobs:
+  aero-rpc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: evm-amm-state
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-amm-state -> target
+
+      # Hash-pinned Aero parity (Ethereum 26292020, Base 53205395, Optimism
+      # 158800699) and the multi-block differential replay windows. Every
+      # endpoint must serve archive state and `debug_traceCall`-free reads;
+      # the Base and Optimism urls derive from the Ethereum url's Alchemy host
+      # when their own secrets are unset.
+      - name: Aero CL and volatile parity, differential replay
+        env:
+          E2E_RPC_URL: ${{ secrets.E2E_RPC_URL }}
+          E2E_BASE_RPC_URL: ${{ secrets.E2E_BASE_RPC_URL }}
+          E2E_OPTIMISM_RPC_URL: ${{ secrets.E2E_OPTIMISM_RPC_URL }}
+        run: ./scripts/stage10-aero-live-gates.sh

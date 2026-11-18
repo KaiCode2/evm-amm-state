@@ -10,9 +10,11 @@ use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
 use evm_fork_cache::cache::{EvmCache, EvmOverlay, EvmSnapshot, MissingState};
 use revm::database_interface::Database;
 
+use super::cache::JournalAccessRecorder;
 use super::{
-    AdapterCache, AdapterRegistry, CacheError, CallOutcome, PoolKey, ProtocolId, SimError,
-    SlotChange, StateDiff, StateUpdate, StateView, StorageAccessList, SwapQuote,
+    AdapterCache, AdapterRegistry, CacheError, CallOutcome, CallTxContext, PoolKey, ProtocolId,
+    SimError, SlotChange, StateDiff, StateUpdate, StateView, StorageAccessList, SwapQuote,
+    overlay_call_raw_with_context,
 };
 
 /// One representative exact-input quote whose read set must be resident before
@@ -640,6 +642,36 @@ impl AdapterCache for RecordingCache<'_> {
         );
         self.record(result)
     }
+
+    /// A transaction context is honoured through the cache's inspector entry
+    /// point so the learned read set still reflects the exact cells the quote
+    /// touched under that `tx.gasprice`. Code overrides are ignored, as on
+    /// every live-backed call.
+    fn call_raw_with_context(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        code_overrides: &[(Address, Bytes)],
+        context: &CallTxContext,
+        commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        if context.is_default() {
+            return self.call_raw_with_code_overrides(from, to, calldata, code_overrides, commit);
+        }
+        let result = self
+            .cache
+            .call_raw_with_inspector(
+                from,
+                to,
+                calldata,
+                &context.upstream_tx_config(),
+                JournalAccessRecorder::default(),
+            )
+            .map(|(outcome, recorder)| (CallOutcome::from(outcome), recorder.into_access_list()))
+            .map_err(CacheError::from);
+        self.record(result)
+    }
 }
 
 struct OfflineSnapshotCache {
@@ -718,6 +750,25 @@ impl AdapterCache for OfflineSnapshotCache {
             .call_raw_with_code_overrides(from, to, calldata, code_overrides)
             .map(CallOutcome::from)
             .map_err(|error| CacheError::Backend(Box::new(error)))
+    }
+
+    fn call_raw_with_context(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        code_overrides: &[(Address, Bytes)],
+        context: &CallTxContext,
+        _commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        overlay_call_raw_with_context(
+            &mut self.overlay,
+            from,
+            to,
+            calldata,
+            code_overrides,
+            context,
+        )
     }
 }
 

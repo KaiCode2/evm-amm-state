@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, Bytes, U256};
 use evm_fork_cache::access_set::StorageAccessList as UpstreamStorageAccessList;
-use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::cache::{EvmCache, EvmOverlay, TxConfig};
 
 pub use super::state::{
     PurgeScope, SkippedDelta, SkippedMask, SlotChange, SlotDelta, StateDiff, StateUpdate,
@@ -73,6 +73,46 @@ impl From<revm::context::result::ExecutionResult> for CallOutcome {
             ExecutionResult::Halt { reason, .. } => Self::Halt {
                 reason: format!("{reason:?}"),
             },
+        }
+    }
+}
+
+/// Transaction-environment context for a simulated call.
+///
+/// Every field is optional and defaults to the cache's historical behaviour,
+/// so a default context is byte-for-byte the plain
+/// [`call_raw`](AdapterCache::call_raw). Protocols whose fees depend on the
+/// transaction — the Aero families, whose MEV-tax modules read `tx.gasprice`
+/// against `block.basefee` — carry the candidate transaction's context here
+/// (see [`SimConfig::tx_context`](super::SimConfig::tx_context)).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CallTxContext {
+    /// `tx.gasprice` in wei. `None` keeps the cache's default (zero).
+    pub gas_price: Option<u128>,
+}
+
+impl CallTxContext {
+    /// A context with no overrides (the cache default).
+    pub const fn new() -> Self {
+        Self { gas_price: None }
+    }
+
+    /// Set `tx.gasprice` in wei.
+    pub const fn with_gas_price(mut self, gas_price: u128) -> Self {
+        self.gas_price = Some(gas_price);
+        self
+    }
+
+    /// Whether this context changes anything relative to the cache default.
+    pub const fn is_default(&self) -> bool {
+        self.gas_price.is_none()
+    }
+
+    fn tx_config(&self) -> TxConfig {
+        TxConfig {
+            gas_price: self.gas_price,
+            ..TxConfig::default()
         }
     }
 }
@@ -190,6 +230,35 @@ pub trait AdapterCache: StateView {
     ) -> Result<CallOutcome, CacheError> {
         let _ = code_overrides;
         self.call_raw(from, to, calldata, commit)
+    }
+
+    /// Execute a raw EVM call under an explicit transaction context
+    /// ([`CallTxContext`]: `tx.gasprice`) with simulation-scoped runtime-code
+    /// overrides.
+    ///
+    /// A default context delegates to
+    /// [`call_raw_with_code_overrides`](Self::call_raw_with_code_overrides),
+    /// so existing cache facades keep their behaviour. A non-default context
+    /// **fails closed** on the default implementation: a quote that must run
+    /// under a candidate's gas price (an Aero MEV-tax module reads it) is never
+    /// silently executed at the cache's zero default. [`EvmCache`] and the
+    /// crate's snapshot caches honour the context; a custom snapshot facade
+    /// can delegate to [`overlay_call_raw_with_context`].
+    fn call_raw_with_context(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        code_overrides: &[(Address, Bytes)],
+        context: &CallTxContext,
+        commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        if context.is_default() {
+            return self.call_raw_with_code_overrides(from, to, calldata, code_overrides, commit);
+        }
+        Err(CacheError::Backend(Box::new(std::io::Error::other(
+            "this cache does not support a transaction context (tx.gasprice) for simulated calls",
+        ))))
     }
 
     /// Traced counterpart to [`Self::call_raw_with_code_overrides`].
@@ -313,6 +382,24 @@ impl AdapterCache for EvmCache {
             .map_err(CacheError::from)
     }
 
+    /// Live-backed execution honours the transaction context through the
+    /// cache's own [`TxConfig`] entry point. Code overrides are ignored, as in
+    /// [`call_raw_with_code_overrides`](AdapterCache::call_raw_with_code_overrides):
+    /// the real callee code and lazily resolved state execute.
+    fn call_raw_with_context(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        _code_overrides: &[(Address, Bytes)],
+        context: &CallTxContext,
+        commit: bool,
+    ) -> Result<CallOutcome, CacheError> {
+        EvmCache::call_raw_with(self, from, to, calldata, commit, &context.tx_config())
+            .map(CallOutcome::from)
+            .map_err(CacheError::from)
+    }
+
     fn call_raw_with_code_overrides_and_access_list(
         &mut self,
         from: Address,
@@ -325,5 +412,131 @@ impl AdapterCache for EvmCache {
         EvmCache::call_raw_with_access_list(self, from, to, calldata)
             .map(|(outcome, accesses)| (CallOutcome::from(outcome), accesses))
             .map_err(CacheError::from)
+    }
+}
+
+/// Execute a non-committing call on an immutable-snapshot [`EvmOverlay`] with
+/// temporary runtime-code overrides **and** an explicit transaction context.
+///
+/// This is the building block a snapshot-backed [`AdapterCache`] uses to
+/// implement [`AdapterCache::call_raw_with_context`]. The overlay's own
+/// override entry point cannot carry a gas price, so the call is assembled
+/// directly on the overlay's EVM: each override is journaled as a code change,
+/// the transaction executes under `context`, and the journal checkpoint is
+/// reverted afterwards so neither the override nor the call's writes survive.
+/// Missing snapshot state is still recorded by the overlay.
+pub fn overlay_call_raw_with_context(
+    overlay: &mut EvmOverlay,
+    from: Address,
+    to: Address,
+    calldata: Bytes,
+    code_overrides: &[(Address, Bytes)],
+    context: &CallTxContext,
+) -> Result<CallOutcome, CacheError> {
+    use revm::ExecuteEvm;
+    use revm::context::TxEnv;
+    use revm::context_interface::JournalTr;
+    use revm::primitives::TxKind;
+    use revm::state::Bytecode;
+
+    if context.is_default() {
+        return overlay
+            .call_raw_with_code_overrides(from, to, calldata, code_overrides)
+            .map(CallOutcome::from)
+            .map_err(|error| CacheError::Backend(Box::new(error)));
+    }
+    let mut builder = TxEnv::builder()
+        .caller(from)
+        .kind(TxKind::Call(to))
+        .data(calldata)
+        .value(U256::ZERO);
+    if let Some(gas_price) = context.gas_price {
+        builder = builder.gas_price(gas_price);
+    }
+    let tx = builder
+        .build()
+        .map_err(|error| CacheError::Backend(Box::from(format!("tx env: {error:?}"))))?;
+    let mut evm = overlay.build_evm();
+    let checkpoint = evm.journaled_state.checkpoint();
+    let result = (|| {
+        for (address, code) in code_overrides {
+            evm.journaled_state
+                .load_account(*address)
+                .map_err(|error| CacheError::Backend(Box::from(format!("{error:?}"))))?;
+            evm.journaled_state
+                .set_code(*address, Bytecode::new_raw(code.clone()));
+        }
+        evm.transact_one(tx)
+            .map_err(|error| CacheError::Backend(Box::from(format!("{error:?}"))))
+    })();
+    evm.journaled_state.checkpoint_revert(checkpoint);
+    result.map(CallOutcome::from)
+}
+
+/// Journal-backed access recorder for inspector-driven calls on the live
+/// cache: captures the touched accounts, their runtime-code hashes and every
+/// storage key the EVM journal holds when the outermost call frame ends,
+/// which mirrors the cache's own access-list extraction.
+#[derive(Default)]
+pub(crate) struct JournalAccessRecorder {
+    access: UpstreamStorageAccessList,
+}
+
+impl JournalAccessRecorder {
+    pub(crate) fn into_access_list(self) -> UpstreamStorageAccessList {
+        self.access
+    }
+}
+
+impl<'a>
+    revm::Inspector<
+        revm::context::Context<
+            revm::context::BlockEnv,
+            revm::context::TxEnv,
+            revm::context::CfgEnv,
+            &'a mut evm_fork_cache::cache::ForkCacheDB,
+            revm::context::Journal<&'a mut evm_fork_cache::cache::ForkCacheDB>,
+            (),
+        >,
+    > for JournalAccessRecorder
+{
+    fn call_end(
+        &mut self,
+        context: &mut revm::context::Context<
+            revm::context::BlockEnv,
+            revm::context::TxEnv,
+            revm::context::CfgEnv,
+            &'a mut evm_fork_cache::cache::ForkCacheDB,
+            revm::context::Journal<&'a mut evm_fork_cache::cache::ForkCacheDB>,
+            (),
+        >,
+        _inputs: &revm::interpreter::CallInputs,
+        _outcome: &mut revm::interpreter::CallOutcome,
+    ) {
+        // The journal is cumulative, so the last `call_end` (the outermost
+        // frame) observes every touched account and slot of the transaction.
+        let mut access = UpstreamStorageAccessList::default();
+        for (address, account) in context.journaled_state.state.iter() {
+            if !account.is_touched() {
+                continue;
+            }
+            access.accounts.insert(*address);
+            let code_hash = account.info.code_hash;
+            if code_hash != alloy_primitives::B256::ZERO
+                && code_hash != revm::primitives::KECCAK_EMPTY
+            {
+                access.code_hashes.insert(code_hash);
+            }
+            for slot in account.storage.keys() {
+                access.slots.insert((*address, *slot));
+            }
+        }
+        self.access = access;
+    }
+}
+
+impl CallTxContext {
+    pub(crate) fn upstream_tx_config(&self) -> TxConfig {
+        self.tx_config()
     }
 }

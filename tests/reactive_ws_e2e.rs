@@ -11,11 +11,16 @@
 //!      block `N`, and `simulate_swap` matches the on-chain `getAmountsOut`
 //!      quote at `N`.
 //!
-//! No-cheat discriminator: the cache backend is pinned at `B0`, so any sneaky
-//! refetch would yield the STALE `B0` reserves. We assert the sim does NOT equal
-//! the `B0` quote, and (when the chain has moved) does NOT equal the live-head
-//! `M` quote — so the only way it matches `N` is by reading the event-sourced
-//! state.
+//! No-cheat discriminator: warm the quote path at `B0`, then simulate from a
+//! provider-disconnected immutable snapshot captured after the last target Sync.
+//! Missing state fails the test. Canonical ingest correctly advances the live
+//! backend pin; the simulation cannot use that backend. The quote must still
+//! differ from `B0` and, when different, the later live-head `M` quote.
+//!
+//! Logs do not contain parent hashes. At most 64 cached, hash-pinned header
+//! reads supply ancestry metadata during the fixed 300-second live window.
+//! These reads never fetch reserves. Removed input, rollback, gaps or degraded
+//! runtime reports fail the attempt rather than silently discarding events.
 //!
 //! Uniswap V2 is used because its `Sync` event carries the EXACT new reserves,
 //! making the masked write pure event-sourcing with zero refetch. (V3
@@ -28,6 +33,13 @@
 //! ```text
 //! E2E_RPC_URL=<https-archive> cargo test --test reactive_ws_e2e -- --ignored --nocapture
 //! ```
+
+#[path = "reactive_ws_e2e/lineage.rs"]
+mod lineage;
+#[path = "reactive_ws_e2e/regression.rs"]
+mod regression;
+#[path = "reactive_ws_e2e/strict.rs"]
+mod strict;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,16 +87,19 @@ fn cached_reserves(cache: &EvmCache) -> (U256, U256) {
     (raw & mask112(), (raw >> 112) & mask112())
 }
 
-fn ctx_from_log(log: &RpcLog) -> ReactiveContext {
-    let number = log.block_number.unwrap_or_default();
-    let hash = log.block_hash.unwrap_or_default();
-    let block = BlockRef {
-        number,
-        hash,
-        parent_hash: None,
-        timestamp: log.block_timestamp,
-    };
-    ReactiveContext {
+fn ctx_from_log(log: &RpcLog, block: BlockRef) -> Result<ReactiveContext> {
+    anyhow::ensure!(!log.removed, "removed log is not canonical test input");
+    anyhow::ensure!(
+        log.block_number == Some(block.number)
+            && log.block_hash == Some(block.hash)
+            && block.parent_hash.is_some()
+            && block.timestamp.is_some()
+            && log
+                .block_timestamp
+                .is_none_or(|timestamp| Some(timestamp) == block.timestamp),
+        "log/header identity or ancestry mismatch"
+    );
+    Ok(ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Synthetic,
         chain_status: ChainStatus::Included {
@@ -94,7 +109,7 @@ fn ctx_from_log(log: &RpcLog) -> ReactiveContext {
         block: Some(block),
         transaction_index: log.transaction_index,
         log_index: log.log_index,
-    }
+    })
 }
 
 /// On-chain `Router02.getAmountsOut(amountIn, [USDC, WETH])` at `block` (ground
@@ -102,6 +117,19 @@ fn ctx_from_log(log: &RpcLog) -> ReactiveContext {
 async fn amounts_out_at(
     provider: &RootProvider<AnyNetwork>,
     block: u64,
+    amount_in: U256,
+) -> Result<U256> {
+    amounts_out_at_pin(
+        provider,
+        BlockId::Number(BlockNumberOrTag::Number(block)),
+        amount_in,
+    )
+    .await
+}
+
+async fn amounts_out_at_pin(
+    provider: &RootProvider<AnyNetwork>,
+    block: BlockId,
     amount_in: U256,
 ) -> Result<U256> {
     let calldata = Bytes::from(
@@ -116,9 +144,9 @@ async fn amounts_out_at(
         .with_input(calldata);
     let out = provider
         .call(tx.into())
-        .block(BlockId::Number(BlockNumberOrTag::Number(block)))
+        .block(block)
         .await
-        .with_context(|| format!("eth_call getAmountsOut at block {block}"))?;
+        .with_context(|| format!("eth_call getAmountsOut at block {block:?}"))?;
     let amounts = getAmountsOutCall::abi_decode_returns_validate(&out)?;
     Ok(*amounts.last().ok_or_else(|| anyhow!("empty amounts"))?)
 }
@@ -138,6 +166,10 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
+    anyhow::ensure!(
+        secs == 300,
+        "V2 qualification soak requires exactly 300 seconds"
+    );
 
     let provider = Arc::new(
         RootProvider::<AnyNetwork>::connect(&ws_url)
@@ -173,8 +205,25 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
     let r0 = cached_reserves(&cache);
     eprintln!("[ws-e2e] B0 reserves: ({}, {})", r0.0, r0.1);
 
-    // 2. Reactive runtime with the pair registered; subscribe to its Sync logs.
+    // Warm only at B0. No state hydration is allowed after the event window starts.
     let adapter = UniswapV2Adapter::default();
+    let amount_in = U256::from(1_000_000_u64); // 1 USDC
+    let config = SimConfig::default().with_v2_router(V2_ROUTER_02);
+    cache.ensure_account(Address::ZERO).await?;
+    let warm = adapter
+        .simulate_swap(&registration, &mut cache, USDC, WETH, amount_in, &config)
+        .map_err(|e| anyhow!("B0 quote warmup failed: {e}"))?;
+    let mut initial = strict::StrictCache::new(cache.snapshot());
+    let initial_quote = adapter
+        .simulate_swap(&registration, &mut initial, USDC, WETH, amount_in, &config)
+        .map_err(|e| anyhow!("B0 strict quote failed: {e}"))?;
+    anyhow::ensure!(
+        initial.overlay.missing_state().is_empty(),
+        "B0 strict quote has missing state"
+    );
+    assert_eq!(initial_quote.amount_out, warm.amount_out);
+
+    // 2. Reactive runtime with the pair registered; subscribe to its Sync logs.
     let sources = adapter.event_sources(&registration);
     let mut registry = AdapterRegistry::new();
     registry.register_adapter(Arc::new(UniswapV2Adapter::default()))?;
@@ -198,22 +247,28 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
 
     let mut applied = 0u64;
     let mut last_block = b0;
+    let mut last_snapshot = None;
+    let mut headers = lineage::Headers::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         tokio::select! {
+            biased;
             _ = tokio::time::sleep_until(deadline) => break,
             maybe_log = stream.next() => {
-                let Some(log) = maybe_log else { break };
-                let block_n = log.block_number.unwrap_or(last_block);
-                let ctx = ctx_from_log(&log);
-                let batch = ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
-                    ReactiveInput::Log(log),
-                    ctx,
-                )]);
+                let log = maybe_log.context("Sync subscription ended before the full 300-second window")?;
+                let (mut records, ctx) = tokio::time::timeout_at(
+                    deadline,
+                    headers.records(provider.as_ref(), runtime.last_canonical_block(), &log),
+                ).await.context("ancestry metadata did not finish inside the 300-second window")??;
+                let block_n = ctx.block.context("verified event block missing")?.number;
+                records.push(ReactiveInputRecord::new(ReactiveInput::Log(log), ctx));
+                let batch = ReactiveInputBatch::new(records);
                 let report = runtime.ingest_batch(&mut cache, batch)?;
+                lineage::require_no_recovery(&report)?;
                 if !report.applied.is_empty() {
                     applied += 1;
                     last_block = block_n;
+                    last_snapshot = Some(cache.snapshot());
                     if applied.is_multiple_of(5) {
                         let r = cached_reserves(&cache);
                         eprintln!("[ws-e2e] applied {applied} Syncs; block {last_block}; reserves ({}, {})", r.0, r.1);
@@ -223,7 +278,9 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         }
     }
     eprintln!(
-        "[ws-e2e] window done: {applied} Sync events applied; last event block N={last_block}"
+        "[ws-e2e] window done: {applied} Sync events applied; last event block N={last_block}; header metadata reads={} (cap {})",
+        headers.requests,
+        lineage::MAX_HEADER_READS
     );
 
     // 3. Assertions.
@@ -241,14 +298,42 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         "reserves never changed during the window — inconclusive (need on-chain swaps)"
     );
 
-    let amount_in = U256::from(1_000_000_u64); // 1 USDC
-    let config = SimConfig::default().with_v2_router(V2_ROUTER_02);
+    let snapshot = last_snapshot.context("target event snapshot missing")?;
+    assert_eq!(
+        snapshot.block_number(),
+        Some(last_block),
+        "quote snapshot must identify the last target event block"
+    );
+    let snapshot_reserves = snapshot
+        .storage_value(V2_USDC_WETH_PAIR, V2_RESERVES_SLOT)
+        .context("target snapshot missing reserves")?;
+    assert_eq!(
+        (
+            snapshot_reserves & mask112(),
+            (snapshot_reserves >> 112) & mask112()
+        ),
+        r_event
+    );
+    let pin = snapshot
+        .block_context_hash()
+        .context("target snapshot missing exact hash pin")?;
+    let mut offline = strict::StrictCache::new(snapshot);
     let sim = adapter
-        .simulate_swap(&registration, &mut cache, USDC, WETH, amount_in, &config)
+        .simulate_swap(&registration, &mut offline, USDC, WETH, amount_in, &config)
         .map_err(|e| anyhow!("simulate_swap failed: {e}"))?;
+    anyhow::ensure!(
+        offline.overlay.missing_state().is_empty(),
+        "event-sourced strict quote has missing state"
+    );
+    assert_eq!(
+        cached_reserves(&cache),
+        r_event,
+        "strict simulation must not mutate live reserves"
+    );
+    eprintln!("[ws-e2e] strict snapshot quote: provider disconnected; missing state=0");
 
     // PRIMARY: sim over event-synced state == on-chain getAmountsOut at block N.
-    let q_n = amounts_out_at(&provider, last_block, amount_in).await?;
+    let q_n = amounts_out_at_pin(&provider, BlockId::from((pin, Some(true))), amount_in).await?;
     eprintln!("[ws-e2e] sim={} | eth_call@N={}", sim.amount_out, q_n);
     assert_eq!(
         sim.amount_out, q_n,
@@ -256,8 +341,8 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
     );
 
     // NO-CHEAT 1: sim must NOT equal the pinned cold-start (B0) quote. The
-    // backend is pinned at B0, so a sneaky refetch would yield B0 reserves;
-    // since reserves changed, matching N (not B0) proves event-sourced reads.
+    // snapshot has no provider and its missing-state set was checked above;
+    // matching N while differing from B0 additionally proves event effects matter.
     let q_b0 = amounts_out_at(&provider, b0, amount_in).await?;
     assert_ne!(
         sim.amount_out, q_b0,
@@ -280,7 +365,10 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         }
     }
 
-    eprintln!("[ws-e2e] PASS: WebSocket-event-only sync kept state accurate for swap simulation.");
+    eprintln!(
+        "[ws-e2e] PASS: Sync events maintained reserves; ancestry used {} counted header reference reads; snapshot quote was provider-disconnected with no missing state.",
+        headers.requests
+    );
     Ok(())
 }
 

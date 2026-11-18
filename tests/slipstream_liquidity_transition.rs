@@ -465,7 +465,10 @@ fn reviewed_optimism_pool_uses_the_same_exact_liquidity_transition() {
 
 #[test]
 fn missing_tick_parent_cell_fails_closed_to_full_repair() {
+    // An initialized tick (its bitmap bit is set) must have every word
+    // resident; a missing one cannot be assumed.
     let mut fixture = TransitionFixture::new(POOL, 8_453, -200, 200);
+    fixture.seed_initialized_ticks(1_000);
     fixture.state.0.remove(&(POOL, fixture.upper_keys[4]));
     let decoded = fixture.decode(&mint_log(-200, 200, 7));
     assert!(matches!(
@@ -511,4 +514,41 @@ fn collect_after_liquidity_change_is_exact_search_state_noop() {
     assert_eq!(event.quality, UpdateQuality::Exact);
     assert_eq!(event.repair, RepairAction::None);
     assert!(event.updates.is_empty());
+}
+
+#[test]
+fn an_uninitialized_tick_with_a_resident_bitmap_word_needs_no_cold_read() {
+    // The bitmap word proves the tick is uninitialized, so its absent words
+    // are zero and a Mint at a brand-new tick replays exactly.
+    let mut fixture = TransitionFixture::new(POOL, 8_453, -200, 200);
+    for key in fixture.upper_keys.iter().chain(fixture.lower_keys.iter()) {
+        fixture.state.0.remove(&(POOL, *key));
+    }
+    assert!(fixture.state.storage(POOL, fixture.upper_bitmap).is_some());
+    let decoded = fixture.decode(&mint_log(-200, 200, 7));
+    assert_eq!(decoded.error, None);
+    let event = decoded.event.expect("exact Mint at new ticks");
+    assert_eq!(event.quality, UpdateQuality::Exact);
+    assert_eq!(event.repair, RepairAction::None);
+    let next = apply(&fixture.state, &event.updates);
+    assert_eq!(
+        next.storage(POOL, fixture.upper_keys[5]),
+        Some(U256::from(1) << 248_usize),
+    );
+}
+
+#[test]
+fn a_missing_bitmap_word_keeps_the_exact_requirement() {
+    let mut fixture = TransitionFixture::new(POOL, 8_453, -200, 200);
+    fixture.state.0.remove(&(POOL, fixture.upper_keys[4]));
+    fixture.state.0.remove(&(POOL, fixture.upper_bitmap));
+    let decoded = fixture.decode(&mint_log(-200, 200, 7));
+    assert!(matches!(
+        decoded.error,
+        Some(evm_amm_state::adapters::AdapterEventError::MissingState { .. })
+    ));
+    assert_eq!(
+        decoded.event.expect("unprovable Mint").quality,
+        UpdateQuality::RequiresRepair
+    );
 }

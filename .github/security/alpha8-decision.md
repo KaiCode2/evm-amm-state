@@ -1,0 +1,7 @@
+# Alpha.8 qualification decision
+
+On 2 November 2026 Kai approved qualification of the exact Aero library payload through **5 November 2026 at 16:00 UTC**. The reviewed commit is `829df3b10c38d04f320451b1d1cabb0fc5f0aba8`. Its verified Cargo archive has SHA-256 `cf87fa93f549d747b4906c23e4c1aa48f6fc04668543abd8e91d9c32b46b8357`. The gate checks every member name, file mode and content hash, and separately binds the generated VCS provenance to the actual clean checkout. Only the four explicitly listed policy files may differ. The package source, dependency graph, toolchain requirements and runtime behavior are fixed.
+
+The accepted finding is RUSTSEC-2026-0387 on the registry package `crypto-bigint 0.5.5`. Its arithmetic can leak secret information through timing. The reviewed library prepares public chain state and quotes, and exposes no keystore or transaction-signing API. Arbitrary downstream callers can choose different inputs and features. This decision applies solely to qualification of this library. It does not certify downstream secret processing or remove the vulnerability. The CI report retains the complete audit, including the independently checked inactive tracing-subscriber finding.
+
+Expiry, a new vulnerability, changed package contents or a changed dependency checksum blocks admission. Nothing renews this decision automatically. Publication, tagging, worker images, use with trading keys, deployment and trading require separate decisions. The package audit for ordinary consumers continues to report this finding.
