@@ -365,7 +365,10 @@ async fn ws_v2_reactive_sync_keeps_state_for_accurate_sim() -> Result<()> {
         }
     }
 
-    eprintln!("[ws-e2e] PASS: WebSocket-event-only sync kept state accurate for swap simulation.");
+    eprintln!(
+        "[ws-e2e] PASS: Sync events maintained reserves; ancestry used {} counted header reference reads; snapshot quote was provider-disconnected with no missing state.",
+        headers.requests
+    );
     Ok(())
 }
 
