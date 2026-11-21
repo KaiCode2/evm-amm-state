@@ -312,6 +312,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
                     if let Some(metadata) = v3_metadata(pool) {
                         targets.extend(metadata.token0);
                         targets.extend(metadata.token1);
+                        targets.extend(metadata.quoter);
                     }
                     return targets;
                 }
