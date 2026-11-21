@@ -10,14 +10,13 @@ use alloy_provider::Provider;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, Id, JoinSet};
 
-use evm_fork_cache::cold_start::{
-    AccountProofRoundFetcher, StorageRoundFetcher, StorageRoundRequest,
-};
+use evm_fork_cache::cold_start::{StorageRoundFetcher, StorageRoundRequest};
 use evm_fork_cache::{StorageBatchConfig, StorageFetchStrategy};
 
 use super::cold_start::{
     PreparedPoolFetchers, PreparedPoolJob, PreparedPoolStep, PreparedSnapshotState,
-    ResumableColdStartConfig, prepare_fast_pool, prepare_verified_code_targets,
+    ResumableColdStartConfig, bulk_account_fields_proof_fetcher, prepare_fast_pool,
+    prepare_verified_code_targets,
 };
 use super::{
     AdapterRegistrySnapshot, AmmPreparedStorage, AmmRuntimeCommandError, AmmRuntimeHandle,
@@ -885,7 +884,7 @@ where
             }
 
             let provider = Arc::new(provider);
-            let account_fetcher = AccountProofRoundFetcher::from_provider(Arc::clone(&provider), 8);
+            let account_fetcher = bulk_account_fields_proof_fetcher(Arc::clone(&provider));
             let fast = tokio::select! {
                 biased;
                 _ = shutdown.changed() => {

@@ -28,7 +28,9 @@ use alloy_primitives::keccak256;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use evm_fork_cache::CacheError as UpstreamCacheError;
 #[cfg(feature = "live-runtime")]
-use evm_fork_cache::bulk_storage::run_storage_program;
+use evm_fork_cache::bulk_storage::{
+    AccountFieldsSample, fetch_account_fields_bulk, run_storage_program,
+};
 use evm_fork_cache::bulk_storage::{StorageProgram, run_storage_programs};
 use evm_fork_cache::cache::{CodeSeedState, EvmCache};
 use evm_fork_cache::cold_start::ColdStartConfig;
@@ -1138,32 +1140,82 @@ where
     Ok(Some(prepared))
 }
 
-/// Fetch the real runtime for V3-family forks that cannot use the embedded
-/// canonical Uniswap pool template. QuoterV2 calls the pool recursively, so an
-/// immutable snapshot needs these bytes in addition to the pool's hydrated
-/// storage. The proof and code are both pinned to the exact runtime baseline;
-/// the actor revalidates the hash before installing the prepared patch.
 #[cfg(feature = "live-runtime")]
-async fn prepare_verified_code_target<P>(
-    address: Address,
-    baseline: AmmStatePoint,
+const COLD_START_RPC_RETRY_DELAYS_MS: [u64; 3] = [300, 600, 1_000];
+
+#[cfg(feature = "live-runtime")]
+pub(crate) fn is_transient_rpc_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "header not found",
+        "no state found",
+        "block not found",
+        "unknown block",
+        "missing trie node",
+        "state not available",
+        "timeout",
+        "timed out",
+        "429",
+        "too many requests",
+        "502",
+        "503",
+        "504",
+        "connection",
+        "reset",
+        "broken pipe",
+        "eof",
+        "transport",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+#[cfg(feature = "live-runtime")]
+async fn fetch_account_fields_bulk_with_retry<P>(
     provider: &P,
-    expected_runtime_code_hash: Option<B256>,
-) -> Result<PreparedAccountValue, PreparedColdStartError>
+    addresses: &[Address],
+    block: BlockId,
+) -> Result<Vec<(Address, AccountFieldsSample)>, evm_fork_cache::StorageFetchError>
 where
     P: alloy_provider::Provider<alloy_network::AnyNetwork>,
 {
-    let block = BlockId::from((baseline.block_hash(), Some(true)));
-    let mut attempt = 0u32;
-    let (code, proof) = loop {
-        match tokio::try_join!(
-            provider.get_code_at(address).block_id(block),
-            provider.get_proof(address, Vec::new()).block_id(block),
-        ) {
-            Ok(result) => break result,
-            Err(_) if attempt < 2 => {
+    let mut attempt = 0usize;
+    loop {
+        match fetch_account_fields_bulk(provider, addresses, block).await {
+            Ok(samples) => return Ok(samples),
+            Err(error)
+                if attempt < COLD_START_RPC_RETRY_DELAYS_MS.len()
+                    && is_transient_rpc_message(&error.to_string()) =>
+            {
+                let delay = COLD_START_RPC_RETRY_DELAYS_MS[attempt];
                 attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "live-runtime")]
+async fn fetch_code_with_retry<P>(
+    provider: &P,
+    address: Address,
+    block: BlockId,
+) -> Result<Bytes, PreparedColdStartError>
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match provider.get_code_at(address).block_id(block).await {
+            Ok(code) => return Ok(code),
+            Err(error)
+                if attempt < COLD_START_RPC_RETRY_DELAYS_MS.len()
+                    && is_transient_rpc_message(&error.to_string()) =>
+            {
+                let delay = COLD_START_RPC_RETRY_DELAYS_MS[attempt];
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             Err(error) => {
                 return Err(PreparedColdStartError::CodeProofFailed {
@@ -1172,33 +1224,91 @@ where
                 });
             }
         }
-    };
-    if code.is_empty() {
-        return Err(PreparedColdStartError::CodeProofFailed {
-            address,
-            reason: "pool account has no runtime code".to_owned(),
-        });
     }
-    let actual = keccak256(&code);
-    if actual != proof.code_hash {
-        return Err(PreparedColdStartError::CodeProofMismatch { address });
-    }
-    // A reviewed identity pins the runtime beyond the proof: the fetched code
-    // must be the reviewed deployment, not merely self-consistent.
-    if expected_runtime_code_hash.is_some_and(|expected| expected != actual) {
-        return Err(PreparedColdStartError::CodeProofMismatch { address });
-    }
-    Ok(PreparedAccountValue::new(
-        address,
-        evm_fork_cache::AccountProof {
-            storage_hash: proof.storage_hash,
-            balance: proof.balance,
-            nonce: proof.nonce,
-            code_hash: proof.code_hash,
-            slots: Vec::new(),
-        },
-        code,
-    ))
+}
+
+/// Build an [`AccountProofRoundFetcher`] backed by `eth_call` (`EXTCODEHASH` +
+/// `BALANCE` via `fetch_account_fields_bulk`) with transient-lag retries, so
+/// code-seed verification never depends on `eth_getProof`.
+#[cfg(feature = "live-runtime")]
+pub(crate) fn bulk_account_fields_proof_fetcher<P>(provider: Arc<P>) -> AccountProofRoundFetcher
+where
+    P: alloy_provider::Provider<alloy_network::AnyNetwork> + 'static,
+{
+    AccountProofRoundFetcher::new(Arc::new(move |requests, block| {
+        let addresses: Vec<Address> = requests.iter().map(|(addr, _)| *addr).collect();
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                handle
+            }
+            Ok(_) => {
+                return addresses
+                    .into_iter()
+                    .map(|addr| {
+                        (
+                            addr,
+                            Err(evm_fork_cache::StorageFetchError::Runtime(
+                                evm_fork_cache::RuntimeError::CurrentThreadRuntime,
+                            )),
+                        )
+                    })
+                    .collect();
+            }
+            Err(err) => {
+                return addresses
+                    .into_iter()
+                    .map(|addr| {
+                        (
+                            addr,
+                            Err(evm_fork_cache::StorageFetchError::Runtime(
+                                evm_fork_cache::RuntimeError::MissingRuntime {
+                                    details: err.to_string(),
+                                },
+                            )),
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let provider = Arc::clone(&provider);
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                match fetch_account_fields_bulk_with_retry(provider.as_ref(), &addresses, block)
+                    .await
+                {
+                    Ok(samples) => samples
+                        .into_iter()
+                        .map(|(addr, sample)| {
+                            (
+                                addr,
+                                Ok(evm_fork_cache::AccountProof {
+                                    storage_hash: B256::ZERO,
+                                    balance: sample.balance,
+                                    nonce: 0,
+                                    code_hash: sample.code_hash,
+                                    slots: Vec::new(),
+                                }),
+                            )
+                        })
+                        .collect(),
+                    Err(error) => {
+                        let reason = error.to_string();
+                        addresses
+                            .into_iter()
+                            .map(|addr| {
+                                (
+                                    addr,
+                                    Err(evm_fork_cache::StorageFetchError::custom(reason.clone())),
+                                )
+                            })
+                            .collect()
+                    }
+                }
+            })
+        })
+    }))
 }
 
 #[cfg(feature = "live-runtime")]
@@ -1211,14 +1321,62 @@ pub(crate) async fn prepare_verified_code_targets<P>(
 where
     P: alloy_provider::Provider<alloy_network::AnyNetwork>,
 {
-    let identities = adapter.reviewed_code_identities(pool);
-    let mut values = Vec::new();
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
     for address in adapter.verified_code_targets(pool) {
+        if seen.insert(address) {
+            targets.push(address);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let block = BlockId::from((baseline.block_hash(), Some(true)));
+    let samples = fetch_account_fields_bulk_with_retry(provider, &targets, block)
+        .await
+        .map_err(|error| PreparedColdStartError::CodeProofFailed {
+            address: targets[0],
+            reason: error.to_string(),
+        })?;
+    let codes = futures::future::try_join_all(
+        targets
+            .iter()
+            .map(|&address| fetch_code_with_retry(provider, address, block)),
+    )
+    .await?;
+
+    let identities = adapter.reviewed_code_identities(pool);
+    let mut values = Vec::with_capacity(targets.len());
+    for ((address, sample), code) in samples.into_iter().zip(codes) {
+        if code.is_empty() {
+            return Err(PreparedColdStartError::CodeProofFailed {
+                address,
+                reason: "pool account has no runtime code".to_owned(),
+            });
+        }
+        let actual = keccak256(&code);
+        if actual != sample.code_hash {
+            return Err(PreparedColdStartError::CodeProofMismatch { address });
+        }
         let expected = identities
             .iter()
             .find(|(reviewed, _)| *reviewed == address)
             .map(|(_, hash)| *hash);
-        values.push(prepare_verified_code_target(address, baseline, provider, expected).await?);
+        if expected.is_some_and(|expected| expected != actual) {
+            return Err(PreparedColdStartError::CodeProofMismatch { address });
+        }
+        values.push(PreparedAccountValue::new(
+            address,
+            evm_fork_cache::AccountProof {
+                storage_hash: B256::ZERO,
+                balance: sample.balance,
+                nonce: 0,
+                code_hash: sample.code_hash,
+                slots: Vec::new(),
+            },
+            code,
+        ));
     }
     Ok(values)
 }
@@ -1264,7 +1422,7 @@ where
         evm_fork_cache::StorageBatchConfig::default(),
         evm_fork_cache::StorageFetchStrategy::default(),
     );
-    let account_fetcher = AccountProofRoundFetcher::from_provider(Arc::clone(&provider), 8);
+    let account_fetcher = bulk_account_fields_proof_fetcher(Arc::clone(&provider));
 
     if let Some(prepared) = prepare_fast_pool(
         registry,

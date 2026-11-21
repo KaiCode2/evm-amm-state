@@ -1327,6 +1327,7 @@ impl AmmRuntime {
             pending_pool_followup: BTreeMap::new(),
             pending_followup_intents: BTreeMap::new(),
             pending_pool_work: BTreeMap::new(),
+            cold_start_retries: BTreeMap::new(),
             registration_evidence,
             registration_revalidation: BTreeMap::new(),
             pending_revalidations: BTreeMap::new(),
@@ -2488,6 +2489,7 @@ struct AmmRuntimeActor {
     pending_pool_followup: BTreeMap<super::PoolInstanceId, RuntimeWorkId>,
     pending_followup_intents: BTreeMap<super::PoolInstanceId, AmmPendingFollowUpIntent>,
     pending_pool_work: BTreeMap<PoolKey, RuntimeWorkId>,
+    cold_start_retries: BTreeMap<PoolKey, u32>,
     registration_evidence: BTreeMap<super::PoolInstanceId, RegistrationEvidenceSet>,
     registration_revalidation:
         BTreeMap<super::PoolInstanceId, BTreeMap<DiscoveryOwnerId, TokenEdgeDiscoveryRequest>>,
@@ -5520,6 +5522,7 @@ impl AmmRuntimeActor {
         }
         self.scheduled_work.remove(&work);
         self.pending_pool_work.remove(pool.key());
+        self.cold_start_retries.remove(pool.key());
         self.pending_lifecycles.remove(&pool);
         self.active_work.remove(&work);
         self.publish_runtime_events(vec![AmmRuntimeEventKind::WorkCompleted { work }])?;
@@ -5652,7 +5655,29 @@ impl AmmRuntimeActor {
         self.pending_lifecycles
             .insert(pool.clone(), PoolRuntimeState::Failed);
         self.active_work.remove(work);
-        let retry = message.contains("baseline is stale").then(|| {
+        const MAX_TRANSIENT_COLD_START_RETRIES: u32 = 5;
+        let stale_baseline = message.contains("baseline is stale");
+        let transient_rpc = !stale_baseline
+            && super::cold_start::is_transient_rpc_message(&message)
+            && !message.contains("mismatch")
+            && !message.contains("unsupported")
+            && !message.contains("has no runtime code");
+        let should_retry = if stale_baseline {
+            true
+        } else if transient_rpc {
+            let attempts = self.cold_start_retries.entry(pool.key().clone()).or_insert(0);
+            if *attempts < MAX_TRANSIENT_COLD_START_RETRIES {
+                *attempts += 1;
+                true
+            } else {
+                self.cold_start_retries.remove(pool.key());
+                false
+            }
+        } else {
+            self.cold_start_retries.remove(pool.key());
+            false
+        };
+        let retry = should_retry.then(|| {
             scheduled
                 .supporting_discovery
                 .iter()
