@@ -1333,18 +1333,21 @@ where
     }
 
     let block = BlockId::from((baseline.block_hash(), Some(true)));
-    let samples = fetch_account_fields_bulk_with_retry(provider, &targets, block)
-        .await
-        .map_err(|error| PreparedColdStartError::CodeProofFailed {
-            address: targets[0],
-            reason: error.to_string(),
-        })?;
-    let codes = futures::future::try_join_all(
-        targets
-            .iter()
-            .map(|&address| fetch_code_with_retry(provider, address, block)),
-    )
-    .await?;
+    let (samples, codes) = tokio::try_join!(
+        async {
+            fetch_account_fields_bulk_with_retry(provider, &targets, block)
+                .await
+                .map_err(|error| PreparedColdStartError::CodeProofFailed {
+                    address: targets[0],
+                    reason: error.to_string(),
+                })
+        },
+        futures::future::try_join_all(
+            targets
+                .iter()
+                .map(|&address| fetch_code_with_retry(provider, address, block)),
+        ),
+    )?;
 
     let identities = adapter.reviewed_code_identities(pool);
     let mut values = Vec::with_capacity(targets.len());
