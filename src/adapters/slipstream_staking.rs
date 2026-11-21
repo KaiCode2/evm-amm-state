@@ -970,7 +970,7 @@ fn derive(
         return Err(failure("staking event identity mismatch"));
     }
     let layout = layout_for(pool).ok_or_else(|| failure("missing staking layout"))?;
-    super::v3_transition::validate_reviewed_slipstream_event(runtime.pool, layout, context)?;
+    super::v3_transition::validate_reviewed_slipstream_event(runtime.pool, layout, None, context)?;
     if layout.tick_spacing != runtime.tick_spacing {
         return Err(failure(
             "registration tick spacing does not match the staking runtime",
@@ -1104,7 +1104,7 @@ fn derive_settlement(
         return Err(failure("a settlement carries no staked-liquidity delta"));
     }
     let layout = layout_for(pool).ok_or_else(|| failure("missing staking layout"))?;
-    super::v3_transition::validate_reviewed_slipstream_event(runtime.pool, layout, context)?;
+    super::v3_transition::validate_reviewed_slipstream_event(runtime.pool, layout, None, context)?;
     let address = runtime.pool;
     let read = |slot| {
         state

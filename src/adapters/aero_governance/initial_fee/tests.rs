@@ -19,7 +19,6 @@ fn fixture() -> (
     AdapterEventContext,
 ) {
     let pool = address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8");
-    let runtime = aero_cl_governance_runtime_for_pool(pool).unwrap();
     let registration = PoolRegistration::new(PoolKey::Slipstream(pool)).with_metadata(
         ProtocolMetadata::Slipstream(
             V3Metadata::default()
@@ -27,6 +26,7 @@ fn fixture() -> (
                 .with_storage_layout(V3StorageLayout::aero_cl(100)),
         ),
     );
+    let runtime = aero_cl_governance_runtime_for_pool(&registration).unwrap();
     let mut state = State::default();
     state
         .0

@@ -88,21 +88,24 @@ fn fixture() -> (PoolRegistration, Log, Parent, AdapterEventContext, U256) {
             reviewed.implementation,
             reviewed.implementation_runtime_code_hash,
         ),
-        reviewed.gauge,
+        reviewed.gauge.unwrap(),
         reviewed.gauge_implementation,
     ] {
         state.identities.insert((8453, address), hash);
     }
-    for (index, expected) in [(4, reviewed.gauge.1), (5, reviewed.gauge_implementation.1)] {
+    for (index, expected) in [
+        (4, reviewed.gauge.unwrap().1),
+        (5, reviewed.gauge_implementation.1),
+    ] {
         let code: Bytes = value(&requests[index]["response"]["result"]);
         assert_eq!(keccak256(code), expected);
     }
     state.slots.insert(
         (reviewed.pool, U256::from(3)),
-        U256::from_be_slice(reviewed.gauge.0.as_slice()),
+        U256::from_be_slice(reviewed.gauge_address().as_slice()),
     );
     state.slots.insert(
-        (reviewed.gauge.0, CURSOR_SLOT),
+        (reviewed.gauge_address(), CURSOR_SLOT),
         value(&requests[2]["response"]["result"]),
     );
     (

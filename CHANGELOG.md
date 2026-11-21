@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `ClFactorySpec::aero_cl` discovery for the reviewed Ethereum and Base
+  Aero CL factories: `getPool` base slot 19, the enabled spacings, a CREATE2
+  cross-check, the Aero layout and Metaquoter, and the pool's gauge read in the
+  same batch (`V3Metadata::gauge`, persisted). The Aero `PoolCreated` log
+  decodes too.
+- Admit any pool a reviewed Aero CL factory deployed by CREATE2 proof: it gets
+  the deployment's reviewed identities, warm cells, quote overrides and the
+  pool-local plus governance event replay. Gauge stake transitions, fee evidence 
+  and unstaked-fee evaluation stay pinned-only.
+
 ## [0.3.1-alpha.10] - Unreleased candidate
 
 - Add the opt-in `live-runtime` canonical state source owner. Complete source

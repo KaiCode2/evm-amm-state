@@ -1,3 +1,8 @@
+use super::aero_cl_pool::{
+    AERO_CL_BASE, AERO_CL_ETHEREUM, AERO_CL_IMPLEMENTATION,
+    AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH, AERO_CL_PROXY_RUNTIME_CODE_HASH, AdmittedAeroClPool,
+    AeroClDeployment, admit_aero_cl_pool,
+};
 use super::bytecode::{
     AdapterCodeSeed, BytecodeTemplateError, uniswap_v3_max_liquidity_per_tick,
     v3_code_seed_from_metadata,
@@ -186,6 +191,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
             .address()
             .map(|address| EventSource::direct(address, v3_mutating_event_topics(pool.protocol())))
             .into_iter()
+            .chain(super::aero_governance::sources(pool))
             .collect()
     }
 
@@ -299,7 +305,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         match pool.protocol() {
             ProtocolId::PancakeV3 => vec![address],
             ProtocolId::Slipstream => {
-                if let Some(reviewed) = reviewed_aero_cl_runtime_for_pool(address) {
+                if let Some(reviewed) = aero_cl_runtime(pool) {
                     let mut targets = reviewed_aero_cl_code_targets(reviewed);
                     // A strict snapshot quote loads the path tokens' account
                     // headers even though their runtime is overridden.
@@ -334,7 +340,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         let Some(address) = pool.key.address() else {
             return Vec::new();
         };
-        if let Some(reviewed) = reviewed_aero_cl_runtime_for_pool(address) {
+        if let Some(reviewed) = aero_cl_runtime(pool) {
             let metaquoter = v3_metadata(pool)
                 .filter(|metadata| metadata.quoter_kind == V3QuoterKind::Metaquoter)
                 .and_then(|metadata| metadata.quoter);
@@ -349,9 +355,7 @@ impl AmmAdapter for ConcentratedLiquidityAdapter {
         if pool.protocol() != ProtocolId::Slipstream {
             return Vec::new();
         }
-        pool.key
-            .address()
-            .and_then(reviewed_aero_cl_runtime_for_pool)
+        aero_cl_runtime(pool)
             .map(reviewed_aero_cl_identities)
             .unwrap_or_default()
     }
@@ -696,19 +700,14 @@ impl ConcentratedLiquidityAdapter {
     /// `settleGauge` reports zero emissions, which no quoted amount depends
     /// on). Empty for every other registration.
     pub fn aero_cl_quote_code_overrides(pool: &PoolRegistration) -> Vec<(Address, Bytes)> {
-        let Some(reviewed) = pool
-            .key
-            .address()
-            .filter(|_| pool.protocol() == ProtocolId::Slipstream)
-            .and_then(reviewed_aero_cl_runtime_for_pool)
-        else {
+        let Some(reviewed) = aero_cl_runtime(pool) else {
             return Vec::new();
         };
         let stub = Bytes::from_static(ZERO_WORD_RUNTIME);
-        vec![
-            (reviewed.pool_tape.0, stub.clone()),
-            (reviewed.gauge.0, stub),
-        ]
+        std::iter::once(reviewed.pool_tape.0)
+            .chain(reviewed.gauge.map(|(gauge, _)| gauge))
+            .map(|address| (address, stub.clone()))
+            .collect()
     }
 }
 
@@ -910,7 +909,8 @@ fn reviewed_slipstream_fee_storage_targets(
 /// 53205395; `debug_traceCall` prestate read sets of the metaquoter quotes).
 #[derive(Clone, Copy)]
 struct ReviewedAeroClRuntime {
-    family: SlipstreamRuntimeFamily,
+    /// The pinned family; `None` for a factory-admitted pool.
+    family: Option<SlipstreamRuntimeFamily>,
     chain_id: u64,
     pool: Address,
     tick_spacing: i32,
@@ -932,8 +932,9 @@ struct ReviewedAeroClRuntime {
     unstaked_fee_module: (Address, B256),
     unstaked_fee_module_wired: bool,
     pool_tape: (Address, B256),
-    /// The pool's `CLGauge` proxy and its implementation.
-    gauge: (Address, B256),
+    /// The pool's `CLGauge` proxy (absent until the voter creates one) and
+    /// the implementation every gauge proxy delegates to.
+    gauge: Option<(Address, B256)>,
     gauge_implementation: (Address, B256),
     /// The NonfungiblePositionManager the gauge stakes through (same address
     /// on every chain, per-chain runtime); staking evidence binds to it.
@@ -1027,101 +1028,85 @@ const AERO_CL_SETTLEMENT_PATH: [Address; 2] = [
     alloy_primitives::address!("c7e262e848fca78c3c66ee3c9835e4e65e3e0398"),
 ];
 
+impl ReviewedAeroClRuntime {
+    fn new(
+        family: Option<SlipstreamRuntimeFamily>,
+        deployment: AeroClDeployment,
+        pool: Address,
+        tick_spacing: i32,
+        gauge: Option<Address>,
+    ) -> Self {
+        Self {
+            family,
+            chain_id: deployment.chain_id,
+            pool,
+            tick_spacing,
+            proxy_runtime_code_hash: AERO_CL_PROXY_RUNTIME_CODE_HASH,
+            implementation: AERO_CL_IMPLEMENTATION,
+            implementation_runtime_code_hash: AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH,
+            factory: deployment.factory,
+            factory_runtime_code_hash: deployment.factory_runtime_code_hash,
+            hook: AERO_CL_HOOK,
+            hook_runtime_code_hash: deployment.hook_runtime_code_hash,
+            discount_registry: AERO_CL_DISCOUNT_REGISTRY,
+            discount_registry_runtime_code_hash: AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH,
+            mev_tax_module: deployment.mev_tax_module,
+            unstaked_fee_module: (
+                AERO_CL_UNSTAKED_FEE_MODULE,
+                deployment.unstaked_fee_module_runtime_code_hash,
+            ),
+            unstaked_fee_module_wired: deployment.unstaked_fee_module_wired,
+            pool_tape: AERO_CL_POOL_TAPE,
+            gauge: gauge.map(|gauge| (gauge, AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH)),
+            gauge_implementation: AERO_CL_GAUGE_IMPLEMENTATION,
+            nft: (AERO_CL_NFT, deployment.nft_runtime_code_hash),
+            voter: AERO_CL_VOTER,
+            factory_registry: deployment.factory_registry,
+            gauge_factory: AERO_CL_GAUGE_FACTORY,
+            settlement_path: AERO_CL_SETTLEMENT_PATH,
+        }
+    }
+
+    fn admitted(admitted: AdmittedAeroClPool) -> Self {
+        Self::new(
+            None,
+            admitted.deployment,
+            admitted.pool,
+            admitted.tick_spacing,
+            admitted.gauge,
+        )
+    }
+
+    /// The pool's gauge; [`Address::ZERO`] (never an emitter or a voter
+    /// gauge) when the pool has none, so gauge-bound paths fail closed.
+    fn gauge_address(&self) -> Address {
+        self.gauge.map_or(Address::ZERO, |(gauge, _)| gauge)
+    }
+}
+
 fn reviewed_aero_cl_runtime(family: SlipstreamRuntimeFamily) -> Option<ReviewedAeroClRuntime> {
+    let runtime = |deployment, pool, tick_spacing, gauge| {
+        Some(ReviewedAeroClRuntime::new(
+            Some(family),
+            deployment,
+            pool,
+            tick_spacing,
+            Some(gauge),
+        ))
+    };
     match family {
-        SlipstreamRuntimeFamily::AeroEthereumBifi => Some(ReviewedAeroClRuntime {
-            family,
-            chain_id: 1,
-            pool: alloy_primitives::address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1"),
-            tick_spacing: 50,
-            proxy_runtime_code_hash: b256!(
-                "55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"
-            ),
-            implementation: alloy_primitives::address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
-            implementation_runtime_code_hash: b256!(
-                "041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"
-            ),
-            factory: alloy_primitives::address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2"),
-            factory_runtime_code_hash: b256!(
-                "3e53af145d8106d91fad73c6dbbbfe3229c5aa96aab1e18a4bf49a705c773ef5"
-            ),
-            hook: AERO_CL_HOOK,
-            hook_runtime_code_hash: b256!(
-                "d64b9e760431c312c53515167ffb260b357705388da9354f31095d974e19e449"
-            ),
-            discount_registry: AERO_CL_DISCOUNT_REGISTRY,
-            discount_registry_runtime_code_hash: AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH,
-            mev_tax_module: None,
-            unstaked_fee_module: (
-                AERO_CL_UNSTAKED_FEE_MODULE,
-                b256!("90c9628c5dd2b42252a3ddadfc1bf8bf4fe81ed4ee4d2df1beb48403d5434a2d"),
-            ),
-            unstaked_fee_module_wired: true,
-            pool_tape: AERO_CL_POOL_TAPE,
-            gauge: (
-                alloy_primitives::address!("0ee89bdfd62e3a5325416fb93c0f1601474a5b04"),
-                AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH,
-            ),
-            gauge_implementation: AERO_CL_GAUGE_IMPLEMENTATION,
-            nft: (
-                AERO_CL_NFT,
-                b256!("0e52c540913f0de73b9063379637246c59eff6e75ebad5ad7ed23f0bd591ab04"),
-            ),
-            voter: AERO_CL_VOTER,
-            factory_registry: alloy_primitives::address!(
-                "dd1705e23762f4d6e44d8c31bd8ea80c54612239"
-            ),
-            gauge_factory: AERO_CL_GAUGE_FACTORY,
-            settlement_path: AERO_CL_SETTLEMENT_PATH,
-        }),
-        SlipstreamRuntimeFamily::AeroBaseMooBifi => Some(ReviewedAeroClRuntime {
-            family,
-            chain_id: 8_453,
-            pool: alloy_primitives::address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8"),
-            tick_spacing: 100,
-            proxy_runtime_code_hash: b256!(
-                "55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45"
-            ),
-            implementation: alloy_primitives::address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8"),
-            implementation_runtime_code_hash: b256!(
-                "041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693"
-            ),
-            factory: alloy_primitives::address!("9cb220581b91b0c83223012fe69688b92ad07a76"),
-            factory_runtime_code_hash: b256!(
-                "6c09090837ace0aefe6bfa24a3bc772d13a9775b7e3109c9fece534a0ce053a6"
-            ),
-            hook: AERO_CL_HOOK,
-            hook_runtime_code_hash: b256!(
-                "198b45ce022f423a9852526890d236531333e97861078501357e1c72f0eeecbd"
-            ),
-            discount_registry: AERO_CL_DISCOUNT_REGISTRY,
-            discount_registry_runtime_code_hash: AERO_CL_DISCOUNT_REGISTRY_RUNTIME_CODE_HASH,
-            mev_tax_module: Some((
-                alloy_primitives::address!("29f12ce5be3d88b56d245b7f4e969c518f799a4a"),
-                b256!("fb10c802d480cf1d35d1878c7dc9b9e12a54b600f66da776991554ff0c2f9657"),
-            )),
-            unstaked_fee_module: (
-                AERO_CL_UNSTAKED_FEE_MODULE,
-                b256!("e3ec637a6e3236331711ec5d4c476d8f0c0e9d54e8c3936fe068195884b5b829"),
-            ),
-            unstaked_fee_module_wired: false,
-            pool_tape: AERO_CL_POOL_TAPE,
-            gauge: (
-                alloy_primitives::address!("84c029f26652d37bc153c39deb8767ec54037334"),
-                AERO_CL_GAUGE_PROXY_RUNTIME_CODE_HASH,
-            ),
-            gauge_implementation: AERO_CL_GAUGE_IMPLEMENTATION,
-            nft: (
-                AERO_CL_NFT,
-                b256!("b2d0d8278354542651e2db288b71292635d9fd7bd28784f736373da801974599"),
-            ),
-            voter: AERO_CL_VOTER,
-            factory_registry: alloy_primitives::address!(
-                "7b2a2c12dc5ea2a31455952a05031c3e4bb28f3e"
-            ),
-            gauge_factory: AERO_CL_GAUGE_FACTORY,
-            settlement_path: AERO_CL_SETTLEMENT_PATH,
-        }),
+        SlipstreamRuntimeFamily::AeroEthereumBifi => runtime(
+            AERO_CL_ETHEREUM,
+            alloy_primitives::address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1"),
+            50,
+            alloy_primitives::address!("0ee89bdfd62e3a5325416fb93c0f1601474a5b04"),
+        ),
+        SlipstreamRuntimeFamily::AeroBaseMooBifi => runtime(
+            AERO_CL_BASE,
+            alloy_primitives::address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8"),
+            100,
+            alloy_primitives::address!("84c029f26652d37bc153c39deb8767ec54037334"),
+        ),
         SlipstreamRuntimeFamily::AerodromeBaseBifi
         | SlipstreamRuntimeFamily::VelodromeOptimismBifi => None,
     }
@@ -1129,6 +1114,17 @@ fn reviewed_aero_cl_runtime(family: SlipstreamRuntimeFamily) -> Option<ReviewedA
 
 fn reviewed_aero_cl_runtime_for_pool(pool: Address) -> Option<ReviewedAeroClRuntime> {
     reviewed_slipstream_family_for_pool(pool).and_then(reviewed_aero_cl_runtime)
+}
+
+/// The reviewed Aero CL runtime of a Slipstream registration: the pinned
+/// family at its address, else the factory-admitted pool it proves to be.
+fn aero_cl_runtime(pool: &PoolRegistration) -> Option<ReviewedAeroClRuntime> {
+    let address = pool
+        .key
+        .address()
+        .filter(|_| pool.protocol() == ProtocolId::Slipstream)?;
+    reviewed_aero_cl_runtime_for_pool(address)
+        .or_else(|| admit_aero_cl_pool(pool).map(ReviewedAeroClRuntime::admitted))
 }
 
 /// Every runtime the Aero CL quote path executes: pinned identities first,
@@ -1144,10 +1140,12 @@ fn reviewed_aero_cl_code_targets(reviewed: ReviewedAeroClRuntime) -> Vec<Address
     if let Some((module, _)) = reviewed.mev_tax_module {
         targets.push(module);
     }
+    targets.extend(
+        [reviewed.unstaked_fee_module.0, reviewed.pool_tape.0]
+            .into_iter()
+            .chain(reviewed.gauge.map(|(gauge, _)| gauge)),
+    );
     targets.extend([
-        reviewed.unstaked_fee_module.0,
-        reviewed.pool_tape.0,
-        reviewed.gauge.0,
         reviewed.gauge_implementation.0,
         reviewed.nft.0,
         reviewed.voter,
@@ -1178,13 +1176,9 @@ fn reviewed_aero_cl_identities(reviewed: ReviewedAeroClRuntime) -> Vec<(Address,
     if let Some(module) = reviewed.mev_tax_module {
         identities.push(module);
     }
-    identities.extend([
-        reviewed.unstaked_fee_module,
-        reviewed.pool_tape,
-        reviewed.gauge,
-        reviewed.gauge_implementation,
-        reviewed.nft,
-    ]);
+    identities.extend([reviewed.unstaked_fee_module, reviewed.pool_tape]);
+    identities.extend(reviewed.gauge);
+    identities.extend([reviewed.gauge_implementation, reviewed.nft]);
     identities
 }
 
@@ -1220,20 +1214,26 @@ impl From<ReviewedAeroClRuntime> for AeroClGovernanceRuntime {
 }
 
 pub(crate) fn aero_cl_governance_runtime_for_pool(
-    pool: Address,
+    pool: &PoolRegistration,
 ) -> Option<AeroClGovernanceRuntime> {
-    reviewed_aero_cl_runtime_for_pool(pool).map(Into::into)
+    aero_cl_runtime(pool).map(Into::into)
 }
 
-pub(crate) fn aero_cl_governance_runtimes() -> Vec<AeroClGovernanceRuntime> {
+/// Whether `address` is a contract whose setters reconfigure the reviewed
+/// Aero CL quote path of some deployment.
+pub(crate) fn is_aero_cl_governance_emitter(address: Address) -> bool {
     [
-        SlipstreamRuntimeFamily::AeroEthereumBifi,
-        SlipstreamRuntimeFamily::AeroBaseMooBifi,
+        AERO_CL_HOOK,
+        AERO_CL_DISCOUNT_REGISTRY,
+        AERO_CL_UNSTAKED_FEE_MODULE,
     ]
-    .into_iter()
-    .filter_map(reviewed_aero_cl_runtime)
-    .map(Into::into)
-    .collect()
+    .contains(&address)
+        || [AERO_CL_ETHEREUM, AERO_CL_BASE].iter().any(|deployment| {
+            deployment.factory == address
+                || deployment
+                    .mev_tax_module
+                    .is_some_and(|(module, _)| module == address)
+        })
 }
 
 pub(crate) fn solidity_nested_mapping_key(outer: Address, inner: U256, mapping_slot: u64) -> U256 {
@@ -1269,7 +1269,7 @@ fn reviewed_aero_cl_storage_targets(
     metaquoter: Option<Address>,
 ) -> Vec<(Address, U256)> {
     let pool = reviewed.pool;
-    let gauge = reviewed.gauge.0;
+    let gauge = reviewed.gauge.map(|(gauge, _)| gauge);
     let mut targets = vec![
         (reviewed.factory, U256::from(AERO_CL_FACTORY_VOTER_SLOT)),
         (
@@ -1315,19 +1315,23 @@ fn reviewed_aero_cl_storage_targets(
             reviewed.hook,
             solidity_address_mapping_key(pool, AERO_CL_HOOK_DYNAMIC_FEE_CONFIG_SLOT),
         ),
-        (
-            reviewed.voter,
-            solidity_address_mapping_key(gauge, AERO_CL_VOTER_GAUGES_SLOT) + U256::from(1),
-        ),
-        (
-            reviewed.gauge_factory,
-            solidity_address_mapping_key(gauge, AERO_CL_GAUGE_FACTORY_GAUGE_SLOT),
-        ),
-        (
-            reviewed.pool_tape.0,
-            solidity_address_mapping_key(pool, AERO_CL_TAPE_POOL_HOOK_SLOT),
-        ),
     ];
+    targets.extend(gauge.into_iter().flat_map(|gauge| {
+        [
+            (
+                reviewed.voter,
+                solidity_address_mapping_key(gauge, AERO_CL_VOTER_GAUGES_SLOT) + U256::from(1),
+            ),
+            (
+                reviewed.gauge_factory,
+                solidity_address_mapping_key(gauge, AERO_CL_GAUGE_FACTORY_GAUGE_SLOT),
+            ),
+        ]
+    }));
+    targets.push((
+        reviewed.pool_tape.0,
+        solidity_address_mapping_key(pool, AERO_CL_TAPE_POOL_HOOK_SLOT),
+    ));
     let record_base = solidity_address_mapping_key(pool, AERO_CL_TAPE_POOL_RECORD_SLOT);
     targets.extend(
         (0..AERO_CL_TAPE_POOL_RECORD_WORDS)
@@ -1353,15 +1357,17 @@ fn reviewed_aero_cl_storage_targets(
                 reviewed.factory_registry,
                 solidity_address_mapping_key(pool, AERO_CL_REGISTRY_POOL_TO_GAUGE_SLOT),
             ),
+        ]);
+        targets.extend(gauge.map(|gauge| {
             (
                 reviewed.factory_registry,
                 solidity_address_mapping_key(gauge, AERO_CL_REGISTRY_GAUGE_TO_FACTORY_SLOT),
-            ),
-            (
-                reviewed.discount_registry,
-                solidity_address_mapping_key(metaquoter, AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT),
-            ),
-        ]);
+            )
+        }));
+        targets.push((
+            reviewed.discount_registry,
+            solidity_address_mapping_key(metaquoter, AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT),
+        ));
     }
     targets
 }
@@ -1474,6 +1480,7 @@ fn validate_snapshot_lineage(
 /// and the module wiring must match the review, every pinned runtime must be
 /// resident, and the result must not depend on the caller.
 fn evaluate_aero_unstaked_fee(
+    family: SlipstreamRuntimeFamily,
     reviewed: ReviewedAeroClRuntime,
     snapshot: Arc<EvmSnapshot>,
     identity: SlipstreamSnapshotIdentity,
@@ -1495,7 +1502,7 @@ fn evaluate_aero_unstaked_fee(
     Ok(SlipstreamUnstakedFeeEvaluation::new(
         outcome.effective_fee,
         SlipstreamUnstakedFeeProof::reviewed_runtime_evaluation(
-            reviewed.family,
+            family,
             outcome.gauge_alive,
             outcome.effective_fee,
             identity,
@@ -1542,7 +1549,8 @@ fn evaluate_aero_unstaked_fee_path(
     )?);
     if actual_factory != reviewed.factory
         || actual_module != expected_module
-        || actual_gauge != reviewed.gauge.0
+        || reviewed.gauge.is_none()
+        || actual_gauge != reviewed.gauge_address()
     {
         return Err(SlipstreamUnstakedFeeEvaluationError::RuntimeAddressIdentity);
     }
@@ -1551,7 +1559,7 @@ fn evaluate_aero_unstaked_fee_path(
         caller,
         reviewed.voter,
         "isActivated(address)",
-        Some(reviewed.gauge.0),
+        Some(reviewed.gauge_address()),
         &mut observed_code_hashes,
     )?;
     if alive_word > U256::from(1) {
@@ -1793,7 +1801,13 @@ impl ConcentratedLiquidityAdapter {
             return V3SwapTransitionCapability::Unsupported;
         };
         if pool.protocol() != ProtocolId::Slipstream
-            || validate_reviewed_slipstream_event(address, layout, context).is_err()
+            || validate_reviewed_slipstream_event(
+                address,
+                layout,
+                admit_aero_cl_pool(pool),
+                context,
+            )
+            .is_err()
         {
             return V3SwapTransitionCapability::Unsupported;
         }
@@ -1860,7 +1874,13 @@ impl ConcentratedLiquidityAdapter {
             return V3LiquidityTransitionCapability::Unsupported;
         };
         if pool.protocol() != ProtocolId::Slipstream
-            || validate_reviewed_slipstream_event(address, layout, context).is_err()
+            || validate_reviewed_slipstream_event(
+                address,
+                layout,
+                admit_aero_cl_pool(pool),
+                context,
+            )
+            .is_err()
         {
             return V3LiquidityTransitionCapability::Unsupported;
         }
@@ -1885,7 +1905,7 @@ impl ConcentratedLiquidityAdapter {
         context: &AdapterEventContext,
     ) -> Result<SlipstreamUnstakedFeeEvaluation, SlipstreamUnstakedFeeEvaluationError> {
         if let Some(reviewed) = reviewed_aero_cl_runtime(family) {
-            return evaluate_aero_unstaked_fee(reviewed, snapshot, identity, context);
+            return evaluate_aero_unstaked_fee(family, reviewed, snapshot, identity, context);
         }
         let reviewed = reviewed_slipstream_fee_runtime(family)
             .ok_or(SlipstreamUnstakedFeeEvaluationError::UnsupportedFamily)?;
@@ -1968,6 +1988,21 @@ impl ConcentratedLiquidityAdapter {
         (layout.slipstream_family() == Some(SlipstreamLayoutFamily::AeroCl)
             && layout.tick_spacing == reviewed.tick_spacing)
             .then_some(reviewed.family)
+            .flatten()
+    }
+
+    /// Whether `pool` is admitted to the reviewed Aero CL runtime by its
+    /// factory: a Slipstream registration of a reviewed Aero CL factory whose
+    /// tokens, tick spacing and Aero CL layout re-derive its address by
+    /// CREATE2. Address-pinned families report `false`; see
+    /// [`aero_cl_runtime_family`](Self::aero_cl_runtime_family).
+    pub fn is_aero_cl_factory_pool(pool: &PoolRegistration) -> bool {
+        admit_aero_cl_pool(pool).is_some()
+            && pool
+                .key
+                .address()
+                .and_then(reviewed_slipstream_family_for_pool)
+                .is_none()
     }
 
     /// The pinned runtime identities (`address → runtime keccak`) of a
@@ -2016,12 +2051,7 @@ impl ConcentratedLiquidityAdapter {
         pool: &PoolRegistration,
         block_number: u64,
     ) -> Vec<(Address, U256)> {
-        let Some(reviewed) = pool
-            .key
-            .address()
-            .filter(|_| pool.protocol() == ProtocolId::Slipstream)
-            .and_then(reviewed_aero_cl_runtime_for_pool)
-        else {
+        let Some(reviewed) = aero_cl_runtime(pool) else {
             return Vec::new();
         };
         vec![(
@@ -2062,11 +2092,7 @@ impl ConcentratedLiquidityAdapter {
         pool: &PoolRegistration,
         account: Address,
     ) -> Option<(Address, U256)> {
-        let reviewed = pool
-            .key
-            .address()
-            .filter(|_| pool.protocol() == ProtocolId::Slipstream)
-            .and_then(reviewed_aero_cl_runtime_for_pool)?;
+        let reviewed = aero_cl_runtime(pool)?;
         Some((
             reviewed.discount_registry,
             solidity_address_mapping_key(account, AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT),
@@ -2107,7 +2133,14 @@ impl ConcentratedLiquidityAdapter {
             ));
         }
         let swap = decode_swap_body(log)?;
-        infer_slipstream_swap_fee(address, layout, swap, view, context)
+        infer_slipstream_swap_fee(
+            address,
+            layout,
+            admit_aero_cl_pool(pool),
+            swap,
+            view,
+            context,
+        )
     }
 
     fn decode_swap_without_context(
@@ -2201,7 +2234,14 @@ impl ConcentratedLiquidityAdapter {
                 };
                 derive_uniswap_v3_swap(address, layout, fee, swap, view, context)
             }
-            ProtocolId::Slipstream => derive_slipstream_swap(address, layout, swap, view, context),
+            ProtocolId::Slipstream => derive_slipstream_swap(
+                address,
+                layout,
+                admit_aero_cl_pool(pool),
+                swap,
+                view,
+                context,
+            ),
             _ => Err(AdapterEventError::Unsupported(UnsupportedReason::Protocol(
                 pool.protocol(),
             ))),
@@ -2584,7 +2624,14 @@ impl ConcentratedLiquidityAdapter {
                 );
             }
         };
-        let updates = match derive_slipstream_liquidity(address, layout, decoded, view, context) {
+        let updates = match derive_slipstream_liquidity(
+            address,
+            layout,
+            admit_aero_cl_pool(pool),
+            decoded,
+            view,
+            context,
+        ) {
             Ok(updates) => updates,
             Err(error) => {
                 return AdapterEventResult::event_with_error(
@@ -2642,7 +2689,9 @@ impl ConcentratedLiquidityAdapter {
                 UnsupportedReason::MissingMetadata("Slipstream storage layout"),
             ));
         };
-        if let Err(error) = validate_reviewed_slipstream_event(address, layout, context) {
+        if let Err(error) =
+            validate_reviewed_slipstream_event(address, layout, admit_aero_cl_pool(pool), context)
+        {
             return invalid(error);
         }
         let Some(layout_family) = layout.slipstream_family() else {
@@ -2716,7 +2765,14 @@ impl ConcentratedLiquidityAdapter {
             );
         };
         match decode_observation_growth_body(log).and_then(|event| {
-            derive_slipstream_observation_growth(address, layout, event, view, context)
+            derive_slipstream_observation_growth(
+                address,
+                layout,
+                admit_aero_cl_pool(pool),
+                event,
+                view,
+                context,
+            )
         }) {
             Ok(updates) => AdapterEventResult::event(AdapterEvent {
                 pool: pool.key.clone(),
@@ -2767,7 +2823,9 @@ impl ConcentratedLiquidityAdapter {
                 )),
             );
         };
-        if let Err(error) = validate_reviewed_slipstream_event(address, layout, context) {
+        if let Err(error) =
+            validate_reviewed_slipstream_event(address, layout, admit_aero_cl_pool(pool), context)
+        {
             return AdapterEventResult::event_with_error(
                 non_swap_mutation_invalidation(pool, log.address, Collect::SIGNATURE_HASH, address),
                 error,

@@ -12,6 +12,10 @@
 
 use alloy_primitives::{Address, U256, address, aliases::U512, b256};
 
+use super::aero_cl_pool::{
+    AERO_CL_IMPLEMENTATION, AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH,
+    AERO_CL_PROXY_RUNTIME_CODE_HASH, AdmittedAeroClPool,
+};
 use super::storage::{
     SlipstreamLayoutFamily, V3StorageLayout, slipstream_tick_info_storage_keys_with_base,
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base, v3_word_position,
@@ -324,7 +328,9 @@ struct SlipstreamStepBoundary {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ReviewedSlipstreamRuntime {
+pub(super) struct ReviewedSlipstreamRuntime {
+    /// The pinned family; `None` for a factory-admitted Aero CL pool.
+    pub(super) family: Option<SlipstreamRuntimeFamily>,
     chain_id: u64,
     pool: Address,
     factory: Address,
@@ -1417,6 +1423,7 @@ pub(super) fn uniswap_v3_position_slots(
 pub(super) fn derive_slipstream_swap(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     swap: DecodedSwap,
     state: &dyn StateView,
     context: &AdapterEventContext,
@@ -1425,7 +1432,7 @@ pub(super) fn derive_slipstream_swap(
         .slipstream_fee_evidence
         .map(|evidence| evidence.effective_swap_fee);
     let (updates, inferred_fee) =
-        derive_slipstream_swap_inner(address, layout, swap, state, context)?;
+        derive_slipstream_swap_inner(address, layout, admitted, swap, state, context)?;
     if claimed_fee.is_some_and(|claimed_fee| claimed_fee != inferred_fee) {
         return Err(AdapterEventError::V3Transition(
             V3TransitionError::SlipstreamFeeEvidence(
@@ -1448,12 +1455,12 @@ pub(super) fn derive_slipstream_swap(
 pub(super) fn derive_slipstream_liquidity(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     event: DecodedLiquidity,
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<Vec<StateUpdate>, AdapterEventError> {
-    let family = validate_reviewed_slipstream_event(address, layout, context)?;
-    let reviewed = reviewed_slipstream_runtime(family);
+    let reviewed = validate_reviewed_slipstream_event(address, layout, admitted, context)?;
     let slots = slipstream_slots(reviewed.layout_family);
     if event.tick_lower < -887_272
         || event.tick_upper > 887_272
@@ -1737,14 +1744,16 @@ fn update_slipstream_liquidity_tick(
 }
 
 /// Validate that `address`/`layout`/`context` name one reviewed Slipstream
-/// family deployment and return it. The registration layout must classify
-/// as that family's storage layout and carry the pool's immutable tick
-/// spacing; the context must name the family's chain and complete lineage.
+/// runtime — a pinned family deployment, else the factory-admitted Aero CL
+/// pool `admitted` — and return it. The registration layout must classify
+/// as that runtime's storage layout and carry the pool's immutable tick
+/// spacing; the context must name the runtime's chain and complete lineage.
 pub(super) fn validate_reviewed_slipstream_event(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     context: &AdapterEventContext,
-) -> Result<SlipstreamRuntimeFamily, AdapterEventError> {
+) -> Result<ReviewedSlipstreamRuntime, AdapterEventError> {
     validate_context(context)?;
     let Some(layout_family) = layout.slipstream_family() else {
         return Err(contradiction(
@@ -1755,16 +1764,21 @@ pub(super) fn validate_reviewed_slipstream_event(
         return Err(contradiction("Slipstream tick spacing must be positive"));
     }
     let chain_id = context.chain_id.expect("validated");
-    if !ALL_REVIEWED_SLIPSTREAM_FAMILIES
-        .iter()
-        .any(|family| reviewed_slipstream_runtime(*family).chain_id == chain_id)
+    let admitted = admitted
+        .filter(|admitted| admitted.pool == address && admitted.deployment.chain_id == chain_id);
+    if admitted.is_none()
+        && !ALL_REVIEWED_SLIPSTREAM_FAMILIES
+            .iter()
+            .any(|family| reviewed_slipstream_runtime(*family).chain_id == chain_id)
     {
         return Err(contradiction("unreviewed Slipstream chain identity"));
     }
-    let Some(family) = reviewed_slipstream_family_for(chain_id, address) else {
+    let Some(reviewed) = reviewed_slipstream_family_for(chain_id, address)
+        .map(reviewed_slipstream_runtime)
+        .or_else(|| admitted.map(admitted_slipstream_runtime))
+    else {
         return Err(contradiction("unreviewed Slipstream pool identity"));
     };
-    let reviewed = reviewed_slipstream_runtime(family);
     if reviewed.layout_family != layout_family {
         return Err(contradiction(
             "registration storage layout does not match the reviewed Slipstream family",
@@ -1775,7 +1789,7 @@ pub(super) fn validate_reviewed_slipstream_event(
             "reviewed Slipstream pool tick spacing does not match registration",
         ));
     }
-    Ok(family)
+    Ok(reviewed)
 }
 
 /// Derive the exact transition for a reviewed Slipstream / Aero CL
@@ -1784,11 +1798,12 @@ pub(super) fn validate_reviewed_slipstream_event(
 pub(super) fn derive_slipstream_observation_growth(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     event: DecodedObservationGrowth,
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<Vec<StateUpdate>, AdapterEventError> {
-    validate_reviewed_slipstream_event(address, layout, context)?;
+    validate_reviewed_slipstream_event(address, layout, admitted, context)?;
     if event.new <= event.old {
         return Err(contradiction(
             "observation cardinality growth must increase the reservation",
@@ -1831,22 +1846,25 @@ pub(super) fn derive_slipstream_observation_growth(
 pub(super) fn infer_slipstream_swap_fee(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     swap: DecodedSwap,
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<u32, AdapterEventError> {
-    derive_slipstream_swap_inner(address, layout, swap, state, context).map(|(_, fee)| fee)
+    derive_slipstream_swap_inner(address, layout, admitted, swap, state, context)
+        .map(|(_, fee)| fee)
 }
 
 fn derive_slipstream_swap_inner(
     address: Address,
     layout: V3StorageLayout,
+    admitted: Option<AdmittedAeroClPool>,
     swap: DecodedSwap,
     state: &dyn StateView,
     context: &AdapterEventContext,
 ) -> Result<(Vec<StateUpdate>, u32), AdapterEventError> {
-    let family = validate_reviewed_slipstream_event(address, layout, context)?;
-    let slots = slipstream_slots(reviewed_slipstream_runtime(family).layout_family);
+    let reviewed = validate_reviewed_slipstream_event(address, layout, admitted, context)?;
+    let slots = slipstream_slots(reviewed.layout_family);
     let evidence = context
         .slipstream_fee_evidence
         .map(|_| validate_slipstream_evidence(address, state, context))
@@ -2376,17 +2394,10 @@ struct SlipstreamRewardUpdate {
     staked_seconds: Option<U256>,
 }
 
-/// Shared Aero (Dromos) CL implementation behind every Aero CL pool proxy.
-const AERO_CL_IMPLEMENTATION: Address = address!("1642634c8cb1c9f1b84c9a1a08534f8c3f4e89f8");
-const AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH: alloy_primitives::B256 =
-    b256!("041172c7cbffc45627f9dd52727a0124cd6eeb2b5830ab392df54f71a6948693");
-/// EIP-1167 proxy runtime delegating to [`AERO_CL_IMPLEMENTATION`].
-const AERO_CL_PROXY_RUNTIME_CODE_HASH: alloy_primitives::B256 =
-    b256!("55e3735acd886d76160bfd959db31dd476e73e46e8a0d70ac36e4c53ef5a2a45");
-
 fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlipstreamRuntime {
     match family {
         SlipstreamRuntimeFamily::AerodromeBaseBifi => ReviewedSlipstreamRuntime {
+            family: Some(family),
             chain_id: 8_453,
             pool: address!("b378137c90444bbcecd44a1f766851fbf53d2a9e"),
             factory: address!("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"),
@@ -2402,6 +2413,7 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             initializes_reward_growth_outside: false,
         },
         SlipstreamRuntimeFamily::VelodromeOptimismBifi => ReviewedSlipstreamRuntime {
+            family: Some(family),
             chain_id: 10,
             pool: address!("173cdc71e29d5cffa6d090ad99f555a24b8831f9"),
             factory: address!("cc0bddb707055e04e497ab22a59c2af4391cd12f"),
@@ -2417,6 +2429,7 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             initializes_reward_growth_outside: true,
         },
         SlipstreamRuntimeFamily::AeroEthereumBifi => ReviewedSlipstreamRuntime {
+            family: Some(family),
             chain_id: 1,
             pool: address!("ff35aa95669b5668ac6727fdcfc0d5582cdd78d1"),
             factory: address!("f4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2"),
@@ -2428,6 +2441,7 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             initializes_reward_growth_outside: true,
         },
         SlipstreamRuntimeFamily::AeroBaseMooBifi => ReviewedSlipstreamRuntime {
+            family: Some(family),
             chain_id: 8_453,
             pool: address!("eebe78d734dc4bac027061cee9bc12c5803fe4f8"),
             factory: address!("9cb220581b91b0c83223012fe69688b92ad07a76"),
@@ -2438,6 +2452,21 @@ fn reviewed_slipstream_runtime(family: SlipstreamRuntimeFamily) -> ReviewedSlips
             layout_family: SlipstreamLayoutFamily::AeroCl,
             initializes_reward_growth_outside: true,
         },
+    }
+}
+
+fn admitted_slipstream_runtime(admitted: AdmittedAeroClPool) -> ReviewedSlipstreamRuntime {
+    ReviewedSlipstreamRuntime {
+        family: None,
+        chain_id: admitted.deployment.chain_id,
+        pool: admitted.pool,
+        factory: admitted.deployment.factory,
+        proxy_runtime_code_hash: AERO_CL_PROXY_RUNTIME_CODE_HASH,
+        implementation: AERO_CL_IMPLEMENTATION,
+        implementation_runtime_code_hash: AERO_CL_IMPLEMENTATION_RUNTIME_CODE_HASH,
+        tick_spacing: admitted.tick_spacing,
+        layout_family: SlipstreamLayoutFamily::AeroCl,
+        initializes_reward_growth_outside: true,
     }
 }
 

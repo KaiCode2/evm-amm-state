@@ -46,12 +46,17 @@ use super::SolidlyV2Metadata;
 #[cfg(feature = "uniswap-v2")]
 use super::UniswapV2Metadata;
 #[cfg(feature = "uniswap-v3")]
-use super::V3Metadata;
+use super::aero_cl_pool::{
+    AERO_CL_GET_POOL_BASE_SLOT, AERO_CL_METAQUOTER, AERO_CL_POOL_GAUGE_SLOT,
+    AERO_CL_POOL_INIT_CODE_HASH, AERO_CL_TICK_SPACINGS,
+};
 use super::{AdapterCache, AdapterRegistry, EventSource, PoolKey, PoolRegistration, ProtocolId};
+#[cfg(feature = "uniswap-v3")]
+use super::{V3Metadata, V3QuoterKind};
 #[cfg(feature = "solidly-v2")]
 use crate::adapters::storage::SolidlyStorageLayout;
 #[cfg(feature = "uniswap-v3")]
-use crate::adapters::storage::V3StorageLayout;
+use crate::adapters::storage::{SlipstreamLayoutFamily, V3StorageLayout};
 #[cfg(any(feature = "uniswap-v2", feature = "uniswap-v3", feature = "solidly-v2"))]
 use alloy_primitives::B256;
 use alloy_primitives::{Address, Log, U256};
@@ -372,6 +377,18 @@ mod cl_factory_events {
 }
 #[cfg(feature = "uniswap-v3")]
 use cl_factory_events::{PoolCreated, PoolCreatedTickSpacing};
+
+/// Aero (Dromos) CL `CLFactory` pool-creation event, in its own module so the
+/// generated struct keeps the on-chain name `PoolCreated` (its topic0) next to
+/// the Uniswap one. Unlike [`PoolCreatedTickSpacing`] it carries no fee.
+#[cfg(feature = "uniswap-v3")]
+mod aero_cl_factory_events {
+    alloy_sol_types::sol! {
+        event PoolCreated(address indexed token0, address indexed token1, int24 indexed tickSpacing, address pool);
+    }
+}
+#[cfg(feature = "uniswap-v3")]
+use aero_cl_factory_events::PoolCreated as AeroClPoolCreated;
 
 /// Solidly V2 (Aerodrome / Velodrome V2) pool-creation event, wrapped in its own
 /// module so the generated struct keeps the on-chain name `PoolCreated` (whose
@@ -799,6 +816,12 @@ pub struct ClFactorySpec {
     pub creation_topic0: Option<B256>,
     /// Whether to run the CREATE2 cross-check (requires [`create2`](Self::create2)).
     pub verify_derivations: bool,
+    /// The quote ABI [`quoter`](Self::quoter) speaks.
+    pub quoter_kind: V3QuoterKind,
+    /// The pool storage layout family a [`ProtocolId::Slipstream`] factory
+    /// deploys. [`SlipstreamLayoutFamily::AeroCl`] additionally reads each
+    /// pool's gauge at its CREATE2-derived address during discovery.
+    pub slipstream_layout: SlipstreamLayoutFamily,
 }
 
 #[cfg(feature = "uniswap-v3")]
@@ -825,6 +848,8 @@ impl ClFactorySpec {
             quoter: None,
             creation_topic0: None,
             verify_derivations: false,
+            quoter_kind: V3QuoterKind::QuoterV2,
+            slipstream_layout: SlipstreamLayoutFamily::Legacy,
         }
     }
 
@@ -853,12 +878,27 @@ impl ClFactorySpec {
             quoter: None,
             creation_topic0: None,
             verify_derivations: false,
+            quoter_kind: V3QuoterKind::QuoterV2,
+            slipstream_layout: SlipstreamLayoutFamily::Legacy,
         }
     }
 
     /// Set the per-fork swap-quote target (a fork's own QuoterV2).
     pub fn with_quoter(mut self, quoter: Address) -> Self {
         self.quoter = Some(quoter);
+        self
+    }
+
+    /// Set the per-fork swap-quote target to an Aero `Metaquoter`.
+    pub fn with_metaquoter(mut self, metaquoter: Address) -> Self {
+        self.quoter = Some(metaquoter);
+        self.quoter_kind = V3QuoterKind::Metaquoter;
+        self
+    }
+
+    /// Set the pool storage layout family a Slipstream factory deploys.
+    pub fn with_slipstream_layout(mut self, layout: SlipstreamLayoutFamily) -> Self {
+        self.slipstream_layout = layout;
         self
     }
 
@@ -1004,6 +1044,31 @@ impl ClFactorySpec {
             SLIPSTREAM_TICK_SPACINGS,
         )
         .with_creation_topic0(PoolCreatedTickSpacing::SIGNATURE_HASH)
+    }
+
+    /// Aero (Dromos) CL `CLFactory` (Base, Ethereum and the other Superchain
+    /// deployments). Protocol [`ProtocolId::Slipstream`] with the
+    /// [`SlipstreamLayoutFamily::AeroCl`] storage layout, tickSpacing-keyed
+    /// over the enabled spacings `[1, 10, 50, 100, 150, 200, 250]`, quoted
+    /// through the Aero `Metaquoter`.
+    ///
+    /// The `_getPool` base slot (19), the EIP-1167 clone init-code hash and the
+    /// spacing table are VERIFIED on-chain (Base and Ethereum `CLFactory`), so
+    /// `verify_derivations` is ON. Discovery also reads each pool's `gauge`.
+    /// Pools of the reviewed Base and Ethereum factories are admitted to the
+    /// reviewed Aero CL runtime by their CREATE2 derivation.
+    pub fn aero_cl(factory: Address) -> Self {
+        Self::tick_spacing_keyed(
+            ProtocolId::Slipstream,
+            factory,
+            U256::from(AERO_CL_GET_POOL_BASE_SLOT),
+            AERO_CL_TICK_SPACINGS,
+        )
+        .with_slipstream_layout(SlipstreamLayoutFamily::AeroCl)
+        .with_create2(None, AERO_CL_POOL_INIT_CODE_HASH)
+        .with_verify_derivations(true)
+        .with_metaquoter(AERO_CL_METAQUOTER)
+        .with_creation_topic0(AeroClPoolCreated::SIGNATURE_HASH)
     }
 }
 
@@ -1876,6 +1941,7 @@ impl ConcentratedLiquidityFactory {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn registration(
         &self,
         pool: Address,
@@ -1883,12 +1949,16 @@ impl ConcentratedLiquidityFactory {
         token1: Address,
         fee: u32,
         tick_spacing: i32,
+        gauge: Option<Address>,
         source: DiscoverySource,
     ) -> DiscoveredPool {
-        let storage_layout = match self.spec.protocol {
-            ProtocolId::UniswapV3 => V3StorageLayout::uniswap(tick_spacing),
-            ProtocolId::PancakeV3 => V3StorageLayout::pancake(tick_spacing),
-            ProtocolId::Slipstream => V3StorageLayout::slipstream(tick_spacing),
+        let storage_layout = match (self.spec.protocol, self.spec.slipstream_layout) {
+            (ProtocolId::UniswapV3, _) => V3StorageLayout::uniswap(tick_spacing),
+            (ProtocolId::PancakeV3, _) => V3StorageLayout::pancake(tick_spacing),
+            (ProtocolId::Slipstream, SlipstreamLayoutFamily::AeroCl) => {
+                V3StorageLayout::aero_cl(tick_spacing)
+            }
+            (ProtocolId::Slipstream, _) => V3StorageLayout::slipstream(tick_spacing),
             _ => V3StorageLayout::uniswap(tick_spacing),
         };
         let mut metadata = V3Metadata::default()
@@ -1906,9 +1976,15 @@ impl ConcentratedLiquidityFactory {
             metadata = metadata.with_fee(fee);
         }
         let metadata = if let Some(quoter) = self.spec.quoter {
-            metadata.with_quoter(quoter)
+            metadata
+                .with_quoter(quoter)
+                .with_quoter_kind(self.spec.quoter_kind)
         } else {
             metadata
+        };
+        let metadata = match gauge {
+            Some(gauge) => metadata.with_gauge(gauge),
+            None => metadata,
         };
         let key = match self.spec.protocol {
             ProtocolId::PancakeV3 => PoolKey::PancakeV3(pool),
@@ -1964,6 +2040,30 @@ impl ConcentratedLiquidityFactory {
         }
         let _ = self.derivation_verified.set(());
         Ok(())
+    }
+
+    /// The pool a CREATE2 derivation predicts for a tickSpacing-keyed probe
+    /// of a spec that reads per-pool gauges (Aero CL), so the gauge read joins
+    /// the same batch as the mapping read.
+    fn predicted_gauge_pool(
+        &self,
+        token0: Address,
+        token1: Address,
+        spacing: i32,
+    ) -> Option<Address> {
+        if self.spec.protocol != ProtocolId::Slipstream
+            || self.spec.slipstream_layout != SlipstreamLayoutFamily::AeroCl
+        {
+            return None;
+        }
+        let create2 = self.spec.create2?;
+        Some(derive::v3_pool_address_by_spacing(
+            create2.deployer.unwrap_or(self.spec.factory),
+            create2.init_code_hash,
+            token0,
+            token1,
+            spacing,
+        ))
     }
 
     fn fee_for_key(
@@ -2057,6 +2157,9 @@ impl PoolFactory for ConcentratedLiquidityFactory {
                                 derive::v3_tick_spacing_fee_slot(base_slot, spacing),
                             ));
                         }
+                        if let Some(pool) = self.predicted_gauge_pool(*token0, *token1, spacing) {
+                            slots.push((pool, U256::from(AERO_CL_POOL_GAUGE_SLOT)));
+                        }
                     }
                 }
             }
@@ -2113,6 +2216,7 @@ impl PoolFactory for ConcentratedLiquidityFactory {
                             *token1,
                             self.fee_for_key(key, values)?,
                             tick_spacing,
+                            None,
                             DiscoverySource::Query,
                         ));
                     }
@@ -2134,12 +2238,20 @@ impl PoolFactory for ConcentratedLiquidityFactory {
                             continue;
                         }
                         self.ensure_derivation_matches(pool, *token0, *token1, key)?;
+                        let gauge = self
+                            .predicted_gauge_pool(*token0, *token1, spacing)
+                            .filter(|predicted| *predicted == pool)
+                            .and_then(|_| values.get(&(pool, U256::from(AERO_CL_POOL_GAUGE_SLOT))))
+                            .map(|word| address_from_word(*word))
+                            .transpose()?
+                            .filter(|gauge| *gauge != Address::ZERO);
                         found.push(self.registration(
                             pool,
                             *token0,
                             *token1,
                             self.fee_for_key(key, values)?,
                             spacing,
+                            gauge,
                             DiscoverySource::Query,
                         ));
                     }
@@ -2186,6 +2298,7 @@ impl PoolFactory for ConcentratedLiquidityFactory {
                 event.token1,
                 fee,
                 tick_spacing,
+                None,
                 DiscoverySource::CreationEvent {
                     block_number: context.block_number,
                     log_index: context.log_index,
@@ -2210,6 +2323,35 @@ impl PoolFactory for ConcentratedLiquidityFactory {
                 event.token1,
                 fee,
                 tick_spacing,
+                None,
+                DiscoverySource::CreationEvent {
+                    block_number: context.block_number,
+                    log_index: context.log_index,
+                },
+            )));
+        }
+        if topic0 == AeroClPoolCreated::SIGNATURE_HASH {
+            let event = AeroClPoolCreated::decode_log(log)
+                .map_err(|_| DiscoveryError::Malformed("Aero CL PoolCreated failed to decode"))?
+                .data;
+            let tick_spacing: i32 = event.tickSpacing.as_i32();
+            self.ensure_derivation_matches(
+                event.pool,
+                event.token0,
+                event.token1,
+                ClLookupKey::TickSpacing(tick_spacing),
+            )?;
+            let fee = match self.spec.fee_source {
+                FeeSource::Fixed(fee) => fee,
+                _ => 0,
+            };
+            return Ok(Some(self.registration(
+                event.pool,
+                event.token0,
+                event.token1,
+                fee,
+                tick_spacing,
+                None,
                 DiscoverySource::CreationEvent {
                     block_number: context.block_number,
                     log_index: context.log_index,

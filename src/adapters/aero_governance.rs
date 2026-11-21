@@ -23,8 +23,13 @@
 //!   affected cells are purged and verified).
 //!
 //! Hook events carry the pool as `topic1`; events for other pools never route
-//! to a reviewed registration.
+//! to a reviewed registration. A deployment-wide event (a hook default, a
+//! factory setter, the MEV module, the discount registry) routes to one
+//! registered pool of that deployment: its exact writes land in the shared
+//! cells every pool reads, but a fail-closed identity purge reaches only that
+//! pool, so the others re-check identities at their next cold start.
 
+use super::aero_cl_pool::admit_aero_cl_pool;
 use super::storage::layout_for;
 use super::uniswap_v3::{
     AERO_CL_DISCOUNT_REGISTRY_DISCOUNTS_SLOT, AERO_CL_FACTORY_SWAP_FEE_MANAGER_SLOT,
@@ -33,8 +38,8 @@ use super::uniswap_v3::{
     AERO_CL_HOOK_MEV_TAX_MODULE_SLOT, AERO_CL_HOOK_SECONDS_AGO_SLOT,
     AERO_CL_MEV_MODULE_MULTIPLIER_SLOT, AERO_CL_MEV_MODULE_THRESHOLD_SLOT,
     AERO_CL_UNSTAKED_FEE_MODULE_CUSTOM_FEE_SLOT, AeroClGovernanceRuntime,
-    aero_cl_governance_runtime_for_pool, aero_cl_governance_runtimes, solidity_address_mapping_key,
-    solidity_i24_mapping_key,
+    aero_cl_governance_runtime_for_pool, is_aero_cl_governance_emitter,
+    solidity_address_mapping_key, solidity_i24_mapping_key,
 };
 use super::v3_transition::validate_reviewed_slipstream_event;
 use super::{
@@ -156,9 +161,7 @@ fn runtime_for(pool: &PoolRegistration) -> Option<AeroClGovernanceRuntime> {
     if pool.protocol() != ProtocolId::Slipstream {
         return None;
     }
-    pool.key
-        .address()
-        .and_then(aero_cl_governance_runtime_for_pool)
+    aero_cl_governance_runtime_for_pool(pool)
 }
 
 /// Event sources a reviewed Aero CL registration subscribes beyond its pool
@@ -194,36 +197,42 @@ pub(crate) fn sources(pool: &PoolRegistration) -> Vec<EventSource> {
 /// Route a governance log to the reviewed Aero CL registration it configures.
 pub(crate) fn route(log: &Log, registry: &AdapterRegistry) -> Option<PoolKey> {
     let topic0 = log.topics().first().copied()?;
-    aero_cl_governance_runtimes()
-        .into_iter()
-        .find_map(|runtime| {
-            let key = PoolKey::Slipstream(runtime.pool);
-            registry.pool(&key)?;
-            let pool_scoped = |topics: &[B256]| {
-                topics.contains(&topic0)
-                    && log
-                        .topics()
-                        .get(1)
-                        .is_some_and(|topic| *topic == runtime.pool.into_word())
-            };
-            let routed = if log.address == runtime.hook {
-                hook_global_topics().contains(&topic0) || pool_scoped(&hook_pool_topics())
-            } else if log.address == runtime.factory {
-                factory_global_topics().contains(&topic0)
-                    || pool_scoped(&[abi::PoolSwapHookChanged::SIGNATURE_HASH])
-            } else if log.address == runtime.discount_registry {
-                registry_topics().contains(&topic0)
-            } else if Some(log.address) == runtime.mev_tax_module {
-                mev_topics().contains(&topic0)
-            } else if log.address == runtime.unstaked_fee_module
-                && runtime.unstaked_fee_module_wired
-            {
-                pool_scoped(&[abi::CustomFeeSet::SIGNATURE_HASH])
-            } else {
-                false
-            };
-            routed.then_some(key)
-        })
+    if !is_aero_cl_governance_emitter(log.address) {
+        return None;
+    }
+    let configures = |pool: &PoolRegistration| {
+        runtime_for(pool).is_some_and(|runtime| routes_to(runtime, log, topic0))
+    };
+    log.topics()
+        .get(1)
+        .and_then(|topic| registry.pool(&PoolKey::Slipstream(Address::from_word(*topic))))
+        .filter(|pool| configures(pool))
+        .or_else(|| registry.pools().find(|pool| configures(pool)))
+        .map(|pool| pool.key.clone())
+}
+
+fn routes_to(runtime: AeroClGovernanceRuntime, log: &Log, topic0: B256) -> bool {
+    let pool_scoped = |topics: &[B256]| {
+        topics.contains(&topic0)
+            && log
+                .topics()
+                .get(1)
+                .is_some_and(|topic| *topic == runtime.pool.into_word())
+    };
+    if log.address == runtime.hook {
+        hook_global_topics().contains(&topic0) || pool_scoped(&hook_pool_topics())
+    } else if log.address == runtime.factory {
+        factory_global_topics().contains(&topic0)
+            || pool_scoped(&[abi::PoolSwapHookChanged::SIGNATURE_HASH])
+    } else if log.address == runtime.discount_registry {
+        registry_topics().contains(&topic0)
+    } else if Some(log.address) == runtime.mev_tax_module {
+        mev_topics().contains(&topic0)
+    } else if log.address == runtime.unstaked_fee_module && runtime.unstaked_fee_module_wired {
+        pool_scoped(&[abi::CustomFeeSet::SIGNATURE_HASH])
+    } else {
+        false
+    }
 }
 
 fn failure(reason: &'static str) -> AdapterEventError {
@@ -536,7 +545,9 @@ pub(crate) fn decode_event(
         Some(layout) => layout,
         None => return Some(identity(failure("missing Slipstream storage layout"))),
     };
-    if let Err(error) = validate_reviewed_slipstream_event(runtime.pool, layout, context) {
+    if let Err(error) =
+        validate_reviewed_slipstream_event(runtime.pool, layout, admit_aero_cl_pool(pool), context)
+    {
         return Some(identity(error));
     }
     Some(match derive(runtime, log, state) {
@@ -627,7 +638,7 @@ mod tests {
     fn per_pool_setters_reconstruct_the_live_config_word() {
         let registration = registration();
         let mut state = State::default();
-        let key = config_key(aero_cl_governance_runtime_for_pool(BASE_POOL).unwrap());
+        let key = config_key(aero_cl_governance_runtime_for_pool(&registration).unwrap());
         state.0.insert((HOOK, key), U256::ZERO);
         for log in [
             log(
@@ -834,7 +845,7 @@ mod tests {
         let result = decode_event(&registration, &unconfirmed, &state, &context()).unwrap();
         let event = result.event.unwrap();
         assert_eq!(event.quality, UpdateQuality::RequiresRepair);
-        let key = config_key(aero_cl_governance_runtime_for_pool(BASE_POOL).unwrap());
+        let key = config_key(aero_cl_governance_runtime_for_pool(&registration).unwrap());
         assert_eq!(event.repair, RepairAction::VerifySlots(vec![(HOOK, key)]));
         // A packed write needs the parent word: missing state verifies it.
         let packed = log(

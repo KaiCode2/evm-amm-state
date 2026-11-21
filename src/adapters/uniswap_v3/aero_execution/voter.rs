@@ -90,7 +90,7 @@ fn gauge_words(
     reviewed: ReviewedAeroClRuntime,
     state: &dyn StateView,
 ) -> Result<(U256, [U256; 6]), AdapterEventError> {
-    let base = solidity_address_mapping_key(reviewed.gauge.0, 8);
+    let base = solidity_address_mapping_key(reviewed.gauge_address(), 8);
     let mut words = [U256::ZERO; 6];
     for (index, word) in words.iter_mut().enumerate() {
         *word = read(state, reviewed.voter, base.wrapping_add(U256::from(index)))?;

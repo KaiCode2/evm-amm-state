@@ -132,11 +132,12 @@ fn target_cursor_weight_and_missing_expiry_schedule_fail_closed() {
     let log = logs
         .iter()
         .find(|log| {
-            canonical::<GaugeCapSettled>(log).is_ok_and(|event| event.gauge == runtime().gauge.0)
+            canonical::<GaugeCapSettled>(log)
+                .is_ok_and(|event| event.gauge == runtime().gauge_address())
         })
         .unwrap();
     let mut wrong = parent.clone();
-    let base = solidity_address_mapping_key(runtime().gauge.0, 8);
+    let base = solidity_address_mapping_key(runtime().gauge_address(), 8);
     let point = base.wrapping_add(U256::from(4));
     wrong.words.insert(point, U256::ZERO);
     assert!(derive(runtime(), log, &wrong, &context).is_err());
@@ -154,7 +155,7 @@ fn target_cursor_weight_and_missing_expiry_schedule_fail_closed() {
 fn known_expiry_boundary_reduces_slope_and_creates_exact_global_checkpoints() {
     let (mut parent, _, _, mut context) = fixture();
     let reviewed = runtime();
-    let base = solidity_address_mapping_key(reviewed.gauge.0, 8);
+    let base = solidity_address_mapping_key(reviewed.gauge_address(), 8);
     let start = WEEK + 1;
     let end = 2 * WEEK + 1;
     // Explicit model baseline for an expiring allocation, not a canonical
@@ -187,7 +188,7 @@ fn known_expiry_boundary_reduces_slope_and_creates_exact_global_checkpoints() {
     parent.words.insert(
         mapping(
             U256::from(2 * WEEK),
-            solidity_address_mapping_key(reviewed.gauge.0, 9),
+            solidity_address_mapping_key(reviewed.gauge_address(), 9),
         ),
         U256::from(10),
     );
@@ -195,7 +196,7 @@ fn known_expiry_boundary_reduces_slope_and_creates_exact_global_checkpoints() {
     let log = Log {
         address: reviewed.voter,
         data: GaugeCapSettled {
-            gauge: reviewed.gauge.0,
+            gauge: reviewed.gauge_address(),
             effectiveShare: 0,
             surplusDelta: 0,
             cap: u128::MAX,

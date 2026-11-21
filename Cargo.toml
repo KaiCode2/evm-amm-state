@@ -393,6 +393,10 @@ required-features = ["uniswap-v3", "curve"]
 name = "aero_cl_family"
 required-features = ["uniswap-v3"]
 
+[[test]]
+name = "aero_cl_factory_pools"
+required-features = ["uniswap-v3"]
+
 # Deterministic Aero volatile Solidly-variant coverage against a mock pool.
 [[test]]
 name = "aero_volatile"

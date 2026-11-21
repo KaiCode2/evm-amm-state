@@ -517,7 +517,8 @@ fn aero_metadata_fields_round_trip_and_legacy_payloads_stay_identical() -> Resul
                 .with_storage_layout(
                     V3StorageLayout::aero_cl(50).with_observations_slot(U256::from(17)),
                 )
-                .with_metaquoter(Address::repeat_byte(0x1d)),
+                .with_metaquoter(Address::repeat_byte(0x1d))
+                .with_gauge(Address::repeat_byte(0x1e)),
         ),
     );
     let aero_volatile = PoolRegistration::new(PoolKey::SolidlyV2(volatile)).with_metadata(
@@ -541,6 +542,7 @@ fn aero_metadata_fields_round_trip_and_legacy_payloads_stay_identical() -> Resul
         ProtocolMetadata::Slipstream(metadata) => {
             assert_eq!(metadata.quoter_kind, V3QuoterKind::Metaquoter);
             assert_eq!(metadata.quoter, Some(Address::repeat_byte(0x1d)));
+            assert_eq!(metadata.gauge, Some(Address::repeat_byte(0x1e)));
             assert_eq!(
                 metadata.storage_layout,
                 Some(V3StorageLayout::aero_cl(50).with_observations_slot(U256::from(17)))
@@ -565,6 +567,7 @@ fn aero_metadata_fields_round_trip_and_legacy_payloads_stay_identical() -> Resul
     }
     let payload = String::from_utf8(std::fs::read(&path)?[PAYLOAD_OFFSET..].to_vec())?;
     assert!(payload.contains("\"quoter_kind\":\"metaquoter\""));
+    assert!(payload.contains("\"gauge\""));
     assert!(payload.contains("\"variant\":\"aero_volatile\""));
     assert!(payload.contains("\"observations_slot\""));
 
@@ -597,6 +600,7 @@ fn aero_metadata_fields_round_trip_and_legacy_payloads_stay_identical() -> Resul
     AmmRegistrationArchive::capture(1, &legacy)?.save(&legacy_path)?;
     let payload = String::from_utf8(std::fs::read(&legacy_path)?[PAYLOAD_OFFSET..].to_vec())?;
     assert!(!payload.contains("quoter_kind"));
+    assert!(!payload.contains("gauge"));
     assert!(!payload.contains("\"variant\":\"legacy\""));
     assert!(!payload.contains("observations_slot"));
     AmmRegistrationArchive::load(&legacy_path, 1)?;

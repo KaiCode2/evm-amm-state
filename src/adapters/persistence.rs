@@ -441,6 +441,8 @@ struct PersistedV3Metadata {
     /// older readers reject archives that carry another quoter kind.
     #[serde(default, skip_serializing_if = "PersistedV3QuoterKind::is_quoter_v2")]
     quoter_kind: PersistedV3QuoterKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gauge: Option<Address>,
     storage_layout: Option<PersistedV3Layout>,
     warm_word_radius: Option<i16>,
     #[serde(default)]
@@ -930,6 +932,7 @@ impl From<&V3Metadata> for PersistedV3Metadata {
             factory: metadata.factory,
             quoter: metadata.quoter,
             quoter_kind: metadata.quoter_kind.into(),
+            gauge: metadata.gauge,
             storage_layout: metadata.storage_layout.map(Into::into),
             warm_word_radius: metadata.warm_word_radius,
             warmed_slots: metadata.warmed_slots.clone(),
@@ -947,6 +950,7 @@ impl From<PersistedV3Metadata> for V3Metadata {
             factory: metadata.factory,
             quoter: metadata.quoter,
             quoter_kind: metadata.quoter_kind.into(),
+            gauge: metadata.gauge,
             storage_layout: metadata.storage_layout.map(Into::into),
             warm_word_radius: metadata.warm_word_radius,
             warmed_slots: metadata.warmed_slots,
