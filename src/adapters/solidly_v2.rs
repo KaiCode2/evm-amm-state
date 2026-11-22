@@ -12,9 +12,9 @@ use super::storage::{SolidlyStorageLayout, decode_address_slot};
 use super::{
     AdapterCache, AdapterEvent, AdapterEventError, AdapterEventKind, AdapterEventResult,
     AeroVolatileRuntimeFamily, AmmAdapter, CallOutcome, ColdStartOutcome, ColdStartPolicy,
-    ColdStartReport, DeferredWork, EventSource, PoolRegistration, PoolStatus, ProtocolId,
-    ProtocolMetadata, RepairAction, SlotChange, SolidlyPoolVariant, SolidlyV2Metadata, StateUpdate,
-    StateView, UnsupportedReason, UpdateQuality,
+    ColdStartReport, DeferredWork, EventSource, PoolRegistration, PoolStateDependencies,
+    PoolStatus, ProtocolId, ProtocolMetadata, RepairAction, SlotChange, SolidlyPoolVariant,
+    SolidlyV2Metadata, StateSlot, StateUpdate, StateView, UnsupportedReason, UpdateQuality,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256, keccak256};
 use alloy_sol_types::{SolCall, SolEvent};
@@ -279,6 +279,33 @@ impl AmmAdapter for SolidlyV2Adapter {
             .map(|address| EventSource::direct(address, vec![Sync::SIGNATURE_HASH]))
             .into_iter()
             .collect()
+    }
+
+    /// The layout's reserve and token slots plus the reviewed external fee
+    /// cells, so a prepared one-shot state can be verified slot by slot. Without
+    /// a layout the pool cannot cold-start and keeps the whole-account default.
+    fn state_dependencies(&self, pool: &PoolRegistration) -> PoolStateDependencies {
+        let Some(address) = pool.key.address() else {
+            return PoolStateDependencies::default();
+        };
+        let Some(layout) = solidly_layout(pool) else {
+            return PoolStateDependencies::default().with_whole_accounts(
+                std::iter::once(address).chain(pool.state_addresses.iter().copied()),
+            );
+        };
+        let pool_slots = [
+            layout.reserve0_slot,
+            layout.reserve1_slot,
+            layout.token0_slot,
+            layout.token1_slot,
+        ]
+        .into_iter()
+        .map(|slot| StateSlot::new(address, slot));
+        let external_slots = self
+            .verified_storage_targets(pool)
+            .into_iter()
+            .map(|(address, slot)| StateSlot::new(address, slot));
+        PoolStateDependencies::default().with_slots(pool_slots.chain(external_slots))
     }
 
     fn pool_factories(&self, config: &FactoryConfig) -> Vec<Box<dyn PoolFactory>> {
@@ -845,6 +872,47 @@ mod tests {
         .with_metadata(ProtocolMetadata::SolidlyV2(
             SolidlyV2Metadata::default().with_aero_volatile(),
         ))
+    }
+
+    #[test]
+    fn state_dependencies_are_the_layout_slots_and_reviewed_fee_cells() {
+        let adapter = SolidlyV2Adapter::default();
+        let pool = aero_pool();
+        let address = pool.key.address().unwrap();
+        let layout = solidly_layout(&pool).unwrap();
+
+        let dependencies = adapter.state_dependencies(&pool);
+
+        let mut expected: Vec<StateSlot> = [
+            layout.reserve0_slot,
+            layout.reserve1_slot,
+            layout.token0_slot,
+            layout.token1_slot,
+        ]
+        .into_iter()
+        .map(|slot| StateSlot::new(address, slot))
+        .chain(
+            adapter
+                .verified_storage_targets(&pool)
+                .into_iter()
+                .map(|(address, slot)| StateSlot::new(address, slot)),
+        )
+        .collect();
+        expected.sort();
+        assert!(dependencies.whole_accounts().is_empty());
+        assert!(dependencies.associated_addresses().contains(&address));
+        assert_eq!(dependencies.slots(), expected.as_slice());
+    }
+
+    #[test]
+    fn state_dependencies_without_a_layout_keep_the_whole_account() {
+        let address = Address::repeat_byte(0x51);
+        let pool = PoolRegistration::new(PoolKey::SolidlyV2(address)).with_state_address(address);
+
+        let dependencies = SolidlyV2Adapter::default().state_dependencies(&pool);
+
+        assert_eq!(dependencies.whole_accounts(), &[address]);
+        assert!(dependencies.slots().is_empty());
     }
 
     #[test]

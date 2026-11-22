@@ -40,9 +40,10 @@ use evm_amm_state::adapters::{
     DiscoveryError, DiscoveryOwnerKey, EventSource, FactoryConfig, OwnerRuntimeState,
     PoolDiscovery, PoolFactory, PoolGeneration, PoolInstanceId, PoolKey, PoolRegistration,
     PoolStateDependencies, PoolStatus, ProtocolId, ProtocolMetadata, QuoteWarmup, RepairAction,
-    RuntimeOwnerId, SimConfig, StateSlot, StateUpdate as AdapterStateUpdate, StateView,
-    TokenEdgeDiscoveryRequest, UniswapV2Adapter, UniswapV2Metadata, UpdateQuality, V3Metadata,
-    V3StorageLayout, uniswap_v2_pair_runtime_code_hash,
+    RuntimeOwnerId, SimConfig, SolidlyFactoryConfig, SolidlyV2Adapter, SolidlyV2Metadata,
+    StateSlot, StateUpdate as AdapterStateUpdate, StateView, TokenEdgeDiscoveryRequest,
+    UniswapV2Adapter, UniswapV2Metadata, UpdateQuality, V3Metadata, V3StorageLayout,
+    uniswap_v2_pair_runtime_code_hash,
 };
 
 #[test]
@@ -3115,6 +3116,91 @@ async fn prepared_state_from_a_replaced_hash_is_rejected_without_mutation() -> R
                 None
             );
             runtime.shutdown().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// A Solidly pool as factory discovery hands it over: tokens, variant and layout, but no state yet.
+fn discovered_solidly_registration(address: Address) -> PoolRegistration {
+    let layout = SolidlyFactoryConfig::aerodrome(Address::repeat_byte(0xfa)).storage_layout;
+    PoolRegistration::new(PoolKey::SolidlyV2(address))
+        .with_state_address(address)
+        .with_metadata(ProtocolMetadata::SolidlyV2(
+            SolidlyV2Metadata::default()
+                .with_token0(Address::repeat_byte(0xa2))
+                .with_token1(Address::repeat_byte(0xa3))
+                .with_stable(false)
+                .with_storage_layout(layout),
+        ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_one_shot_solidly_cold_start_publishes_the_pool() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut cache = setup_cache().await;
+            align_cache(&mut cache, 500);
+            let mut registry = AdapterRegistry::new();
+            registry.register_adapter(Arc::new(SolidlyV2Adapter::default()))?;
+            let runtime = AmmRuntime::spawn(
+                cache,
+                registry,
+                runtime_baseline(500),
+                AmmRuntimeConfig::default(),
+            )?;
+            let pool = Address::repeat_byte(0x92);
+            let assertions = Asserter::new();
+            assertions.push_success(&encoded_words([
+                U256::from(11),
+                U256::from(22),
+                U256::from_be_slice(Address::repeat_byte(0xa2).as_slice()),
+                U256::from_be_slice(Address::repeat_byte(0xa3).as_slice()),
+            ]));
+            let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(assertions));
+            let _worker = runtime
+                .attach_cold_start_worker(provider, AmmColdStartWorkerConfig::default())
+                .await?;
+            let mut snapshots = runtime.subscribe_snapshots();
+            let mut observer = runtime.subscribe_events();
+
+            runtime
+                .queue_cold_start(
+                    vec![discovered_solidly_registration(pool)],
+                    AmmColdStartOptions::default(),
+                )
+                .await?;
+            let published = tokio::time::timeout(Duration::from_millis(500), async {
+                while snapshots.borrow().registry().pool_count() == 0 {
+                    snapshots.changed().await.expect("runtime remains alive");
+                }
+            })
+            .await;
+            if published.is_err() {
+                let mut seen = Vec::new();
+                while let Ok(Ok(event)) =
+                    tokio::time::timeout(Duration::from_millis(1), observer.next_event()).await
+                {
+                    seen.push(format!("{:?}", event.kind()));
+                }
+                anyhow::bail!("Solidly pool was not published; events: {seen:?}");
+            }
+
+            let snapshot = runtime.latest_snapshot();
+            let instance = snapshot
+                .registry()
+                .pool_instance(&PoolKey::SolidlyV2(pool))
+                .expect("pool published");
+            let registration = snapshot.registry().pool(instance).expect("registration");
+            assert_eq!(registration.status, PoolStatus::Ready);
+            assert_eq!(
+                snapshot.cache().storage_value(pool, U256::from(20)),
+                Some(U256::from(11))
+            );
+            assert_eq!(
+                snapshot.cache().storage_value(pool, U256::from(21)),
+                Some(U256::from(22))
+            );
             Ok(())
         })
         .await
