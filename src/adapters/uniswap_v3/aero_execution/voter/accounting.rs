@@ -15,7 +15,7 @@ pub(super) fn mint(
     if event.recipients.len() != event.amounts.len() || event.amounts.len() > 64 {
         return Err(unsupported("invalid LeafVoter emissions array lengths"));
     }
-    if event.gauge != reviewed.gauge.0 {
+    if event.gauge != reviewed.gauge_address() {
         return Ok(Vec::new());
     }
     let (base, words) = gauge_words(reviewed, state)?;
@@ -47,7 +47,7 @@ pub(super) fn forfeit(
         .checked_add(U256::from(event.amount))
         .ok_or_else(arithmetic)?;
     let mut updates = vec![StateUpdate::slot(reviewed.voter, U256::from(15), total)];
-    if event.gauge == reviewed.gauge.0 {
+    if event.gauge == reviewed.gauge_address() {
         let (base, words) = gauge_words(reviewed, state)?;
         if U256::from(event.amount) > claimable(&words)? {
             return Err(unsupported(

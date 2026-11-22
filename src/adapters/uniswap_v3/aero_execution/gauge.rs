@@ -17,7 +17,7 @@ pub(super) fn derive(
     log: &Log,
     state: &dyn StateView,
 ) -> Result<Vec<StateUpdate>, AdapterEventError> {
-    if log.address != reviewed.gauge.0
+    if log.address != reviewed.gauge_address()
         || log.topics().first() != Some(&GaugeSettled::SIGNATURE_HASH)
     {
         return Err(unsupported(
@@ -31,7 +31,7 @@ pub(super) fn derive(
             "noncanonical Aero CL GaugeSettled",
         ));
     }
-    let parent = read(state, reviewed.gauge.0, CURSOR_SLOT)?;
+    let parent = read(state, reviewed.gauge_address(), CURSOR_SLOT)?;
     if event.delta.is_zero() || parent.checked_add(event.delta) != Some(event.cumulativeRewardShare)
     {
         return Err(unsupported(
@@ -39,7 +39,7 @@ pub(super) fn derive(
         ));
     }
     Ok(vec![StateUpdate::slot(
-        reviewed.gauge.0,
+        reviewed.gauge_address(),
         CURSOR_SLOT,
         event.cumulativeRewardShare,
     )])

@@ -1357,6 +1357,11 @@ pub struct V3Metadata {
     /// [`V3QuoterKind::Metaquoter`] selects the Aero `Metaquoter` single-pool
     /// quote (set it with [`with_metaquoter`](Self::with_metaquoter)).
     pub quoter_kind: V3QuoterKind,
+    /// The pool's Aero CL gauge (`CLPool.gauge`), when one was created. Aero CL
+    /// factory discovery reads it; it is the gauge a factory-admitted pool's
+    /// quote path stubs and its gauge-keyed external cells are derived from.
+    /// `None` for every other family and for Aero CL pools without a gauge.
+    pub gauge: Option<Address>,
     /// Explicit V3 storage layout (slot bases + tick spacing). When unset it is
     /// derived from `tick_spacing` per the pool's family.
     pub storage_layout: Option<V3StorageLayout>,
@@ -1484,6 +1489,12 @@ impl V3Metadata {
     pub fn with_metaquoter(mut self, metaquoter: Address) -> Self {
         self.quoter = Some(metaquoter);
         self.quoter_kind = V3QuoterKind::Metaquoter;
+        self
+    }
+
+    /// Set the pool's Aero CL gauge (see [`gauge`](Self::gauge)).
+    pub fn with_gauge(mut self, gauge: Address) -> Self {
+        self.gauge = Some(gauge);
         self
     }
 

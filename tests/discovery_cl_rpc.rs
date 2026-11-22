@@ -33,6 +33,10 @@
 //!   `slipstream_get_pool_base_slot_matches_getter`
 //!   confirms the `getPool` base slot + the tickSpacing salt encoding against
 //!   Aerodrome's live CLFactory on Base.
+//! - **Aero CL**: `aero_cl_discovery_admits_live_base_pools` resolves every
+//!   WETH/USDC spacing of the Base `CLFactory` through the preset (base slot
+//!   19, CREATE2 cross-check on), compares each pool and its gauge with the
+//!   live getters, and requires every discovered pool to be factory-admitted.
 
 #![cfg(feature = "uniswap-v3")]
 
@@ -48,7 +52,8 @@ use anyhow::{Context, Result};
 
 use evm_amm_state::adapters::factory::derive;
 use evm_amm_state::adapters::{
-    ClFactorySpec, ConcentratedLiquidityFactory, PoolDiscovery, PoolFactory, PoolQuery, ProtocolId,
+    ClFactorySpec, ConcentratedLiquidityAdapter, ConcentratedLiquidityFactory, PoolDiscovery,
+    PoolFactory, PoolQuery, ProtocolId, ProtocolMetadata,
 };
 use evm_fork_cache::cache::EvmCache;
 
@@ -64,6 +69,7 @@ sol! {
 mod slipstream_abi {
     alloy_sol_types::sol! {
         function getPool(address tokenA, address tokenB, int24 tickSpacing) returns (address pool);
+        function gauge() returns (address gauge);
     }
 }
 
@@ -85,6 +91,8 @@ const BASE_FORK_BLOCK: u64 = 47_700_000;
 // canonical volatile pool. The parity test scans the preset's spacing table and
 // requires at least one to resolve.
 const SLIPSTREAM_WETH_USDC_SPACING: i32 = 100;
+// Aero (Dromos) CL CLFactory on Base.
+const AERO_CL_BASE_FACTORY: Address = address!("9CB220581b91b0c83223012fe69688b92ad07a76");
 
 fn eth_rpc_url() -> Option<String> {
     std::env::var("E2E_RPC_URL").ok()
@@ -328,5 +336,75 @@ async fn slipstream_get_pool_base_slot_matches_getter() -> Result<()> {
          get_pool_base_slot.",
         spec.get_pool_base_slot
     );
+    Ok(())
+}
+
+/// Aero CL (Base): the preset resolves the live WETH/USDC pools (base slot 19
+/// and the clone CREATE2 hash cross-checked on first use), each pool and gauge
+/// matches the live getters, and every discovered pool is factory-admitted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Base RPC (E2E_BASE_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
+async fn aero_cl_discovery_admits_live_base_pools() -> Result<()> {
+    let Some(url) = base_rpc_url() else {
+        eprintln!("no Base RPC; skipping");
+        return Ok(());
+    };
+    let provider = provider(&url).await?;
+    let block = provider.get_block_number().await.context("block number")? - 16;
+    let mut cache = EvmCache::at_block(
+        Arc::clone(&provider),
+        BlockId::Number(BlockNumberOrTag::Number(block)),
+    )
+    .await;
+    let discovery =
+        PoolDiscovery::new([
+            Box::new(ConcentratedLiquidityFactory::new(ClFactorySpec::aero_cl(
+                AERO_CL_BASE_FACTORY,
+            ))) as Box<dyn PoolFactory>,
+        ]);
+    let found = discovery.find(&mut cache, PoolQuery::pair(BASE_WETH, BASE_USDC))?;
+    assert!(!found.is_empty(), "no Aero CL WETH/USDC pool on Base");
+    let (t0, t1) = derive::sort_tokens(BASE_WETH, BASE_USDC);
+    for pool in &found {
+        let ProtocolMetadata::Slipstream(metadata) = &pool.registration.metadata else {
+            panic!("Aero CL pools register as Slipstream");
+        };
+        let address = pool.key.address().expect("address-keyed");
+        let spacing = metadata.tick_spacing.expect("spacing");
+        let getter = eth_call_addr(
+            &provider,
+            AERO_CL_BASE_FACTORY,
+            Bytes::from(
+                slipstream_abi::getPoolCall {
+                    tokenA: t0,
+                    tokenB: t1,
+                    tickSpacing: I24::try_from(spacing).unwrap(),
+                }
+                .abi_encode(),
+            ),
+            block,
+        )
+        .await?;
+        assert_eq!(
+            address, getter,
+            "spacing {spacing}: discovered pool differs"
+        );
+        let gauge = eth_call_addr(
+            &provider,
+            address,
+            Bytes::from(slipstream_abi::gaugeCall {}.abi_encode()),
+            block,
+        )
+        .await?;
+        assert_eq!(
+            metadata.gauge.unwrap_or_default(),
+            gauge,
+            "spacing {spacing}: discovered gauge differs"
+        );
+        assert!(
+            ConcentratedLiquidityAdapter::is_aero_cl_factory_pool(&pool.registration),
+            "spacing {spacing}: discovered pool is not admitted"
+        );
+    }
     Ok(())
 }

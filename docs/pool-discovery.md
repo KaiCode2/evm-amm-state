@@ -81,6 +81,7 @@ the protocol boundary below.)
 | --- | --- | --- |
 | Uniswap V3 / Sushi V3 / Pancake V3 | DerivedSlot (fee-keyed `getPool[t0][t1][fee]`) via [`ClFactorySpec`] | per-fork base slots / fee tiers / quoter; fork presets (`uniswap_v3`, `sushi_v3`, `pancake_v3`) |
 | Slipstream / Aerodrome CL | DerivedSlot (tickSpacing-keyed `getPool[t0][t1][tickSpacing]`) via [`ClFactorySpec`] | native signed-tick-spacing quoting; configure the chain-specific compatible quoter with `with_quoter` or `SimConfig` |
+| Aero (Dromos) CL | DerivedSlot (`getPool[t0][t1][tickSpacing]`, base slot 19) via [`ClFactorySpec::aero_cl`] | CREATE2-checked, Aero layout, Metaquoter and gauge set on the registration; see [Aero families](aero-families.md) |
 | Uniswap V2 | DerivedSlot (`getPair[t0][t1]`) | one pool per pair |
 | Solidly V2 (Aerodrome / Velodrome) | DerivedSlot (`getPool[t0][t1][bool stable]`) | stable **and** volatile — a pair yields up to two pools |
 
@@ -158,7 +159,7 @@ stable — a novel AMM never requires forking the crate.
 Beyond pull queries, factories that carry a creation-event `topic0` also decode
 their own pool-creation logs via [`PoolDiscovery::decode_creation`] (Uniswap V2
 `PairCreated`, the Uniswap/Pancake `PoolCreated`, the Slipstream tickSpacing
-`PoolCreated`, and the Solidly `PoolCreated`). This is the push counterpart to
+`PoolCreated`, the Aero CL `PoolCreated`, and the Solidly `PoolCreated`). This is the push counterpart to
 the pull queries above: feed it a factory log and it yields the same
 [`DiscoveredPool`].
 
@@ -172,6 +173,7 @@ the pull queries above: feed it a factory log and it yields the same
 [`ClFactorySpec`]: ../src/adapters/factory.rs
 [`ClFactorySpec::uniswap_v3`]: ../src/adapters/factory.rs
 [`ClFactorySpec::tick_spacing_keyed`]: ../src/adapters/factory.rs
+[`ClFactorySpec::aero_cl`]: ../src/adapters/factory.rs
 [`sushi_v3`]: ../src/adapters/factory.rs
 [`pancake_v3`]: ../src/adapters/factory.rs
 [`slipstream`]: ../src/adapters/factory.rs

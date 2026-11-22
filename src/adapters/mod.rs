@@ -57,6 +57,8 @@ pub mod types;
 #[cfg(all(test, feature = "uniswap-v3"))]
 mod aero_accounting_tests;
 #[cfg(feature = "uniswap-v3")]
+pub(crate) mod aero_cl_pool;
+#[cfg(feature = "uniswap-v3")]
 pub(crate) mod aero_governance;
 /// Balancer V2 adapter (shared-vault `queryBatchSwap` quotes).
 #[cfg(feature = "balancer-v2")]

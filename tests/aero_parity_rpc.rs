@@ -15,6 +15,9 @@
 //!   `getAmountOutWithTotalFee` / `getAmountInWithTotalFee` quotes equal
 //!   `eth_call` under the same `tx.gasprice`, and reproduce the MEV-tax
 //!   ladder (30 bps up to a 1 gwei tip, 10% cap from 1.1 gwei).
+//! - Base, recent block: a WETH/USDC CL100 pool found through the
+//!   `ClFactorySpec::aero_cl` preset (factory-admitted, not pinned) quotes
+//!   through the Metaquoter at `eth_call` parity under both priority fees.
 //! - Every learned quote read set replays against an RPC-disconnected
 //!   snapshot (offline closure).
 //!
@@ -35,8 +38,9 @@ use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow, ensure};
 
 use evm_amm_state::adapters::{
-    AdapterRegistry, AmmAdapter, ColdStartOutcome, ColdStartPolicy, ConcentratedLiquidityAdapter,
-    PoolKey, PoolRegistration, PoolStatus, ProtocolMetadata, QuoteWarmup, SimConfig,
+    AdapterRegistry, AmmAdapter, ClFactorySpec, ColdStartOutcome, ColdStartPolicy,
+    ConcentratedLiquidityAdapter, ConcentratedLiquidityFactory, PoolDiscovery, PoolFactory,
+    PoolKey, PoolQuery, PoolRegistration, PoolStatus, ProtocolMetadata, QuoteWarmup, SimConfig,
     SlipstreamRuntimeFamily, SolidlyV2Adapter, SolidlyV2Metadata, V3Metadata, V3StorageLayout,
 };
 use evm_fork_cache::cache::EvmCache;
@@ -748,5 +752,181 @@ async fn optimism_aero_volatile_total_fee_parity() -> Result<()> {
         .validate_quote_read_sets(cache.snapshot(), [&key])
         .map_err(|error| anyhow!("offline replay of the taxed quote: {error}"))?;
     eprintln!("[10] taxed total-fee quote replays offline");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a Base RPC (E2E_BASE_RPC_URL / E2E_RPC_URL on Alchemy); run with --ignored"]
+async fn base_factory_admitted_aero_cl_metaquoter_parity() -> Result<()> {
+    const FACTORY: Address = address!("9CB220581b91b0c83223012fe69688b92ad07a76");
+    const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    const SPACING: i32 = 100;
+    let url = base_url()?;
+    let provider = provider(&url).await?;
+    let block = provider.get_block_number().await? - 16;
+    let header = provider
+        .get_block_by_number(BlockNumberOrTag::Number(block))
+        .await?
+        .ok_or_else(|| anyhow!("block {block} missing"))?;
+    let basefee = u128::from(header.header.base_fee_per_gas.unwrap_or_default());
+    let mut cache = EvmCache::at_block(
+        Arc::clone(&provider),
+        BlockId::Number(BlockNumberOrTag::Number(block)),
+    )
+    .await;
+    let discovery =
+        PoolDiscovery::new([
+            Box::new(ConcentratedLiquidityFactory::new(ClFactorySpec::aero_cl(
+                FACTORY,
+            ))) as Box<dyn PoolFactory>,
+        ]);
+    let registration = discovery
+        .find(&mut cache, PoolQuery::pair(L2_WETH, USDC))?
+        .into_iter()
+        .map(|found| found.registration)
+        .find(|registration| match &registration.metadata {
+            ProtocolMetadata::Slipstream(metadata) => metadata.tick_spacing == Some(SPACING),
+            _ => false,
+        })
+        .ok_or_else(|| anyhow!("no Aero CL WETH/USDC CL{SPACING} pool"))?;
+    ensure!(ConcentratedLiquidityAdapter::is_aero_cl_factory_pool(
+        &registration
+    ));
+    let pool = registration
+        .key
+        .address()
+        .ok_or_else(|| anyhow!("address-keyed pool"))?;
+
+    let mut registry =
+        AdapterRegistry::new().with_sim_config(SimConfig::default().with_tx_origin(EOA));
+    registry.register_adapter(Arc::new(ConcentratedLiquidityAdapter::default()))?;
+    let mut pools = vec![registration];
+    let outcomes = registry
+        .cold_start_many(
+            &mut pools,
+            &mut cache,
+            provider.as_ref(),
+            ColdStartPolicy::Eager,
+        )
+        .await?;
+    ensure!(
+        matches!(outcomes[0], ColdStartOutcome::Ready(_)),
+        "cold start must be ready: {:?}",
+        outcomes[0]
+    );
+    let registration = pools.remove(0);
+    let adapter = ConcentratedLiquidityAdapter::default();
+    for (address, slot) in adapter.verified_storage_targets(&registration) {
+        ensure!(
+            cache.cached_storage_value(address, slot).is_some(),
+            "reviewed cell {address}:{slot:#x} must be resident after cold start"
+        );
+    }
+    for (address, hash) in adapter.reviewed_code_identities(&registration) {
+        ensure!(
+            cache.snapshot().account_code_hash(address) == Some(hash),
+            "reviewed runtime {address} must be resident with hash {hash}"
+        );
+    }
+    eprintln!("[8453] block {block}: admitted pool {pool} cold start ready");
+
+    let contexts = [
+        ("tip 0", SimConfig::default().with_tx_origin(EOA)),
+        (
+            "tip 1 gwei",
+            SimConfig::default()
+                .with_tx_origin(EOA)
+                .with_effective_gas_price(basefee, 1_000_000_000),
+        ),
+    ];
+    let weth_sizes = [10u128.pow(16), 10u128.pow(18), 25 * 10u128.pow(18)];
+    for (label, config) in &contexts {
+        let gas_price = config.gas_price.unwrap_or(0);
+        for size in weth_sizes {
+            let amount = U256::from(size);
+            let sell = adapter
+                .simulate_swap(&registration, &mut cache, L2_WETH, USDC, amount, config)
+                .map_err(|error| anyhow!("offline sell quote: {error}"))?;
+            let truth = eth_call(
+                &provider,
+                EOA,
+                METAQUOTER,
+                Bytes::from(
+                    IMetaquoter::quoteExactInputSingleV3Call {
+                        pool,
+                        tokenIn: L2_WETH,
+                        amountIn: amount,
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    }
+                    .abi_encode(),
+                ),
+                gas_price,
+                block,
+            )
+            .await?;
+            let truth =
+                IMetaquoter::quoteExactInputSingleV3Call::abi_decode_returns_validate(&truth)?;
+            ensure!(
+                sell.amount_out == truth.amountOut,
+                "[{label}] sell {size}: offline {} vs eth_call {}",
+                sell.amount_out,
+                truth.amountOut
+            );
+            let buy = adapter
+                .simulate_swap_exact_output(
+                    &registration,
+                    &mut cache,
+                    USDC,
+                    L2_WETH,
+                    amount,
+                    config,
+                )
+                .map_err(|error| anyhow!("offline buy quote: {error}"))?;
+            let truth = eth_call(
+                &provider,
+                EOA,
+                METAQUOTER,
+                Bytes::from(
+                    IMetaquoter::quoteExactOutputSingleV3Call {
+                        pool,
+                        tokenIn: USDC,
+                        amountOut: amount,
+                        sqrtPriceLimitX96: U256::ZERO.to(),
+                    }
+                    .abi_encode(),
+                ),
+                gas_price,
+                block,
+            )
+            .await?;
+            let truth =
+                IMetaquoter::quoteExactOutputSingleV3Call::abi_decode_returns_validate(&truth)?;
+            ensure!(
+                buy.amount_in == truth.amountIn,
+                "[{label}] buy {size}: offline {} vs eth_call {}",
+                buy.amount_in,
+                truth.amountIn
+            );
+            eprintln!(
+                "[{label}] size {size}: sell -> {} buy <- {} (eth_call parity ok)",
+                sell.amount_out, buy.amount_in
+            );
+        }
+    }
+
+    registry.register_pool(registration.clone())?;
+    let key = registration.key.clone();
+    registry
+        .warm_quote_read_sets(
+            &mut cache,
+            [
+                QuoteWarmup::exact_input(key.clone(), L2_WETH, USDC, U256::from(10u128.pow(18))),
+                QuoteWarmup::exact_input(key.clone(), USDC, L2_WETH, U256::from(1_000_000_000u64)),
+            ],
+        )
+        .map_err(|error| anyhow!("quote read-set warming: {error}"))?;
+    registry
+        .validate_quote_read_sets(cache.snapshot(), [&key])
+        .map_err(|error| anyhow!("offline replay of learned read sets: {error}"))?;
     Ok(())
 }

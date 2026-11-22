@@ -55,6 +55,44 @@ Aerodrome/Velodrome core slots versus Aero core slots) and from the reviewed
 pool address. A legacy layout on an Aero pool, an Aero layout on a legacy pool,
 a wrong tick spacing or an unreviewed address all fail closed.
 
+## Factory-admitted Aero CL pools
+
+Beyond the pinned BIFI pools, any pool deployed by a reviewed Aero CL factory
+(Ethereum `0xf4fd2e6c…`, Base `0x9cb22058…`) gets the reviewed runtime surface
+without an address list. Discover it through the preset:
+
+```rust
+use evm_amm_state::adapters::{
+    ClFactorySpec, ConcentratedLiquidityFactory, PoolDiscovery, PoolFactory, PoolQuery,
+};
+
+let discovery = PoolDiscovery::new([Box::new(ConcentratedLiquidityFactory::new(
+    ClFactorySpec::aero_cl(factory),
+)) as Box<dyn PoolFactory>]);
+let pools = discovery.find(&mut cache, PoolQuery::pair(weth, usdc))?;
+```
+
+The preset reads `getPool` (base slot 19) over the enabled spacings
+`[1, 10, 50, 100, 150, 200, 250]`, cross-checks every hit against the CREATE2
+address (init code hash `0x3e77b70b…`), reads the pool's gauge (slot 3) in the
+same batch and registers `V3StorageLayout::aero_cl(spacing)` with the
+Metaquoter and `V3Metadata::gauge`. `PoolDiscovery::decode_creation` decodes
+the Aero `PoolCreated` log the same way.
+
+A registration is admitted when its factory is a reviewed deployment, its
+tokens are sorted, its layout is the Aero CL family and the CREATE2 address of
+`(factory, token0, token1, tickSpacing)` equals the pool address. Admission
+yields the deployment's factory / hook / MEV-module / voter / registry
+identities, the pool proxy identity, the gauge identity when a gauge exists,
+the reviewed warm cells and the Metaquoter quote overrides. A pinned address
+always wins over admission; `ConcentratedLiquidityAdapter::is_aero_cl_factory_pool`
+tells the two apart.
+
+Event replay for admitted pools covers the pool's own `Swap` / `Mint` / `Burn`
+/ `Collect` / ring growth and the deployment's governance setters. A
+governance log is routed to the pool its topic names, or, for a
+deployment-wide setter, to the first registered pool of that deployment.
+
 ## Storage layouts
 
 | Cell | Legacy Slipstream | Aero CL |
@@ -323,8 +361,13 @@ with divergent storage, repairs, missing evidence, or unmatched quotes.
 
 ## Known gaps
 
-- The Optimism Aero CL deployment (USDC pool, hook `0x3064a620…`) and the
-  Aero factories' discovery (`getPool`) are not reviewed in this release.
+- The Optimism Aero CL deployment (USDC pool, hook `0x3064a620…`) is not
+  reviewed in this release.
+- Factory-admitted pools have no gauge `Deposit` / `Withdraw` transitions, no
+  runtime-bound swap fee evidence and no unstaked-fee evaluation; their swaps
+  replay through the quote surface with the inferred effective fee, and fee
+  evidence for them fails closed. A deployment-wide identity purge reaches
+  only the pool the governance log was routed to.
 - `EmergencyWithdraw`, the hook's initial-fee setters and dynamic-fee reset,
   and discount-registry writes have no confirmed packing: they fail closed
   into a verify/purge of the affected cells instead of an exact write.

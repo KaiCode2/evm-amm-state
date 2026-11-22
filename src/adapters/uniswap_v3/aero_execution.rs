@@ -62,16 +62,21 @@ fn reviewed(
         .address()
         .ok_or_else(|| unsupported("missing pool address"))?;
     let layout = super::layout_for(pool).ok_or_else(|| unsupported("missing Aero CL layout"))?;
-    let family = validate_reviewed_slipstream_event(address, layout, context)?;
+    let family = validate_reviewed_slipstream_event(address, layout, None, context)?
+        .family
+        .ok_or_else(|| unsupported("execution transition requires a pinned Aero CL family"))?;
     let reviewed = reviewed_aero_cl_runtime(family)
         .ok_or_else(|| unsupported("execution transition requires an Aero CL runtime"))?;
+    let pinned_gauge = reviewed
+        .gauge
+        .ok_or_else(|| unsupported("execution transition requires an Aero CL gauge"))?;
     for (account, hash) in [
         (reviewed.pool, reviewed.proxy_runtime_code_hash),
         (
             reviewed.implementation,
             reviewed.implementation_runtime_code_hash,
         ),
-        reviewed.gauge,
+        pinned_gauge,
         reviewed.gauge_implementation,
     ] {
         if state.verified_code_hash(reviewed.chain_id, account) != Some(hash) {
@@ -79,7 +84,7 @@ fn reviewed(
         }
     }
     let gauge = read(state, address, U256::from(3))?;
-    if gauge != U256::from_be_slice(reviewed.gauge.0.as_slice()) {
+    if gauge != U256::from_be_slice(pinned_gauge.0.as_slice()) {
         return Err(unsupported("Aero CL gauge binding changed"));
     }
     Ok(reviewed)

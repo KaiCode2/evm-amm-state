@@ -74,7 +74,7 @@ pub(super) fn derive(
     chain
         .updates
         .push(StateUpdate::slot(reviewed.voter, U256::from(15), surplus));
-    if event.gauge != reviewed.gauge.0 {
+    if event.gauge != reviewed.gauge_address() {
         return Ok(chain.updates);
     }
     let (base, mut words) = gauge_words(reviewed, state)?;
