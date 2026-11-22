@@ -1081,7 +1081,7 @@ impl StateView for PreparedSnapshotState {
 #[cfg(feature = "live-runtime")]
 pub(crate) async fn prepare_fast_pool<P>(
     registry: &AdapterRegistry,
-    mut pool: PoolRegistration,
+    pool: PoolRegistration,
     baseline: AmmStatePoint,
     provider: &P,
     account_fetcher: Option<&AccountProofRoundFetcher>,
@@ -1092,29 +1092,57 @@ where
     let Some(adapter) = registry.adapter(pool.protocol()).cloned() else {
         return Ok(None);
     };
-    if !fast_metadata_complete(&pool) || !adapter.verified_storage_targets(&pool).is_empty() {
+    if !fast_metadata_complete(&pool) {
         return Ok(None);
     }
     let Some(kind) = hydration_kind(&pool) else {
         return Ok(None);
     };
-    let fast = async {
-        let output = run_storage_program(
-            provider,
-            BlockId::from((baseline.block_hash(), Some(true))),
-            &kind.program(),
-        )
-        .await
-        .map_err(|error| HydrationError::Fetch(Box::new(error)))?;
+    let block = BlockId::from((baseline.block_hash(), Some(true)));
+    let external_targets = adapter.verified_storage_targets(&pool);
+    let mut fast_pool = pool.clone();
+    let fast_fut = async {
+        let output = run_storage_program(provider, block, &kind.program())
+            .await
+            .map_err(|error| HydrationError::Fetch(Box::new(error)))?;
         let entries = kind.decode_entries(&output)?;
-        finalize_prepared_registration(&mut pool, &entries)?;
-        Ok::<_, HydrationError>(entries)
-    }
-    .await;
-    let Ok(entries) = fast else {
+        finalize_prepared_registration(&mut fast_pool, &entries)?;
+        Ok::<_, HydrationError>((fast_pool, entries))
+    };
+    let external_fut = async {
+        if external_targets.is_empty() {
+            return Ok::<_, ()>(Vec::new());
+        }
+        let fetched = evm_fork_cache::bulk_storage::fetch_slots_bulk(
+            provider,
+            external_targets,
+            block,
+            evm_fork_cache::BulkCallConfig::default(),
+        )
+        .await;
+        fetched
+            .into_iter()
+            .map(|(address, slot, result)| result.map(|value| (address, slot, value)).map_err(|_| ()))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let (fast, external_slots, verified_targets) = tokio::join!(
+        fast_fut,
+        external_fut,
+        prepare_verified_code_targets(adapter.as_ref(), &pool, baseline, provider),
+    );
+    let Ok((mut pool, mut entries)) = fast else {
         return Ok(None);
     };
+    let Ok(external_slots) = external_slots else {
+        return Ok(None);
+    };
+    let verified_targets = verified_targets?;
     record_v3_prepared_slots(&mut pool, &entries);
+    for (address, slot, value) in external_slots {
+        if !entries.iter().any(|(a, s, _)| *a == address && *s == slot) {
+            entries.push((address, slot, value));
+        }
+    }
     let accounts = prepare_code_seeds(
         adapter.as_ref(),
         &pool,
@@ -1123,8 +1151,7 @@ where
         account_fetcher,
     )?;
     let mut account_values = accounts.values().to_vec();
-    account_values
-        .extend(prepare_verified_code_targets(adapter.as_ref(), &pool, baseline, provider).await?);
+    account_values.extend(verified_targets);
     let accounts = PreparedAccountPatch::new(
         baseline.block_hash(),
         baseline.block_number(),
